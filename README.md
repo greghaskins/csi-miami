@@ -1,2 +1,2 @@
 # csi-miami
-Kubernetes Container Storage Interface (CSI) for Mounting Items Atop My Infrastructure
+Kubernetes Container Storage Interface (CSI) for Mounting Items Across My Infrastructure
