@@ -1,12 +1,13 @@
 # csi-miami architecture brief
 
-**Status:** Draft, for discussion
+**Status:** Draft, decisions 1 to 5 recorded (section 8)
 **Created:** 2026-10-30
+**Updated:** 2026-10-30
 
 MIAMI = Mounting Items Atop My Infrastructure. csi-miami is a Kubernetes
 CSI driver that mounts *items* (an ext4 image file, a node-local image, a
-Kubernetes object) *atop* *transports* (NFSv3 first; local paths; later
-SMB or anything that yields a directory on a node). Its reason to exist is
+plain shared directory) *atop* *transports* (NFSv3 first; local paths;
+later SMB or anything that yields a directory on a node). Its reason to exist is
 the same as every file-backed block driver's: shared storage that only
 speaks NFSv3 loses POSIX mode bits and locking semantics, and workloads
 such as git, SQLite and anything that calls `flock` need a real local
@@ -34,7 +35,8 @@ are stated here as design inputs, not as history.
 | `fsGroupPolicy: File` for image volumes | yes |
 | `VolumeCondition`, `GET_VOLUME_STATS` | yes |
 | Multi-arch image (arm64, amd64), kustomize base pinned by tag | yes |
-| Writable cross-node Secret directory with a lock | milestone 3 |
+| `ReadWriteMany` directory item straight on the transport (no loop) | yes, section 4.8 |
+| Writable cross-node Secret directory through FUSE | rejected, section 4.9 |
 | Node-local persistent and scratch tiers | future, section 5 |
 | S3-compatible object service built on the driver | future, section 5 |
 
@@ -70,18 +72,22 @@ design treats them as constraints.
    power cycle fixes. Soft NFSv3 with known `timeo` and `retrans` is also
    what makes self-fencing computable. The driver should own those options,
    not validate user-supplied ones.
-8. **`requiresRepublish` plus kubernetes/kubernetes#121271 means a publish
-   must never return a final error after the first success**, or kubelet
-   deletes the mount point for good. Telling "first publish" from
-   "republish after a restart" needs a persisted publish registry with a
-   per-record boot ID.
-9. **FUSE dies with its process.** There is no live handoff; every plugin
-   upgrade restarts FUSE-volume consumers on that node. "Delete
-   controller-owned pods on my node, narrowed by a
-   ValidatingAdmissionPolicy" is one shared component for every item kind.
+8. **FUSE-backed volumes are the most fragile thing a node plugin can
+   carry.** `requiresRepublish` plus kubernetes/kubernetes#121271 forbids
+   a final error after the first publish, so a persisted registry with
+   boot IDs is needed to tell restarts from first publishes; the mount dies
+   with the process, so every plugin upgrade restarts consumers; and the
+   content cap, flat namespace and `EPERM` on `chmod` all leak into the
+   consumer. For the one use that motivated it (a small credential file
+   refreshed exactly once cluster-wide) the hard part is the refresh
+   contract, which needs a cooperating wrapper regardless of the
+   filesystem beneath it.
+9. **`flock` on an NFS mount with `nolock` coordinates nothing across
+   nodes and reports success.** Cross-node mutual exclusion on NFSv3 must
+   use `mkdir` or `O_EXCL` create, which the protocol makes atomic, with
+   stale locks broken by the server's mtime.
 10. **Leases are awkward.** `create` cannot be scoped by `resourceNames`,
-    and GitOps tools commonly exclude `coordination.k8s.io/Lease`. A lock
-    should not need a second object.
+    and GitOps tools commonly exclude `coordination.k8s.io/Lease`.
 11. **Tests that pin argv strings don't catch behaviour.** An NFSv3 mount
     can break in the container image while every unit test stays green.
     End-to-end on NFSv3 from the first milestone.
@@ -105,7 +111,8 @@ design treats them as constraints.
 - **Exclusivity is layered and both layers are on by default.**
 - **Small privileged surface, explicit grants**, each mirrored by an
   admission policy.
-- **One binary, one DaemonSet, two CSI driver names** (section 4.3).
+- **One binary, one DaemonSet, one CSI driver name**; the item kind is a
+  StorageClass parameter (section 4.3).
 - **Observability from day one.** Metrics and events are part of the
   contract.
 
@@ -114,20 +121,21 @@ design treats them as constraints.
 ### 4.1 Vocabulary and layers
 
 ```
-pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)      FUSE dir
-                    ▲                         ▲                           ▲
-                  Item                   ImageItem                   ObjectItem
-                    ▲                         ▲
-                Transport           nfs3 / smb / local
+pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    bind of a subdirectory
+                    ▲                         ▲                             ▲
+                  Item                   ImageItem                    DirectoryItem
+                    ▲                         ▲                             ▲
+                Transport                       nfs3 / smb / local
 ```
 
 - **Transport**: yields a directory on this node. `nfs3` (server, export,
   driver-owned options), `local` (a host path; also how a pre-mounted SMB or
   FUSE directory is used), later `smb`. Identified by a short hash of its
   canonical config, mounted once per node at `<root>/transports/<id>`.
-- **Item**: a thing inside a transport directory that becomes a filesystem.
-  `image` (sparse ext4 `.img`, optional LUKS2) and `object` (a Kubernetes
-  Secret or ConfigMap rendered through FUSE; no transport).
+- **Item**: a thing inside a transport directory that becomes a mount.
+  `image` (sparse ext4 `.img`, optional LUKS2, single-node) and
+  `directory` (a subdirectory bound straight into the pod, many-node,
+  with the transport's own semantics).
 - **Mount**: the staged filesystem plus its bind mounts into pods.
 
 Package boundaries follow these nouns. Each layer exposes `Observe(ctx)
@@ -161,25 +169,22 @@ volume stay serialized.
 
 - **One binary**, `miami`, with subcommands `node` and `controller`.
 - **One DaemonSet**: `hostNetwork` (NAS export ACLs typically admit node
-  IPs only), privileged for loop, dm and FUSE, kubelet dir `Bidirectional`,
-  host `/dev`. It serves **two CSI sockets** with two registrar sidecars:
-  - `image.<domain>`: `attachRequired: true`, `podInfoOnMount: false`,
-    `fsGroupPolicy: File`, `Persistent`, `requiresRepublish: false`.
-  - `object.<domain>`: `attachRequired: false`, `podInfoOnMount: true`,
-    `tokenRequests`, `fsGroupPolicy: None`, `Ephemeral`,
-    `requiresRepublish: true`.
-  These `CSIDriver` fields are driver-wide and mutually incompatible:
-  `requiresRepublish` would hammer image volumes with publishes, and
-  `fsGroupPolicy: File` would make kubelet chown a FUSE directory that
-  returns `EPERM`.
-- **One controller Deployment** (image driver only) with csi-provisioner,
-  csi-resizer, csi-attacher and livenessprobe. **Option A** (proposed): it
-  mounts transports with the same transport package, is stateless, and
-  performs only `truncate`, `unlink` and `stat`. Formatting moves to first
-  stage, so the controller never runs `mkfs`. It needs `hostNetwork` and
-  `privileged` for the NFS mount. **Option B**: unprivileged controller that
-  delegates delete and expand to a node agent through a PV annotation
-  handshake; one privileged pod fewer, one cross-component dance more.
+  IPs only), privileged for loop and dm, kubelet dir `Bidirectional`, host
+  `/dev`. One CSI socket, one registrar. `CSIDriver` name
+  `miami.csi.greghaskins.com` (decision 1): `attachRequired: true`,
+  `podInfoOnMount: false`, `fsGroupPolicy: File`, `Persistent` lifecycle,
+  `requiresRepublish: false`. Directory items ride the same settings; the
+  attacher creates one `VolumeAttachment` per node for them, which is
+  harmless.
+- **One controller Deployment** with csi-provisioner, csi-resizer,
+  csi-attacher and livenessprobe. **Decision 2: option A.** It mounts
+  transports with the same transport package, is stateless, and performs
+  only `truncate`, `unlink`, `mkdir`, `rm -r` (directory items) and `stat`.
+  Formatting moves to first stage, so the controller never runs `mkfs`. It
+  needs `hostNetwork` and `privileged` for the NFS mount; the DaemonSet is
+  already privileged on every node, so the alternative (an unprivileged
+  controller delegating delete and expand to a node agent through a PV
+  annotation handshake) buys little and adds a cross-component protocol.
 - **Transport mounts on the host mount table**: the agent mounts into a
   `hostPath` directory with `mountPropagation: Bidirectional`, so the mount
   persists across plugin restarts, loop back-files always show the host
@@ -189,13 +194,18 @@ volume stay serialized.
 
 ### 4.4 Self-describing volumes
 
-Volume ID: `m1:<kind>:<transportID>:<name>`; the volume context carries the
-full transport config and item parameters. `DeleteVolume` and
-`ControllerExpandVolume` receive only the ID, so the locator for those two
-calls must be recoverable from the ID alone. Proposal: the ID carries the
-transport locator (`nfs3=<server>:<export>/<subdir>`) when it fits the 128
-byte CSI guideline, with a controller-side PV lookup as the fallback only
-(decision Q4).
+**Decision 3: opaque IDs, everything in the volume context.** Volume ID is
+`<kind>:<name>`; the volume context carries the full transport config and
+item parameters. `DeleteVolume` and `ControllerExpandVolume` receive only
+the ID, so the controller reads the PV for those two calls (Kubernetes
+1.31+ keeps the PV until delete returns; on older clusters a delete with
+no PV succeeds without deleting and logs it). This maximizes flexibility:
+no 128-byte constraint on the ID, a transport change (server address,
+export path) is corrected by editing a PV rather than re-provisioning, and
+static provisioning works, which both migration (4.10) and adopting
+pre-existing images need. The controller never deletes on doubt: if the
+rebuilt transport config does not contain the named file, it returns
+`Unavailable`.
 
 On disk: `<name>.img` beside `<name>.holder` under `<export>/<subdir>/`.
 Capacity is `stat().Size()`; sizes round to 4 KiB; the loop sector size is
@@ -251,37 +261,59 @@ and key size from StorageClass parameters, key passed over `/dev/fd/N`
 only, slot rotation when `previousKey` is present, keys never persisted.
 Minimum encrypted volume size accounts for the LUKS2 header.
 
-### 4.8 Object items
+### 4.8 Directory items
 
-Milestone 3. Borrowed pod identity via `tokenRequests` (the driver's own
-ServiceAccount never reads Secrets), per-key merge-patch writes with no
-read-modify-write, quorum GET with an empty `resourceVersion`,
-name-selector watches (no informers), commit before unlock, copy-on-write
-handle buffers, an RBAC hint in the `FailedMount` event, and a persisted
-publish registry with per-record boot IDs so a republish never returns a
-final error.
+A `directory` item is a subdirectory of the transport
+(`<export>/<subdir>/<name>/`) bound straight into the pod: `ReadWriteMany`,
+no loop, no holder, no fencing, the transport's own POSIX semantics. It
+exists so that one driver covers both needs of a shared NAS: image items
+where a workload needs a real local filesystem, directory items where
+plain shared files are enough, both under the same driver-owned transport
+profile and per-namespace subtree rules. Create is `mkdir`, delete is
+`rm -r`, expand is a no-op (reported capacity is the export's).
 
-Two deliberate choices:
+The documented contract: close-to-open consistency (a reader that opens
+after the writer closes sees the new content); `flock` and `fcntl` locks
+are node-local on a `nolock` transport and must not be relied on across
+nodes; cross-node mutual exclusion is `mkdir` or `O_EXCL` create plus a
+stale-lock rule on the server's mtime. The driver ships a small
+`miami lock` helper (run, hold, release, break-if-older-than) so that
+wrappers around non-cooperating writers do not reinvent it.
 
-- **The lock lives on the object.** `flock` becomes a metadata-only patch
-  of an annotation `<domain>/lock: {holder, expiry}` with a
-  `resourceVersion` precondition on the Secret the consumer already has
-  `patch` on. No Lease, no `create` grant, no GitOps exclusion problem.
-  Expiry is judged against local observation, not the remote timestamp.
-- **Explicit `O_TRUNC` semantics.** A handle that was truncated and never
-  written is treated as "no change" and not committed; otherwise commit on
-  `fsync`, `flush` and `release`. This is a documented consumer contract
-  line, because a writer killed between `open(O_TRUNC)` and `write` must
-  not publish an empty object cluster-wide.
+### 4.9 Rejected: FUSE-backed Kubernetes object volumes
 
-### 4.9 Observability and security posture
+Considered and rejected for v1. A Secret or ConfigMap rendered as a
+writable directory through FUSE, with a lock behind it, solves the
+"refresh a shared credential exactly once" problem with API-server
+consistency and per-object RBAC. It costs a second `CSIDriver` name (its
+required spec fields contradict the image driver's), borrowed pod identity,
+a persisted publish registry with boot IDs, consumer restarts on every
+plugin upgrade, and a content cap, for one or two small files. The same
+problem is served by a directory item plus a locking wrapper (4.8). If a
+Secret must remain the source of truth, a sidecar mirroring the file into
+it is simpler than a filesystem. This can be revisited if a consumer
+appears that needs the API-server guarantees specifically.
+
+### 4.10 Migration from an existing file-backed driver
+
+**Decision 4: a rename tool.** Per volume, with the workload scaled to
+zero: set the old PV's `reclaimPolicy` to `Retain`; delete the PVC and the
+PV; rename the image file to the new layout on the transport; create a
+static PV for `miami.csi.greghaskins.com` with the same capacity, the
+volume context the new driver expects, and a `claimRef` to the PVC name;
+recreate the PVC; scale up. The tool does the Kubernetes side and prints
+the rename it expects, or runs it over the mounted transport when given
+access. Both drivers can be installed side by side during the window;
+nothing forces a flag day.
+
+### 4.11 Observability and security posture
 
 - Prometheus `/metrics` on both roles: staged volumes by kind and
   transport, holder renew latency and failures, transport health, fenced
   count, failed volumes, remediation actions, reconcile duration.
 - Events on the PVC and pod for every state change a human would ask about.
 - Every API write the node agent can perform is enumerated in RBAC and
-  mirrored by a VAP. The object driver's own SA has no object access.
+  mirrored by a VAP.
 - Image: slim Debian for the image role (`e2fsprogs`, `util-linux`,
   `cryptsetup`, `nfs-common`, `iproute2`; build-assert `netbase`),
   distroless for roles that need no shell. CI mounts NFSv3 for real.
@@ -328,7 +360,7 @@ RWO volume with takeover; the service is a consumer, not an item kind.
 
 - Unit tests through an `exec.Runner` seam, weighted toward table tests of
   the reconciler against fake observers rather than argv pinning.
-- `envtest` for API semantics (object items, scratch GC, admission policy
+- `envtest` for API semantics (PV lookups, scratch GC, admission policy
   CEL).
 - Root smoke under `unshare --mount`, including plugin replacement and a
   simulated reboot (boot ID change).
@@ -339,37 +371,42 @@ RWO volume with takeover; the service is a consumer, not an item kind.
 
 ## 7. Non-goals
 
-- RWX on image items; only object items are many-node.
+- RWX on image items; only directory items are many-node.
 - Online expansion, snapshots, clones, block mode, fsTypes other than ext4.
-- Byte-range locks on object items.
+- Any cross-node locking guarantee on directory items beyond what `mkdir`
+  and `O_EXCL` give.
 - Nodes that cannot reach the NAS from the host network.
 
-## 8. Decisions needed
+## 8. Decisions
 
-1. **Driver names and domain**: `image.<domain>` / `object.<domain>`;
-   choose `<domain>`. Unique in the cluster forever.
-2. **Two driver names in one DaemonSet** (proposed) versus one name with
-   compromises, versus two DaemonSets.
-3. **Controller shape**: option A (stateless, mounts transports,
-   privileged) or option B (unprivileged, delegates through a PV
-   annotation).
-4. **Volume ID content**: locator in the ID with PV lookup as fallback, or
-   PV lookup always with an opaque ID.
-5. **A Kubernetes Lease alongside the transport-clock holder**: proposed
+Recorded:
+
+1. **Driver name**: `miami.csi.greghaskins.com`. One name; item kind is a
+   StorageClass parameter. (The owner's first choice was an `image.`
+   prefix, which only made sense with a second driver name; confirm.)
+2. **Controller shape**: option A, stateless and privileged, never formats.
+3. **Volume ID**: opaque; all config in the volume context; PV lookup for
+   delete and expand. Chosen for flexibility and compatibility.
+4. **Migration**: rename tool with static PVs (4.10).
+5. **License**: GPL-3.0. The sidecars are separate images and the Go
+   dependencies (gRPC, CSI spec, kernel-interface libraries) are
+   Apache-2.0 or BSD, which flow into GPLv3 without conflict.
+
+Pending:
+
+6. **FUSE-backed object volumes**: rejected in favour of directory items
+   plus a locking wrapper (4.8, 4.9); confirm.
+7. **A Kubernetes Lease alongside the transport-clock holder**: proposed
    no; the transport clock covers the partition that matters (NAS reachable,
    API server not).
-6. **Transport profile ownership**: driver-dictated named profiles
+8. **Transport profile ownership**: driver-dictated named profiles
    (proposed) versus raw option strings in StorageClasses.
-7. **Migration from an existing file-backed driver**: a one-shot rename
-   and PV rewrite tool, or run side by side and let PVCs drain.
-8. **Active failed-volume probe** for kernels whose mountinfo shows
+9. **Active failed-volume probe** for kernels whose mountinfo shows
    nothing, or document the gap.
-9. **Object items in v1 or milestone 3** (proposed 3).
-10. **Which node-local tier comes first** once section 5.1 is scheduled,
+10. **Whether directory items replace a separate NFS CSI driver** in the
+    first deployment or later.
+11. **Which node-local tier comes first** once section 5.1 is scheduled,
     and whether it displaces an existing local-path provisioner.
-11. **License.** The repository is GPL-3.0. The CSI ecosystem is Apache-2.0
-    throughout; GPL is a legitimate choice for a personal project but
-    narrows reuse by others. Decide before the first public release.
 
 ## 9. Milestones (proposal)
 
@@ -379,6 +416,5 @@ RWO volume with takeover; the service is a consumer, not an item kind.
    expand, metrics, kind e2e on NFSv3.
 2. **M2, recovery**: failed-volume detection, shared remediation package
    and VAP, re-stage via the publish secret, canaries, migration tooling.
-3. **M3, object items**: second driver name, borrowed identity, annotation
-   lock, `O_TRUNC` contract.
+3. **M3, directory items** and the `miami lock` helper.
 4. **Later**: node-local tiers (5.1), then the S3 service (5.2).
