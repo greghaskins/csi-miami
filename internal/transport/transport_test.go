@@ -406,6 +406,35 @@ func TestNFS3MountAddr(t *testing.T) {
 	}
 }
 
+// addr must be safe on its own: a Spec that was never validated (built
+// without New) cannot get an IPv6 address through it.
+func TestNFS3AddrRefusesIPv6WithoutValidate(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		server string
+		want   string
+	}{
+		{name: "an IPv6 literal", server: "2001:db8::1", want: "IPv6 is not supported"},
+		{name: "a bracketed IPv6 literal", server: "[2001:db8::1]", want: "no IPv4 address"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res := resolver(func(context.Context, string) ([]net.IPAddr, error) { return nil, nil })
+			n := &nfs3{base: base{
+				spec: Spec{Kind: KindNFS3, Server: tt.server, Export: "/export/data"},
+				opts: Options{Resolver: res, ResolveTimeout: time.Second},
+				busy: &inflight{},
+			}}
+			got, err := n.addr(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("addr() = %q, %v; want an error containing %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestNFS3MountResolutionHonoursTheCallersContext(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

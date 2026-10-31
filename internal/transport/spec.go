@@ -45,10 +45,10 @@ const (
 // Spec is what a StorageClass describes: where a transport's directory comes
 // from.
 //
-// A valid Spec is in normal form: paths are cleaned, a host name is lower
-// case ASCII. Validate rejects anything else, so the strings a Spec carries (and a volume context stores)
-// can be compared byte for byte. Normalize and ParseSpec produce the normal
-// form from a looser spelling.
+// A valid Spec is in normal form: paths are cleaned and a host name is lower
+// case ASCII. Validate rejects anything else, so the strings a Spec carries
+// (and a volume context stores) can be compared byte for byte. Normalize and
+// ParseSpec produce the normal form from a looser spelling.
 type Spec struct {
 	Kind   string // "nfs3" | "local"
 	Server string // nfs3: ASCII host name or dotted IPv4 literal; IPv6 is not supported
@@ -209,8 +209,8 @@ func normalizePath(p string) string {
 }
 
 // Normalize returns the Spec with its server lower-cased (ASCII only) and
-// its paths cleaned. It does
-// not make an invalid Spec valid: a path with a ".." element is left alone.
+// its paths cleaned. It does not make an invalid Spec valid: a path with a
+// ".." element is left alone.
 func (s Spec) Normalize() Spec {
 	s.Server = asciiLower(s.Server)
 	s.Export = normalizePath(s.Export)
@@ -256,10 +256,10 @@ func (s Spec) MountPoint(root string) (string, error) {
 }
 
 // ParseSpec builds a validated Spec in normal form from StorageClass
-// parameters: paths are cleaned (a trailing slash is accepted), the server
-// is lower-cased before validation. It
-// reads only the transport.* keys and ignores the rest; rejecting unknown
-// keys is the caller's job, since the other keys belong to the caller.
+// parameters: paths are cleaned (a trailing slash is accepted) and the server
+// is lower-cased before validation. It reads only the transport.* keys and
+// ignores the rest; rejecting unknown keys is the caller's job, since the
+// other keys belong to the caller.
 func ParseSpec(params map[string]string) (Spec, error) {
 	s := Spec{
 		Kind:   params[ParamKind],

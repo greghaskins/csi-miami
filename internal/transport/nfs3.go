@@ -217,6 +217,9 @@ func (n *nfs3) Mount(ctx context.Context) error {
 func (n *nfs3) addr(ctx context.Context) (string, error) {
 	server := n.spec.Server
 	if a, err := netip.ParseAddr(server); err == nil {
+		if !a.Is4() {
+			return "", fmt.Errorf("nfs3 server %q: IPv6 is not supported; use an IPv4 address or a host name", server)
+		}
 		return a.String(), nil
 	}
 	what := fmt.Sprintf("resolving nfs3 server %q", server)
