@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "volumeID": "directory:pvc-0a1b2c3d-1111-2222-3333-444455556666",
+  "kind": "directory",
+  "transport": {
+    "kind": "nfs3",
+    "server": "Nfs.Example.COM",
+    "export": "/export/data"
+  },
+  "subdir": "pvc-0a1b2c3d-1111-2222-3333-444455556666",
+  "stagePath": "/var/lib/kubelet/plugins/example/stage/pvc-0a1b2c3d-1111-2222-3333-444455556666",
+  "publishes": [
+    {
+      "targetPath": "/var/lib/kubelet/pods/uid-a/volumes/mount",
+      "readOnly": false
+    },
+    {
+      "targetPath": "/var/lib/kubelet/pods/uid-b/volumes/mount",
+      "readOnly": true
+    }
+  ],
+  "mountFlags": [
+    "noatime",
+    "nodiratime"
+  ],
+  "accessMode": "MULTI_NODE_MULTI_WRITER"
+}
