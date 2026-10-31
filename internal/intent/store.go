@@ -132,6 +132,13 @@ func (s *Store) saveLocked(in Intent) error {
 	if err := in.Validate(); err != nil {
 		return fmt.Errorf("intent store: invalid intent: %w", err)
 	}
+	// The generation is the store's to set: one more than the record being
+	// replaced. A record that cannot be read has no generation to continue
+	// from, and the write that repairs it starts again at 1.
+	in.Generation = 1
+	if prev, ok, err := s.getLocked(in.VolumeID); err == nil && ok {
+		in.Generation = prev.Generation + 1
+	}
 	data, err := json.MarshalIndent(in, "", "  ")
 	if err != nil {
 		return fmt.Errorf("intent store: encode: %w", err)

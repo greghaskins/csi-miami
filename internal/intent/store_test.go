@@ -142,9 +142,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("Failures = %v, want none", got.Failures)
 	}
 	want := map[string]Intent{
-		empty.VolumeID: empty,
-		full.VolumeID:  full,
-		local.VolumeID: local,
+		empty.VolumeID: gen(empty, 1),
+		full.VolumeID:  gen(full, 1),
+		local.VolumeID: gen(local, 1),
 	}
 	if !reflect.DeepEqual(got.Intents, want) {
 		t.Fatalf("Intents =\n%+v\nwant\n%+v", got.Intents, want)
@@ -207,8 +207,8 @@ func TestSaveReplacesAtomically(t *testing.T) {
 	mustSave(t, s, next)
 
 	got := mustLoad(t, s)
-	if !reflect.DeepEqual(got.Intents[old.VolumeID], next) {
-		t.Fatalf("loaded %+v, want the new record %+v", got.Intents[old.VolumeID], next)
+	if want := gen(next, 2); !reflect.DeepEqual(got.Intents[old.VolumeID], want) {
+		t.Fatalf("loaded %+v, want the new record %+v", got.Intents[old.VolumeID], want)
 	}
 	if files := names(t, dir); !reflect.DeepEqual(files, []string{"directory%3Apvc-1.json"}) {
 		t.Fatalf("files = %v, want only the record (no temp file)", files)
@@ -288,6 +288,13 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+// gen returns in with the generation the store gives a record at its nth
+// write.
+func gen(in Intent, n uint64) Intent {
+	in.Generation = n
+	return in
+}
+
 func TestDeleteIf(t *testing.T) {
 	t.Parallel()
 	s, _ := openStore(t)
@@ -296,10 +303,11 @@ func TestDeleteIf(t *testing.T) {
 	mustSave(t, s, sample("pvc-b"))
 
 	// A record changed since it was read is kept.
+	read, _, _ := s.Get(a.VolumeID)
 	changed := a
 	changed.Publishes = []Publish{{TargetPath: "/pods/p1/mount"}}
 	mustSave(t, s, changed)
-	if ok, err := s.DeleteIf(a.VolumeID, a); err != nil || ok {
+	if ok, err := s.DeleteIf(a.VolumeID, read); err != nil || ok {
 		t.Fatalf("DeleteIf of a stale copy = %v, %v; want false, nil", ok, err)
 	}
 	if _, ok, _ := s.Get(a.VolumeID); !ok {
@@ -307,6 +315,7 @@ func TestDeleteIf(t *testing.T) {
 	}
 
 	// The record as it is goes, and only it.
+	changed, _, _ = s.Get(a.VolumeID)
 	if ok, err := s.DeleteIf(a.VolumeID, changed); err != nil || !ok {
 		t.Fatalf("DeleteIf = %v, %v; want true, nil", ok, err)
 	}
@@ -320,6 +329,47 @@ func TestDeleteIf(t *testing.T) {
 	// Gone already is not an error and not a deletion.
 	if ok, err := s.DeleteIf(a.VolumeID, changed); err != nil || ok {
 		t.Errorf("DeleteIf of a missing record = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// A record rewritten with exactly the same content is still a rewrite: the
+// generation says so, and a delete decided on the earlier read does not take
+// it. This is a Stage repeated with the same parameters while an Unstage runs.
+func TestDeleteIfIsNotFooledByAnIdenticalRewrite(t *testing.T) {
+	t.Parallel()
+	s, _ := openStore(t)
+	a := sample("pvc-a")
+	mustSave(t, s, a)
+	read, _, _ := s.Get(a.VolumeID)
+	if read.Generation != 1 {
+		t.Fatalf("generation = %d, want 1", read.Generation)
+	}
+
+	mustSave(t, s, a) // the same record again
+	again, _, _ := s.Get(a.VolumeID)
+	if again.Generation != 2 {
+		t.Fatalf("generation after a second Save = %d, want 2", again.Generation)
+	}
+	if ok, err := s.DeleteIf(a.VolumeID, read); err != nil || ok {
+		t.Fatalf("DeleteIf of the copy read before the rewrite = %v, %v; want false, nil", ok, err)
+	}
+	// An Update that changes nothing counts as a write too.
+	if err := s.Update(a.VolumeID, func(*Intent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s.DeleteIf(a.VolumeID, again); ok {
+		t.Error("DeleteIf took a record an Update had rewritten")
+	}
+	// The caller's own copy is never altered, and a Generation it sets is
+	// ignored.
+	b := sample("pvc-b")
+	b.Generation = 99
+	mustSave(t, s, b)
+	if b.Generation != 99 {
+		t.Error("Save changed the caller's Intent")
+	}
+	if got, _, _ := s.Get(b.VolumeID); got.Generation != 1 {
+		t.Errorf("generation = %d, want the store's 1", got.Generation)
 	}
 }
 
@@ -489,8 +539,8 @@ func TestLoadCorruptRecords(t *testing.T) {
 	before := names(t, dir)
 	got := mustLoad(t, s)
 
-	if len(got.Intents) != 2 || !reflect.DeepEqual(got.Intents[good.VolumeID], good) ||
-		!reflect.DeepEqual(got.Intents[good2.VolumeID], good2) {
+	if len(got.Intents) != 2 || !reflect.DeepEqual(got.Intents[good.VolumeID], gen(good, 1)) ||
+		!reflect.DeepEqual(got.Intents[good2.VolumeID], gen(good2, 1)) {
 		t.Fatalf("good records did not load: %+v", got.Intents)
 	}
 	if len(got.Failures) != len(cases) {
@@ -602,7 +652,7 @@ func TestSaveRepairsALoadFailure(t *testing.T) {
 	in := sample("pvc-1")
 	mustSave(t, s, in)
 	got := mustLoad(t, s)
-	if len(got.Failures) != 0 || !reflect.DeepEqual(got.Intents[in.VolumeID], in) {
+	if len(got.Failures) != 0 || !reflect.DeepEqual(got.Intents[in.VolumeID], gen(in, 1)) {
 		t.Fatalf("after Save: %+v", got)
 	}
 }

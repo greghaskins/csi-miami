@@ -18,6 +18,9 @@ type wireIntent struct {
 	Publishes  []Publish       `json:"publishes,omitempty"`
 	MountFlags []string        `json:"mountFlags,omitempty"`
 	AccessMode string          `json:"accessMode"`
+	// Generation is informational for a version 1 reader, which ignores it;
+	// a record without it reads as 0.
+	Generation uint64 `json:"generation"`
 }
 
 // transportRecord is the on-disk form of a transport.Spec, with its own
@@ -46,6 +49,7 @@ func toWire(in Intent) wireIntent {
 		Publishes:  in.Publishes,
 		MountFlags: in.MountFlags,
 		AccessMode: in.AccessMode,
+		Generation: in.Generation,
 	}
 }
 
@@ -65,5 +69,6 @@ func fromWire(w wireIntent) Intent {
 		Publishes:  w.Publishes,
 		MountFlags: w.MountFlags,
 		AccessMode: w.AccessMode,
+		Generation: w.Generation,
 	}
 }

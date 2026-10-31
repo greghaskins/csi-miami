@@ -114,6 +114,44 @@ func TestAnUnstageAfterAStageWins(t *testing.T) {
 	}
 }
 
+// Kubelet repeats NodeStage with the same parameters. If that lands while a
+// teardown that no longer has a waiting caller is running, the record it
+// writes is byte for byte the one the teardown loaded; only the generation
+// tells it apart, and the teardown must not delete it.
+func TestUnstageDoesNotDeleteAnIdenticalStageWrittenDuringTheTeardown(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", "pvc-1")
+	mustNil(t, "Stage", e.r.Stage(bg, in))
+	loaded, _ := e.intentOf(in.VolumeID)
+
+	e.setHook(func(c fake.Call) {
+		if c.Op == fake.OpUnmount && c.Target == in.StagePath {
+			// What Stage writes: the same record again.
+			mustNil(t, "identical Stage", e.store.Save(in))
+		}
+	})
+	err := e.r.Unstage(bg, in.VolumeID)
+	if !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("Unstage = %v, want ErrSuperseded", err)
+	}
+	got, ok := e.intentOf(in.VolumeID)
+	if !ok {
+		t.Fatal("the identical Stage was deleted")
+	}
+	if got.Generation <= loaded.Generation {
+		t.Errorf("generation %d did not move past %d", got.Generation, loaded.Generation)
+	}
+	e.hook.Store(nil)
+	n := e.passes()
+	e.r.nudge()
+	e.waitPasses(n + 1)
+	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+		t.Error("the volume was not restored")
+	}
+}
+
 // A Publish recorded after the pass loaded the record is invisible to the
 // teardown running in that pass. The record must survive it.
 func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
