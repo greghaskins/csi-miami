@@ -27,7 +27,13 @@
 // garbage.go: mounts strictly below the staging root that no volume's stage
 // path covers, publish targets the reconciler was asked or has reason to
 // drop, and (only if a timeout is configured) transports nothing references.
-// A pass whose intent store could not be read collects nothing. Every stat and
+// A record that cannot be read makes its volume's intent unknown, not absent:
+// a pass in which the store or any record could not be read collects nothing
+// (an explicit Unpublish excepted), and a request that would have to read or
+// rewrite that record fails as ErrIntentsUnknown and changes nothing. The
+// driver unmounts only what the mount table shows to be a bind of what it
+// should be a bind of, so a foreign mount at a stage path or a publish target
+// is reported and left. Every stat and
 // observation of a path that may sit on a dead server runs under a deadline in
 // its own goroutine that is abandoned, never joined (internal/deadline), and a
 // transport that times out is not tried again by the other volumes on it in

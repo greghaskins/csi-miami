@@ -307,7 +307,7 @@ func (p *pass) noteVolume(id string, res *volumeResult) {
 		// Shutting down: the steps that failed were cancelled, not broken.
 		return
 	}
-	err, reason := res.err()
+	reason, err := res.problem()
 	prev, had := r.lastErr[id]
 	if err == nil {
 		if had {
@@ -373,9 +373,10 @@ func conditionOf(err error) string {
 	}
 }
 
-// err joins everything that is wrong with the volume, for logs and events, and
-// names the event reason. A publish that was pruned is not wrong.
-func (res *volumeResult) err() (error, string) {
+// problem names the event reason for what is wrong with the volume and joins
+// everything that is, for logs and events. A publish that was pruned is not
+// wrong.
+func (res *volumeResult) problem() (string, error) {
 	reason := ReasonMountFailed
 	var errs []error
 	if res.stage != nil {
@@ -394,7 +395,7 @@ func (res *volumeResult) err() (error, string) {
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...), reason
+	return reason, errors.Join(errs...)
 }
 
 // ensureTransport makes sure the transport at dir is mounted: observed

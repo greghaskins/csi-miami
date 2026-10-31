@@ -10,6 +10,7 @@
 // toward the stage path being a mount of the volume, and Teardown undoes it.
 //
 // This package holds the interface, the errors every item kind shares, and
-// the helper that unmounts a path safely. The directory kind lives in
+// UnmountBind, the one way to take down a mount: only if it is a bind of what
+// it should be a bind of. The directory kind lives in
 // internal/item/directory; M2 adds image.
 package item

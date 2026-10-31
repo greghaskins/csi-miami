@@ -457,13 +457,6 @@ func TestStageKeepsThePublishesOfAStagedVolume(t *testing.T) {
 	}
 }
 
-// corrupt overwrites a volume's record with junk.
-func corrupt(t *testing.T, e *env, volumeID string) {
-	t.Helper()
-	p := filepath.Join(e.store.Dir(), intent.Escape(volumeID)+".json")
-	mustNil(t, "corrupt", os.WriteFile(p, []byte("{not json"), 0o600))
-}
-
 func TestStageValidation(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
