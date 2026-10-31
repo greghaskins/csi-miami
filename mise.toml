@@ -4,7 +4,7 @@ gitleaks = "8.30.1"
 "pipx:pre-commit" = "4.7.0"
 
 [hooks]
-postinstall = "pre-commit install --install-hooks --hook-type pre-commit --hook-type commit-msg"
+postinstall = "pre-commit install --install-hooks --hook-type pre-commit --hook-type commit-msg --hook-type pre-push"
 
 # The gitleaks config is kept outside this repository. Export
 # GITLEAKS_CONFIG_TOML in your environment (README, Development); an [env]
