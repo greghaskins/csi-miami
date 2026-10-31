@@ -8,12 +8,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 )
@@ -34,15 +34,39 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func TestGetPV(t *testing.T) {
 	t.Parallel()
-	pv := corev1.PersistentVolume{
-		TypeMeta:   metav1.TypeMeta{Kind: "PersistentVolume", APIVersion: "v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
-		Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{
-			CSI: &corev1.CSIPersistentVolumeSource{Driver: "d.example.com", VolumeHandle: "directory:pvc-1"},
-		}},
+	pv := map[string]any{
+		"apiVersion": "v1", "kind": "PersistentVolume",
+		"metadata": map[string]any{"name": "pvc-1"},
+		"spec": map[string]any{
+			"persistentVolumeReclaimPolicy": "Delete",
+			"capacity":                      map[string]any{"storage": "1Gi"},
+			"csi": map[string]any{
+				"driver": "d.example.com", "volumeHandle": "directory:pvc-1",
+				"volumeAttributes": map[string]any{"miami/kind": "directory", "x": "y"},
+			},
+		},
 	}
-	status := func(code int32, reason metav1.StatusReason) metav1.Status {
-		return metav1.Status{TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: metav1.StatusFailure, Code: code, Reason: reason, Message: "x"}
+	hostPath := map[string]any{
+		"apiVersion": "v1", "kind": "PersistentVolume",
+		"metadata": map[string]any{"name": "nocsi"},
+		"spec":     map[string]any{"hostPath": map[string]any{"path": "/x"}},
+	}
+	badType := map[string]any{
+		"apiVersion": "v1", "kind": "PersistentVolume",
+		"metadata": map[string]any{"name": "badtype"},
+		"spec":     map[string]any{"csi": map[string]any{"driver": "d", "volumeHandle": 7}},
+	}
+	badAttr := map[string]any{
+		"apiVersion": "v1", "kind": "PersistentVolume",
+		"metadata": map[string]any{"name": "badattr"},
+		"spec":     map[string]any{"csi": map[string]any{"driver": "d", "volumeAttributes": map[string]any{"k": 1}}},
+	}
+	status := func(code int32, reason metav1.StatusReason, name string) metav1.Status {
+		return metav1.Status{
+			TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"}, Status: metav1.StatusFailure,
+			Code: code, Reason: reason, Message: "x",
+			Details: &metav1.StatusDetails{Name: name, Kind: "persistentvolumes"},
+		}
 	}
 	var mu sync.Mutex
 	var paths []string
@@ -53,12 +77,32 @@ func TestGetPV(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v1/persistentvolumes/pvc-1":
 			writeJSON(w, 200, pv)
+		case "/api/v1/persistentvolumes/nocsi":
+			writeJSON(w, 200, hostPath)
+		case "/api/v1/persistentvolumes/badtype":
+			writeJSON(w, 200, badType)
+		case "/api/v1/persistentvolumes/badattr":
+			writeJSON(w, 200, badAttr)
 		case "/api/v1/persistentvolumes/gone":
-			writeJSON(w, 404, status(404, metav1.StatusReasonNotFound))
+			writeJSON(w, 404, status(404, metav1.StatusReasonNotFound, "gone"))
 		case "/api/v1/persistentvolumes/denied":
-			writeJSON(w, 403, status(403, metav1.StatusReasonForbidden))
+			writeJSON(w, 403, status(403, metav1.StatusReasonForbidden, "denied"))
+		// What a load balancer or reverse proxy in front of a wrong endpoint
+		// answers for a path it does not know: not the API server's NotFound.
+		case "/api/v1/persistentvolumes/html":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte("<html><body>404 page not found</body></html>"))
+		case "/api/v1/persistentvolumes/plain":
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte("404 page not found\n"))
+		case "/api/v1/persistentvolumes/empty":
+			w.WriteHeader(404)
+		case "/api/v1/persistentvolumes/jsonnotstatus":
+			writeJSON(w, 404, map[string]any{"error": "no route"})
 		default:
-			writeJSON(w, 500, status(500, metav1.StatusReasonInternalError))
+			writeJSON(w, 500, status(500, metav1.StatusReasonInternalError, ""))
 		}
 	})
 	c, err := NewClient(cfg, time.Minute)
@@ -68,13 +112,23 @@ func TestGetPV(t *testing.T) {
 	ctx := context.Background()
 
 	got, err := c.GetPV(ctx, "pvc-1")
-	if err != nil || got.Name != "pvc-1" || got.Spec.CSI.VolumeHandle != "directory:pvc-1" {
-		t.Errorf("GetPV(pvc-1) = %v, %v", got, err)
+	want := &PV{
+		Name: "pvc-1", Driver: "d.example.com", VolumeHandle: "directory:pvc-1", ReclaimPolicy: "Delete",
+		VolumeAttributes: map[string]string{"miami/kind": "directory", "x": "y"},
+	}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("GetPV(pvc-1) = %+v, %v; want %+v", got, err, want)
+	}
+	got, err = c.GetPV(ctx, "nocsi")
+	if err != nil || got.Name != "nocsi" || got.Driver != "" || got.VolumeHandle != "" || len(got.VolumeAttributes) != 0 {
+		t.Errorf("GetPV(nocsi) = %+v, %v; want a PV with no CSI fields", got, err)
 	}
 	if _, err := c.GetPV(ctx, "gone"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetPV(gone) error = %v, want ErrNotFound", err)
 	}
-	for _, name := range []string{"denied", "broken"} {
+	// Anything else is an unknown answer, and in particular a 404 that is not
+	// the API server's own must never be read as "no such PV".
+	for _, name := range []string{"denied", "broken", "html", "plain", "empty", "jsonnotstatus", "badtype", "badattr"} {
 		pv, err := c.GetPV(ctx, name)
 		if err == nil || errors.Is(err, ErrNotFound) || pv != nil {
 			t.Errorf("GetPV(%s) = %v, %v; want an error that is not ErrNotFound", name, pv, err)
@@ -178,10 +232,25 @@ func TestRestConfig(t *testing.T) {
 	}
 }
 
+// An explicit kubeconfig wins over the in-cluster configuration, so a
+// developer's flag is never silently ignored inside a cluster.
+func TestRestConfigPrefersAnExplicitKubeconfig(t *testing.T) {
+	// Not parallel: it sets the environment.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "192.0.2.77")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
+	good := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(good, []byte(kubeconfigYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := RestConfig(good)
+	if err != nil || cfg.Host != "https://192.0.2.1:6443" {
+		t.Errorf("RestConfig = %v, %v; want the kubeconfig's server", cfg, err)
+	}
+}
+
 func TestRestConfigInCluster(t *testing.T) {
 	// Not parallel: it sets the environment. Without the service account files
-	// the in-cluster configuration fails, and that failure is reported rather
-	// than papered over by the kubeconfig.
+	// the in-cluster configuration fails, and that failure is reported.
 	t.Setenv("KUBERNETES_SERVICE_HOST", "192.0.2.1")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
 	if _, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token"); err == nil {

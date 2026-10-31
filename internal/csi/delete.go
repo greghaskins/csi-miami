@@ -12,7 +12,6 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/observe"
@@ -114,24 +113,29 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 //   - its volume handle is the requested ID, so a PV cannot be made to
 //     authorise the deletion of another volume, and a volume ID of another
 //     kind or name is not mistaken for this one;
+//   - its reclaim policy is Delete, so a caller that asks to delete a volume
+//     the cluster means to keep (Retain) is refused, which costs nothing and
+//     stops a misdirected call;
 //   - its attributes decode with volume.DecodeContext, which accepts only what
 //     volume.NewContext produces and repairs nothing, and the kind matches the
 //     ID.
-func contextOfPV(pv *corev1.PersistentVolume, id volume.ID) (volume.Context, error) {
+func contextOfPV(pv *kube.PV, id volume.ID) (volume.Context, error) {
 	if pv.Name != id.Name {
 		return volume.Context{}, errors.New("the PV returned has another name")
 	}
-	src := pv.Spec.CSI
-	if src == nil {
+	if pv.Driver == "" {
 		return volume.Context{}, errors.New("the PV is not a CSI volume")
 	}
-	if src.Driver != DriverName {
+	if pv.Driver != DriverName {
 		return volume.Context{}, errors.New("the PV belongs to another driver")
 	}
-	if src.VolumeHandle != id.String() {
+	if pv.VolumeHandle != id.String() {
 		return volume.Context{}, errors.New("the PV's volume handle is not the requested volume ID")
 	}
-	vctx, err := volume.DecodeContext(src.VolumeAttributes)
+	if pv.ReclaimPolicy != reclaimDelete {
+		return volume.Context{}, errors.New("the PV's reclaim policy is not Delete")
+	}
+	vctx, err := volume.DecodeContext(pv.VolumeAttributes)
 	if err != nil {
 		return volume.Context{}, fmt.Errorf("the PV's volume attributes do not decode: %w", err)
 	}
@@ -140,6 +144,10 @@ func contextOfPV(pv *corev1.PersistentVolume, id volume.ID) (volume.Context, err
 	}
 	return vctx, nil
 }
+
+// reclaimDelete is the persistentVolumeReclaimPolicy of a PV whose volume is
+// meant to be deleted with it.
+const reclaimDelete = "Delete"
 
 // treeReader is the part of mount.Mounter that removeItemDir needs.
 type treeReader interface {

@@ -4,6 +4,7 @@ package csi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -112,10 +113,10 @@ func TestEnvtestPVPaths(t *testing.T) {
 	t.Run("GetPV finds a PV and reports a missing one as not found", func(t *testing.T) {
 		createPV(t, cfg, apiPV("pvc-00000000-0000-4000-8000-000000000001", "directory:pvc-00000000-0000-4000-8000-000000000001", map[string]string{"miami/kind": "directory"}))
 		pv, err := c.GetPV(ctx, "pvc-00000000-0000-4000-8000-000000000001")
-		if err != nil || pv.Spec.CSI.VolumeHandle != "directory:pvc-00000000-0000-4000-8000-000000000001" {
+		if err != nil || pv.VolumeHandle != "directory:pvc-00000000-0000-4000-8000-000000000001" {
 			t.Errorf("GetPV = %v, %v", pv, err)
 		}
-		if _, err := c.GetPV(ctx, "pvc-00000000-0000-4000-8000-0000000000ff"); err == nil || !strings.Contains(err.Error(), "not found") {
+		if _, err := c.GetPV(ctx, "pvc-00000000-0000-4000-8000-0000000000ff"); err == nil || !errors.Is(err, kube.ErrNotFound) {
 			t.Errorf("GetPV of a missing PV: error = %v, want not found", err)
 		}
 	})

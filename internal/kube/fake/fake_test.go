@@ -6,14 +6,11 @@ import (
 	"slices"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/greghaskins/csi-miami/internal/kube"
 )
 
-func pv(name string) *corev1.PersistentVolume {
-	return &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"a": "b"}}}
+func pv(name string) *kube.PV {
+	return &kube.PV{Name: name, VolumeAttributes: map[string]string{"a": "b"}}
 }
 
 func TestReader(t *testing.T) {
@@ -30,8 +27,8 @@ func TestReader(t *testing.T) {
 	if err != nil || got.Name != "x" {
 		t.Fatalf("GetPV = %v, %v", got, err)
 	}
-	got.Labels["a"] = "changed"
-	if again, _ := r.GetPV(ctx, "x"); again.Labels["a"] != "b" {
+	got.VolumeAttributes["a"] = "changed"
+	if again, _ := r.GetPV(ctx, "x"); again.VolumeAttributes["a"] != "b" {
 		t.Error("a caller changed the stored PV")
 	}
 

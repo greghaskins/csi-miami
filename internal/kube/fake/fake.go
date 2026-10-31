@@ -5,9 +5,8 @@ package fake
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
-
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/greghaskins/csi-miami/internal/kube"
 )
@@ -16,21 +15,21 @@ import (
 // concurrent use.
 type Reader struct {
 	mu    sync.Mutex
-	pvs   map[string]*corev1.PersistentVolume
+	pvs   map[string]*kube.PV
 	errs  map[string]error
 	calls []string
 }
 
 var _ kube.PVReader = (*Reader)(nil)
 
-// Add stores a deep copy of pv under its name, replacing any PV of that name.
-func (r *Reader) Add(pv *corev1.PersistentVolume) {
+// Add stores a copy of pv under its name, replacing any PV of that name.
+func (r *Reader) Add(pv *kube.PV) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.pvs == nil {
-		r.pvs = map[string]*corev1.PersistentVolume{}
+		r.pvs = map[string]*kube.PV{}
 	}
-	r.pvs[pv.Name] = pv.DeepCopy()
+	r.pvs[pv.Name] = clone(pv)
 }
 
 // Remove forgets the PV with the given name.
@@ -62,9 +61,9 @@ func (r *Reader) Calls() []string {
 	return append([]string(nil), r.calls...)
 }
 
-// GetPV returns a deep copy of the stored PV, the configured error, or an
+// GetPV returns a copy of the stored PV, the configured error, or an
 // error wrapping kube.ErrNotFound. It honours a context that is already done.
-func (r *Reader) GetPV(ctx context.Context, name string) (*corev1.PersistentVolume, error) {
+func (r *Reader) GetPV(ctx context.Context, name string) (*kube.PV, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -78,5 +77,11 @@ func (r *Reader) GetPV(ctx context.Context, name string) (*corev1.PersistentVolu
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", kube.ErrNotFound, name)
 	}
-	return pv.DeepCopy(), nil
+	return clone(pv), nil
+}
+
+func clone(pv *kube.PV) *kube.PV {
+	c := *pv
+	c.VolumeAttributes = maps.Clone(pv.VolumeAttributes)
+	return &c
 }

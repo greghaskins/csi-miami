@@ -10,8 +10,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
-	corev1 "k8s.io/api/core/v1"
 
+	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -111,44 +111,47 @@ func TestDeleteVolumeWithoutAPVSucceedsAndLogsAWarning(t *testing.T) {
 
 func TestDeleteVolumeNeverDeletesOnDoubt(t *testing.T) {
 	t.Parallel()
-	wrongDriver := func(pv *corev1.PersistentVolume) { pv.Spec.CSI.Driver = "other.example.com" }
+	wrongDriver := func(pv *kube.PV) { pv.Driver = "other.example.com" }
 	tests := []struct {
 		name   string
-		setup  func(e *env, pv *corev1.PersistentVolume)
+		setup  func(e *env, pv *kube.PV)
 		code   codes.Code
 		wantIn string
 	}{
-		{"PV cannot be read", func(e *env, _ *corev1.PersistentVolume) { e.pvs.FailOn(nameA, errors.New("api down")) }, codes.Unavailable, "location is unknown"},
-		{"not a CSI PV", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI = nil }, codes.Unavailable, "not a CSI"},
-		{"another driver", func(_ *env, pv *corev1.PersistentVolume) { wrongDriver(pv) }, codes.Unavailable, "another driver"},
-		{"handle of another volume", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeHandle = "directory:" + nameB }, codes.Unavailable, "volume handle"},
-		{"handle of another kind", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeHandle = "image:" + nameA }, codes.Unavailable, "volume handle"},
-		{"empty handle", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeHandle = "" }, codes.Unavailable, "volume handle"},
-		{"no attributes", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeAttributes = nil }, codes.Unavailable, "do not decode"},
-		{"unknown miami key", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeAttributes["miami/extra"] = "x" }, codes.Unavailable, "do not decode"},
-		{"missing kind", func(_ *env, pv *corev1.PersistentVolume) { delete(pv.Spec.CSI.VolumeAttributes, "miami/kind") }, codes.Unavailable, "do not decode"},
-		{"unknown kind", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeAttributes["miami/kind"] = "image" }, codes.Unavailable, "do not decode"},
-		{"relative transport path", func(_ *env, pv *corev1.PersistentVolume) {
-			pv.Spec.CSI.VolumeAttributes["miami/transport.path"] = "rel"
+		{"PV cannot be read", func(e *env, _ *kube.PV) { e.pvs.FailOn(nameA, errors.New("api down")) }, codes.Unavailable, "location is unknown"},
+		{"not a CSI PV", func(_ *env, pv *kube.PV) { pv.Driver = "" }, codes.Unavailable, "not a CSI"},
+		{"another driver", func(_ *env, pv *kube.PV) { wrongDriver(pv) }, codes.Unavailable, "another driver"},
+		{"reclaim policy Retain", func(_ *env, pv *kube.PV) { pv.ReclaimPolicy = "Retain" }, codes.Unavailable, "reclaim policy"},
+		{"reclaim policy Recycle", func(_ *env, pv *kube.PV) { pv.ReclaimPolicy = "Recycle" }, codes.Unavailable, "reclaim policy"},
+		{"no reclaim policy", func(_ *env, pv *kube.PV) { pv.ReclaimPolicy = "" }, codes.Unavailable, "reclaim policy"},
+		{"handle of another volume", func(_ *env, pv *kube.PV) { pv.VolumeHandle = "directory:" + nameB }, codes.Unavailable, "volume handle"},
+		{"handle of another kind", func(_ *env, pv *kube.PV) { pv.VolumeHandle = "image:" + nameA }, codes.Unavailable, "volume handle"},
+		{"empty handle", func(_ *env, pv *kube.PV) { pv.VolumeHandle = "" }, codes.Unavailable, "volume handle"},
+		{"no attributes", func(_ *env, pv *kube.PV) { pv.VolumeAttributes = nil }, codes.Unavailable, "do not decode"},
+		{"unknown miami key", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/extra"] = "x" }, codes.Unavailable, "do not decode"},
+		{"missing kind", func(_ *env, pv *kube.PV) { delete(pv.VolumeAttributes, "miami/kind") }, codes.Unavailable, "do not decode"},
+		{"unknown kind", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/kind"] = "image" }, codes.Unavailable, "do not decode"},
+		{"relative transport path", func(_ *env, pv *kube.PV) {
+			pv.VolumeAttributes["miami/transport.path"] = "rel"
 		}, codes.Unavailable, "do not decode"},
-		{"path that is not cleaned", func(e *env, pv *corev1.PersistentVolume) {
-			pv.Spec.CSI.VolumeAttributes["miami/transport.path"] = e.host + "/"
+		{"path that is not cleaned", func(e *env, pv *kube.PV) {
+			pv.VolumeAttributes["miami/transport.path"] = e.host + "/"
 		}, codes.Unavailable, "do not decode"},
-		{"subdir with ..", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeAttributes["miami/subdir"] = "../x" }, codes.Unavailable, "do not decode"},
-		{"absolute subdir", func(_ *env, pv *corev1.PersistentVolume) { pv.Spec.CSI.VolumeAttributes["miami/subdir"] = "/x" }, codes.Unavailable, "do not decode"},
-		{"nfs3 attributes on a local path", func(_ *env, pv *corev1.PersistentVolume) {
-			pv.Spec.CSI.VolumeAttributes["miami/transport.server"] = "192.0.2.10"
+		{"subdir with ..", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/subdir"] = "../x" }, codes.Unavailable, "do not decode"},
+		{"absolute subdir", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/subdir"] = "/x" }, codes.Unavailable, "do not decode"},
+		{"nfs3 attributes on a local path", func(_ *env, pv *kube.PV) {
+			pv.VolumeAttributes["miami/transport.server"] = "192.0.2.10"
 		}, codes.Unavailable, "do not decode"},
-		{"transport cannot be mounted", func(e *env, _ *corev1.PersistentVolume) {
+		{"transport cannot be mounted", func(e *env, _ *kube.PV) {
 			e.mounter.FailOp(fake.OpBind, e.mountDir(), errors.New("boom"))
 		}, codes.Unavailable, "cannot be mounted"},
-		{"mount table unreadable", func(e *env, _ *corev1.PersistentVolume) {
+		{"mount table unreadable", func(e *env, _ *kube.PV) {
 			e.mounter.SetMountsError(errors.New("no mountinfo"))
 		}, codes.Unavailable, ""},
-		{"a mount inside the directory", func(e *env, _ *corev1.PersistentVolume) {
+		{"a mount inside the directory", func(e *env, _ *kube.PV) {
 			e.mounter.SetTable(tableWithMountAt(filepath.Join(e.mountDir(), nameA, "deep")))
 		}, codes.Unavailable, "mount is at or below"},
-		{"a mount at the directory", func(e *env, _ *corev1.PersistentVolume) {
+		{"a mount at the directory", func(e *env, _ *kube.PV) {
 			e.mounter.SetTable(tableWithMountAt(filepath.Join(e.mountDir(), nameA)))
 		}, codes.Unavailable, "mount is at or below"},
 	}
@@ -359,9 +362,9 @@ func TestContextOfPV(t *testing.T) {
 		t.Errorf("context = %+v", vctx)
 	}
 
-	renamed := good.DeepCopy()
+	renamed := *good
 	renamed.Name = nameB
-	if _, err := contextOfPV(renamed, id); err == nil {
+	if _, err := contextOfPV(&renamed, id); err == nil {
 		t.Error("a PV with another name was accepted")
 	}
 }
@@ -377,8 +380,8 @@ func TestDeleteVolumeNeverTreatsASubdirAsAVolume(t *testing.T) {
 	writeFile(t, filepath.Join(vol, "keep"), "x")
 	spoof := pvFor(resp)
 	spoof.Name = "team-a"
-	spoof.Spec.CSI.VolumeHandle = "directory:team-a"
-	spoof.Spec.CSI.VolumeAttributes = map[string]string{
+	spoof.VolumeHandle = "directory:team-a"
+	spoof.VolumeAttributes = map[string]string{
 		"miami/kind": "directory", "miami/transport.kind": "local", "miami/transport.path": e.host,
 	}
 	e.pvs.Add(spoof)

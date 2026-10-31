@@ -13,9 +13,8 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/greghaskins/csi-miami/internal/kube"
 	kubefake "github.com/greghaskins/csi-miami/internal/kube/fake"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 	"github.com/greghaskins/csi-miami/internal/observe"
@@ -155,18 +154,15 @@ func (e *env) create(name string, extra ...string) *csi.CreateVolumeResponse {
 }
 
 // pvFor is the PV the provisioner would make for a created volume.
-func pvFor(resp *csi.CreateVolumeResponse) *corev1.PersistentVolume {
+func pvFor(resp *csi.CreateVolumeResponse) *kube.PV {
 	id := resp.GetVolume().GetVolumeId()
 	_, name, _ := strings.Cut(id, ":")
-	return &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: corev1.PersistentVolumeSpec{PersistentVolumeSource: corev1.PersistentVolumeSource{
-			CSI: &corev1.CSIPersistentVolumeSource{
-				Driver:           DriverName,
-				VolumeHandle:     id,
-				VolumeAttributes: resp.GetVolume().GetVolumeContext(),
-			},
-		}},
+	return &kube.PV{
+		Name:             name,
+		Driver:           DriverName,
+		VolumeHandle:     id,
+		VolumeAttributes: resp.GetVolume().GetVolumeContext(),
+		ReclaimPolicy:    "Delete",
 	}
 }
 
