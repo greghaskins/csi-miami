@@ -94,10 +94,11 @@ jobs:
       - run: make envtest
 
   # csi-sanity (the version mise.toml pins) against the identity and
-  # controller services, as root under `unshare --mount --propagation
-  # private` (hack/sanity.sh), because the local transport it provisions on is
-  # really bind-mounted. The node specs are skipped until the node service
-  # exists. The suite's output is uploaded when it fails.
+  # controller services on a local transport (the controller touches no file
+  # system for it), and the delete-path tests that mount real file systems and
+  # race renames and mounts against the removal, as root under `unshare --mount
+  # --propagation private` (hack/sanity.sh). The node specs are skipped until
+  # the node service exists. The output is uploaded when it fails.
   sanity:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

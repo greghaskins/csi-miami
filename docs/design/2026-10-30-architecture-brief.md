@@ -383,8 +383,8 @@ static PV for `miami.csi.greghaskins.com` with the same capacity, the
 volume context the new driver expects, and a `claimRef` to the PVC name;
 recreate the PVC; scale up. The tool does the Kubernetes side and prints
 the rename it expects, or runs it over the mounted transport when given
-access. The rename keeps the `pvc-<uuid>` name (decision 22). Both drivers can be installed side by side during the window;
-nothing forces a flag day.
+access. The rename keeps the `pvc-<uuid>` name (decision 22). Both drivers
+can be installed side by side during the window; nothing forces a flag day.
 
 ### 4.12 Observability and security posture
 

@@ -20,8 +20,11 @@ real cluster by hand:
 1. A PVC with `storageClassName` naming an `nfs3` transport binds, its pod
    runs, and a second pod on another node sees the first pod's writes.
 2. The same with a `local` transport on one node.
-3. Deleting the PVC removes the directory on the transport; deleting after
-   a controller restart still removes it.
+3. With an `nfs3` transport, deleting the PVC removes the directory on the
+   transport, and deleting after a controller restart still removes it. With
+   a `local` transport, deleting the PVC deletes the PV and the directory
+   remains on its node (decision 23); the e2e for `local` asserts exactly
+   that, and does not expect the directory to be gone.
 4. Restarting the node plugin pod while pods are running changes nothing:
    the transport stays mounted on the host, bind mounts survive, and the
    next stage and unstage on that node succeed.
