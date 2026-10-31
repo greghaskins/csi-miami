@@ -155,7 +155,7 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 }
 
 // unmountRounds repeats: read the table, select the candidates, unmount them
-// deepest first, until a round leaves as many mounts to remove as it found.
+// deepest first, until a round leaves the table as large as it found it.
 // It returns the last table read (nil if the table could not be read) and,
 // for the candidates still mounted at the end, the error of their last
 // unmount attempt (or a note that the unmount reported success and the mount
@@ -170,11 +170,14 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 			r.log.Warn("garbage collection could not read the mount table", "error", err)
 			return nil, map[string]error{"": err}
 		}
-		cands, weight := p.candidates(table, claimedStage)
+		cands := p.candidates(table, claimedStage)
 		if len(cands) == 0 {
 			return table, nil
 		}
-		if prev >= 0 && weight >= prev {
+		// Progress is the table getting smaller: a round only unmounts, so if
+		// it did not shrink nothing came off. The count of candidates would
+		// miss a mount that a removed cover has just revealed.
+		if size := len(table); prev >= 0 && size >= prev {
 			for _, c := range cands {
 				if errs[c.path] == nil {
 					errs[c.path] = fmt.Errorf("%s is still mounted after it was unmounted", c.path)
@@ -193,7 +196,7 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 			}
 			return table, errs
 		}
-		prev = weight
+		prev = len(table)
 		errs = map[string]error{}
 		for _, c := range cands {
 			if err := r.m.Unmount(p.ctx, c.path, 0); err != nil {
@@ -227,10 +230,8 @@ func stillMounted(cands []candidate, path string) bool {
 }
 
 // candidates selects the mounts of rules (a) and (b) in t, deepest path
-// first, one entry per path, and returns how many mounts they stand for (a
-// stack of mounts at one path counts each layer, so a round that pops one
-// layer is progress).
-func (p *pass) candidates(t observe.Table, claimedStage func(string) bool) ([]candidate, int) {
+// first, one entry per path.
+func (p *pass) candidates(t observe.Table, claimedStage func(string) bool) []candidate {
 	r := p.r
 	seen := map[string]bool{}
 	var out []candidate
@@ -266,13 +267,7 @@ func (p *pass) candidates(t observe.Table, claimedStage func(string) bool) ([]ca
 		}
 		return out[i].path < out[j].path
 	})
-	weight := 0
-	for _, m := range t {
-		if seen[m.MountPoint] {
-			weight++
-		}
-	}
-	return out, weight
+	return out
 }
 
 // finishDrops settles the drop set and the answers to the Unpublish requests

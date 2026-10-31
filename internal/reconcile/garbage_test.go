@@ -86,18 +86,29 @@ func TestMountsThatNoIntentEverNamedAreLeftAlone(t *testing.T) {
 	}
 }
 
-func TestAHiddenStrayIsNotTouchedUntilItIsReachable(t *testing.T) {
+// A stray hidden under a cover cannot be reached by any path: an unmount of
+// its path would report success and do nothing. It is left until the cover
+// has gone, and then removed in the same pass, which repeats until nothing is
+// left.
+func TestAHiddenStrayIsRemovedOnlyAfterItsCoverIsGone(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	hidden := filepath.Join(e.sRoot, "x", "y")
+	coverPath := filepath.Join(e.sRoot, "x")
 	e.sim.addMount(hidden, "tmpfs", "t")
-	cover := e.sim.addMount(filepath.Join(e.sRoot, "x"), "tmpfs", "cover")
-	_ = cover
+	e.sim.addMount(coverPath, "tmpfs", "cover")
+	if _, ok := e.visible(hidden); ok {
+		t.Fatal("the fixture is wrong: the mount is not hidden")
+	}
+
 	e.pass()
-	// The cover is a stray too and goes; the one it hid is then reachable
-	// only if it is still in the table, which the real kernel keeps.
-	if o := e.unmountOrder(); slices.Contains(o, hidden) && slices.Index(o, hidden) < slices.Index(o, filepath.Join(e.sRoot, "x")) {
-		t.Errorf("unmounted the hidden mount before its cover: %v", o)
+
+	order := e.unmountOrder()
+	if !slices.Equal(order, []string{coverPath, hidden}) {
+		t.Errorf("unmounts = %v, want the cover and then the mount it hid, one call each", order)
+	}
+	if n := len(e.sim.table()); n != 1 {
+		t.Errorf("%d mounts left, want only the root: %+v", n, e.sim.table())
 	}
 }
 
@@ -326,6 +337,11 @@ func TestTheStageMountIsRestoredIfItsDirectoryReturns(t *testing.T) {
 	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
 		t.Error("not bound")
 	}
-	// A conflict from the Mounter itself (a race) is a conflict too.
-	_ = mount.ErrConflict
+	// A conflict the Mounter reports itself (someone mounted there between
+	// the table read and the bind) is a stage conflict too.
+	e.sim.remove(in.StagePath)
+	e.sim.FailOp(fake.OpBind, in.StagePath, mount.ErrConflict)
+	if err := e.converge(in.VolumeID); !errors.Is(err, ErrStageConflict) {
+		t.Errorf("got %v, want ErrStageConflict", err)
+	}
 }
