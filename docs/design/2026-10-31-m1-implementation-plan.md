@@ -198,6 +198,22 @@ PV that cannot be read; `DeadlineExceeded` from any observation that hits
 its deadline; `FailedPrecondition` for a stage path mounted from something
 other than this volume's transport directory. Never `panic` in a handler.
 
+Choices made in T8 where the plan was silent:
+
+- A volume ID that does not parse is one this driver could not have issued.
+  `ValidateVolumeCapabilities` and `ControllerPublishVolume` answer
+  `NotFound`; `ControllerUnpublishVolume` and `DeleteVolume` answer success
+  (the CSI specification's idempotent reading), and delete deletes nothing.
+- `ListVolumes` lists directories two levels below each mounted transport
+  whose names are valid volume names, does not descend into a directory named
+  like a PV, ignores `max_entries`, and answers `Aborted` to any starting
+  token. It is for operators and the sanity suite, not for completeness.
+- The controller remembers, in memory and bounded, what each `CreateVolume`
+  name answered, so a repeat with other parameters or capacity is
+  `AlreadyExists`. A restart forgets it; nothing else depends on it.
+- A second request for a volume whose first is still running is `Aborted`.
+- `mount_flags` in a capability are ignored: the driver owns the mount options.
+
 ## 7. Controller
 
 - Stateless. Mounts transports with the same `internal/transport` code
