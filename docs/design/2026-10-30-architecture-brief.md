@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 8 recorded (section 8)
+**Status:** Draft, decisions 1 to 12 recorded (section 8)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -38,7 +38,8 @@ are stated here as design inputs, not as history.
 | `ReadWriteMany` directory item straight on the transport (no loop) | yes, section 4.8 |
 | `ReadWriteMany` on an image volume, re-exported from the holder node | milestone 4, section 4.9 |
 | Writable cross-node Secret directory through FUSE | rejected, section 4.10 |
-| Node-local persistent and scratch tiers | future, section 5 |
+| Scratch (not backed up): a StorageClass whose transport path is outside the backup set | yes, section 5.1 |
+| Node-local persistent volumes with a move operation | future, section 5.2 |
 | S3-compatible object service built on the driver | future, section 5 |
 
 ## 2. Lessons that shape the design
@@ -256,9 +257,19 @@ loops always on NFS transports.
 
 ### 4.6 Failed volumes and recovery
 
-- Detection: ext4 state from mountinfo (forced read-only, `emergency_ro`,
-  shutdown). Some kernel series expose nothing in mountinfo; an optional
-  active probe is decision Q8.
+- Passive detection: ext4 state from mountinfo (forced read-only,
+  `emergency_ro`, shutdown). Some kernel series expose nothing there, so
+  it is never the only signal.
+- **Active probe (decision 9).** Every staged image is probed on a timer,
+  each probe in its own goroutine under a deadline: an `O_DIRECT` read of
+  the ext4 superblock through the loop device (bypasses the page cache, so
+  a stale NFS handle or dead transport surfaces as `EIO` or a timeout
+  rather than a cached success) and a `statfs` on the stage mount. Each
+  transport is probed the same way through its clock probe file. Two
+  consecutive failures mark the volume failed; a probe that exceeds its
+  deadline counts as a failure and its goroutine is abandoned, never
+  joined, because a hung NFS call does not return. Probe results are
+  exported as metrics so a wedge is visible before a pod notices.
 - Report: `VolumeCondition` abnormal; one event per consuming pod.
 - Remediation: a shared package for all item kinds deletes controller-owned
   pods on this node that mount the failed volume, with a UID precondition,
@@ -334,10 +345,20 @@ In the layer vocabulary the holder's export is just another transport, so
 an RWX image volume is a directory item on an `export` transport; the CSI
 surface hides that and presents one PVC.
 
-Node prerequisites: the `nfsd` kernel module and the kernel server's
-userspace (`rpc.nfsd`, `rpc.mountd`, `exportfs`) available to the
-DaemonSet, which already runs with host networking. A node without them
-can still be a client.
+**Decision 11: the kernel NFS server**, on these conditions. Consumers see
+a normal PVC; the only difference from an RWO image is `export: nfs4` on
+the StorageClass and `ReadWriteMany` on the claim. Nothing in a pod
+manifest changes. Security: exports are NFSv4-only, per-volume `fsid`,
+limited to the cluster's node addresses (a CIDR flag, or the Node list),
+`no_root_squash` because pods legitimately run as root inside their own
+volume, and the export disappears the moment the holder unstages. The
+trust boundary is "nodes are trusted", the same boundary the NAS exports
+already draw; `sec=sys` means a trusted node vouches for UIDs. Host-network
+traffic is not subject to NetworkPolicy, so port 2049 on nodes should be
+firewalled to the node network at the host level, and the DaemonSet runs
+`rpc.nfsd` with `-N 2 -N 3`. Node prerequisites: the `nfsd` kernel module
+and the server's userspace (`rpc.nfsd`, `rpc.mountd`, `exportfs`) available
+to the DaemonSet. A node without them can still be a client.
 
 ### 4.10 Rejected: FUSE-backed Kubernetes object volumes
 
@@ -377,34 +398,45 @@ nothing forces a flag day.
   `cryptsetup`, `nfs-common`, `iproute2`; build-assert `netbase`),
   distroless for roles that need no shell. CI mounts NFSv3 for real.
 
-## 5. Future directions the design must not preclude
+## 5. Storage tiers
 
-These are not v1 scope. They are listed so that v1 choices (item kinds,
-transport abstraction, topology handling, ID format) leave room for them.
+### 5.1 Scratch is a location, not a kind
 
-### 5.1 Node-local tiers: persistent and scratch
+"Persistent but recreatable" state needs no special item kind. What
+decides whether a volume is backed up is where its file lives on the
+transport, so scratch is **a StorageClass whose transport path sits outside
+the backup set** (a sibling export or subtree that the NAS backup job does
+not cover). Same image items, same exclusivity, same encryption if wanted;
+only the location differs. The driver's one obligation is to make the
+location an explicit, visible StorageClass parameter so that "is this
+backed up?" can be answered by reading the class. **Decision 12.**
 
-Two tiers share one mechanism, an **image item on the `local` transport
-pointed at the node's own disk** (same loop/ext4 code path, a real size
-cap, which matters when root and data share one disk):
+### 5.2 Node-local persistent volumes
 
-- **local-persistent**: the PV advertises node topology; the volume is
-  pinned to its node like a local-path volume, but with a quota, optional
-  LUKS2, and the same observability. Candidate replacement for a
-  local-path provisioner under databases that handle their own
-  replication.
-- **scratch**: persistent-but-recreatable. No topology; if a pod lands on
-  a node without the image, stage creates a fresh empty one, and the old
-  copy is garbage-collected by the converge loop using a PV annotation
-  naming the current node. No holder, no fencing. Excluded from any backup
-  that covers the shared transport, by construction, because it never
-  touches it. Optional `seed` parameter to warm from a transport path.
+A close replacement for a local-path provisioner, with only the features
+actually needed:
 
-What v1 must keep open: the `local` transport is a first-class transport
-(not a test shim); item parameters include a topology mode; the reconciler
-can create an image at stage time (already true for encrypted volumes).
+- An **image item on the `local` transport** pointed at the node's own
+  disk: a real size cap (root and data commonly share one disk), optional
+  LUKS2, the same observers and metrics. A directory item on the same
+  transport is also possible and is exactly what a local-path provisioner
+  gives today; the image form is the recommended default.
+- **Topology**: `CreateVolume` returns the chosen node as accessible
+  topology, so the PV carries node affinity and the scheduler pins pods
+  to it. `WaitForFirstConsumer` picks the node from the first pod.
+- No holder, no fencing, no re-export: single-node by construction.
+- **Move without fuss**: `miami move <pvc> --to <node>` with the workload
+  scaled to zero. The source node exports its local transport directory
+  through the same NFSv4 re-export path as 4.9; the target node mounts it
+  as an `export` transport and copies the image sparsely; the tool then
+  recreates the PV with the new node's topology and the same `claimRef`
+  (PV node affinity is immutable, so this is the same Retain, delete,
+  recreate dance as migration, 4.11) and removes the source copy. One
+  command, no external copy host, no NAS round trip.
+- When the node is gone for good, the same tool can recreate the PV
+  empty on another node, for workloads that rebuild their own state.
 
-### 5.2 S3-compatible object service
+### 5.3 S3-compatible object service
 
 An S3 endpoint whose durability comes from a csi-miami image volume, so it
 inherits encryption, exclusivity, takeover and whatever backup covers the
@@ -412,15 +444,15 @@ transport. Shapes considered: reuse an existing single-node S3 engine on a
 driver-provisioned PVC and own only bucket provisioning (through COSI
 `BucketClaim`/`BucketAccess`) and the operational wrapper; or write the S3
 front end here with buckets as directories inside one image. Reuse is the
-expected path. What v1 must keep open: nothing special beyond a reliable
-RWO volume with takeover; the service is a consumer, not an item kind.
+expected path. Nothing in v1 needs to change for it; the service is a
+consumer, not an item kind.
 
 ## 6. Testing strategy
 
 - Unit tests through an `exec.Runner` seam, weighted toward table tests of
   the reconciler against fake observers rather than argv pinning.
-- `envtest` for API semantics (PV lookups, scratch GC, admission policy
-  CEL).
+- `envtest` for API semantics (PV lookups, PV recreation in move and
+  migration, admission policy CEL).
 - Root smoke under `unshare --mount`, including plugin replacement and a
   simulated reboot (boot ID change).
 - kind e2e in three transport variants (local, NFSv3, NFSv4 to prove the
@@ -459,28 +491,33 @@ Recorded:
    observation period (4.5).
 8. **Driver-owned mount options** through named transport profiles (4.5).
 
-Pending:
+9. **Active failed-volume probe**: yes, in addition to passive detection
+   (4.6).
+10. **Directory items are the first feature** and ship in the first
+    deployment; they prove the transport, intent and reconciler plumbing
+    before loop devices enter the picture, and they replace a separate NFS
+    CSI driver.
+11. **Kernel NFS server** for RWX images, with the security conditions in
+    4.9 and no change to consumer manifests.
+12. **Scratch is a StorageClass location**, not an item kind (5.1).
+    **Node-local persistent** is an image item on the `local` transport
+    with topology and a move operation (5.2), scheduled after RWX images.
 
-9. **Active failed-volume probe** for kernels whose mountinfo shows
-   nothing, or document the gap.
-10. **Directory items replace a separate NFS CSI driver**: agreed in
-    principle; decide whether in the first deployment or after M1 settles.
-11. **Re-export server** for RWX images: the kernel NFS server (proposed:
-    lowest overhead, coherent locking with local processes) versus a
-    userspace server that needs no host packages.
-12. **Which node-local tier comes first** once section 5.1 is scheduled,
-    and whether it displaces an existing local-path provisioner.
+Pending: none that block M1.
 
-## 9. Milestones (proposal)
+## 9. Milestones
 
-1. **M1, image items on NFSv3 and local**: node reconciler, transports on
-   the host mount table, self-describing IDs, holder plus attach
-   exclusivity, driver-owned transport profile with fencing, LUKS2, offline
-   expand, metrics, kind e2e on NFSv3.
-2. **M2, recovery**: failed-volume detection, shared remediation package
-   and VAP, re-stage via the publish secret, canaries, migration tooling.
-3. **M3, directory items** and the `miami lock` helper.
-4. **M4, RWX images** via holder-node re-export (4.9): `export`
+1. **M1, directory items on NFSv3 and local**: the binary, controller and
+   DaemonSet; transports on the host mount table with driver-owned
+   profiles; intent store and reconciler; opaque IDs with PV lookup;
+   metrics; the `miami lock` helper; kind e2e on NFSv3. Proves the plumbing
+   with nothing but `mkdir` and bind mounts.
+2. **M2, image items**: loop, ext4, LUKS2, offline expand, holder plus
+   attach exclusivity, fencing, the active and passive probes, the shared
+   remediation package and VAP, re-stage via the publish secret, canaries,
+   the migration tool.
+3. **M3, RWX images** via holder-node re-export (4.9): `export`
    transport, client markers, promotion on takeover, e2e with a holder
    kill while remote clients write.
-5. **Later**: node-local tiers (5.1), then the S3 service (5.2).
+4. **M4, node-local persistent** with `miami move` (5.2).
+5. **Later**: the S3 service (5.3).
