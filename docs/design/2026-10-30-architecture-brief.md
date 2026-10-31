@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 18 recorded (section 9)
+**Status:** Draft, decisions 1 to 19 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -558,11 +558,11 @@ Every PR runs the full set below as parallel jobs; nothing waits for
 | `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | amd64 |
 | `unit` | `go test -race -shuffle=on ./...` with coverage | amd64 |
 | `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | amd64 |
-| `build` (matrix) | native `buildx` from the one Dockerfile, per-arch image pushed as `:<sha>-<arch>` on `main`, uploaded as an artifact on PRs | amd64 and arm64 |
+| `build` (matrix) | native `buildx` from the one Dockerfile; per-arch image pushed as `:c-<hash>-<arch>` only when that content tag is missing, and run from the registry on every PR | amd64 and arm64 |
 | `smoke` (matrix) | root on the runner: loop devices, ext4, LUKS2, `unshare --mount` plugin replacement, simulated reboot | amd64 and arm64, from that arch's image |
 | `sanity` (matrix) | csi-sanity against the binary | amd64 and arm64 |
 | `e2e` matrix `local`, `nfs3`, `nfs4` | kind cluster, real NFS server container (kernel server for `nfs3` and `nfs4`), fault injection: server restart, partition, plugin restart, force detach, surge rollout, holder kill with remote writers | amd64; `nfs3` also on arm64 |
-| `manifest` | `buildx imagetools create` combining the per-arch tags into the multi-arch tag, then signing | `main` and releases only |
+| `manifest` | creates the multi-arch index `c-<hash>` once; on `main` the sha alias; then signing | every PR for the index, `main` and releases for the alias and signing |
 | `ci-ok` | a single required check that depends on all of the above | nothing |
 
 Rules that keep it honest:
@@ -577,8 +577,9 @@ Rules that keep it honest:
   deadline.
 - **Build once per architecture, test everywhere.** Each architecture's
   image is built one time per PR and every downstream job for that
-  architecture consumes the artifact, so smoke, sanity and e2e all test
-  the bytes that would ship, on the hardware they would ship to.
+  architecture pulls `c-<hash>-<arch>` from the registry, so smoke, sanity
+  and e2e all test the bytes that would ship, on the hardware they would
+  ship to.
 - **Superseded runs are cancelled** (concurrency group per branch), job
   timeouts are set, and on failure every job uploads mountinfo, `losetup`,
   dm state, kernel log excerpts and the plugin's logs as artifacts.
@@ -656,6 +657,15 @@ Recorded:
     Squash forces a rebase of every stacked branch on each merge; merge
     commits keep branch history and make stacking cheap. The PR body never
     enters git history either way.
+19. **Content-addressed images**: CI tags images by a hash of the build
+    inputs (the Dockerfile, its allowlisted context and the module files).
+    A pull request builds and pushes `c-<hash>-<arch>` only when that tag
+    does not exist, every run proves the image starts, the multi-arch index
+    `c-<hash>` is created once, and a push to `main` only adds the commit
+    sha as an alias of that index. The binary's version string is the
+    content hash, so identical inputs have one identity across commits.
+    Fork pull requests are unsupported because the push needs package write
+    access.
 
 Pending: none that block M1.
 

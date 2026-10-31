@@ -344,7 +344,7 @@ Workflows, all pinned by SHA with least permissions:
 
 - `ci.yml` on every PR and push to `main`: `static`, `unit`, `envtest`,
   `build` (matrix amd64 on `ubuntu-latest`, arm64 on the arm runner;
-  artifact on PRs, per-arch tag on `main`), `smoke` (matrix, root, under
+  content-addressed per-arch tags pushed from the PR, sha alias on `main`), `smoke` (matrix, root, under
   `unshare --mount`: transport survives a plugin restart, bind adoption,
   garbage unmount, simulated reboot via a fresh mount namespace),
   `sanity` (matrix), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
