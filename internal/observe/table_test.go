@@ -330,6 +330,45 @@ func TestIsBindOfDeletedRoot(t *testing.T) {
 	}
 }
 
+func TestIsBindOfIncludingDeleted(t *testing.T) {
+	t.Parallel()
+	tbl := loadFixture(t)
+	f, err := os.Open("testdata/mountinfo_odd.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	odd, err := Parse(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl = append(tbl, odd...)
+
+	// Mount 94 is a bind of /vols/gone whose directory has been removed: not
+	// usable, but still the mount that was made from that directory.
+	for _, tt := range []struct {
+		name               string
+		mountPoint, source string
+		plain, including   bool
+	}{
+		{"a deleted bind of the removed directory", "/mnt/gone", "/mnt/nfs/vols/gone", false, true},
+		{"a deleted bind is not a bind of a sibling", "/mnt/gone", "/mnt/nfs/vols/pvc-1", false, false},
+		{"a live bind is a bind either way", "/mnt/stage/pvc-1", "/mnt/nfs/vols/pvc-1", true, true},
+		{"a live bind of another directory is not", "/mnt/stage/pvc-1", "/mnt/nfs/vols/pvc-2", false, false},
+		{"the mount containing the source is not a bind of it", "/mnt/nfs", "/mnt/nfs", false, false},
+		{"nothing mounted there", "/mnt/publish/pod-z", "/mnt/nfs/vols/gone", false, false},
+	} {
+		plain, err := tbl.IsBindOf(tt.mountPoint, tt.source)
+		if err != nil || plain != tt.plain {
+			t.Errorf("%s: IsBindOf = %v, %v; want %v", tt.name, plain, err, tt.plain)
+		}
+		inc, err := tbl.IsBindOfIncludingDeleted(tt.mountPoint, tt.source)
+		if err != nil || inc != tt.including {
+			t.Errorf("%s: IsBindOfIncludingDeleted = %v, %v; want %v", tt.name, inc, err, tt.including)
+		}
+	}
+}
+
 func TestIsBindOfErrors(t *testing.T) {
 	t.Parallel()
 	tbl := loadFixture(t)

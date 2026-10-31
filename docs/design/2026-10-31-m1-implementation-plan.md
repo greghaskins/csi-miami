@@ -115,10 +115,12 @@ store at start and mutated only by CSI calls, and runs:
 
 ```
 for each intent:        transport.Mount → item.Converge → publishes present
-for each observed mount under <root>/stage or a target path with no intent:
+for each observed mount under <root>/stage no volume's stage path covers,
+and each publish target no intent claims that was named by an Unpublish or
+claimed by the previous pass (and is a bind of what it should be):
                         unmount, in reverse depth order
 for each transport mount with no intent referencing it and idle > TTL:
-                        unmount (TTL default: never)
+                        unmount (TTL default: never; off unless configured)
 ```
 
 One goroutine runs the loop; CSI calls enqueue a request and wait on a
@@ -332,8 +334,18 @@ unavailable, and the goroutine is abandoned, never joined.
 per volume named by a filesystem-safe form of the ID, written by
 temp-file-and-rename with `fsync` on the file and the directory. Records
 carry `version: 1`. Loading an unreadable record logs it and keeps the file
-for inspection; the volume is treated as having no intent, which means its
-mounts are garbage, so the load failure is also surfaced as a metric.
+for inspection. The volume's intent is then unknown, not absent: its mounts
+are left alone and the failure is surfaced as a metric and a log line, and
+nothing is collected anywhere on the node while any record is unreadable
+(an explicit `NodeUnpublishVolume` still unmounts the target it names). The
+log line says what a person should do: repair the file or, if the volume is
+gone, remove it; removing the record of a volume still in use unmounts it, as
+its mounts are then garbage. A
+request that would have to read or rewrite that record (`NodeStageVolume`,
+`NodeUnstageVolume`, `NodePublishVolume`, `NodeUnpublishVolume`) fails as
+unavailable and writes and unmounts nothing; collection resumes on its own
+once every record reads, whether a person repaired the file or a transient
+read error passed.
 
 **Observer.** `/proc/self/mountinfo` through a maintained parser; filtered
 to mounts under `--transports-root`, the stage root, and target paths named
@@ -352,14 +364,22 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 4. Each publish target is a bind of the stage path with the requested
    read-only flag (remount read-only if needed).
 
-**Garbage.** Any mount under the stage root or at a recorded target path
-whose volume has no intent is unmounted, deepest first. A transport with
-no referencing intent is unmounted only past the idle TTL.
+**Garbage.** Any mount strictly under the stage root that no volume's stage
+path covers is unmounted, deepest first, and so is a mount at a publish target
+that no intent claims but that an `Unpublish` named or that the previous pass
+saw claimed; a publish target is unmounted only if it is a bind of the
+volume's directory in its transport (the same device and root path, also for a
+directory that has since been removed), once, never a stack. The one wider
+case is an explicit `NodeUnpublishVolume` for a volume with no intent: kubelet
+named the path and nothing identifies the volume, so a bind of any directory
+in one of the driver's transports is accepted. A transport with no referencing intent is unmounted only
+past the idle TTL, which is off by default (never).
 
 **CSI mapping.** `NodeStageVolume` writes the intent (without publishes)
 and waits for converge; `NodePublishVolume` adds a publish and waits;
-`NodeUnpublishVolume` removes it and waits; `NodeUnstageVolume` removes the
-intent and waits for the garbage pass. All four are idempotent by
+`NodeUnpublishVolume` removes it and waits; `NodeUnstageVolume` unmounts the
+publishes and the stage path, and only then removes the intent, so a failed
+unmount keeps the intent and is retried. All four are idempotent by
 construction.
 
 **Kubelet directory.** `--kubelet-dir` (default `/var/lib/kubelet`) because

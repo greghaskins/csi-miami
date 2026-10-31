@@ -299,21 +299,6 @@ func TestLocalHostPathInFlightGuard(t *testing.T) {
 	}
 }
 
-func TestInflightKeysAreIndependent(t *testing.T) {
-	t.Parallel()
-	var g inflight
-	hang := make(chan struct{})
-	defer close(hang)
-	_, err := within(context.Background(), 5*time.Millisecond, "a", &g, "k1", func(context.Context) (int, error) { <-hang; return 0, nil })
-	if !errors.Is(err, mount.ErrTimeout) {
-		t.Fatalf("got %v, want ErrTimeout", err)
-	}
-	// Another key is not held back.
-	if v, err := within(context.Background(), time.Minute, "b", &g, "k2", func(context.Context) (int, error) { return 7, nil }); err != nil || v != 7 {
-		t.Errorf("another key: %v, %v", v, err)
-	}
-}
-
 // ---- the mount point is not created through a symlink ----
 
 func TestMountPointIsNotCreatedThroughASymlink(t *testing.T) {

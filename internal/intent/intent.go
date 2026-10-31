@@ -19,8 +19,10 @@ import (
 // field names of types defined elsewhere. Changing the format follows three
 // rules. Any field that a version 1 reader must not ignore needs a version
 // bump. A purely informational field may be added without one, because
-// readers tolerate unknown fields. And a change to the golden file under
-// testdata/ requires a version decision in the same commit.
+// readers tolerate unknown fields. (Generation was added that way: a reader
+// that does not know it ignores it, and a record without it reads as 0.) And
+// a change to the golden file under testdata/ requires a version decision in
+// the same commit.
 const Version = 1
 
 // maxPathLen is the longest path accepted in a record, in bytes.
@@ -71,6 +73,16 @@ type Intent struct {
 	// AccessMode is the name of a CSI access mode, such as
 	// "MULTI_NODE_MULTI_WRITER".
 	AccessMode string
+
+	// Generation counts the writes of the record: the store sets it to one
+	// more than the record it replaces (1 for a new record, whatever the
+	// caller put here), on every Save and Update. It tells a record that was
+	// rewritten, even with identical content, from the one a caller read:
+	// DeleteIf compares it, so a Stage repeated with the same parameters
+	// while a teardown is running is not deleted along with it. A record
+	// written before the field existed reads as 0. It is not part of what
+	// the record says should be true.
+	Generation uint64
 }
 
 // ID returns the volume ID in the record, split into kind and name. It

@@ -42,6 +42,13 @@ func goldenIntent() Intent {
 	}
 }
 
+// stored is what Save leaves on disk for a record written for the first time:
+// the same Intent with the store's generation.
+func stored(in Intent) Intent {
+	in.Generation = 1
+	return in
+}
+
 func readGolden(t *testing.T) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("testdata", "v1.json"))
@@ -51,10 +58,41 @@ func readGolden(t *testing.T) []byte {
 	return b
 }
 
+// The generation was added to version 1 after the format shipped, as an
+// informational field a version 1 reader ignores (see Version), so Version
+// stays 1. testdata/v1_before_generation.json is the record as it was written
+// before: it must keep loading, with generation 0.
+func TestRecordWrittenBeforeTheGenerationFieldStillLoads(t *testing.T) {
+	t.Parallel()
+	s, dir := openStore(t)
+	want := goldenIntent() // generation 0
+	old, err := os.ReadFile(filepath.Join("testdata", "v1_before_generation.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(old), "generation") {
+		t.Fatal("the pre-generation record has a generation")
+	}
+	if err := os.WriteFile(filepath.Join(dir, Escape(want.VolumeID)+".json"), old, 0o600); err != nil { // #nosec G703 -- a test file in a temp dir
+		t.Fatal(err)
+	}
+	got := mustLoad(t, s)
+	if len(got.Failures) != 0 || !reflect.DeepEqual(got.Intents[want.VolumeID], want) {
+		t.Fatalf("loaded %+v, failures %v; want %+v", got.Intents, got.Failures, want)
+	}
+	// And the next write continues from it.
+	if err := s.Save(got.Intents[want.VolumeID]); err != nil {
+		t.Fatal(err)
+	}
+	if again, _, _ := s.Get(want.VolumeID); again.Generation != 1 {
+		t.Errorf("generation after the first write over an old record = %d, want 1", again.Generation)
+	}
+}
+
 func TestGoldenRecordLoads(t *testing.T) {
 	t.Parallel()
 	s, dir := openStore(t)
-	want := goldenIntent()
+	want := stored(goldenIntent())
 	if err := os.WriteFile(filepath.Join(dir, Escape(want.VolumeID)+".json"), readGolden(t), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +129,7 @@ func TestGoldenRecordBytesArePinned(t *testing.T) {
 func TestUnknownFieldsAreTolerated(t *testing.T) {
 	t.Parallel()
 	s, dir := openStore(t)
-	want := goldenIntent()
+	want := stored(goldenIntent())
 	golden := string(readGolden(t))
 	withExtra := strings.Replace(golden, `"version": 1,`, `"version": 1,
   "addedLater": {"note": "informational"},`, 1)

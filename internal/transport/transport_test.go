@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 	"github.com/greghaskins/csi-miami/internal/observe"
@@ -425,7 +426,7 @@ func TestNFS3AddrRefusesIPv6WithoutValidate(t *testing.T) {
 			n := &nfs3{base: base{
 				spec: Spec{Kind: KindNFS3, Server: tt.server, Export: "/export/data"},
 				opts: Options{Resolver: res, ResolveTimeout: time.Second},
-				busy: &inflight{},
+				busy: &deadline.Set{},
 			}}
 			got, err := n.addr(context.Background())
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
@@ -963,21 +964,5 @@ func TestResolveDirectory(t *testing.T) {
 	}
 	if _, err := ResolveDirectory(fx.file); err == nil || !strings.Contains(err.Error(), "not a directory") {
 		t.Errorf("file: got %v, want not a directory", err)
-	}
-}
-
-func TestWithinReturnsAResultThatWonTheRace(t *testing.T) {
-	t.Parallel()
-	got, err := within(context.Background(), time.Minute, "x", &inflight{}, "k", func(context.Context) (int, error) { return 7, nil })
-	if err != nil || got != 7 {
-		t.Errorf("got %v, %v; want 7", got, err)
-	}
-	if _, err := within(context.Background(), time.Minute, "x", &inflight{}, "k", func(context.Context) (int, error) { return 0, os.ErrClosed }); !errors.Is(err, os.ErrClosed) {
-		t.Errorf("got %v, want the function's error", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := within(ctx, time.Minute, "x", &inflight{}, "k", func(context.Context) (int, error) { return 1, nil }); !errors.Is(err, context.Canceled) {
-		t.Errorf("got %v, want context.Canceled for a context that is done before the call", err)
 	}
 }
