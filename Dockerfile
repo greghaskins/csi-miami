@@ -12,5 +12,10 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /miami ./cmd/miami
 
 FROM scratch
+# Labels only; they add no file to the image. The source label links the
+# package to this repository in the registry.
+LABEL org.opencontainers.image.source="https://github.com/greghaskins/csi-miami" \
+      org.opencontainers.image.licenses="GPL-3.0-only" \
+      org.opencontainers.image.description="csi-miami: a Kubernetes CSI driver for directory volumes on NFSv3 and local transports"
 COPY --from=build /miami /miami
 ENTRYPOINT ["/miami"]
