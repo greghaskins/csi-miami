@@ -22,7 +22,8 @@ type pass struct {
 	// volumes whose unstage succeeded in it.
 	intents map[string]intent.Intent
 
-	unstaging   map[string]struct{}      // volumes with an unstage request in this pass
+	unstaging   map[string]struct{}      // volumes with an unstage request carried out in this pass
+	superseded  map[*request]bool        // unstage requests overtaken by a later stage or publish
 	teardownErr map[string]error         // by volume, for the unstage requests
 	results     map[string]*volumeResult // by volume, for the volumes that were converged
 	dropErr     map[string]error         // by publish target, for the unpublish requests
@@ -77,6 +78,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 		ctx:         ctx,
 		intents:     loaded.Intents,
 		unstaging:   map[string]struct{}{},
+		superseded:  map[*request]bool{},
 		teardownErr: map[string]error{},
 		results:     map[string]*volumeResult{},
 		dropErr:     map[string]error{},
@@ -106,7 +108,11 @@ func (p *pass) answer(batch []*request) {
 		case reqUnpublish:
 			err = p.dropErr[req.target]
 		case reqUnstage:
-			err = p.teardownErr[req.volume]
+			if p.superseded[req] {
+				err = fmt.Errorf("%w: a later request wants %s staged", ErrSuperseded, req.volume)
+			} else {
+				err = p.teardownErr[req.volume]
+			}
 		}
 		req.done <- err
 	}
@@ -114,6 +120,9 @@ func (p *pass) answer(batch []*request) {
 
 // stageAnswer is the answer to a Stage.
 func (p *pass) stageAnswer(req *request) error {
+	if _, gone := p.unstaging[req.volume]; gone {
+		return fmt.Errorf("%w: a later request unstaged %s", ErrSuperseded, req.volume)
+	}
 	res, ok := p.results[req.volume]
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownVolume, req.volume)
@@ -124,6 +133,9 @@ func (p *pass) stageAnswer(req *request) error {
 // publishAnswer is the answer to a Publish: its own target's outcome, or the
 // stage's failure when the stage was not there to bind from.
 func (p *pass) publishAnswer(req *request) error {
+	if _, gone := p.unstaging[req.volume]; gone {
+		return fmt.Errorf("%w: a later request unstaged %s", ErrSuperseded, req.volume)
+	}
 	res, ok := p.results[req.volume]
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownVolume, req.volume)

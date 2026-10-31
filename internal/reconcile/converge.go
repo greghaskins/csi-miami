@@ -23,13 +23,30 @@ import (
 // the next Unstage retries. The transport is not touched. A volume with no
 // record in this pass has nothing to undo.
 //
-// Every volume named by an unstage request is excluded from convergence in
-// this pass, whether or not its teardown succeeded: converging it would bind
-// the publishes that were just unmounted.
+// Order within a batch is the order the requests were made, and a later Stage
+// or Publish of a volume supersedes an earlier Unstage of it that is still
+// waiting: a caller whose context ended leaves its Unstage in the queue, and
+// the Stage that follows it is kubelet saying the volume is wanted again. The
+// superseded Unstage is not carried out and is answered ErrSuperseded.
+//
+// The record is deleted only if it is still the one this pass loaded
+// (Store.DeleteIf). A Stage or Publish that was recorded after the Load is not
+// in the batch, so nothing else would tell teardown about it; if the record
+// changed, the stage and publishes that were just taken down are brought back
+// by the next pass, the Unstage is answered ErrSuperseded, and no newer intent
+// is lost.
+//
+// Every volume with an Unstage that is carried out is excluded from
+// convergence in this pass, whether or not its teardown succeeded: converging
+// it would bind the publishes that were just unmounted.
 func (p *pass) teardown(batch []*request) {
 	r := p.r
-	for _, req := range batch {
+	for i, req := range batch {
 		if req.kind != reqUnstage {
+			continue
+		}
+		if wantedAgain(batch[i+1:], req.volume) {
+			p.superseded[req] = true
 			continue
 		}
 		if _, done := p.unstaging[req.volume]; done {
@@ -43,12 +60,7 @@ func (p *pass) teardown(batch []*request) {
 		}
 		err := p.teardownVolume(in)
 		if err == nil {
-			if derr := r.store.Delete(in.VolumeID); derr != nil {
-				err = fmt.Errorf("removing the intent of %s after its mounts were removed: %w", in.VolumeID, derr)
-			} else {
-				delete(p.intents, in.VolumeID)
-				delete(r.lastErr, in.VolumeID)
-			}
+			err = p.deleteRecord(in)
 		}
 		if err != nil {
 			r.metrics.IncReconcileError("teardown")
@@ -59,6 +71,37 @@ func (p *pass) teardown(batch []*request) {
 		}
 		p.teardownErr[req.volume] = err
 	}
+}
+
+// wantedAgain reports whether any of the requests asks for the volume to be
+// staged or published.
+func wantedAgain(later []*request, volumeID string) bool {
+	for _, q := range later {
+		if q.volume == volumeID && (q.kind == reqStage || q.kind == reqPublish) {
+			return true
+		}
+	}
+	return false
+}
+
+// deleteRecord deletes the record of a volume whose mounts are gone, if it is
+// still the record teardown acted on.
+func (p *pass) deleteRecord(in intent.Intent) error {
+	r := p.r
+	deleted, err := r.store.DeleteIf(in.VolumeID, in)
+	if err != nil {
+		return fmt.Errorf("removing the intent of %s after its mounts were removed: %w", in.VolumeID, err)
+	}
+	if deleted {
+		delete(p.intents, in.VolumeID)
+		delete(r.lastErr, in.VolumeID)
+		return nil
+	}
+	if _, ok, gerr := r.store.Get(in.VolumeID); gerr == nil && !ok {
+		delete(p.intents, in.VolumeID) // already gone
+		return nil
+	}
+	return fmt.Errorf("%w: the record of %s changed while it was being unstaged, so it was kept", ErrSuperseded, in.VolumeID)
 }
 
 // teardownVolume unmounts the publishes and then the stage path. Each unmount

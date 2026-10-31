@@ -67,6 +67,14 @@ var (
 	// is converged and nothing is collected. It is retryable.
 	ErrIntentsUnknown = errors.New("the intents on this node cannot be read")
 
+	// ErrSuperseded is returned to a request that a later request for the same
+	// volume overtook: an Unstage that was still waiting when a Stage or a
+	// Publish arrived, a Stage or Publish that a later Unstage took down, or an
+	// Unstage whose record changed while it ran. The record is kept in the
+	// last case. The caller of a superseded request is usually gone; one that
+	// is not retries.
+	ErrSuperseded = errors.New("the request was superseded by a later one for the same volume")
+
 	// ErrStopped is returned to requests that were waiting when Run returned,
 	// and to requests made after it did. The intent they wrote is kept, and
 	// the next process converges it.
