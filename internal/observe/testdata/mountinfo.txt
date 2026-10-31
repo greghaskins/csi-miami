@@ -1,0 +1,14 @@
+20 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+21 20 0:5 / /proc rw,nosuid,nodev,noexec,relatime shared:2 - proc proc rw
+30 20 0:40 / /mnt/nfs rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,rsize=1048576,wsize=1048576,namlen=255,softerr,proto=tcp,timeo=100,retrans=3,sec=sys,mountaddr=198.51.100.10,mountvers=3,mountproto=tcp,local_lock=all,addr=198.51.100.10
+31 20 0:40 /vols/pvc-1 /mnt/stage/pvc-1 rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+32 20 0:40 /vols/pvc-1 /mnt/publish/pod-a rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+33 20 0:40 /vols/pvc-1 /mnt/publish/pod-b ro,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+34 20 0:40 /vols/pvc-2 /mnt/publish/pod-c rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+35 20 0:40 /vols/my\040volume /mnt/publish/my\040pod rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+36 20 0:52 / /mnt/scratch rw,relatime - tmpfs tmpfs rw,size=1024k
+37 36 0:53 / /mnt/scratch rw,nosuid,nodev - tmpfs tmpfs rw,size=512k
+38 20 8:2 / /mnt/extra rw,relatime shared:7 master:3 propagate_from:2 unbindable - ext4 /dev/sda2 rw
+39 20 0:54 / /srv/odd rw,relatime - fuse.example /srv/with\040space\134back\011tab rw,user_id=0,group_id=0
+40 20 0:40 /vols/pvc-2 /mnt/stage/pvc-2 rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+41 20 0:55 / /mnt/stage/pvc-2 rw,relatime - tmpfs tmpfs rw,size=64k
