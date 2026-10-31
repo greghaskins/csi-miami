@@ -68,10 +68,10 @@ jobs:
           path: coverage.out
           if-no-files-found: error
 
-  # The mount and observe packages against the real kernel, natively on each
-  # architecture: hack/smoke.sh builds the smoke tests and runs them as root
-  # under `unshare --mount --propagation private`, so nothing they mount
-  # outlives or escapes them. sudo gets the pinned Go through PATH. A failing
+  # The mount, observe and transport packages against the real kernel,
+  # natively on each architecture: hack/smoke.sh builds each package's smoke
+  # tests and runs them as root under `unshare --mount --propagation
+  # private`, so nothing they mount outlives or escapes them. sudo gets the pinned Go through PATH. A failing
   # run uploads the mountinfo lines for the test's own temporary paths.
   smoke:
     name: smoke (${{ matrix.arch }})
@@ -102,6 +102,44 @@ jobs:
         with:
           name: smoke-mountinfo-${{ matrix.arch }}
           path: ${{ runner.temp }}/smoke/mountinfo-*.txt
+          if-no-files-found: ignore
+
+  # A transport against a real server: hack/e2e.sh starts the kernel NFSv3
+  # server of hack/nfs-server in a privileged container on the runner's docker
+  # network and runs the nfs3 transport's end-to-end test as root under
+  # `unshare --mount --propagation private`. This is the check that mount(2)
+  # with the driver's option profile works on a real kernel with no helper
+  # binary. If the runner cannot load nfsd the job fails with that message;
+  # there is no user-space fallback. A failing run uploads the mountinfo lines
+  # for the test's own paths and the server container's output.
+  e2e:
+    name: e2e (${{ matrix.transport }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transport: nfs3
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run the e2e test as root
+        env:
+          E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e
+          TRANSPORT: ${{ matrix.transport }}
+        run: sudo -E env "PATH=$PATH" make e2e E2E_TRANSPORT="$TRANSPORT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-${{ matrix.transport }}
+          path: ${{ runner.temp }}/e2e/
           if-no-files-found: ignore
 
   # Builds and pushes x-<hash>-<arch> natively on each architecture (no
@@ -292,7 +330,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [static, unit, smoke, build, manifest, publish]
+    needs: [static, unit, smoke, e2e, build, manifest, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -302,13 +340,14 @@ jobs:
           STATIC: ${{ needs.static.result }}
           UNIT: ${{ needs.unit.result }}
           SMOKE: ${{ needs.smoke.result }}
+          E2E: ${{ needs.e2e.result }}
           BUILD: ${{ needs.build.result }}
           MANIFEST: ${{ needs.manifest.result }}
           PUBLISH: ${{ needs.publish.result }}
           PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           fail=0
-          for pair in "static=$STATIC" "unit=$UNIT" "smoke=$SMOKE" "build=$BUILD" "manifest=$MANIFEST"; do
+          for pair in "static=$STATIC" "unit=$UNIT" "smoke=$SMOKE" "e2e=$E2E" "build=$BUILD" "manifest=$MANIFEST"; do
             if [ "${pair#*=}" != "success" ]; then
               echo "::error::${pair%%=*} was ${pair#*=}, expected success"
               fail=1

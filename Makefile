@@ -14,7 +14,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check smoke
+.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check smoke e2e
 
 build:
 	mkdir -p bin
@@ -82,6 +82,16 @@ image:
 # separate CI job and not part of `check`.
 smoke:
 	hack/smoke.sh
+
+# End-to-end tests of one transport against a real server, chosen by
+# E2E_TRANSPORT (nfs3: a kernel NFSv3 server in a privileged container, see
+# hack/nfs-server). ROOT ONLY, and Docker is needed: run it as
+# `sudo -E make e2e E2E_TRANSPORT=nfs3`, with the pinned Go on PATH. A
+# separate CI job, not part of `check`.
+E2E_TRANSPORT ?=
+
+e2e:
+	E2E_TRANSPORT="$(E2E_TRANSPORT)" hack/e2e.sh
 
 # Exactly what CI runs: the static job runs fmt-check vet lint tidy-check vuln
 # and the unit job runs cover.

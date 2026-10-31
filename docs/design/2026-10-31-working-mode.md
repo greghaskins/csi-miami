@@ -34,6 +34,10 @@ Done once by the repository owner; the session checks, never assumes.
    when a wave needs it.
 4. `mise install` has been run in the checkout at least once (installs the
    hooks). In a worktree, hooks are already shared.
+5. The repository is public (visibility only): forks and external
+   contributions are not accepted; every branch is pushed by the owner or
+   the orchestrator, which is also why fork pull requests, which cannot push
+   images or read the scan config, are unsupported.
 
 ## 2. Per task
 
@@ -96,8 +100,9 @@ unmerged predecessor's branch when the wave needs it, and says so in the PR.
 - Pull request titles and bodies are scanned before they are posted (the
   pre-publish hook in `.claude/settings.json` does this for agents), and
   say what changed and what was verified, nothing about where it runs.
-- Commit messages: imperative subject, a body that says why, no model or
-  tool identifiers beyond the trailer lines the environment adds.
+- Commit messages: imperative subject, a body that says why; one
+  `Co-Authored-By` attribution line and nothing else; never a session link
+  or other tool identifier, in commits, PR text or comments.
 - Design changes go to `docs/design/` in the same PR as the code that
   needs them; the brief's decision log is updated, never rewritten.
 - `make check` before every push, on the task's own branch.
