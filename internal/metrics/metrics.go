@@ -29,6 +29,11 @@ var requestBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5,
 // reconcileBuckets are the bounds, in seconds, of the converge-pass histogram.
 var reconcileBuckets = []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60}
 
+// ReconcileSteps are the step names the reconciler passes to IncReconcileError
+// and IncObservationTimeout (see reconcile.Metrics). Their counters are
+// created at zero.
+var ReconcileSteps = []string{"load", "transport", "item", "publish", "teardown", "garbage", "observe"}
+
 // Registry holds the driver's metrics. Build one with New. It implements
 // reconcile.Metrics and is safe for concurrent use.
 type Registry struct {
@@ -79,6 +84,14 @@ func New() *Registry {
 	r.requestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "miami_csi_request_duration_seconds", Help: "Duration of CSI calls, by method.", Buckets: requestBuckets,
 	}, []string{"method"})
+
+	// The steps the reconciler reports are a fixed list (reconcile.Metrics), so
+	// their counters exist at zero from the start: a series that appears only
+	// at the first failure cannot be rated or alerted on before it.
+	for _, step := range ReconcileSteps {
+		r.reconcileErrs.WithLabelValues(step)
+		r.obsTimeouts.WithLabelValues(step)
+	}
 
 	r.reg.MustRegister(
 		r.intents, r.transports, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,

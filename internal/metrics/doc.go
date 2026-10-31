@@ -18,6 +18,8 @@
 //	miami_csi_requests_total{method,code}     counter: finished CSI calls
 //	miami_csi_request_duration_seconds{method} histogram: their duration
 //
+// The counters of the reconciler's fixed steps exist at zero from the start.
+//
 // A transport's state is the value of its gauge, not a label: a "mounted"
 // label would leave a stale series behind at every change, and one series per
 // transport is what an alert on "== 0" wants. The plan names

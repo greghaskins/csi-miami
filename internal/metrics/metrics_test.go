@@ -226,3 +226,18 @@ func TestServeReportsAListenerThatFails(t *testing.T) {
 		t.Error("a closed listener was served")
 	}
 }
+
+// The counters of the reconciler's fixed steps are there at zero before the
+// first failure.
+func TestStepCountersExistAtZero(t *testing.T) {
+	t.Parallel()
+	r := New()
+	for _, step := range ReconcileSteps {
+		if v := sample(t, r, "miami_reconcile_errors_total", map[string]string{"step": step}).GetCounter().GetValue(); v != 0 {
+			t.Errorf("errors[%s] = %v", step, v)
+		}
+		if v := sample(t, r, "miami_observation_timeouts_total", map[string]string{"op": step}).GetCounter().GetValue(); v != 0 {
+			t.Errorf("timeouts[%s] = %v", step, v)
+		}
+	}
+}

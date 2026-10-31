@@ -181,7 +181,7 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 	)
 	for _, name := range []string{
 		"miami_reconcile_duration_seconds_count", "miami_csi_request_duration_seconds_count",
-		"# TYPE miami_reconcile_errors_total counter", "# TYPE miami_observation_timeouts_total counter",
+		`miami_reconcile_errors_total{step="item"} 0`, `miami_observation_timeouts_total{op="transport"} 0`,
 		"go_goroutines", "process_resident_memory_bytes",
 	} {
 		if !strings.Contains(body, name) {
