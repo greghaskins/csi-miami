@@ -663,3 +663,35 @@ func TestSmokeUnpublishAndDropsLeaveWhatIsNotOurs(t *testing.T) {
 		t.Error("the foreign mount was unmounted as a target no intent claims")
 	}
 }
+
+// (7) A drop found by comparing passes is held to the volume's own directory:
+// another volume's directory bound over our publish, in the same transport, is
+// not ours to remove, and our bind beneath it is left too.
+func TestSmokeADerivedDropLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+	a, b := n.intent("pvc-1"), n.intent("pvc-2")
+	if err := r.Stage(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stage(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	target := n.target("pod1")
+	if err := r.Publish(ctx, a.VolumeID, intent.Publish{TargetPath: target}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount(filepath.Join(n.tdir(), "pvc-2"), target, "", unix.MS_BIND, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.store.Delete(a.VolumeID); err != nil { // the record goes; the target is a derived drop
+		t.Fatal(err)
+	}
+	for range 3 {
+		n.runPass(r)
+	}
+	if c := n.mountsAt(target); c != 2 {
+		t.Errorf("%d mounts at the target, want our bind and the one stacked on it left", c)
+	}
+}
