@@ -3,6 +3,7 @@
 # unknown (a brand-new branch) or not an ancestor falls back to the last 50
 # commits, which is never silently nothing.
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 base=${1:?base}; head=${2:?head}
 git rev-parse -q --verify "$head^{commit}" >/dev/null || { echo "secret-scan: unknown head commit" >&2; exit 1; }
 if [[ "$base" =~ ^0+$ ]] || ! git merge-base --is-ancestor "$base" "$head" 2>/dev/null; then

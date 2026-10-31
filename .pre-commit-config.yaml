@@ -1,7 +1,8 @@
 # Secret scanning with gitleaks on every commit: staged content, paths and
 # the commit message. The gitleaks config is kept outside the repository
 # (it extends the default rules with private detectors) and reaches gitleaks
-# through GITLEAKS_CONFIG_TOML: an environment variable locally (README,
+# through GITLEAKS_CONFIG_TOML (or GITLEAKS_CONFIG_TOML_B64, the same TOML
+# base64-encoded on one line): an environment variable locally (README,
 # Development) and a repository secret in CI. Without it gitleaks would fall
 # back to its default rules, so the first hook fails closed instead.
 #

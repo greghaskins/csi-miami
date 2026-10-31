@@ -3,6 +3,7 @@
 # Writes hit=true|false and kind=comment|text to $GITHUB_OUTPUT. Never
 # prints the text.
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 ev=${GITHUB_EVENT_NAME:?}; path=${GITHUB_EVENT_PATH:?}
 case "$ev" in
   issue_comment|pull_request_review_comment|discussion_comment)
