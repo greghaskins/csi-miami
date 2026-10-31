@@ -208,17 +208,19 @@ func (n *nfs3) Mount(ctx context.Context) error {
 	return err
 }
 
-// addr returns the address for the addr= option: an IP literal as it is, a
-// name resolved by the host resolver under its own deadline, the first
-// address it returns. The server name is the key of the lookup in flight:
+// addr returns the address for the addr= option. The driver is IPv4 only: an
+// IPv4 literal is used as it is, and a name is resolved by the host resolver
+// under its own deadline and the first IPv4 address of the answer is used
+// (an IPv4-mapped IPv6 address counts as IPv4). An answer with no IPv4
+// address is an error. The server name is the key of the lookup in flight:
 // while one that timed out has not returned, the next fails with
 // mount.ErrBusy instead of starting another.
 func (n *nfs3) addr(ctx context.Context) (string, error) {
 	server := n.spec.Server
-	if a, ok := parseIPv6Literal(server); ok {
-		return a.String(), nil
-	}
 	if a, err := netip.ParseAddr(server); err == nil {
+		if !a.Is4() {
+			return "", fmt.Errorf("nfs3 server %q: IPv6 is not supported; use an IPv4 address or a host name", server)
+		}
 		return a.String(), nil
 	}
 	what := fmt.Sprintf("resolving nfs3 server %q", server)
@@ -232,16 +234,10 @@ func (n *nfs3) addr(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(addrs) == 0 {
-		return "", fmt.Errorf("%s: the name has no address", what)
+	for _, ia := range addrs {
+		if a, ok := netip.AddrFromSlice(ia.IP); ok && a.Unmap().Is4() {
+			return a.Unmap().String(), nil
+		}
 	}
-	a, ok := netip.AddrFromSlice(addrs[0].IP)
-	if !ok {
-		return "", fmt.Errorf("%s: the resolver returned an invalid address", what)
-	}
-	a = a.Unmap()
-	if addrs[0].Zone != "" && a.Is6() {
-		a = a.WithZone(addrs[0].Zone)
-	}
-	return a.String(), nil
+	return "", fmt.Errorf("%s: the name has no IPv4 address", what)
 }
