@@ -14,7 +14,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check
+.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check smoke
 
 build:
 	mkdir -p bin
@@ -75,6 +75,13 @@ content-hash:
 image:
 	@hash="$$(hack/content-hash.sh)" || exit 1; \
 	hack/image-build.sh --arch "$$(go env GOARCH)" --tag "$(IMAGE):x-$$hash" --load
+
+# Smoke tests against the real kernel (mount, bind, remount, unmount), run as
+# root under `unshare --mount --propagation private` by hack/smoke.sh. ROOT
+# ONLY: run it as `sudo -E make smoke`, with the pinned Go on PATH. It is a
+# separate CI job and not part of `check`.
+smoke:
+	hack/smoke.sh
 
 # Exactly what CI runs: the static job runs fmt-check vet lint tidy-check vuln
 # and the unit job runs cover.
