@@ -101,7 +101,7 @@ jobs:
         if: failure()
         with:
           name: smoke-mountinfo-${{ matrix.arch }}
-          path: ${{ runner.temp }}/smoke/mountinfo.txt
+          path: ${{ runner.temp }}/smoke/mountinfo-*.txt
           if-no-files-found: ignore
 
   # Builds and pushes x-<hash>-<arch> natively on each architecture (no

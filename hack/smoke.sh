@@ -8,8 +8,8 @@
 # All smoke tests live in internal/mount because they exercise it together
 # with internal/observe.
 #
-# If SMOKE_ARTIFACT_DIR is set, a failing run leaves mountinfo.txt there: the
-# lines of /proc/self/mountinfo for the test's own temporary paths, and
+# If SMOKE_ARTIFACT_DIR is set, a failing test leaves mountinfo-<test>.txt
+# there: the lines of /proc/self/mountinfo for its own temporary paths, and
 # nothing else.
 set -euo pipefail
 
@@ -33,5 +33,7 @@ trap 'rm -rf "$dir"' EXIT
 
 go test -c -tags smoke -o "$dir/mount.test" ./internal/mount
 
+# The test compares its own mount namespace with the one we are leaving.
+SMOKE_PARENT_MNT_NS="$(readlink /proc/self/ns/mnt)" \
 unshare --mount --propagation private \
-  "$dir/mount.test" -test.run '^TestSmoke$' -test.v -test.count=1
+  "$dir/mount.test" -test.run '^TestSmoke' -test.v -test.count=1
