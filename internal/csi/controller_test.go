@@ -109,6 +109,8 @@ func TestCreateVolumeInvalidArgument(t *testing.T) {
 	}{
 		{"no name", func(_ *env, r *csi.CreateVolumeRequest) { r.Name = "" }, codes.InvalidArgument, "name"},
 		{"bad name", func(_ *env, r *csi.CreateVolumeRequest) { r.Name = "a/b" }, codes.InvalidArgument, "name"},
+		{"a name shaped like a subdir element", func(_ *env, r *csi.CreateVolumeRequest) { r.Name = "team-a" }, codes.InvalidArgument, "provisioner name"},
+		{"a short pvc name", func(_ *env, r *csi.CreateVolumeRequest) { r.Name = "pvc-1" }, codes.InvalidArgument, "provisioner name"},
 		{"no capabilities", func(_ *env, r *csi.CreateVolumeRequest) { r.VolumeCapabilities = nil }, codes.InvalidArgument, "capabilities"},
 		{"nil capability", func(_ *env, r *csi.CreateVolumeRequest) { r.VolumeCapabilities = []*csi.VolumeCapability{nil} }, codes.InvalidArgument, "empty"},
 		{"fsType", func(_ *env, r *csi.CreateVolumeRequest) { r.VolumeCapabilities = []*csi.VolumeCapability{withFS} }, codes.InvalidArgument, "fsType"},

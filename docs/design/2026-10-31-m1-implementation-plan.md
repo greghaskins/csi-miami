@@ -127,7 +127,10 @@ and unstage of the same ID across calls.
 - `volume_id` = `<kind>:<name>`, where `name` is `pvc-<uuid>` as the
   provisioner names it (`--extra-create-metadata` is on so the PVC name and
   namespace are available for subdir tokens). Opaque; never parsed for a
-  locator.
+  locator. The name is always of that shape, lower-case hex, and any other is
+  refused at every boundary (decision 22), so no subdir element can be a
+  volume and no volume can nest in another; a static PV keeps or receives
+  such a name.
 - `volume_context` (set by `CreateVolume`, stored on the PV, sent on every
   node call):
 

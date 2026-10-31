@@ -23,13 +23,12 @@ import (
 //     controller that has just started lists nothing until it has served a
 //     CreateVolume or DeleteVolume for a transport.
 //   - It looks at two levels below each transport: the directories there, and
-//     the directories inside those. A directory is reported when its name is
-//     a valid volume name. Volumes under a subdir of more than one element are
-//     not found; a subdir element is reported as a volume when its name is a
-//     valid volume name (the first level is not told apart from volumes). The
-//     second level is not entered inside a directory named like a PV
-//     (pvc-<uuid>), because that is a volume and what is inside it is its
-//     owner's data.
+//     the directories inside those that are not themselves volumes. A
+//     directory is reported when its name is a PV name (pvc-<uuid>), the only
+//     shape a volume name has; any other directory is a subdir element and is
+//     entered, never reported. Volumes under a subdir of more than one element
+//     are not found. What is inside a volume is its owner's data and is not
+//     looked at.
 //   - It does not paginate. Any starting token is Aborted, as the listing has
 //     no stable order across calls to resume in, and max_entries is not
 //     applied: the whole listing is returned, with no next token.
@@ -91,20 +90,21 @@ func (c *Controller) ListVolumes(ctx context.Context, req *csi.ListVolumesReques
 	return resp, nil
 }
 
-// volumeNames returns the names of the directories at the first and second
-// level of the transport mounted at dir that are valid volume names. A
-// directory that cannot be read is skipped: the listing is best-effort.
+// volumeNames returns the names of the volumes at the first and second level
+// of the transport mounted at dir: directories named like a PV (pvc-<uuid>),
+// which is the only shape a volume has. A directory with any other name is a
+// subdir element and is entered for the level below; a PV-named directory is
+// not entered, because what is inside it is its owner's data. A directory that
+// cannot be read is skipped: the listing is best-effort.
 func volumeNames(dir string) []string {
 	var out []string
 	for _, first := range subdirectories(dir) {
-		if isVolumeName(first) {
+		if volume.IsPVName(first) {
 			out = append(out, first)
-		}
-		if isPVShaped(first) {
 			continue
 		}
 		for _, second := range subdirectories(filepath.Join(dir, first)) {
-			if isVolumeName(second) {
+			if volume.IsPVName(second) {
 				out = append(out, second)
 			}
 		}
@@ -126,10 +126,4 @@ func subdirectories(dir string) []string {
 		}
 	}
 	return out
-}
-
-// isVolumeName reports whether name is acceptable as the name in a volume ID.
-func isVolumeName(name string) bool {
-	_, err := volume.NewID(volume.KindDirectory, name)
-	return err == nil
 }

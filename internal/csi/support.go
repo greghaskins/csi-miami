@@ -224,30 +224,6 @@ func (c *mounts) ensure(ctx context.Context, spec transport.Spec) (transport.Tra
 	return e.tr, nil
 }
 
-// isPVShaped reports whether name looks like a name the external-provisioner
-// gives a PV: pvc-<uuid>. It is the same rule volume applies to refuse a
-// subdir element of that shape, so a directory with such a name is a volume
-// and never a subdir.
-func isPVShaped(name string) bool {
-	const prefix = "pvc-"
-	if len(name) != len(prefix)+36 || name[:len(prefix)] != prefix {
-		return false
-	}
-	for i, c := range name[len(prefix):] {
-		switch i {
-		case 8, 13, 18, 23:
-			if c != '-' {
-				return false
-			}
-		default:
-			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 var errNoSuchVolume = errors.New("no such volume")
 
 // parseVolumeID parses a volume ID of the driver's own kinds.

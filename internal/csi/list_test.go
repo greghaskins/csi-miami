@@ -44,13 +44,13 @@ func TestListVolumes(t *testing.T) {
 	e := newEnv(t)
 	e.create(nameB)
 	e.create(nameA)
-	e.create("sanity-vol", "subdir", "teams")
+	e.create(nameC, "subdir", "teams")
 	mp := e.mountDir()
 
 	// Things that are not volumes, or not found by design.
 	writeFile(t, filepath.Join(mp, "a-file"), "x")
 	mustSymlink(t, e.host, filepath.Join(mp, "a-link"))
-	writeFile(t, filepath.Join(mp, nameA, "data", "inner", "x"), "x") // a volume's own data is not listed
+	writeFile(t, filepath.Join(mp, nameA, "data", "inner", "x"), "x") // a volume's own data is not listed, whatever its names
 	writeFile(t, filepath.Join(mp, "bad name", "x"), "x")             // not a valid name, but descended into
 	if err := os.MkdirAll(filepath.Join(mp, "bad name", "pvc-in-a-subdir"), 0o750); err != nil {
 		t.Fatal(err)
@@ -70,8 +70,7 @@ func TestListVolumes(t *testing.T) {
 	got := listIDs(t, e)
 	want := []string{
 		"directory:" + nameA, "directory:" + nameB,
-		"directory:elsewhere", "directory:pvc-in-a-subdir",
-		"directory:sanity-vol", "directory:teams",
+		"directory:" + nameC,
 	}
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
@@ -113,28 +112,5 @@ func TestListVolumesReturnsEverythingWhateverMaxEntries(t *testing.T) {
 	}
 	if len(resp.GetEntries()) != 2 || resp.GetNextToken() != "" {
 		t.Errorf("entries = %d, next token = %q; want both and no token", len(resp.GetEntries()), resp.GetNextToken())
-	}
-}
-
-func TestIsPVShaped(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		want bool
-	}{
-		{nameA, true},
-		{"pvc-0b9e1a3c-5d7f-4e21-8a6b-1c2d3e4f5a6", false},
-		{"pvc-0b9e1a3c-5d7f-4e21-8a6b-1c2d3e4f5a6bb", false},
-		{"pvc-0B9E1A3C-5D7F-4E21-8A6B-1C2D3E4F5A6B", false},
-		{"pvc_0b9e1a3c-5d7f-4e21-8a6b-1c2d3e4f5a6b", false},
-		{"pvc-0b9e1a3c_5d7f-4e21-8a6b-1c2d3e4f5a6b", false},
-		{"pvc-0b9e1a3c-5d7f-4e21-8a6b-1c2d3e4f5a6g", false},
-		{"sanity", false},
-		{"", false},
-	}
-	for _, tt := range tests {
-		if got := isPVShaped(tt.name); got != tt.want {
-			t.Errorf("isPVShaped(%q) = %v, want %v", tt.name, got, tt.want)
-		}
 	}
 }

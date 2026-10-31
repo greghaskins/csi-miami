@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 21 recorded (section 9)
+**Status:** Draft, decisions 1 to 22 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -383,7 +383,7 @@ static PV for `miami.csi.greghaskins.com` with the same capacity, the
 volume context the new driver expects, and a `claimRef` to the PVC name;
 recreate the PVC; scale up. The tool does the Kubernetes side and prints
 the rename it expects, or runs it over the mounted transport when given
-access. Both drivers can be installed side by side during the window;
+access. The rename keeps the `pvc-<uuid>` name (decision 22). Both drivers can be installed side by side during the window;
 nothing forces a flag day.
 
 ### 4.12 Observability and security posture
@@ -688,6 +688,10 @@ Recorded:
     literal is rejected and a host name must resolve to an IPv4 address.
     The target environments have no IPv6 and the driver carries no IPv6
     code path.
+22. **Volume names are provisioner-shaped**: a volume name is always
+    `pvc-<uuid>`; the driver refuses any other name at every boundary, so no
+    subdir element can ever be a volume and no volume can nest in another.
+    Static PVs (migration, adoption) keep or receive such names.
 
 Pending: none that block M1.
 

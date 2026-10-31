@@ -4,6 +4,8 @@ package csi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -31,6 +33,9 @@ import (
 // The suite expects a cluster around the driver in two places, and the
 // harness stands in for the part of it that the controller depends on:
 //
+//   - The external-provisioner names every volume pvc-<uuid>, the only name
+//     the controller accepts. The suite's names (sanity-controller-...,
+//     128 bytes at most) are mapped to such names.
 //   - The external-provisioner passes the node a volume is for in the
 //     CreateVolume request (volumeBindingMode WaitForFirstConsumer with
 //     topology enabled), and a local transport cannot be created without
@@ -54,10 +59,6 @@ var sanitySkips = []string{
 	// The controller accepts any node on publish, by design (the volumes need
 	// no attachment), so it cannot tell that a node does not exist.
 	`ControllerPublishVolume should fail when the node does not exist`,
-	// The suite sends a 128-byte name. A volume ID is "<kind>:<name>" and CSI
-	// limits it to 128 bytes, so a name can have 118. The provisioner's names
-	// (pvc-<uuid>) are 40.
-	`should not fail when creating volume with maximum-length name`,
 }
 
 type nodeStub struct{ csi.UnimplementedNodeServer }
@@ -83,12 +84,26 @@ func (nodeStub) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesReq
 	return &csi.NodeGetCapabilitiesResponse{}, nil
 }
 
+// provisionerName maps a name the suite chose to the pvc-<uuid> name the
+// external-provisioner would give the volume, the only shape the controller
+// accepts. The same suite name always maps to the same PV name, so the suite's
+// repeated creates of one name stay repeats, and different names stay
+// different (the digest is of the whole name, even a 128-byte one).
+func provisionerName(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	h := hex.EncodeToString(sum[:16])
+	return "pvc-" + h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
 // provisionerStandIn is a unary server interceptor that does for the
 // controller what the external-provisioner and Kubernetes do around it.
 func provisionerStandIn(pvs *kubefake.Reader) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
-		if r, ok := req.(*csi.CreateVolumeRequest); ok && r.GetAccessibilityRequirements() == nil {
-			r.AccessibilityRequirements = onNode(sanityNode)
+		if r, ok := req.(*csi.CreateVolumeRequest); ok {
+			r.Name = provisionerName(r.GetName())
+			if r.GetAccessibilityRequirements() == nil {
+				r.AccessibilityRequirements = onNode(sanityNode)
+			}
 		}
 		resp, err := h(ctx, req)
 		if err != nil {

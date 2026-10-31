@@ -365,3 +365,29 @@ func TestContextOfPV(t *testing.T) {
 		t.Error("a PV with another name was accepted")
 	}
 }
+
+// A static PV named like a subdir element must not make DeleteVolume remove
+// that subdir and the volumes beneath it: the name is not a volume name, so the
+// ID is refused before any PV is read.
+func TestDeleteVolumeNeverTreatsASubdirAsAVolume(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	resp := e.create(nameA, "subdir", "team-a")
+	vol := filepath.Join(e.mountDir(), "team-a", nameA)
+	writeFile(t, filepath.Join(vol, "keep"), "x")
+	spoof := pvFor(resp)
+	spoof.Name = "team-a"
+	spoof.Spec.CSI.VolumeHandle = "directory:team-a"
+	spoof.Spec.CSI.VolumeAttributes = map[string]string{
+		"miami/kind": "directory", "miami/transport.kind": "local", "miami/transport.path": e.host,
+	}
+	e.pvs.Add(spoof)
+
+	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq("directory:team-a")); err != nil {
+		t.Fatal(err)
+	}
+	mustExist(t, filepath.Join(vol, "keep"))
+	if calls := e.pvs.Calls(); len(calls) != 0 {
+		t.Errorf("a PV was read for a name that is not a volume name: %v", calls)
+	}
+}

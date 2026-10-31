@@ -25,6 +25,7 @@ import (
 const (
 	nameA = "pvc-0b9e1a3c-5d7f-4e21-8a6b-1c2d3e4f5a6b"
 	nameB = "pvc-6f1d2c3b-4a59-4687-9a0b-c1d2e3f4a5b6"
+	nameC = "pvc-7a2e3d4c-5b6a-4798-8b1c-d2e3f4a5b6c7"
 )
 
 // syncBuffer is a bytes.Buffer safe for the logger's concurrent use.
