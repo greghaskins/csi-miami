@@ -305,7 +305,7 @@ func TestReadConsistent(t *testing.T) {
 	t.Run("a table that never settles is an error", func(t *testing.T) {
 		t.Parallel()
 		n := 0
-		_, err := readConsistent(func() ([]byte, error) { n++; return []byte{byte(n)}, nil }, 4)
+		_, err := readConsistent(func() ([]byte, error) { n++; return []byte(strings.Repeat("x", n)), nil }, 4)
 		if err == nil || !strings.Contains(err.Error(), "kept changing across 4 reads") {
 			t.Errorf("got %v, want an error after the bound", err)
 		}

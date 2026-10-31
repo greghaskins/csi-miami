@@ -5,6 +5,7 @@ package mount_test
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -339,6 +340,92 @@ func TestSmokeCoveredMountPoint(t *testing.T) {
 	}
 }
 
+// The kernel crosses the shortest mount point first. A mount at /t/vols made
+// before a cover at /t is hidden by it, although both are children of the same
+// parent; a mount at /t/vols made afterwards is the cover's child.
+func TestSmokeHiddenBySiblingCover(t *testing.T) {
+	base, m := smokeEnv(t)
+	ctx := context.Background()
+
+	cover := filepath.Join(base, "t")
+	hidden := filepath.Join(cover, "vols")
+	src := filepath.Join(base, "src")
+	mkdir(t, hidden, src)
+
+	// The hidden mount is a tmpfs with the same source and type as the one the
+	// Mounter is later asked for, so a table that still showed it would make
+	// that Mount a false no-op.
+	if err := m.Mount(ctx, "tmpfs", hidden, "tmpfs", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Mount(ctx, "cover", cover, "tmpfs", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// The kernel agrees the mount is gone from view.
+	if _, err := os.Stat(hidden); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat %s: %v; the cover should hide the directory", hidden, err)
+	}
+	tbl := currentTable(t)
+	if _, ok := tbl.At(hidden); ok {
+		t.Errorf("At(%s) found the hidden mount", hidden)
+	}
+	if res, ok := tbl.Resolve(hidden); !ok || res.MountPoint != cover || res.Source != "cover" {
+		t.Errorf("Resolve(%s) = %+v, %v; want the cover", hidden, res, ok)
+	}
+	if err := m.Mount(ctx, "tmpfs", hidden, "tmpfs", 0, ""); !errors.Is(err, unix.ENOENT) {
+		t.Errorf("mount at the hidden path: got %v, want the kernel's ENOENT, not a false no-op", err)
+	}
+	if err := m.Unmount(ctx, hidden, 0); err != nil {
+		t.Errorf("unmount at the hidden path: %v; nothing is visible there, so there is nothing to do", err)
+	}
+
+	// Make the directory inside the cover and bind there: the new mount is the
+	// cover's child and is what the table shows at the path.
+	mkdir(t, hidden)
+	if err := m.Bind(ctx, src, hidden, false); err != nil {
+		t.Fatalf("bind in the cover: %v", err)
+	}
+	tbl = currentTable(t)
+	top, ok := tbl.At(hidden)
+	coverMount, _ := tbl.At(cover)
+	if !ok || top.ParentID != coverMount.ID {
+		t.Errorf("At(%s) = %+v, %v; want the bind made in the cover (parent %d)", hidden, top, ok, coverMount.ID)
+	}
+	requireBind(t, hidden, src, true)
+	var got []string
+	for _, mm := range tbl.Under(cover) {
+		got = append(got, mm.MountPoint)
+	}
+	if want := []string{hidden, cover, hidden}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("Under(%s) = %v, want %v", cover, got, want)
+	}
+}
+
+// Read-only is a per-mount flag. It cannot make a read-only filesystem
+// writable, and SuperReadOnly says when that is the case.
+func TestSmokeSuperblockReadOnly(t *testing.T) {
+	base, m := smokeEnv(t)
+	ctx := context.Background()
+
+	vol, pub := filepath.Join(base, "ro"), filepath.Join(base, "pub")
+	mkdir(t, vol, pub)
+	if err := m.Mount(ctx, "tmpfs", vol, "tmpfs", unix.MS_RDONLY, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Bind(ctx, vol, pub, false); err != nil {
+		t.Fatalf("bind of a read-only filesystem, read-write requested: %v", err)
+	}
+	cur, ok := currentTable(t).At(pub)
+	if !ok || cur.ReadOnly() || !cur.SuperReadOnly() {
+		t.Fatalf("mount %+v, %v; want a per-mount rw on a read-only filesystem", cur, ok)
+	}
+	err := os.WriteFile(filepath.Join(pub, "probe"), []byte("x"), 0o600)
+	if !errors.Is(err, syscall.EROFS) {
+		t.Errorf("write: got %v, want EROFS: the filesystem stays read-only", err)
+	}
+}
+
 // A bind inherits the read-only flag of the mount its source lives in, so the
 // requested state must win, on the first call and on a retry.
 func TestSmokeReadOnlyIsWhatWasAskedFor(t *testing.T) {
@@ -402,6 +489,10 @@ func TestSmokeSymlinksAreRefused(t *testing.T) {
 	if err := os.Symlink(realDir, link); err != nil {
 		t.Fatal(err)
 	}
+	dangling := filepath.Join(base, "dangling")
+	if err := os.Symlink(filepath.Join(base, "nowhere"), dangling); err != nil {
+		t.Fatal(err)
+	}
 
 	for name, err := range map[string]error{
 		"mount onto a symlink":       m.Mount(ctx, "tmpfs", link, "tmpfs", 0, ""),
@@ -412,9 +503,12 @@ func TestSmokeSymlinksAreRefused(t *testing.T) {
 		"unmount through a symlink":  m.Unmount(ctx, filepath.Join(link, "sub"), 0),
 		"unmount of a symlink":       m.Unmount(ctx, link, 0),
 		"bind under a symlinked dir": m.Bind(ctx, realDir, filepath.Join(link, "sub"), false),
+		"mount onto a dangling link": m.Mount(ctx, "tmpfs", dangling, "tmpfs", 0, ""),
+		"bind from a dangling link":  m.Bind(ctx, dangling, filepath.Join(realDir, "sub"), false),
+		"unmount a dangling link":    m.Unmount(ctx, dangling, 0),
 	} {
-		if !errors.Is(err, mount.ErrNotResolved) {
-			t.Errorf("%s: got %v, want ErrNotResolved", name, err)
+		if !errors.Is(err, mount.ErrNotResolved) || errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s: got %v, want ErrNotResolved and not a not-exist error", name, err)
 		}
 	}
 	if n := len(currentTable(t).Under(base)); n != 0 {

@@ -11,9 +11,16 @@
 # If SMOKE_ARTIFACT_DIR is set, a failing test leaves mountinfo-<test>.txt
 # there: the lines of /proc/self/mountinfo for its own temporary paths, and
 # nothing else.
+# Run as `sudo -E make smoke`: root builds the test binary too, so Go's build
+# and module caches get root-owned files. To keep them out of your own caches,
+# point GOCACHE and GOMODCACHE at scratch directories for the run.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+# The Makefile sets these; running this script directly must not differ.
+export GOTOOLCHAIN=local
+export CGO_ENABLED=0
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "smoke: must run as root (it mounts filesystems); try: sudo -E make smoke" >&2
