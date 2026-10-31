@@ -22,6 +22,7 @@ type pass struct {
 	// volumes whose unstage succeeded in it.
 	intents map[string]intent.Intent
 
+	failures    []intent.LoadFailure     // the records that did not load in this pass
 	unstaging   map[string]struct{}      // volumes with an unstage request carried out in this pass
 	superseded  map[*request]bool        // unstage requests overtaken by a later stage or publish
 	teardownErr map[string]error         // by volume, for the unstage requests
@@ -85,6 +86,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 		r:           r,
 		ctx:         ctx,
 		intents:     loaded.Intents,
+		failures:    loaded.Failures,
 		unstaging:   map[string]struct{}{},
 		superseded:  map[*request]bool{},
 		conflicts:   map[string]error{},
@@ -129,12 +131,15 @@ func (p *pass) answer(batch []*request) {
 
 // stageAnswer is the answer to a Stage.
 func (p *pass) stageAnswer(req *request) error {
+	if err := p.unreadableAnswer(req.volume); err != nil {
+		return err
+	}
 	if _, gone := p.unstaging[req.volume]; gone {
 		return fmt.Errorf("%w: a later request unstaged %s", ErrSuperseded, req.volume)
 	}
 	res, ok := p.results[req.volume]
 	if !ok {
-		return fmt.Errorf("%w: %s", ErrUnknownVolume, req.volume)
+		return p.absent(req.volume)
 	}
 	return res.stage
 }
@@ -142,12 +147,15 @@ func (p *pass) stageAnswer(req *request) error {
 // publishAnswer is the answer to a Publish: its own target's outcome, or the
 // stage's failure when the stage was not there to bind from.
 func (p *pass) publishAnswer(req *request) error {
+	if err := p.unreadableAnswer(req.volume); err != nil {
+		return err
+	}
 	if _, gone := p.unstaging[req.volume]; gone {
 		return fmt.Errorf("%w: a later request unstaged %s", ErrSuperseded, req.volume)
 	}
 	res, ok := p.results[req.volume]
 	if !ok {
-		return fmt.Errorf("%w: %s", ErrUnknownVolume, req.volume)
+		return p.absent(req.volume)
 	}
 	if res.stage != nil {
 		return fmt.Errorf("%q was not attempted because the stage of %s is not ready: %w", req.target, req.volume, res.stage)
@@ -157,6 +165,39 @@ func (p *pass) publishAnswer(req *request) error {
 		return fmt.Errorf("%q is not in the record of %s", req.target, req.volume)
 	}
 	return err
+}
+
+// unreadableAnswer is ErrIntentsUnknown for a volume with no record in this
+// pass because its record could not be read, and nil otherwise. It is checked
+// before anything that depends on the record, such as an unstage that found
+// nothing to do for lack of one.
+func (p *pass) unreadableAnswer(volumeID string) error {
+	if _, recorded := p.intents[volumeID]; !recorded && p.unreadable(volumeID) {
+		return p.absent(volumeID)
+	}
+	return nil
+}
+
+// absent is the error for a volume that has no record in this pass: unknown
+// if it never was staged, but not if its record is there and could not be
+// read, which is not the same thing and is retryable. A load failure whose
+// file name does not say which volume it was could be this one, so it counts.
+func (p *pass) absent(volumeID string) error {
+	if p.unreadable(volumeID) {
+		return fmt.Errorf("%w: the record of %s could not be read in this pass", ErrIntentsUnknown, volumeID)
+	}
+	return fmt.Errorf("%w: %s", ErrUnknownVolume, volumeID)
+}
+
+// unreadable reports whether a record that failed to load in this pass may be
+// the volume's.
+func (p *pass) unreadable(volumeID string) bool {
+	for _, f := range p.failures {
+		if f.VolumeID == "" || f.VolumeID == volumeID {
+			return true
+		}
+	}
+	return false
 }
 
 // noteLoadFailures reports the records that did not load: the gauge every
@@ -209,7 +250,7 @@ func (r *Reconciler) observe(ctx context.Context) (observe.Table, error) {
 		if errors.Is(err, mount.ErrTimeout) {
 			r.metrics.IncObservationTimeout("observe")
 		}
-		return nil, fmt.Errorf("reading the mount table: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrObserve, err)
 	}
 	return t, nil
 }

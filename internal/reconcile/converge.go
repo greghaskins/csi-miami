@@ -56,7 +56,13 @@ func (p *pass) teardown(batch []*request) {
 		p.unstaging[req.volume] = struct{}{}
 		in, ok := p.intents[req.volume]
 		if !ok {
-			p.teardownErr[req.volume] = nil
+			// Nothing recorded, so nothing to undo; unless the record is
+			// there and could not be read in this pass, which is not "done".
+			if p.unreadable(req.volume) {
+				p.teardownErr[req.volume] = p.absent(req.volume)
+			} else {
+				p.teardownErr[req.volume] = nil
+			}
 			continue
 		}
 		err := p.teardownVolume(in)

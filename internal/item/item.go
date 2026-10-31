@@ -65,6 +65,11 @@ var (
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
 )
 
+// ErrObserve is returned when the mount table cannot be read. It is the one
+// error for that, wherever it is found, so that it has one class however the
+// request that met it came by it. Retrying is the remedy.
+var ErrObserve = errors.New("the mount table cannot be read")
+
 // ErrTransportNotMounted is returned by an Item's Teardown when the stage path
 // is mounted but the transport it was made from is not, so the stage mount
 // cannot be told from a foreign one. Nothing is unmounted. The reconciler
@@ -125,7 +130,7 @@ func UnmountBind(ctx context.Context, m mount.Mounter, mountPoint, source string
 func UnmountIf(ctx context.Context, m mount.Mounter, mountPoint string, owned Owned, what string, conflict error) error {
 	t, err := m.Mounts(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrObserve, err)
 	}
 	top, ok := t.At(mountPoint)
 	if !ok {
@@ -143,7 +148,7 @@ func UnmountIf(ctx context.Context, m mount.Mounter, mountPoint string, owned Ow
 	}
 	t, err = m.Mounts(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrObserve, err)
 	}
 	if _, ok := t.At(mountPoint); ok {
 		return fmt.Errorf("%w: another mount is stacked at %s and is left in place", conflict, mountPoint)
