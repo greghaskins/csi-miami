@@ -17,7 +17,7 @@ case "$ev" in
   issue_comment|pull_request_review_comment|discussion_comment)
     kind=comment; spec=(body=.comment.body) ;;
   issues)               kind=text; spec=(title=.issue.title body=.issue.body) ;;
-  pull_request_target)  kind=text; spec=(title=.pull_request.title body=.pull_request.body ref=.pull_request.head.ref) ;;
+  pull_request)         kind=text; spec=(title=.pull_request.title body=.pull_request.body ref=.pull_request.head.ref) ;;
   pull_request_review)  kind=text; spec=(body=.review.body) ;;
   release)              kind=text; spec=(tag=.release.tag_name name=.release.name body=.release.body) ;;
   discussion)           kind=text; spec=(title=.discussion.title body=.discussion.body) ;;
