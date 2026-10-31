@@ -24,9 +24,14 @@ Done once by the repository owner; the session checks, never assumes.
    shared `.git` directory, so every worktree is covered once the variable
    is present.
 3. A ruleset on `main`: pull request required; required checks `ci-ok`
-   (once `ci.yml` exists, task T1) and `secret-scan`; squash merge with the
-   default message set to pull request title only, so a PR body never
-   becomes a commit message.
+   (once `ci.yml` exists, task T1) and `secret-scan`; merge commits (squash
+   and rebase disabled), with the merge commit message set to the pull
+   request title only, so a PR body never becomes a commit message and the
+   branch's own commits stay on `main` with their bodies. Squash makes
+   stacked pull requests expensive, because every merge forces a rebase of
+   everything stacked on it, while a merge commit keeps the branch history
+   intact so a later task branch can be based on an unmerged predecessor
+   when a wave needs it.
 4. `mise install` has been run in the checkout at least once (installs the
    hooks). In a worktree, hooks are already shared.
 

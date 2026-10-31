@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 17 recorded (section 9)
+**Status:** Draft, decisions 1 to 18 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -651,6 +651,11 @@ Recorded:
     `resize2fs` are the real tools; no embedded template, no fsck-free
     mounts (7.1).
 17. **LUKS2 through `cryptsetup`**, not a Go implementation (7.1).
+18. **Merge commits, not squash**, on `main`: the merge commit message is
+    the pull request title only; squash and rebase merges are disabled.
+    Squash forces a rebase of every stacked branch on each merge; merge
+    commits keep branch history and make stacking cheap. The PR body never
+    enters git history either way.
 
 Pending: none that block M1.
 
