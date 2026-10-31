@@ -554,7 +554,7 @@ Every PR runs the full set below as parallel jobs; nothing waits for
 
 | Job | What it proves | Runs on |
 |---|---|---|
-| `secret-scan` | gitleaks over the tree, every commit's content and message in the PR range, and the branch name, with the config held in a repository secret; a second workflow scans issue, PR, review, comment, discussion and release text as it is posted from accounts with write access and installed apps and removes what matches | amd64 |
+| `secret-scan` | gitleaks over the tree, every commit's content and message in the PR range, and the branch name, with the config held in a repository secret; a second workflow scans issue, PR, review, comment, discussion and release text as it is posted from accounts with write access (bot accounts by an explicit list) and removes what matches | amd64 |
 | `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | amd64 |
 | `unit` | `go test -race -shuffle=on ./...` with coverage | amd64 |
 | `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | amd64 |
