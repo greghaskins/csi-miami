@@ -26,19 +26,78 @@ func unavailable(format string, args ...any) error {
 	return status.Errorf(codes.Unavailable, format, args...)
 }
 
+// maxStuckPerTransport bounds how many file system operations on one
+// transport may be running at once, running or abandoned.
+const maxStuckPerTransport = 8
+
+// opLimiter bounds the operations that blocking has started. A call on a dead
+// network file system never returns, so each one pins a goroutine, and with
+// it an OS thread, until the kernel lets go; retries across many claims would
+// otherwise pile one on top of another toward the process's thread limit.
+//
+// An operation names the transport it works on (group) and what it works on
+// (key). Two operations on one key never run at once, and at most
+// maxStuckPerTransport run on one transport, so a hung transport costs a
+// bounded number of threads and the rest of the requests for it fail at once
+// with Unavailable instead of piling up. The slot is released by the
+// operation's own goroutine when it exits, not when the caller gives up.
+type opLimiter struct {
+	mu    sync.Mutex
+	keys  map[string]struct{}
+	count map[string]int // by group
+}
+
+// acquire takes the slot of (group, key) and returns the function that
+// releases it, or false if key is busy or group is full.
+func (l *opLimiter) acquire(group, key string) (release func(), ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, busy := l.keys[key]; busy || l.count[group] >= maxStuckPerTransport {
+		return nil, false
+	}
+	if l.keys == nil {
+		l.keys, l.count = map[string]struct{}{}, map[string]int{}
+	}
+	l.keys[key] = struct{}{}
+	l.count[group]++
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		delete(l.keys, key)
+		if l.count[group]--; l.count[group] <= 0 {
+			delete(l.count, group)
+		}
+	}, true
+}
+
+// errStuck is the status for an operation refused because a previous one on
+// the same transport or the same directory has not returned.
+func errStuck() error {
+	return unavailable("a previous operation on this transport has not returned, so this one was not started; it will be retried")
+}
+
 // blocking runs fn, which makes a system call that can hang on a dead network
 // file system and ignores cancellation, in a goroutine of its own and gives up
 // waiting when ctx ends. The goroutine is abandoned, not stopped; it writes to
-// a buffered channel so it can exit whenever the kernel lets it go. The
-// caller then reports the context's error, and what fn did or did not finish
-// is for a retry to find out: every operation passed here is idempotent.
-func blocking[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+// a buffered channel so it can exit whenever the kernel lets it go, and it
+// releases its slot in l then. While the slot for (group, key) is taken, or
+// group has maxStuckPerTransport operations running, blocking starts nothing
+// and returns Unavailable. When ctx ends first the caller gets the context's
+// error, and what fn did or did not finish is for a retry to find out: every
+// operation passed here is idempotent.
+func blocking[T any](ctx context.Context, l *opLimiter, group, key string, fn func() (T, error)) (T, error) {
+	var zero T
+	release, ok := l.acquire(group, key)
+	if !ok {
+		return zero, errStuck()
+	}
 	type result struct {
 		v   T
 		err error
 	}
 	done := make(chan result, 1)
 	go func() {
+		defer release()
 		v, err := fn()
 		done <- result{v, err}
 	}()
@@ -46,7 +105,6 @@ func blocking[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 	case r := <-done:
 		return r.v, r.err
 	case <-ctx.Done():
-		var zero T
 		return zero, ctx.Err()
 	}
 }

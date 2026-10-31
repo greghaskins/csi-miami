@@ -29,6 +29,11 @@ import (
 //     entered, never reported. Volumes under a subdir of more than one element
 //     are not found. What is inside a volume is its owner's data and is not
 //     looked at.
+//   - It has a deadline of its own (the controller's --deadline), and the
+//     transports are read at once under it. A transport that does not answer
+//     in time, or is refused because an earlier read of it has not returned,
+//     is logged and left out; the others are listed. Only the caller giving up
+//     fails the call.
 //   - It does not paginate. Any starting token is Aborted, as the listing has
 //     no stable order across calls to resume in, and max_entries is not
 //     applied: the whole listing is returned, with no next token.
@@ -43,7 +48,12 @@ func (c *Controller) ListVolumes(ctx context.Context, req *csi.ListVolumesReques
 		return nil, status.Error(codes.InvalidArgument, "max_entries must not be negative")
 	}
 
-	table, err := c.mounter.Mounts(ctx)
+	// The handler has a deadline of its own, so that a caller without one
+	// cannot be made to wait for ever by a transport that does not answer.
+	lctx, cancel := context.WithTimeout(ctx, c.deadline)
+	defer cancel()
+
+	table, err := c.mounter.Mounts(lctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, contextStatus(ctx.Err())
@@ -61,18 +71,35 @@ func (c *Controller) ListVolumes(ctx context.Context, req *csi.ListVolumesReques
 	}
 	sort.Strings(mountPoints)
 
-	names := map[string]bool{}
+	// Every transport is read at once, each under the deadline, so that one
+	// that does not answer costs the listing that transport and nothing more.
+	type scanned struct {
+		mountPoint string
+		names      []string
+		err        error
+	}
+	results := make(chan scanned, len(mountPoints))
 	for _, mp := range mountPoints {
-		if err := ctx.Err(); err != nil {
-			return nil, contextStatus(err)
+		go func() {
+			found, err := blocking(lctx, &c.ops, mp, mp, func() ([]string, error) { return c.scan(mp), nil })
+			results <- scanned{mp, found, err}
+		}()
+	}
+	names := map[string]bool{}
+	for range mountPoints {
+		r := <-results
+		if r.err != nil {
+			// Which transport, by its ID (the last element of its mount
+			// point), and why; not its address or path.
+			c.log.Warn("transport did not answer; its volumes are not listed", "transport", filepath.Base(r.mountPoint), "error", status.Convert(r.err).Message())
+			continue
 		}
-		found, err := blocking(ctx, func() ([]string, error) { return volumeNames(mp), nil })
-		if err != nil {
-			return nil, contextStatus(err)
-		}
-		for _, n := range found {
+		for _, n := range r.names {
 			names[n] = true
 		}
+	}
+	if ctx.Err() != nil { // the caller gave up; the handler's own deadline is not that
+		return nil, contextStatus(ctx.Err())
 	}
 
 	sorted := make([]string, 0, len(names))

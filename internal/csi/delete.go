@@ -88,7 +88,7 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 		return nil, unavailable("the directory of volume %q cannot be computed, so nothing is deleted: %v", id.Name, err)
 	}
 
-	removed, err := blocking(ctx, func() (bool, error) {
+	removed, err := blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) {
 		return removeItemDir(ctx, c.mounter, tr.Dir(), dir, id.Name)
 	})
 	if err != nil {

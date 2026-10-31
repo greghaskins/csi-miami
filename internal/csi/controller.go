@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -38,7 +39,15 @@ type ControllerOptions struct {
 
 	// Log receives the controller's own messages. Nil means slog.Default().
 	Log *slog.Logger
+
+	// Deadline bounds ListVolumes, which would otherwise wait for as long as
+	// its caller does. Zero or negative means DefaultListDeadline.
+	Deadline time.Duration
 }
+
+// DefaultListDeadline bounds ListVolumes when ControllerOptions.Deadline is
+// not positive.
+const DefaultListDeadline = 10 * time.Second
 
 // Controller is the CSI controller service for directory volumes.
 //
@@ -53,7 +62,13 @@ type Controller struct {
 	mounts  *mounts
 	log     *slog.Logger
 
+	deadline time.Duration
+	// scan lists the volumes of the transport mounted at a directory; tests
+	// replace it with one that hangs.
+	scan func(dir string) []string
+
 	busy inflight
+	ops  opLimiter
 	seen memo
 }
 
@@ -85,12 +100,19 @@ func NewController(o ControllerOptions) (*Controller, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	deadline := o.Deadline
+	if deadline <= 0 {
+		deadline = DefaultListDeadline
+	}
 	return &Controller{
 		root:    o.Root,
 		mounter: o.Mounter,
 		pvs:     o.PVs,
 		mounts:  newMounts(o.Root, o.Mounter, o.Transport),
 		log:     log,
+
+		deadline: deadline,
+		scan:     volumeNames,
 	}, nil
 }
 
@@ -180,7 +202,7 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 	if err != nil {
 		return nil, err
 	}
-	made, err := blocking(ctx, func() (bool, error) { return ensureItemDir(tr.Dir(), dir) })
+	made, err := blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) { return ensureItemDir(tr.Dir(), dir) })
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, contextStatus(ctx.Err())

@@ -38,7 +38,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.endpoint, "endpoint", "unix:///csi/csi.sock", "CSI endpoint to listen on, unix:///<absolute path>")
 	fs.StringVar(&cfg.root, "transports-root", "/var/lib/miami", "directory to mount transports under; nothing in it needs to survive a restart")
 	fs.StringVar(&cfg.kubeconfig, "kubeconfig", "", "kubeconfig file, for development outside a cluster; in a cluster the service account is used")
-	fs.DurationVar(&cfg.deadline, "deadline", 10*time.Second, "deadline of one API request and of one mount operation")
+	fs.DurationVar(&cfg.deadline, "deadline", 10*time.Second, "deadline of one API request, of one mount operation and of ListVolumes")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -88,7 +88,7 @@ func serveControllerWith(ctx context.Context, cfg controllerConfig, pvs kube.PVR
 	if err != nil {
 		return err
 	}
-	ctrl, err := csi.NewController(csi.ControllerOptions{Root: root, Mounter: m, PVs: pvs, Log: log})
+	ctrl, err := csi.NewController(csi.ControllerOptions{Root: root, Mounter: m, PVs: pvs, Log: log, Deadline: cfg.deadline})
 	if err != nil {
 		return err
 	}
