@@ -1,13 +1,14 @@
-# Continuous integration. Every job runs make targets (or the one docker
-# command the Dockerfile needs), so what passes locally is what passes here.
-# `ci-ok` is the single required check: it fails if any job failed, was
-# cancelled, or was skipped when it should have run.
+# Continuous integration. Every job runs make targets or the scripts under
+# hack/, so what passes locally is what passes here. `ci-ok` is the single
+# required check: it fails if any job failed, was cancelled, or was skipped
+# when it should have run.
 #
 # Images are content-addressed: they are tagged by hack/content-hash.sh, a
-# hash of the build inputs, not by commit. A commit whose inputs are
-# unchanged rebuilds nothing, and a push to main only adds its sha as an alias
-# of the existing index. The registry is the artifact store, so this
-# repository takes no fork pull requests (their token cannot push).
+# hash of the build inputs (including hack/image-build.sh, which holds the
+# build command), not by commit. A commit whose inputs are unchanged rebuilds
+# nothing, and a push to main normally only adds its sha as an alias of the
+# existing index. The registry is the artifact store, so this repository takes
+# no fork pull requests (their token cannot push).
 name: ci
 on:
   pull_request:
@@ -16,15 +17,14 @@ on:
 permissions:
   contents: read
 # Pull request runs are superseded by the next push to the same ref. Runs on
-# main are never cancelled: each commit's alias must be created.
+# main are keyed by commit and never cancelled: each commit's alias must be
+# created.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
 jobs:
   static:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,7 +51,7 @@ jobs:
       - run: make fmt-check vet lint tidy-check vuln
 
   unit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,10 +68,11 @@ jobs:
           path: coverage.out
           if-no-files-found: error
 
-  # Builds and pushes c-<hash>-<arch> natively on each architecture (no
+  # Builds and pushes x-<hash>-<arch> natively on each architecture (no
   # emulation) unless that tag already exists, then runs the image from the
   # registry, so every run proves the image that will be used starts, whether
-  # or not this run built it.
+  # or not this run built it. It records the digest of the image it ran, and
+  # the index is created from exactly those digests.
   build:
     name: build (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -84,131 +85,179 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Compute the content hash
-        id: hash
-        run: echo "hash=$(hack/content-hash.sh)" >> "$GITHUB_OUTPUT"
-      # The docker-container driver is needed for attestations and pushing.
-      # The BuildKit image is pinned by digest (moby/buildkit v0.34.1).
-      - name: Create builder
+      - name: Compute the image identity
+        id: id
+        env:
+          REPO: ${{ github.repository }}
         run: |
-          docker buildx create --name ci --driver docker-container --use \
-            --driver-opt image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+          hash="$(hack/content-hash.sh)"
+          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
+            echo "::error::unexpected content hash: '${hash}'"
+            exit 1
+          fi
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "hash=${hash}"
+            echo "image=${image}"
+          } >> "$GITHUB_OUTPUT"
       - name: Log in to ghcr.io
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      # SBOM generator: docker/buildkit-syft-scanner 1.12.1, pinned by digest.
       - name: Build and push the image unless it exists
         env:
-          HASH: ${{ steps.hash.outputs.hash }}
+          IMAGE: ${{ steps.id.outputs.image }}
+          HASH: ${{ steps.id.outputs.hash }}
           ARCH: ${{ matrix.arch }}
         run: |
-          tag="${IMAGE}:c-${HASH}-${ARCH}"
-          if docker buildx imagetools inspect "$tag" > /dev/null 2>&1; then
+          tag="${IMAGE}:x-${HASH}-${ARCH}"
+          if hack/image-exists.sh "$tag"; then
             echo "$tag already exists; not rebuilding"
           else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              echo "::error::could not tell whether $tag exists"
+              exit "$status"
+            fi
             echo "$tag does not exist; building"
-            docker buildx build --platform "linux/${ARCH}" \
-              --build-arg "VERSION=c-${HASH}" \
-              --provenance=true \
-              --attest "type=sbom,generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315" \
-              --push -t "$tag" .
+            hack/image-build.sh --arch "$ARCH" --tag "$tag" --push
           fi
-      - name: Run the image from the registry
+      - name: Run the image from the registry and record its digest
         env:
-          HASH: ${{ steps.hash.outputs.hash }}
+          IMAGE: ${{ steps.id.outputs.image }}
+          HASH: ${{ steps.id.outputs.hash }}
           ARCH: ${{ matrix.arch }}
         run: |
-          tag="${IMAGE}:c-${HASH}-${ARCH}"
-          got="$(docker run --rm --platform "linux/${ARCH}" "$tag" version)"
-          echo "$tag reports version $got"
-          test "$got" = "c-${HASH}"
+          tag="${IMAGE}:x-${HASH}-${ARCH}"
+          digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$tag" |
+            jq -er --arg arch "$ARCH" '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)]
+              | if length == 1 then .[0].digest else error("expected exactly one linux/" + $arch + " manifest") end')"
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::unexpected digest: '${digest}'"
+            exit 1
+          fi
+          got="$(docker run --rm "${IMAGE}@${digest}" version)"
+          echo "${IMAGE}@${digest} (${tag}) reports version ${got}"
+          test "$got" = "x-${HASH}"
+          printf '%s\n' "$digest" > "digest-${ARCH}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digest-${{ matrix.arch }}
+          if-no-files-found: error
 
-  # Creates the multi-arch index c-<hash> once, from the two per-arch tags,
-  # and verifies that it lists both platforms.
+  # Creates the multi-arch index x-<hash> from exactly the two digests the
+  # build legs ran, and verifies that it lists those and nothing else.
   manifest:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
+    outputs:
+      index_digest: ${{ steps.index.outputs.index_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Compute the content hash
-        id: hash
-        run: echo "hash=$(hack/content-hash.sh)" >> "$GITHUB_OUTPUT"
+      - name: Compute the image identity
+        id: id
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          hash="$(hack/content-hash.sh)"
+          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
+            echo "::error::unexpected content hash: '${hash}'"
+            exit 1
+          fi
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "hash=${hash}"
+            echo "image=${image}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
       - name: Log in to ghcr.io
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Create the multi-arch index unless it exists
+      - name: Create and verify the index
+        id: index
         env:
-          HASH: ${{ steps.hash.outputs.hash }}
+          IMAGE: ${{ steps.id.outputs.image }}
+          HASH: ${{ steps.id.outputs.hash }}
         run: |
-          index="${IMAGE}:c-${HASH}"
-          if docker buildx imagetools inspect "$index" > /dev/null 2>&1; then
-            echo "$index already exists; not recreating"
-          else
-            docker buildx imagetools create -t "$index" \
-              "${index}-amd64" "${index}-arm64"
-          fi
-      - name: Verify the index lists both platforms
-        env:
-          HASH: ${{ steps.hash.outputs.hash }}
-        run: |
-          out="$(docker buildx imagetools inspect "${IMAGE}:c-${HASH}")"
-          echo "$out"
-          for platform in linux/amd64 linux/arm64; do
-            echo "$out" | grep -Eq "^[[:space:]]*Platform:[[:space:]]+${platform}$" || {
-              echo "::error::index does not list ${platform}"
+          amd64="$(cat digests/digest-amd64)"
+          arm64="$(cat digests/digest-arm64)"
+          for d in "$amd64" "$arm64"; do
+            if ! [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::unexpected digest: '${d}'"
               exit 1
-            }
+            fi
           done
+          index="${IMAGE}:x-${HASH}"
+          docker buildx imagetools create -t "$index" "${IMAGE}@${amd64}" "${IMAGE}@${arm64}"
+          docker buildx imagetools inspect --format '{{json .Manifest}}' "$index" |
+            jq -e --arg amd64 "$amd64" --arg arm64 "$arm64" '
+              (.manifests | map({digest: .digest, platform: (.platform.os + "/" + .platform.architecture)})
+                | sort_by(.platform))
+              == [{digest: $amd64, platform: "linux/amd64"}, {digest: $arm64, platform: "linux/arm64"}]'
+          index_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$index")"
+          if ! [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::unexpected index digest: '${index_digest}'"
+            exit 1
+          fi
+          echo "${index} is ${index_digest}, listing ${amd64} (amd64) and ${arm64} (arm64)"
+          echo "index_digest=${index_digest}" >> "$GITHUB_OUTPUT"
 
-  # On main only: add the commit sha as an alias of the content index.
-  # Idempotent, so a re-run or an out-of-order main job is harmless.
+  # On main only: add the commit sha as an alias of the index that this run's
+  # manifest job created and verified. Idempotent, so a re-run or an
+  # out-of-order main job is harmless.
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: manifest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Compute the content hash
-        id: hash
-        run: echo "hash=$(hack/content-hash.sh)" >> "$GITHUB_OUTPUT"
       - name: Log in to ghcr.io
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Alias the commit sha to the content index
+      - name: Alias the commit sha to the verified index
         env:
-          HASH: ${{ steps.hash.outputs.hash }}
+          REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-        run: docker buildx imagetools create -t "${IMAGE}:${SHA}" "${IMAGE}:c-${HASH}"
+          INDEX: ${{ needs.manifest.outputs.index_digest }}
+        run: |
+          if ! [[ "$INDEX" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::unexpected index digest: '${INDEX}'"
+            exit 1
+          fi
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          docker buildx imagetools create -t "${image}:${SHA}" "${image}@${INDEX}"
 
   ci-ok:
     if: always()
     needs: [static, unit, build, manifest, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     steps:
