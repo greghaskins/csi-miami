@@ -179,7 +179,7 @@ func TestRecordFormat(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"version", "volumeID", "kind", "transport", "name", "stagePath", "publishes", "accessMode"} {
+	for _, k := range []string{"version", "volumeID", "kind", "transport", "subdir", "stagePath", "publishes", "accessMode"} {
 		if _, ok := raw[k]; !ok {
 			t.Errorf("record has no %q key", k)
 		}
