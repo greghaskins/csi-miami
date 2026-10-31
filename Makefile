@@ -14,7 +14,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln image check
+.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check
 
 build:
 	mkdir -p bin
@@ -62,9 +62,16 @@ tidy-check:
 vuln:
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
+# Images are tagged, and report their version, by the hash of their build
+# inputs (hack/content-hash.sh), the same identity CI uses.
+content-hash:
+	@hack/content-hash.sh
+
+IMAGE_TAG ?= c-$(shell hack/content-hash.sh)
+
 # Image for the host architecture, loaded into the local Docker daemon.
 image:
-	docker buildx build --load --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
+	docker buildx build --load --build-arg VERSION=$(IMAGE_TAG) -t $(IMAGE):$(IMAGE_TAG) .
 
 # Exactly what CI runs: the static job runs fmt-check vet lint tidy-check vuln
 # and the unit job runs cover.
