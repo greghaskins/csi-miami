@@ -180,7 +180,7 @@ func (r *EventRecorder) send(ctx context.Context, q queued) {
 		"apiVersion": "v1",
 		"kind":       "Event",
 		"metadata": map[string]any{
-			"name":      eventName(q.pv, q.reason, msg),
+			"name":      eventName(q.pv, string(pv.GetUID()), q.reason, msg),
 			"namespace": eventNamespace,
 		},
 		"involvedObject": map[string]any{
@@ -233,10 +233,11 @@ func eventType(reason string) string {
 	return "Normal"
 }
 
-// eventName is deterministic in (PV, reason, message), so that a repeat finds
-// the event it repeats.
-func eventName(pv, reason, message string) string {
-	sum := sha256.Sum256([]byte(reason + "\x00" + message))
+// eventName is deterministic in (PV, its UID, reason, message), so that a
+// repeat finds the event it repeats, and a PV deleted and made again under the
+// same name does not bump an event whose involvedObject is the old one.
+func eventName(pv, uid, reason, message string) string {
+	sum := sha256.Sum256([]byte(uid + "\x00" + reason + "\x00" + message))
 	return pv + "." + hex.EncodeToString(sum[:8])
 }
 

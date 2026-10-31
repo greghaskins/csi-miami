@@ -194,6 +194,34 @@ func TestARepeatedEventCountsInsteadOfDuplicating(t *testing.T) {
 	}
 }
 
+// A PV deleted and made again under the same name has another UID: its event
+// is a new one, not a bump of the old PV's.
+func TestARecreatedPVGetsItsOwnEvent(t *testing.T) {
+	t.Parallel()
+	a := newEventsAPI()
+	r := newRecorder(t, a, 0)
+	r.Event(volumeID, "MountFailed", "the same message")
+	drain(r)
+	a.mu.Lock()
+	a.pvs[pvName] = "uid-2"
+	a.mu.Unlock()
+	r.Event(volumeID, "MountFailed", "the same message")
+	drain(r)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.events) != 2 {
+		t.Fatalf("%d events, want 2", len(a.events))
+	}
+	uids := map[any]float64{}
+	for _, ev := range a.events {
+		c, _ := ev["count"].(float64)
+		uids[ev["involvedObject"].(map[string]any)["uid"]] = c
+	}
+	if uids["uid-1"] != 1 || uids["uid-2"] != 1 {
+		t.Errorf("counts by UID: %v, want 1 each", uids)
+	}
+}
+
 func TestEventsThatCannotBeRecordedAreDropped(t *testing.T) {
 	t.Parallel()
 	t.Run("no volume, or not one of ours", func(t *testing.T) {

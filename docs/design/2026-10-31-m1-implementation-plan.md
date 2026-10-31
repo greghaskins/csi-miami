@@ -243,11 +243,19 @@ Choices made in T7 where the plan was silent:
   reconciler is called: another volume context or staging path is
   `AlreadyExists`. A publish whose `staging_target_path` is not the staged
   record's is `FailedPrecondition`.
+- The directory of a local volume is created only while the intent has
+  `ensureItem` (first stage; a retried stage keeps it, and the reconciler's
+  Stage never gives it back once the loop has cleared it). The flag is
+  informational in the record format (omitted when false), so it needs no
+  version bump.
 - `NodeGetVolumeStats` answers for the stage path and the publish targets of a
-  staged volume (`NotFound` otherwise). The CSI specification this driver is
-  built against (v1.13) has removed `VolumeCondition` from the response, so a
-  statfs that fails or times out is an answer with no usage and a warning in
-  the log, never an error.
+  staged volume (`NotFound` otherwise). A statfs that fails or times out fails
+  the call with the code of its class (`DeadlineExceeded` for a timeout,
+  `Unavailable` for a busy path, `Internal` for an unexpected errno) and a
+  warning in the log, so a wedged transport is not counted as a success. The
+  CSI specification this driver is built against (v1.13) has removed
+  `VolumeCondition` from the response, so there is no field for an abnormal
+  condition beside an answer.
 - `NodeUnpublishVolume` removes the target directory with `rmdir(2)` after the
   unmount, which csi-sanity asks of a plugin that created it (the reconciler
   makes it at publish when kubelet has not). A directory that cannot be removed
@@ -255,7 +263,9 @@ Choices made in T7 where the plan was silent:
 - Events go to the PV named by the volume ID, through the dynamic client
   rather than client-go's recorder and typed events client: a small recorder
   that queues, so the converge loop never waits for the API server, and names
-  an event by PV, reason and message so that a repeat bumps its count.
+  an event by PV, PV UID, reason and message so that a repeat bumps its count
+  and a PV made again under the same name does not (the node needs `events` get,
+  create and patch).
 - The controller serves metrics on `:9811` and the node on `:9810`, both on
   the host network; an empty `--metrics-addr` turns the endpoint off.
 
@@ -382,7 +392,12 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 2. `<transport>/<subdir>/<name>` exists and is a directory (adopt). For
    `nfs3` the controller created it, and a missing directory at stage is
    `NotFound`; for `local` the controller creates nothing (decision 23), so
-   the node creates the directory here, with mode 0755, when it is missing.
+   the node creates the directory here, with mode 0755, at first stage. The
+   intent carries `ensureItem`, set by `NodeStageVolume` when it writes the
+   first record of a local volume and cleared by the reconciler once the item
+   has converged; a directory missing without it is `NotFound`, as for `nfs3`,
+   so a disk that is not mounted, or a reboot, never gives a pod an empty
+   volume.
 3. Stage path is a bind mount of that directory (adopt if mountinfo shows
    exactly that source; `FailedPrecondition` if it shows something else;
    bind if absent).
@@ -427,8 +442,8 @@ On the node (`--metrics-addr`, default `:9810`, served on the host network):
 - `miami_csi_requests_total{method,code}` and a duration histogram, from a
   gRPC interceptor, on both roles.
 
-Events: `MountFailed`, `TransportUnavailable`, `GarbageUnmounted` on the PVC
-or pod where a human would look.
+Events: `MountFailed`, `TransportUnavailable`, `GarbageUnmounted` on the
+PersistentVolume named by the volume ID, where `kubectl describe pv` looks.
 
 ## 11. The `miami lock` helper
 
@@ -447,7 +462,8 @@ documented way to coordinate writers on a directory item; `flock` is not.
 [Persistent]`); ServiceAccounts, ClusterRoles and bindings (controller:
 PV get/list/watch, PVC get/list/watch/update, StorageClass get/list/watch,
 VolumeAttachment and its status, Node get/list/watch, CSINode get/list/watch,
-events, leases; node: PV get, events create and patch); the controller Deployment
+events, leases; node: PV get, events get, create and patch: the recorder reads an event before it bumps its
+count); the controller Deployment
 (provisioner with `--extra-create-metadata --feature-gates=Topology=true`,
 attacher, resizer kept out until M2, livenessprobe); the node DaemonSet
 (registrar, livenessprobe, `Bidirectional` kubelet dir and transports
