@@ -1,0 +1,39 @@
+# Secret scanning with gitleaks on every commit: staged content, paths and
+# the commit message. The gitleaks config is kept outside the repository
+# (it extends the default rules with private detectors) and reaches gitleaks
+# through GITLEAKS_CONFIG_TOML (or GITLEAKS_CONFIG_TOML_B64, the same TOML
+# base64-encoded on one line): an environment variable locally (README,
+# Development) and a repository secret in CI. Without it gitleaks would fall
+# back to its default rules, so the first hook fails closed instead.
+#
+# Install once per clone: `mise install` runs `pre-commit install` for all
+# three hook types (mise.toml). CI runs the same scripts.
+repos:
+  - repo: local
+    hooks:
+      - id: secret-scan-config-present
+        name: "secret scan: config present"
+        entry: hack/secret-scan/require-config.sh
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit, commit-msg]
+      - id: secret-scan-staged
+        name: "secret scan: staged files and paths"
+        entry: hack/secret-scan/staged.sh
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: secret-scan-commit-msg
+        name: "secret scan: commit message"
+        entry: hack/secret-scan/commit-msg.sh
+        language: script
+        stages: [commit-msg]
+      - id: secret-scan-pre-push
+        name: "secret scan: commits and ref name being pushed"
+        entry: hack/secret-scan/pre-push.sh
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]

@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__github__.*|Bash",
+        "hooks": [
+          { "type": "command", "command": "hack/secret-scan/claude-tool-input.sh" }
+        ]
+      }
+    ]
+  }
+}
