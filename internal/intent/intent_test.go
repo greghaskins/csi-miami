@@ -50,9 +50,16 @@ func TestValidate(t *testing.T) {
 		{"transport kind missing", func(in *Intent) { in.Transport = transport.Spec{} }, "transport"},
 		{"transport nfs3 without server", func(in *Intent) { in.Transport.Server = "" }, "transport.server"},
 		{"transport export relative", func(in *Intent) { in.Transport.Export = "export" }, "transport.export"},
-		{"subdir empty", func(in *Intent) { in.Subdir = "" }, "subdir"},
+		{"subdir empty means no prefix", func(in *Intent) { in.Subdir = "" }, ""},
+		{"subdir nested", func(in *Intent) { in.Subdir = "tenant-a/team-b" }, ""},
 		{"subdir absolute", func(in *Intent) { in.Subdir = "/abs" }, "subdir"},
 		{"subdir traversal", func(in *Intent) { in.Subdir = "../x" }, "subdir"},
+		{"subdir not cleaned", func(in *Intent) { in.Subdir = "a//b" }, "subdir"},
+		{"subdir trailing slash", func(in *Intent) { in.Subdir = "a/" }, "subdir"},
+		{"subdir unresolved token", func(in *Intent) { in.Subdir = "${pvc.name}" }, "subdir"},
+		{"subdir shaped like a PV name", func(in *Intent) {
+			in.Subdir = "pvc-0a1b2c3d-1111-2222-3333-444455556666"
+		}, "subdir"},
 		{"stage path empty", func(in *Intent) { in.StagePath = "" }, "stagePath is required"},
 		{"stage path relative", func(in *Intent) { in.StagePath = "stage/a" }, "stagePath"},
 		{"stage path not clean", func(in *Intent) { in.StagePath = "/stage//a" }, "stagePath"},

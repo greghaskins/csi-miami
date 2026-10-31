@@ -26,9 +26,9 @@ type Intent struct {
 	VolumeID  string         `json:"volumeID"`
 	Kind      volume.Kind    `json:"kind"`
 	Transport transport.Spec `json:"transport"`
-	// Subdir is the optional prefix under the transport; the item's
-	// directory is <transport mount>/<Subdir>/<volume name>. It may be empty
-	// once volume.Context allows that.
+	// Subdir is the optional prefix under the transport, empty for none;
+	// the item's directory is <transport mount>/<Subdir>/<volume name>, and
+	// volume.Context.Dir computes it.
 	Subdir     string    `json:"subdir"`
 	StagePath  string    `json:"stagePath"`
 	Publishes  []Publish `json:"publishes,omitempty"`
@@ -37,9 +37,10 @@ type Intent struct {
 }
 
 // Validate reports whether the Intent is a well-formed record: the version is
-// Version, the volume ID parses and agrees with Kind, the transport and the
-// subdir pass the rules of the transport and volume packages, the stage path is
+// Version, the volume ID parses, kind, transport and subdir pass
+// volume.Context.Validate and agree with the ID's kind, the stage path is
 // absolute and clean, and every publish target is absolute, clean and unique.
+// The record mirrors volume.Context plus the ID.
 func (in Intent) Validate() error {
 	if in.Version != Version {
 		return fmt.Errorf("version %d is not supported (want %d)", in.Version, Version)
@@ -48,12 +49,12 @@ func (in Intent) Validate() error {
 	if err != nil {
 		return fmt.Errorf("volumeID: %w", err)
 	}
-	if id.Kind != in.Kind {
-		return fmt.Errorf("kind %q does not match the kind of volumeID %q", in.Kind, in.VolumeID)
-	}
-	// The volume context carries the same three fields under the same
-	// rules; reuse its check rather than restate it.
+	// The record mirrors volume.Context plus the ID, so the context's own
+	// rules decide whether kind, transport and subdir are acceptable.
 	ctx := volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir}
+	if err := ctx.MatchesID(id); err != nil {
+		return fmt.Errorf("kind %q does not match volumeID %q: %w", in.Kind, in.VolumeID, err)
+	}
 	if err := ctx.Validate(); err != nil {
 		return fmt.Errorf("kind, transport or subdir: %w", err)
 	}

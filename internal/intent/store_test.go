@@ -116,7 +116,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	t.Parallel()
 	s, dir := openStore(t)
 
+	// No publishes and no subdir prefix.
 	empty := sample("pvc-empty")
+	empty.Subdir = ""
 
 	full := sample("pvc-full")
 	full.Publishes = []Publish{
