@@ -7,19 +7,29 @@ import (
 )
 
 // Table is a parsed mount table, in mountinfo order, which is the kernel's
-// creation order. Its queries follow the mount tree (ParentID), not mount IDs:
-// the kernel reuses IDs, so an overmount can have a lower ID than the mount it
-// covers.
+// creation order. Resolve, At and IsBindOf follow the mount tree (ParentID),
+// not mount IDs: the kernel reuses IDs, so an overmount can have a lower ID
+// than the mount it covers. Under and Below are plain scans of the table by
+// mount point.
 type Table []Mount
 
 // Resolve returns the mount the kernel resolves path through: from the root of
-// the tree, repeatedly take the child mount whose mount point is the longest
-// prefix of path on a path boundary. A child mounted at exactly its parent's
-// mount point is an overmount that covers the parent's root, and wins over the
-// parent's other children, which it hides; chains of overmounts are followed
-// to the top. It is false only when the table has no mount that contains path.
-// The result's MountPoint equals path only when path is itself a visible mount
-// point.
+// the tree, at each mount take the child whose mount point is the first the
+// path crosses, that is the shortest mount point containing it. A mount made
+// later at a deeper path under an earlier covering mount is the cover's child,
+// not a sibling, and is found on the next step; a sibling made earlier at the
+// deeper path is hidden by the cover and never reached. A child mounted at
+// exactly its parent's mount point is an overmount that covers the parent's
+// root and wins over the parent's other children, which it hides; chains of
+// overmounts are followed to the top. It is false only when the table has no
+// mount that contains path. The result's MountPoint equals path only when path
+// is itself a visible mount point.
+//
+// Roots (mounts whose parent is not in the table) are not siblings under a
+// visible parent, so among them the longest mount point containing path wins.
+// A normal table has one root. Cost is linear in the table plus the depth of
+// the walk; a cyclic table, which the kernel never produces, ends the walk
+// after at most len(t) steps.
 func (t Table) Resolve(path string) (Mount, bool) {
 	path = filepath.Clean(path)
 	known := make(map[int]bool, len(t))
@@ -27,24 +37,20 @@ func (t Table) Resolve(path string) (Mount, bool) {
 		known[m.ID] = true
 	}
 	var roots []Mount
+	children := make(map[int][]Mount, len(t))
 	for _, m := range t {
 		if m.ParentID == m.ID || !known[m.ParentID] {
 			roots = append(roots, m)
+		} else {
+			children[m.ParentID] = append(children[m.ParentID], m)
 		}
 	}
-	cur, ok := pick(roots, path, "")
+	cur, ok := pickRoot(roots, path)
 	if !ok {
 		return Mount{}, false
 	}
-	// The bound only guards against a malformed (cyclic) table.
 	for i := 0; i <= len(t); i++ {
-		var kids []Mount
-		for _, m := range t {
-			if m.ParentID == cur.ID && m.ID != cur.ID {
-				kids = append(kids, m)
-			}
-		}
-		next, ok := pick(kids, path, cur.MountPoint)
+		next, ok := pickChild(children[cur.ID], path, cur.MountPoint)
 		if !ok {
 			return cur, true
 		}
@@ -53,28 +59,36 @@ func (t Table) Resolve(path string) (Mount, bool) {
 	return cur, true
 }
 
-// pick chooses among candidate mounts for path. Under a mount at curMP (empty
-// for the roots of the tree), a candidate at curMP itself is an overmount and
-// wins; otherwise the candidate with the longest mount point that contains
-// path does. Ties go to the one later in the table, which was mounted later.
-func pick(cands []Mount, path, curMP string) (Mount, bool) {
+// pickRoot chooses among the roots of the tree: the longest mount point that
+// contains path, the later one in the table on a tie.
+func pickRoot(roots []Mount, path string) (Mount, bool) {
 	var best Mount
 	found := false
-	if curMP != "" {
-		for _, m := range cands {
-			if m.MountPoint == curMP {
-				best, found = m, true
-			}
-		}
-		if found {
-			return best, true
+	for _, m := range roots {
+		if within(m.MountPoint, path) && (!found || len(m.MountPoint) >= len(best.MountPoint)) {
+			best, found = m, true
 		}
 	}
-	for _, m := range cands {
-		if !within(m.MountPoint, path) {
-			continue
+	return best, found
+}
+
+// pickChild chooses among the children of a mount at curMP. A child at curMP
+// itself is an overmount and wins (the later one, if several); otherwise the
+// child with the shortest mount point that contains path does, the later one
+// on a tie.
+func pickChild(kids []Mount, path, curMP string) (Mount, bool) {
+	var best Mount
+	found := false
+	for _, m := range kids {
+		if m.MountPoint == curMP {
+			best, found = m, true
 		}
-		if !found || len(m.MountPoint) >= len(best.MountPoint) {
+	}
+	if found {
+		return best, true
+	}
+	for _, m := range kids {
+		if within(m.MountPoint, path) && (!found || len(m.MountPoint) <= len(best.MountPoint)) {
 			best, found = m, true
 		}
 	}
@@ -95,12 +109,15 @@ func (t Table) At(mountPoint string) (Mount, bool) {
 }
 
 // Under returns every mount whose mount point is prefix or below it, hidden
-// ones included, newest first. A cover is always newer than what it covers and
-// a child than its parent, so unmounting the result in order never meets a
-// busy mount. Unmounting by path removes the kernel's top mount at that path,
-// so a mount hidden under another is reached only after the one above it is
-// gone: a garbage pass that unmounts from Under must repeat, re-reading the
-// table, until a pass makes no progress.
+// ones included, newest first by mountinfo line. That is usually children
+// before parents and covers before what they cover, but not always: a moved
+// mount (MS_MOVE) can be older than its new parent, and a propagated mount can
+// be tucked beneath an existing one. So unmounting the result in order is a
+// good first pass, not a guarantee. Unmount by path removes the kernel's top
+// mount at that path only, and a mount hidden under another is reached only
+// after the one above it is gone: a garbage pass must repeat, re-reading the
+// table, until a pass makes no progress, and At is the authority for what is
+// visible.
 func (t Table) Under(prefix string) Table {
 	return t.collect(prefix, true)
 }

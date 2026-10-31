@@ -40,24 +40,58 @@ type Mount struct {
 
 // ReadOnly reports whether this mount is read-only: the per-mount "ro"
 // option, which is what a read-only bind remount sets. The superblock's own
-// options are not consulted.
-func (m Mount) ReadOnly() bool {
-	for _, o := range m.Options {
-		if o == "ro" {
+// options are not consulted; see SuperReadOnly.
+func (m Mount) ReadOnly() bool { return hasOption(m.Options, "ro") }
+
+// SuperReadOnly reports whether the filesystem itself is read-only: the "ro"
+// super option. Read-only is a per-mount flag, which cannot make a read-only
+// filesystem writable: a mount of one stays read-only (writes fail with EROFS)
+// even when ReadOnly is false.
+func (m Mount) SuperReadOnly() bool { return hasOption(m.SuperOptions, "ro") }
+
+func hasOption(opts []string, want string) bool {
+	for _, o := range opts {
+		if o == want {
 			return true
 		}
 	}
 	return false
 }
 
-// ReadMountinfo reads and parses /proc/self/mountinfo.
+// readAttempts bounds how often ReadMountinfo re-reads a table that keeps
+// changing under it.
+const readAttempts = 10
+
+// ReadMountinfo reads and parses /proc/self/mountinfo. A table larger than one
+// read(2) can be torn by a mount change between the reads, and a torn table
+// gives wrong answers, so the file is read until two consecutive reads are
+// byte-identical.
 func ReadMountinfo() ([]Mount, error) {
-	f, err := os.Open(MountinfoPath)
+	data, err := readConsistent(func() ([]byte, error) { return os.ReadFile(MountinfoPath) }, readAttempts)
 	if err != nil {
 		return nil, fmt.Errorf("observe: %w", err)
 	}
-	defer func() { _ = f.Close() }()
-	return Parse(f)
+	return Parse(bytes.NewReader(data))
+}
+
+// readConsistent calls read until two consecutive results are identical, at
+// most attempts times.
+func readConsistent(read func() ([]byte, error), attempts int) ([]byte, error) {
+	prev, err := read()
+	if err != nil {
+		return nil, err
+	}
+	for i := 1; i < attempts; i++ {
+		cur, err := read()
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Equal(prev, cur) {
+			return cur, nil
+		}
+		prev = cur
+	}
+	return nil, fmt.Errorf("%s kept changing across %d reads", MountinfoPath, attempts)
 }
 
 // Parse decodes mountinfo text, returning the mounts in file order (the

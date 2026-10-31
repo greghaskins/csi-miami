@@ -37,6 +37,8 @@ func TestAt(t *testing.T) {
 		{"tmpfs over a transport", "/mnt/hid", 73},
 		{"mount point hidden by an overmount of its parent", "/mnt/hid/vols", 0},
 		{"mount made on top of a stack", "/mnt/scratch/inner", 75},
+		{"mount made under a cover, at the path of a hidden sibling", "/mnt/sib/vols", 98},
+		{"a cover with a hidden sibling and a mount made under it", "/mnt/sib", 97},
 		{"below a mount is not a mount", "/mnt/nfs/vols", 0},
 		{"prefix of a mount point is not a mount", "/mnt/stage", 0},
 		{"root", "/", 20},
@@ -66,6 +68,8 @@ func TestResolve(t *testing.T) {
 		{"through a covered mount point goes to the cover", "/mnt/hid/vols/x", 73},
 		{"through a covered mount point itself", "/mnt/hid/vols", 73},
 		{"through the cover with the lower ID", "/mnt/reuse/x", 59},
+		{"under the cover's own mount, not the hidden sibling", "/mnt/sib/vols/x", 98},
+		{"inside the cover beside it", "/mnt/sib/other", 97},
 		{"outside every mount but the root", "/nonexistent/x", 20},
 		{"a longer name sharing a string prefix", "/mnt/nfsx", 20},
 	}
@@ -150,7 +154,7 @@ func TestUnderAndBelow(t *testing.T) {
 	t.Run("a directory with mounts under it, all of them newest first", func(t *testing.T) {
 		t.Parallel()
 		got := ids(tbl.Under("/mnt"))
-		want := []int{75, 73, 72, 71, 59, 60, 41, 40, 38, 37, 36, 35, 34, 33, 32, 31, 30}
+		want := []int{98, 97, 96, 75, 73, 72, 71, 59, 60, 41, 40, 38, 37, 36, 35, 34, 33, 32, 31, 30}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("Under(/mnt) = %v, want %v", got, want)
 		}
@@ -162,11 +166,58 @@ func TestUnderAndBelow(t *testing.T) {
 		if len(got) != len(tbl) {
 			t.Fatalf("Under(/) has %d mounts, want %d", len(got), len(tbl))
 		}
-		if got[0].ID != 75 || got[len(got)-1].ID != 20 {
-			t.Errorf("Under(/) runs from %d to %d, want 75 to 20", got[0].ID, got[len(got)-1].ID)
+		if got[0].ID != 98 || got[len(got)-1].ID != 20 {
+			t.Errorf("Under(/) runs from %d to %d, want 98 to 20", got[0].ID, got[len(got)-1].ID)
 		}
 		if below := tbl.Below("/"); len(below) != len(tbl)-1 {
 			t.Errorf("Below(/) has %d mounts, want %d: all but the root mount", len(below), len(tbl)-1)
+		}
+	})
+}
+
+// A mount at /mnt/sib/vols (96) was made before a tmpfs covered /mnt/sib (97):
+// both are children of the root mount, and the cover hides the other. A mount
+// made at /mnt/sib/vols afterwards (98) goes on the cover.
+func TestHiddenSibling(t *testing.T) {
+	t.Parallel()
+	full := loadFixture(t)
+	var before Table
+	for _, m := range full {
+		if m.ID != 98 {
+			before = append(before, m)
+		}
+	}
+
+	t.Run("hidden by a cover that is its sibling", func(t *testing.T) {
+		t.Parallel()
+		if m, ok := before.At("/mnt/sib/vols"); ok {
+			t.Errorf("At(/mnt/sib/vols) = mount %d, want none: the cover hides it", m.ID)
+		}
+		if m, ok := before.Resolve("/mnt/sib/vols/x"); !ok || m.ID != 97 {
+			t.Errorf("Resolve(/mnt/sib/vols/x) = %d, %v; want the cover 97", m.ID, ok)
+		}
+		got, err := before.IsBindOf("/mnt/sib/vols", "/mnt/nfs/vols/hidden")
+		if err != nil || got {
+			t.Errorf("IsBindOf of the hidden mount = %v, %v; want false", got, err)
+		}
+		if got := ids(before.Under("/mnt/sib")); !reflect.DeepEqual(got, []int{97, 96}) {
+			t.Errorf("Under(/mnt/sib) = %v, want [97 96]: the hidden mount is still listed", got)
+		}
+	})
+
+	t.Run("a mount made after the cover is the cover's child", func(t *testing.T) {
+		t.Parallel()
+		if m, ok := full.At("/mnt/sib/vols"); !ok || m.ID != 98 {
+			t.Errorf("At(/mnt/sib/vols) = %d, %v; want 98", m.ID, ok)
+		}
+		for src, want := range map[string]bool{"/mnt/nfs/vols/new": true, "/mnt/nfs/vols/hidden": false} {
+			got, err := full.IsBindOf("/mnt/sib/vols", src)
+			if err != nil || got != want {
+				t.Errorf("IsBindOf(/mnt/sib/vols, %s) = %v, %v; want %v", src, got, err, want)
+			}
+		}
+		if got := ids(full.Under("/mnt/sib")); !reflect.DeepEqual(got, []int{98, 97, 96}) {
+			t.Errorf("Under(/mnt/sib) = %v, want [98 97 96]", got)
 		}
 	})
 }

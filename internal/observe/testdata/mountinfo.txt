@@ -18,3 +18,6 @@
 72 71 0:60 /vols /mnt/hid/vols rw,noatime - nfs 198.51.100.10:/export/hid rw,vers=3,addr=198.51.100.10
 73 71 0:61 / /mnt/hid rw,relatime - tmpfs tmpfs rw,size=64k
 75 37 0:56 / /mnt/scratch/inner rw,relatime - tmpfs tmpfs rw,size=32k
+96 20 0:40 /vols/hidden /mnt/sib/vols rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+97 20 0:62 / /mnt/sib rw,relatime - tmpfs tmpfs rw,size=64k
+98 97 0:40 /vols/new /mnt/sib/vols rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
