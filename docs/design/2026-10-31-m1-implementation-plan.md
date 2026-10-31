@@ -325,8 +325,11 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 path covers is unmounted, deepest first, and so is a mount at a publish target
 that no intent claims but that an `Unpublish` named or that the previous pass
 saw claimed; a publish target is unmounted only if it is a bind of the
-volume's stage path (or of a directory in one of the driver's transports),
-once, never a stack. A transport with no referencing intent is unmounted only
+volume's directory in its transport (the same device and root path, also for a
+directory that has since been removed), once, never a stack. The one wider
+case is an explicit `NodeUnpublishVolume` for a volume with no intent: kubelet
+named the path and nothing identifies the volume, so a bind of any directory
+in one of the driver's transports is accepted. A transport with no referencing intent is unmounted only
 past the idle TTL, which is off by default (never).
 
 **CSI mapping.** `NodeStageVolume` writes the intent (without publishes)

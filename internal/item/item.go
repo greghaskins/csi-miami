@@ -79,7 +79,12 @@ type Owned func(t observe.Table, top observe.Mount) (bool, error)
 // BindOf is the Owned test for a mount that must be a bind of the directory
 // source: same device and same root path, including when the directory has
 // since been removed (observe.Table.IsBindOfIncludingDeleted). A volume whose
-// directory was deleted while it was staged must still be unstageable.
+// directory was deleted while it was staged must still be unstageable. For a
+// removed directory this is "same device and same last-known root path", not a
+// proof of identity: renaming another directory to the volume's name before
+// the removal would pass for it. The mount table has nothing better to offer,
+// and the cost of the mistake is unmounting a bind of a directory in the
+// driver's own transport.
 func BindOf(source string) Owned {
 	return func(t observe.Table, top observe.Mount) (bool, error) {
 		return t.IsBindOfIncludingDeleted(top.MountPoint, source)
@@ -103,6 +108,16 @@ func UnmountBind(ctx context.Context, m mount.Mounter, mountPoint, source string
 //     what it should have been, for the message.
 //   - The unmount is once and without MNT_DETACH, so a busy mount is an error
 //     and stays.
+//
+// The caller chooses the test. The reconciler uses two, for publish targets.
+// The usual one is BindOf the volume's directory in its transport: used for
+// unstage, for an Unpublish of a volume that has an intent, and for every
+// drop it derives itself, all of which know the volume. The second is wider,
+// a bind of any directory in one of the driver's transports (same device, a
+// root inside the transport's), and is used only for an explicit Unpublish of
+// a volume with no intent, where kubelet named the path and nothing says which
+// volume's directory it should be a bind of. A stage path uses BindOf the
+// volume's directory.
 //   - After it, the table is read again. If something is still visible at
 //     mountPoint, another mount was stacked there; it is not removed and the
 //     error wraps conflict. The driver never stacks, so popping layers until

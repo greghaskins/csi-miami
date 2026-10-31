@@ -109,9 +109,10 @@ func (p *pass) deleteRecord(in intent.Intent) error {
 // is without MNT_DETACH: a busy mount stays and is an error, because a lazy
 // detach would leave a pod writing into a mount nobody tracks. Each is also
 // once, and only if the table shows the mount to be a bind of what the
-// intent says it should be (item.UnmountBind): a publish target must be a
-// bind of the stage path, the stage path (in the item) a bind of the item
-// directory. Anything else is ErrPublishConflict or ErrStageConflict, left in
+// intent says it should be (item.UnmountIf): a publish target must be a bind
+// of the volume's directory in its transport (publishOwnership), the stage
+// path (in the item) a bind of the same directory. Anything else is
+// ErrPublishConflict or ErrStageConflict, left in
 // place and reported, so an Unstage can never unmount a mount the driver did
 // not make; the price is that it fails until a person clears the conflict.
 // The first publish that fails ends the teardown with that one error, so what
@@ -120,8 +121,8 @@ func (p *pass) deleteRecord(in intent.Intent) error {
 func (p *pass) teardownVolume(in intent.Intent) error {
 	r := p.r
 	for _, pub := range in.Publishes {
-		err := item.UnmountIf(p.ctx, r.m, pub.TargetPath, r.publishOwned(in.StagePath),
-			"a bind of the stage path or of a directory in one of the driver's transports", ErrPublishConflict)
+		owned, what := r.publishOwnership(r.itemDirOf(in), false)
+		err := item.UnmountIf(p.ctx, r.m, pub.TargetPath, owned, what, ErrPublishConflict)
 		if err != nil {
 			// The first failure ends it: the stage is not unmounted while a
 			// bind of it is in the way, and the error that reaches the caller

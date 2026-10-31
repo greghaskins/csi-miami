@@ -292,3 +292,19 @@ type atomicCount struct{ n atomic.Int64 }
 
 func (c *atomicCount) add()     { c.n.Add(1) }
 func (c *atomicCount) get() int { return int(c.n.Load()) }
+
+// stackBind puts a bind of source at target as a new mount on top of whatever
+// is there, as someone else mounting over the driver's bind would.
+func (s *sim) stackBind(source, target string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	container, _ := s.tbl.Resolve(source)
+	parent, _ := s.tbl.Resolve(target)
+	rel, _ := filepath.Rel(container.MountPoint, source)
+	s.set(append(s.tbl, observe.Mount{
+		ID: s.nextID, ParentID: parent.ID, Major: container.Major, Minor: container.Minor,
+		Root: filepath.Join(container.Root, rel), MountPoint: target, Options: rwOptions(false),
+		FSType: container.FSType, Source: container.Source, SuperOptions: container.SuperOptions,
+	}))
+	s.nextID++
+}

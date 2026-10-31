@@ -172,7 +172,9 @@ func (t Table) IsBindOf(mountPoint, sourceDir string) (bool, error) {
 // source had, deleted or not, and nothing else could have been mounted there
 // under that path since. The Deleted flag is ignored on both sides; everything
 // else, including the rule that the mount containing the source is not a bind
-// of it, is as in IsBindOf.
+// of it, is as in IsBindOf. For a removed directory the answer is "same device
+// and same last-known root path", not a proof of identity: a different
+// directory renamed to that path before the removal would answer true.
 func (t Table) IsBindOfIncludingDeleted(mountPoint, sourceDir string) (bool, error) {
 	return t.isBindOf(mountPoint, sourceDir, true)
 }

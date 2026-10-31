@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -423,5 +424,97 @@ func TestTheStageMountIsRestoredIfItsDirectoryReturns(t *testing.T) {
 	e.sim.FailOp(fake.OpBind, in.StagePath, mount.ErrConflict)
 	if err := e.converge(in.VolumeID); !errors.Is(err, ErrStageConflict) {
 		t.Errorf("got %v, want ErrStageConflict", err)
+	}
+}
+
+// With the record gone, a drop is derived. The stage and the transport are
+// not what it is tested against: it must be a bind of the volume's own
+// directory. Another volume's directory bound over ours, in the same
+// transport, is not ours to remove, and our bind beneath it is left too.
+func TestADerivedDropLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
+	t.Parallel()
+	lg, buf := logger()
+	e := newEnv(t, func(o *Options) { o.Logger = lg })
+	e.start()
+	a := e.vol("a", "pvc-1")
+	b := e.vol("a", "pvc-2")
+	target := e.stageAndPublish(a, "pod1", false)
+	mustNil(t, "Stage b", e.r.Stage(bg, b))
+	e.sim.stackBind(e.itemDir("a", "pvc-2"), target)
+	e.stop()
+	before := len(e.sim.table())
+
+	mustNil(t, "delete", e.store.Delete(a.VolumeID)) // a's record goes: its target is a derived drop
+	e.sim.Reset()
+	for range 4 {
+		e.pass()
+	}
+	for _, c := range e.unmountCalls() {
+		if c == target {
+			t.Errorf("the target was unmounted: %v", e.unmountCalls())
+		}
+	}
+	if n := len(e.sim.table().Under(target)); n != 2 {
+		t.Errorf("%d mounts at the target, want both left", n)
+	}
+	if len(e.sim.table()) > before {
+		t.Error("the table grew")
+	}
+	if len(e.r.drops) != 0 {
+		t.Errorf("the refused drop was kept: %v", e.r.drops)
+	}
+	if n := strings.Count(buf.String(), "held by a mount the driver did not make"); n != 1 {
+		t.Errorf("%d warnings over four passes, want 1:\n%s", n, buf.String())
+	}
+}
+
+// The same bind, stacked over ours, for an Unpublish of a volume that has an
+// intent: the usual form applies, and the answer is the conflict.
+func TestUnpublishLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	a := e.vol("a", "pvc-1")
+	b := e.vol("a", "pvc-2")
+	target := e.stageAndPublish(a, "pod1", false)
+	mustNil(t, "Stage b", e.r.Stage(bg, b))
+	e.sim.stackBind(e.itemDir("a", "pvc-2"), target)
+	e.sim.Reset()
+
+	if err := e.r.Unpublish(bg, a.VolumeID, target); !errors.Is(err, ErrPublishConflict) {
+		t.Fatalf("Unpublish = %v, want ErrPublishConflict", err)
+	}
+	if c := e.unmountCalls(); len(c) != 0 {
+		t.Errorf("unmounted %v", c)
+	}
+	if n := len(e.sim.table().Under(target)); n != 2 {
+		t.Errorf("%d mounts at the target, want both", n)
+	}
+}
+
+// The wide form is only for a volume with no intent, and still accepts the
+// driver's own bind.
+func TestTheWideFormIsOnlyForAnUnpublishOfAVolumeWithNoIntent(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	a := e.vol("a", "pvc-1")
+	b := e.vol("a", "pvc-2")
+	target := e.stageAndPublish(a, "pod1", false)
+	mustNil(t, "Stage b", e.r.Stage(bg, b))
+
+	// b has an intent and the target is a's: not a bind of b's directory.
+	if err := e.r.Unpublish(bg, b.VolumeID, target); !errors.Is(err, ErrPublishConflict) {
+		t.Fatalf("Unpublish by a volume that does not own it = %v, want ErrPublishConflict", err)
+	}
+	if _, ok := e.visible(target); !ok {
+		t.Fatal("the target was unmounted")
+	}
+	// A volume with no intent has nothing to compare with: the wide form. The
+	// record that claimed the target is gone (unstaged, or removed by hand).
+	mustNil(t, "delete", e.store.Delete(a.VolumeID))
+	mustNil(t, "Unpublish", e.r.Unpublish(bg, "directory:pvc-unknown", target))
+	if _, ok := e.visible(target); ok {
+		t.Error("the wide form did not unmount the driver's own bind")
 	}
 }

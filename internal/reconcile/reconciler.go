@@ -117,15 +117,22 @@ type Reconciler struct {
 // dropped is a publish target that no intent claims and that should be
 // unmounted.
 type dropped struct {
-	volume   string
-	stage    string // the volume's stage path, "" if the reconciler no longer knows it
-	explicit bool   // an Unpublish asked; false means it was derived (garbage)
+	volume string
+	// itemDir is the volume's directory in its transport as the reconciler
+	// knew it (from the intent that claimed the target, or the volume's current
+	// one for an Unpublish). The target must be a bind of it. "" means unknown.
+	itemDir string
+	// wide is set only for an explicit Unpublish of a volume with no intent:
+	// nothing then says which directory the target should be a bind of, so the
+	// target may be a bind of any directory in one of the driver's transports.
+	wide     bool
+	explicit bool // an Unpublish asked; false means it was derived (garbage)
 }
 
 // targetInfo is what the reconciler remembers of a publish target between
-// passes: whose it was, and the stage path it was a bind of.
+// passes: whose it was, and the item directory it was a bind of.
 type targetInfo struct {
-	volume, stage string
+	volume, itemDir string
 }
 
 // New returns a Reconciler over an intent store and a Mounter. It fails if

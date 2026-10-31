@@ -37,7 +37,10 @@ import (
 //	 4. ErrUnknownVolume                          ClassNotFound          NotFound
 //	 5. ErrStageConflict, ErrPublishConflict,     ClassFailedPrecondition FailedPrecondition
 //	    ErrTransportConflict, ErrItemNotDirectory,
-//	    mount.ErrConflict, mount.ErrNotResolved
+//	    mount.ErrConflict, mount.ErrNotResolved,
+//	    errTargetGone (a publish whose target's
+//	    parent directory is gone, seen only as the
+//	    answer to a Publish of that target)
 //	 6. ErrSuperseded                             ClassAborted           Aborted
 //	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
 //	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
@@ -169,8 +172,9 @@ var (
 
 	// ErrTargetOutsideScope is returned by Publish and Unpublish for a target
 	// path the driver must not mount on or unmount: one that is not absolute
-	// and cleaned, or is, or is inside, the transports root, the staging root
-	// or a volume's stage path. It is the caller's mistake, InvalidArgument.
+	// and cleaned, or is, is inside, or contains the transports root, the
+	// staging root or a volume's stage path. It is the caller's mistake, and
+	// InvalidArgument.
 	ErrTargetOutsideScope = errors.New("the target path is not one the driver may publish to")
 
 	// ErrSuperseded is returned to a request that a later request for the same

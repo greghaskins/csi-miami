@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
@@ -90,7 +91,7 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 	for _, in := range p.intents {
 		stages = append(stages, in.StagePath)
 		for _, pub := range in.Publishes {
-			current[pub.TargetPath] = targetInfo{volume: in.VolumeID, stage: in.StagePath}
+			current[pub.TargetPath] = targetInfo{volume: in.VolumeID, itemDir: r.itemDirOf(in)}
 		}
 		dir, err := in.Transport.MountPoint(r.opts.TransportsRoot)
 		if err != nil {
@@ -108,7 +109,7 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 				continue
 			}
 			if _, have := r.drops[t]; !have {
-				r.drops[t] = dropped{volume: info.volume, stage: info.stage}
+				r.drops[t] = dropped{volume: info.volume, itemDir: info.itemDir}
 			}
 		}
 	}
@@ -123,7 +124,13 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 			p.dropErr[req.target] = fmt.Errorf("%w: %s is claimed by the publish of %s", ErrPublishConflict, req.target, owner.volume)
 			continue
 		}
-		r.drops[req.target] = dropped{volume: req.volume, stage: p.intents[req.volume].StagePath, explicit: true}
+		d := dropped{volume: req.volume, explicit: true}
+		if in, known := p.intents[req.volume]; known {
+			d.itemDir = r.itemDirOf(in)
+		} else {
+			d.wide = true // no intent: nothing says which directory it should be a bind of
+		}
+		r.drops[req.target] = d
 	}
 	for t := range r.drops {
 		if _, claimed := current[t]; claimed {
@@ -234,18 +241,18 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 
 // unmountCandidate unmounts one candidate. A stray below the staging root is
 // unmounted outright (the area is the driver's own). A publish target goes
-// through the same ownership check as an unstage: it is unmounted, once, only
-// if it is a bind of the volume's stage path (or, with the stage gone, of a
-// directory in one of the driver's transports), whether it was named by an
-// Unpublish or found by comparing passes. Anything else, a foreign mount at
-// the target or one stacked on our bind, is ErrPublishConflict and is left.
+// through the same ownership check as an unstage (publishOwnership): it is
+// unmounted, once, only if it is a bind of the volume's directory in its
+// transport, whether it was named by an Unpublish or found by comparing
+// passes. Anything else, a foreign mount at the target or one stacked on our
+// bind, is ErrPublishConflict and is left.
 func (p *pass) unmountCandidate(c candidate) error {
 	r := p.r
 	if c.drop == nil {
 		return r.m.Unmount(p.ctx, c.path, 0)
 	}
-	return item.UnmountIf(p.ctx, r.m, c.path, r.publishOwned(c.drop.stage),
-		"a bind of the volume's stage path or of a directory in one of the driver's transports", ErrPublishConflict)
+	owned, what := r.publishOwnership(c.drop.itemDir, c.drop.wide)
+	return item.UnmountIf(p.ctx, r.m, c.path, owned, what, ErrPublishConflict)
 }
 
 // refuse records that a publish target is held by something the driver did not
@@ -261,33 +268,67 @@ func (p *pass) refuse(c candidate, err error) {
 	r.metrics.IncReconcileError("garbage")
 }
 
-// publishOwned is the ownership test for a publish target of a volume whose
-// stage path is stage ("" if unknown). While the stage is mounted the target
-// must be a bind of it. With the stage gone (the volume was unstaged first,
-// or its record is) the target must be a bind of a directory inside one of the
-// transports the driver mounts: the same device, with a root inside the
-// transport's. A mount of any other file system is not the driver's.
-func (r *Reconciler) publishOwned(stage string) item.Owned {
-	return func(t observe.Table, top observe.Mount) (bool, error) {
-		if stage != "" {
-			if _, mounted := t.At(stage); mounted {
-				return t.IsBindOfIncludingDeleted(top.MountPoint, stage)
-			}
-		}
-		base := filepath.Join(r.opts.TransportsRoot, "transports")
-		for _, tm := range t {
-			if filepath.Dir(tm.MountPoint) != base || tm.ID == top.ID {
-				continue
-			}
-			if _, visible := t.At(tm.MountPoint); !visible {
-				continue
-			}
-			if tm.Major == top.Major && tm.Minor == top.Minor && rootWithin(tm.Root, top.Root) {
-				return true, nil
-			}
-		}
-		return false, nil
+// itemDirOf is the directory of the volume of in inside its transport, or ""
+// if the record cannot name one.
+func (r *Reconciler) itemDirOf(in intent.Intent) string {
+	id, err := in.ID()
+	if err != nil {
+		return ""
 	}
+	dir, err := in.Context().Dir(r.opts.TransportsRoot, id)
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// publishOwnership is the ownership test for a publish target, and the words
+// for what it should have been. There are two forms, and the second is wider
+// on purpose.
+//
+// The usual form, for teardown, derived drops and an Unpublish of a volume
+// with an intent: the target must be a bind of the volume's directory in its
+// transport (itemDir), by the same device and the same root path, including a
+// directory that has since been removed (observe.Table.IsBindOfIncludingDeleted).
+// It is tested against the item directory and not the stage path so that it
+// holds with the stage gone, and so that a bind of a different volume's
+// directory, stacked on ours or put there by someone else, is not taken for
+// ours. With itemDir unknown ("") nothing is owned.
+//
+// The wide form (wide is set), only for an explicit Unpublish of a volume that
+// has no intent: the target may be a bind of any directory in one of the
+// transports the driver mounts (the same device, with a root inside the
+// transport's). It is wider because nothing identifies the volume any more,
+// and because kubelet asked for exactly that path by name; a mount of any
+// other file system is still not the driver's. It is never used for a drop the
+// reconciler derived, which always knows the volume's directory.
+func (r *Reconciler) publishOwnership(itemDir string, wide bool) (item.Owned, string) {
+	if wide {
+		return r.inTransport, "a bind of a directory in one of the driver's transports"
+	}
+	if itemDir == "" {
+		return func(observe.Table, observe.Mount) (bool, error) { return false, nil },
+			"a bind of the volume's directory (which is not known)"
+	}
+	return item.BindOf(itemDir), "a bind of the volume's directory " + itemDir
+}
+
+// inTransport is the wide form: top is a bind of a directory inside a transport
+// the driver has mounted.
+func (r *Reconciler) inTransport(t observe.Table, top observe.Mount) (bool, error) {
+	base := filepath.Join(r.opts.TransportsRoot, "transports")
+	for _, tm := range t {
+		if filepath.Dir(tm.MountPoint) != base || tm.ID == top.ID {
+			continue
+		}
+		if _, visible := t.At(tm.MountPoint); !visible {
+			continue
+		}
+		if tm.Major == top.Major && tm.Minor == top.Minor && rootWithin(tm.Root, top.Root) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func stillMounted(cands []candidate, path string) bool {
