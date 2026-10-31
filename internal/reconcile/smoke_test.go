@@ -28,6 +28,12 @@ import (
 // as root under `unshare --mount --propagation private`; they fail, never
 // skip, when they are not.
 
+// Volume names of the one shape a volume may have (decision 22).
+const (
+	pvc1 = "pvc-00000000-0000-4000-8000-000000000001"
+	pvc2 = "pvc-00000000-0000-4000-8000-000000000002"
+)
+
 const (
 	artifactEnv = "SMOKE_ARTIFACT_DIR"
 	parentNSEnv = "SMOKE_PARENT_MNT_NS"
@@ -79,7 +85,7 @@ func newNode(t *testing.T) *node {
 		t.Fatalf("mounting the source tmpfs: %v", err)
 	}
 	n.host = filepath.Join(export, "data")
-	mkdir(t, n.host, filepath.Join(n.host, "pvc-1"), filepath.Join(n.host, "pvc-2"))
+	mkdir(t, n.host, filepath.Join(n.host, pvc1), filepath.Join(n.host, pvc2))
 	if n.store, err = intent.Open(filepath.Join(base, "intents")); err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +222,7 @@ func TestSmokePluginRestartChangesNothing(t *testing.T) {
 	ctx := context.Background()
 	r, _, stop := n.run(nil)
 
-	in := n.intent("pvc-1")
+	in := n.intent(pvc1)
 	if err := r.Stage(ctx, in); err != nil {
 		t.Fatalf("Stage: %v", err)
 	}
@@ -224,13 +230,13 @@ func TestSmokePluginRestartChangesNothing(t *testing.T) {
 	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: target}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	n.requireAll("pvc-1", target)
+	n.requireAll(pvc1, target)
 
 	// A pod writes through the publish; it lands in the volume's directory.
 	if err := os.WriteFile(filepath.Join(target, "data"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(n.host, "pvc-1", "data")); err != nil {
+	if _, err := os.Stat(filepath.Join(n.host, pvc1, "data")); err != nil {
 		t.Errorf("the write did not reach the volume: %v", err)
 	}
 
@@ -249,7 +255,7 @@ func TestSmokePluginRestartChangesNothing(t *testing.T) {
 			t.Errorf("mount %d was replaced by %d", before[i].ID, after[i].ID)
 		}
 	}
-	n.requireAll("pvc-1", target)
+	n.requireAll(pvc1, target)
 }
 
 // (2) A reboot: every mount of the node is gone, the store is not.
@@ -257,7 +263,7 @@ func TestSmokeRebootRestoresTheNode(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
 	r, _, stop := n.run(nil)
-	in := n.intent("pvc-1")
+	in := n.intent(pvc1)
 	if err := r.Stage(ctx, in); err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +285,7 @@ func TestSmokeRebootRestoresTheNode(t *testing.T) {
 	}
 
 	n.run(nil)
-	n.requireAll("pvc-1", target)
+	n.requireAll(pvc1, target)
 	if m, ok := currentTable(t).At(target); !ok || !m.ReadOnly() {
 		t.Errorf("the read-only flag of the publish did not come back: %+v", m)
 	}
@@ -291,7 +297,7 @@ func TestSmokeGarbageAndUnstage(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
 	r, _, _ := n.run(nil)
-	in := n.intent("pvc-1")
+	in := n.intent(pvc1)
 	if err := r.Stage(ctx, in); err != nil {
 		t.Fatal(err)
 	}
@@ -305,11 +311,11 @@ func TestSmokeGarbageAndUnstage(t *testing.T) {
 	outer := filepath.Join(n.sRoot, "stray")
 	inner := filepath.Join(outer, "inner")
 	mkdir(t, outer)
-	if err := unix.Mount(filepath.Join(n.host, "pvc-2"), outer, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount(filepath.Join(n.host, pvc2), outer, "", unix.MS_BIND, ""); err != nil {
 		t.Fatal(err)
 	}
 	mkdir(t, inner)
-	if err := unix.Mount(filepath.Join(n.host, "pvc-2"), inner, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount(filepath.Join(n.host, pvc2), inner, "", unix.MS_BIND, ""); err != nil {
 		t.Fatal(err)
 	}
 	// A mount no intent ever named, where kubelet keeps pod volumes.
@@ -320,7 +326,7 @@ func TestSmokeGarbageAndUnstage(t *testing.T) {
 	}
 
 	// Staging another volume runs a pass, which collects the strays.
-	in2 := n.intent("pvc-2")
+	in2 := n.intent(pvc2)
 	if err := r.Stage(ctx, in2); err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +339,7 @@ func TestSmokeGarbageAndUnstage(t *testing.T) {
 	if _, ok := tbl.At(other); !ok {
 		t.Error("a mount no intent named was unmounted")
 	}
-	n.requireAll("pvc-1", target)
+	n.requireAll(pvc1, target)
 
 	// Unpublish and Unstage take the volume down and leave the transport.
 	if err := r.Unpublish(ctx, in.VolumeID, target); err != nil {
@@ -355,7 +361,7 @@ func TestSmokeGarbageAndUnstage(t *testing.T) {
 	if _, ok, err := n.store.Get(in.VolumeID); err != nil || ok {
 		t.Errorf("the intent is still recorded: %v, %v", ok, err)
 	}
-	n.requireBind(in2.StagePath, filepath.Join(n.tdir(), "pvc-2"), true)
+	n.requireBind(in2.StagePath, filepath.Join(n.tdir(), pvc2), true)
 }
 
 // ---- kernel helpers, as in the other packages' smoke tests ----
@@ -435,7 +441,7 @@ func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
 	r, _, _ := n.run(nil)
-	in := n.intent("pvc-1")
+	in := n.intent(pvc1)
 	if err := r.Stage(ctx, in); err != nil {
 		t.Fatal(err)
 	}
@@ -462,10 +468,10 @@ func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
 	// publish and the stage stay.
 	stray := filepath.Join(n.sRoot, "stray")
 	mkdir(t, stray)
-	if err := unix.Mount(filepath.Join(n.host, "pvc-2"), stray, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount(filepath.Join(n.host, pvc2), stray, "", unix.MS_BIND, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Unstage(ctx, "directory:pvc-2"); err != nil { // nudges a pass
+	if err := r.Unstage(ctx, "directory:"+pvc2); err != nil { // nudges a pass
 		t.Fatal(err)
 	}
 	n.waitPass()
@@ -546,7 +552,7 @@ func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
 	r, _, _ := n.run(nil)
 
 	// Everything unpublished first, then the directory removed.
-	a := n.intent("pvc-1")
+	a := n.intent(pvc1)
 	if err := r.Stage(ctx, a); err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +563,7 @@ func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
 	if err := r.Unpublish(ctx, a.VolumeID, ta); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(n.host, "pvc-1")); err != nil {
+	if err := os.Remove(filepath.Join(n.host, pvc1)); err != nil {
 		t.Fatal(err)
 	}
 	if m, ok := currentTable(t).At(a.StagePath); !ok || !m.Deleted {
@@ -574,7 +580,7 @@ func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
 	}
 
 	// With the publish still mounted, too.
-	b := n.intent("pvc-2")
+	b := n.intent(pvc2)
 	if err := r.Stage(ctx, b); err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +588,7 @@ func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
 	if err := r.Publish(ctx, b.VolumeID, intent.Publish{TargetPath: tb}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(n.host, "pvc-2")); err != nil {
+	if err := os.Remove(filepath.Join(n.host, pvc2)); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Unstage(ctx, b.VolumeID); err != nil {
@@ -601,7 +607,7 @@ func TestSmokeUnpublishAndDropsLeaveWhatIsNotOurs(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
 	r, _, _ := n.run(nil)
-	in := n.intent("pvc-1")
+	in := n.intent(pvc1)
 	if err := r.Stage(ctx, in); err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +677,7 @@ func TestSmokeADerivedDropLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
 	r, _, _ := n.run(nil)
-	a, b := n.intent("pvc-1"), n.intent("pvc-2")
+	a, b := n.intent(pvc1), n.intent(pvc2)
 	if err := r.Stage(ctx, a); err != nil {
 		t.Fatal(err)
 	}
@@ -682,7 +688,7 @@ func TestSmokeADerivedDropLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
 	if err := r.Publish(ctx, a.VolumeID, intent.Publish{TargetPath: target}); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Mount(filepath.Join(n.tdir(), "pvc-2"), target, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount(filepath.Join(n.tdir(), pvc2), target, "", unix.MS_BIND, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.store.Delete(a.VolumeID); err != nil { // the record goes; the target is a derived drop

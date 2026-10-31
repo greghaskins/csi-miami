@@ -62,7 +62,7 @@ func TestStrayMountsBelowTheStageRootAreUnmountedDeepestFirst(t *testing.T) {
 func TestMountsThatNoIntentEverNamedAreLeftAlone(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.sim.addMount(e.sRoot, "tmpfs", "t") // the root itself
 	e.pass()
@@ -172,7 +172,7 @@ func TestATargetDroppedByTheStoreIsUnmountedBecauseThePreviousPassKnewIt(t *test
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.stop()
 	mustNil(t, "pass", func() error { e.pass(); return nil }())
@@ -199,7 +199,7 @@ func TestARestartForgetsPreviousTargetsAndLeavesThemMounted(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.stop()
 	mustNil(t, "delete", e.store.Delete(in.VolumeID))
@@ -219,7 +219,7 @@ func TestUnpublishOfAVolumeWithNoIntentStillUnmountsTheTarget(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	// The record is gone (unstaged, or removed by hand): the volume has no
 	// intent, so the stage path is unknown. The target is still recognised as
@@ -263,7 +263,7 @@ func TestUnpublishDoesNotUnmountWhatIsNotOurs(t *testing.T) {
 		t.Parallel()
 		e := newEnv(t)
 		e.start()
-		in := e.vol("a", "pvc-1")
+		in := e.vol("a", pvc1)
 		target := e.stageAndPublish(in, "pod1", false)
 		e.sim.addMount(target, "tmpfs", "t")
 		e.sim.addMount(target, "tmpfs", "t")
@@ -287,7 +287,7 @@ func TestUnpublishDoesNotUnmountWhatIsNotOurs(t *testing.T) {
 func TestADerivedDropDoesNotUnmountWhatIsNotOurs(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	e.mkTargetParent("pod1")
 	target := e.target("pod1")
 	e.sim.addMount(target, "tmpfs", "t")
@@ -311,7 +311,7 @@ func TestUnpublishThatCannotUnmountReportsAndIsRetriedByLaterPasses(t *testing.T
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 
 	e.sim.FailOp(fake.OpUnmount, target, unix.EBUSY)
@@ -343,7 +343,7 @@ func TestUnpublishWhenTheTableCannotBeRead(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.sim.SetMountsError(errors.New("boom"))
 	err := e.r.Unpublish(bg, in.VolumeID, target)
@@ -357,9 +357,9 @@ func TestUnpublishOfATargetAnotherIntentClaimsLeavesItMounted(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
-	other := e.vol("a", "pvc-2")
+	other := e.vol("a", pvc2)
 	other.Publishes = []intent.Publish{{TargetPath: target}}
 	// Two intents claiming one path is a fault, but Unpublish must not
 	// unmount a target that some intent still claims.
@@ -378,7 +378,7 @@ func TestUnmountWithoutProgressIsAnErrorForTheRequest(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	// An unmount that reports success and changes nothing.
 	nop := &lyingMounter{sim: e.sim, lie: target}
@@ -406,16 +406,16 @@ func (l *lyingMounter) Unmount(_ context.Context, target string, _ int) error {
 func TestTheStageMountIsRestoredIfItsDirectoryReturns(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
-	item := filepath.Join(e.host("a"), "pvc-1")
+	item := filepath.Join(e.host("a"), pvc1)
 	mustNil(t, "remove", os.Remove(item))
 	if err := e.converge(in.VolumeID); !errors.Is(err, ErrItemMissing) {
 		t.Fatalf("got %v", err)
 	}
 	mustNil(t, "restore", os.Mkdir(item, 0o750))
 	mustNil(t, "converge", e.converge(in.VolumeID))
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("not bound")
 	}
 	// A conflict the Mounter reports itself (someone mounted there between
@@ -436,11 +436,11 @@ func TestADerivedDropLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
 	lg, buf := logger()
 	e := newEnv(t, func(o *Options) { o.Logger = lg })
 	e.start()
-	a := e.vol("a", "pvc-1")
-	b := e.vol("a", "pvc-2")
+	a := e.vol("a", pvc1)
+	b := e.vol("a", pvc2)
 	target := e.stageAndPublish(a, "pod1", false)
 	mustNil(t, "Stage b", e.r.Stage(bg, b))
-	e.sim.stackBind(e.itemDir("a", "pvc-2"), target)
+	e.sim.stackBind(e.itemDir("a", pvc2), target)
 	e.stop()
 	before := len(e.sim.table())
 
@@ -474,11 +474,11 @@ func TestUnpublishLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	a := e.vol("a", "pvc-1")
-	b := e.vol("a", "pvc-2")
+	a := e.vol("a", pvc1)
+	b := e.vol("a", pvc2)
 	target := e.stageAndPublish(a, "pod1", false)
 	mustNil(t, "Stage b", e.r.Stage(bg, b))
-	e.sim.stackBind(e.itemDir("a", "pvc-2"), target)
+	e.sim.stackBind(e.itemDir("a", pvc2), target)
 	e.sim.Reset()
 
 	if err := e.r.Unpublish(bg, a.VolumeID, target); !errors.Is(err, ErrPublishConflict) {
@@ -498,8 +498,8 @@ func TestTheWideFormIsOnlyForAnUnpublishOfAVolumeWithNoIntent(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	a := e.vol("a", "pvc-1")
-	b := e.vol("a", "pvc-2")
+	a := e.vol("a", pvc1)
+	b := e.vol("a", pvc2)
 	target := e.stageAndPublish(a, "pod1", false)
 	mustNil(t, "Stage b", e.r.Stage(bg, b))
 

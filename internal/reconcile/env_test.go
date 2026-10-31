@@ -21,6 +21,16 @@ import (
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
+// Volume names of the one shape a volume may have (decision 22:
+// pvc-<lower-case uuid>), one per volume a test stages.
+const (
+	pvc1 = "pvc-00000000-0000-4000-8000-000000000001"
+	pvc2 = "pvc-00000000-0000-4000-8000-000000000002"
+	pvc3 = "pvc-00000000-0000-4000-8000-000000000003"
+	pvc4 = "pvc-00000000-0000-4000-8000-000000000004"
+	pvc5 = "pvc-00000000-0000-4000-8000-000000000005"
+)
+
 // env is one node: a temporary directory tree (a transports root, a staging
 // root, and a host directory per local transport), an intent store, a
 // simulated kernel, and a Reconciler over them. A second Reconciler made with

@@ -19,8 +19,8 @@ func TestTargetsOutsideTheDriversScopeAreRefused(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	a := e.vol("a", "pvc-1")
-	b := e.vol("a", "pvc-2")
+	a := e.vol("a", pvc1)
+	b := e.vol("a", pvc2)
 	mustNil(t, "Stage a", e.r.Stage(bg, a))
 	mustNil(t, "Stage b", e.r.Stage(bg, b))
 	tdir := e.tdir("a")
@@ -31,7 +31,7 @@ func TestTargetsOutsideTheDriversScopeAreRefused(t *testing.T) {
 	}{
 		{"the transports root", e.tRoot},
 		{"a transport's mount point", tdir},
-		{"inside a transport", filepath.Join(tdir, "pvc-1", "x")},
+		{"inside a transport", filepath.Join(tdir, pvc1, "x")},
 		{"the staging root", e.sRoot},
 		{"below the staging root", filepath.Join(e.sRoot, "pod-target")},
 		{"another volume's stage path", b.StagePath},
@@ -76,8 +76,8 @@ func TestATargetAnotherVolumeClaimsIsAConflict(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	a := e.vol("a", "pvc-1")
-	b := e.vol("a", "pvc-2")
+	a := e.vol("a", pvc1)
+	b := e.vol("a", pvc2)
 	target := e.stageAndPublish(a, "pod1", false)
 	mustNil(t, "Stage b", e.r.Stage(bg, b))
 	e.sim.Reset()
@@ -112,7 +112,7 @@ func TestTargetChecksNeedTheStore(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	mustNil(t, "remove the store", os.RemoveAll(e.store.Dir()))
 	if err := e.r.Unpublish(bg, in.VolumeID, e.target("pod1")); !errors.Is(err, ErrIntentsUnknown) {

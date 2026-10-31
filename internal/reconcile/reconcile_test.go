@@ -44,19 +44,19 @@ func TestStageConvergesTransportThenStage(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 
 	if !e.isBind(e.tdir("a"), e.host("a")) {
 		t.Error("the transport is not a bind of the host directory")
 	}
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("the stage path is not a bind of the volume's directory")
 	}
 	want := []fake.Call{
 		{Op: fake.OpBind, Source: e.host("a"), Target: e.tdir("a")},
-		{Op: fake.OpBind, Source: e.itemDir("a", "pvc-1"), Target: in.StagePath},
+		{Op: fake.OpBind, Source: e.itemDir("a", pvc1), Target: in.StagePath},
 	}
 	if got := e.sim.mutating(); !slices.Equal(got, want) {
 		t.Errorf("calls:\n got %+v\nwant %+v", got, want)
@@ -82,7 +82,7 @@ func TestAdoptionAfterRestartMakesNoCalls(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", true)
 	e.stop()
 	before := e.sim.table()
@@ -108,14 +108,14 @@ func TestRebootRestoresEverything(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.stop()
 
 	e.sim.clear()
 	e.passOn(e.newReconciler())
 
-	if !e.isBind(e.tdir("a"), e.host("a")) || !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) || !e.isBind(target, in.StagePath) {
+	if !e.isBind(e.tdir("a"), e.host("a")) || !e.isBind(in.StagePath, e.itemDir("a", pvc1)) || !e.isBind(target, in.StagePath) {
 		t.Errorf("not restored; table: %+v", e.sim.table())
 	}
 }
@@ -165,7 +165,7 @@ func TestConvergeStopsAtTheFirstFailingStepForThatVolume(t *testing.T) {
 		{
 			name: "the volume's directory is missing",
 			prepare: func(e *env, _ intent.Intent) {
-				mustNil(t, "remove", os.Remove(filepath.Join(e.host("a"), "pvc-1")))
+				mustNil(t, "remove", os.Remove(filepath.Join(e.host("a"), pvc1)))
 			},
 			want:     []error{ErrItemMissing, fs.ErrNotExist},
 			noBinds:  true,
@@ -175,7 +175,7 @@ func TestConvergeStopsAtTheFirstFailingStepForThatVolume(t *testing.T) {
 		{
 			name: "the volume's path is a file",
 			prepare: func(e *env, _ intent.Intent) {
-				p := filepath.Join(e.host("a"), "pvc-1")
+				p := filepath.Join(e.host("a"), pvc1)
 				mustNil(t, "remove", os.Remove(p))
 				mustNil(t, "write", os.WriteFile(p, nil, 0o600))
 			},
@@ -200,7 +200,7 @@ func TestConvergeStopsAtTheFirstFailingStepForThatVolume(t *testing.T) {
 			t.Parallel()
 			e := newEnv(t)
 			e.start()
-			in := e.vol("a", "pvc-1")
+			in := e.vol("a", pvc1)
 			tt.prepare(e, in)
 			before := e.sim.table()
 
@@ -243,7 +243,7 @@ func TestConvergeStopsAtTheFirstFailingStepForThatVolume(t *testing.T) {
 func TestForeignStageMountIsLeftAloneByEveryPass(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.sim.addMount(in.StagePath, "tmpfs", "tmpfs")
 	for range 3 {
@@ -263,7 +263,7 @@ func TestPublishAddChangeRemove(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	t1 := e.stageAndPublish(in, "pod1", true)
 
@@ -315,7 +315,7 @@ func TestPublishCreatesTheTargetTreeButConvergeCreatesOnlyTheLeaf(t *testing.T) 
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	target := e.target("pod1") // no parent exists
 	mustNil(t, "Publish", e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: target}))
@@ -335,7 +335,7 @@ func TestPublishCreatesTheTargetTreeButConvergeCreatesOnlyTheLeaf(t *testing.T) 
 	if _, err := os.Stat(filepath.Join(e.base, "kubelet", "pods")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the pod tree was made again: %v", err)
 	}
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("the stage was not restored")
 	}
 }
@@ -347,7 +347,7 @@ func TestPublishCreatesTheTargetTreeButConvergeCreatesOnlyTheLeaf(t *testing.T) 
 func TestAStalePublishIsPrunedAndFailsNothingElse(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	e.mkTargetParent("live")
 	mustNil(t, "mkdir live", os.Mkdir(e.target("live"), 0o750))
 	stale := filepath.Join(e.base, "kubelet", "pods", "gone", "volumes", "mount")
@@ -388,7 +388,7 @@ func TestAPublishIsAnsweredWithItsOwnTargetsOutcome(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	e.mkTargetParent("bad")
 	e.mkTargetParent("good")
@@ -413,7 +413,7 @@ func TestPublishConflicts(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	e.mkTargetParent("pod1")
 	e.sim.addMount(e.target("pod1"), "tmpfs", "tmpfs")
@@ -458,7 +458,7 @@ func TestStageKeepsThePublishesOfAStagedVolume(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 
 	mustNil(t, "Stage again", e.r.Stage(bg, in))
@@ -475,7 +475,7 @@ func TestStageValidation(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	good := e.vol("a", "pvc-1")
+	good := e.vol("a", pvc1)
 	tests := []struct {
 		name string
 		mod  func(*intent.Intent)
@@ -484,7 +484,7 @@ func TestStageValidation(t *testing.T) {
 		{"a stage path outside the root", func(in *intent.Intent) { in.StagePath = filepath.Join(e.base, "elsewhere") }, ErrStagePathOutsideRoot},
 		{"the stage root itself", func(in *intent.Intent) { in.StagePath = e.sRoot }, ErrStagePathOutsideRoot},
 		{"a sibling with the root as prefix", func(in *intent.Intent) { in.StagePath = e.sRoot + "-other/x" }, ErrStagePathOutsideRoot},
-		{"a malformed ID", func(in *intent.Intent) { in.VolumeID = "pvc-1" }, nil},
+		{"a malformed ID", func(in *intent.Intent) { in.VolumeID = pvc1 }, nil},
 		{"a transport not in normal form", func(in *intent.Intent) { in.Transport.Path += "/" }, nil},
 		{"an unknown kind", func(in *intent.Intent) { in.Kind = "image" }, nil},
 	}
@@ -526,7 +526,7 @@ func TestUnstageRemovesTheBindsAndTheIntentAndLeavesTheTransport(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 
 	mustNil(t, "Unstage", e.r.Unstage(bg, in.VolumeID))
@@ -565,7 +565,7 @@ func TestUnstageThatFailsKeepsTheIntentAndIsRetried(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 
 	e.sim.FailOp(fake.OpUnmount, in.StagePath, unix.EBUSY)
@@ -606,7 +606,7 @@ func TestUnstageLeavesMountsThatAreNotOurs(t *testing.T) {
 		t.Parallel()
 		e := newEnv(t)
 		e.start()
-		in := e.vol("a", "pvc-1")
+		in := e.vol("a", pvc1)
 		mustNil(t, "save", e.store.Save(in))
 		e.sim.addMount(in.StagePath, "tmpfs", "tmpfs")
 		e.sim.addMount(in.StagePath, "tmpfs", "tmpfs") // stacked
@@ -627,7 +627,7 @@ func TestUnstageLeavesMountsThatAreNotOurs(t *testing.T) {
 		t.Parallel()
 		e := newEnv(t)
 		e.start()
-		in := e.vol("a", "pvc-1")
+		in := e.vol("a", pvc1)
 		mustNil(t, "Stage", e.r.Stage(bg, in))
 		e.mkTargetParent("pod1")
 		target := e.target("pod1")
@@ -671,7 +671,7 @@ func TestUnstageWhoseRecordSurvivesTheTeardownIsAnError(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	p := filepath.Join(e.store.Dir(), intent.Escape(in.VolumeID)+".json")
 	// While the stage is being unmounted, swap the record for something
@@ -694,7 +694,7 @@ func TestIdleTransportIsUnmountedOnlyAfterTheTTL(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, func(o *Options) { o.TransportIdle = time.Minute })
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	tdir := e.tdir("a")
 
@@ -738,7 +738,7 @@ func TestIdleTransportIsUnmountedOnlyAfterTheTTL(t *testing.T) {
 func TestIdleTimeoutRestartsWhenTheTransportIsReferencedAgain(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, func(o *Options) { o.TransportIdle = time.Minute })
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	mustNil(t, "delete", e.store.Delete(in.VolumeID))
@@ -760,7 +760,7 @@ func TestNoIdleTimeoutMeansTheTransportStays(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	mustNil(t, "Unstage", e.r.Unstage(bg, in.VolumeID))
 	e.stop()
@@ -777,14 +777,14 @@ func TestIdleTransportThatIsStillInUseStays(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, func(o *Options) { o.TransportIdle = time.Minute })
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	mustNil(t, "Unstage", e.r.Unstage(bg, in.VolumeID))
 	e.stop()
 	// Something outside the staging root still holds a bind of the volume.
 	other := filepath.Join(e.base, "other")
 	mustNil(t, "mkdir", os.MkdirAll(other, 0o750))
-	mustNil(t, "bind", e.sim.Bind(bg, e.itemDir("a", "pvc-1"), other, false))
+	mustNil(t, "bind", e.sim.Bind(bg, e.itemDir("a", pvc1), other, false))
 
 	e.pass()
 	e.clock.Advance(time.Hour)
@@ -803,12 +803,12 @@ func TestIdleCollectionIsSkippedWhenAReferenceCannotBeComputed(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, func(o *Options) { o.TransportIdle = time.Minute })
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	e.stop()
 	// A record whose transport is structurally fine but not in normal form
 	// cannot name a mount point, so what it references is unknown.
-	odd := e.vol("b", "pvc-2")
+	odd := e.vol("b", pvc2)
 	odd.Transport = transport.Spec{Kind: transport.KindNFS3, Server: "NAS.example.com", Export: "/export"}
 	mustNil(t, "save", e.store.Save(odd))
 	mustNil(t, "delete", e.store.Delete(in.VolumeID))
@@ -827,9 +827,9 @@ func TestBlockedTransportTimesOutAndOtherTransportsStillConverge(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.sim.DefaultTimeout = 30 * time.Millisecond
-	v1 := e.vol("a", "pvc-1") // on the hung transport
-	v2 := e.vol("b", "pvc-2")
-	v3 := e.vol("a", "pvc-3") // on the hung transport too
+	v1 := e.vol("a", pvc1) // on the hung transport
+	v2 := e.vol("b", pvc2)
+	v3 := e.vol("a", pvc3) // on the hung transport too
 	e.sim.Block(e.tdir("a"))
 
 	errs := make([]error, 3)
@@ -856,7 +856,7 @@ func TestBlockedTransportTimesOutAndOtherTransportsStillConverge(t *testing.T) {
 	if d := time.Since(started); d > 20*time.Second {
 		t.Errorf("the pass took %v", d)
 	}
-	if !e.isBind(v2.StagePath, e.itemDir("b", "pvc-2")) {
+	if !e.isBind(v2.StagePath, e.itemDir("b", pvc2)) {
 		t.Error("v2 did not converge in the same pass")
 	}
 	// The hung transport was tried once, not once per volume.
@@ -888,8 +888,8 @@ func TestAHungItemDirectoryIsNotStattedAgainWhileTheFirstStatIsStuck(t *testing.
 	mustNil(t, "item", err)
 	e.r = e.newReconciler(func(o *Options) { o.Items = []item.Item{d} })
 
-	v1 := e.vol("a", "pvc-1")
-	v2 := e.vol("a", "pvc-2")
+	v1 := e.vol("a", pvc1)
+	v2 := e.vol("a", pvc2)
 	mustNil(t, "save", e.store.Save(v1))
 	mustNil(t, "save", e.store.Save(v2))
 
@@ -922,7 +922,7 @@ func TestMounterBusyIsSurfacedWithoutStackingCalls(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	e.sim.FailOp(fake.OpBind, in.StagePath, mount.ErrBusy)
 
 	for i := 1; i <= 3; i++ {
@@ -949,7 +949,7 @@ func TestMounterBusyIsSurfacedWithoutStackingCalls(t *testing.T) {
 func TestAnUnreadableStoreCollectsNothingAndConvergesNothing(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	stray := filepath.Join(e.sRoot, "stray")
@@ -991,7 +991,7 @@ func TestConcurrentPublishesOfOneVolumeSerialise(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	e.mkTargetParent("pod1")
 	e.mkTargetParent("pod2")
@@ -1072,12 +1072,12 @@ func TestTimerPassRepairsAVolume(t *testing.T) {
 	e := newEnv(t)
 	e.r.newTicker = func(time.Duration) (<-chan time.Time, func()) { return ticks, func() {} }
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 
 	e.sim.remove(in.StagePath) // something unmounted it behind our back
 	e.freshPass(func() { ticks <- time.Time{} })
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("the timer pass did not restore the stage")
 	}
 }
@@ -1085,11 +1085,11 @@ func TestTimerPassRepairsAVolume(t *testing.T) {
 func TestRunConvergesOnceAtStart(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.start()
 	e.waitPasses(1)
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("the start pass did not converge")
 	}
 }
@@ -1106,7 +1106,7 @@ func TestRunTwiceIsAnError(t *testing.T) {
 func TestStoppedReconcilerFailsRequests(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	res := make(chan error, 1)
 	go func() { res <- e.r.Stage(bg, in) }()
 	waitUntil(t, "the request to queue", func() bool { return e.r.queued() == 1 })
@@ -1126,7 +1126,7 @@ func TestStoppedReconcilerFailsRequests(t *testing.T) {
 func TestACallerWhoseContextEndsLeavesItsIntent(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t) // the loop never runs
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	ctx, cancel := context.WithCancel(bg)
 	res := make(chan error, 1)
 	go func() { res <- e.r.Stage(ctx, in) }()
@@ -1161,9 +1161,9 @@ func TestACallerWhoseContextEndsLeavesItsIntent(t *testing.T) {
 func TestEventsFireOnAChangeNotOnEveryPass(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
-	item := filepath.Join(e.host("a"), "pvc-1")
+	item := filepath.Join(e.host("a"), pvc1)
 	mustNil(t, "remove", os.Remove(item))
 
 	for range 3 {
@@ -1188,7 +1188,7 @@ func TestEventsFireOnAChangeNotOnEveryPass(t *testing.T) {
 func TestIntentGaugesFollowTheStore(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	if e.metrics.intents["directory"] != 1 {
