@@ -11,11 +11,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/greghaskins/csi-miami/internal/csi"
 	"github.com/greghaskins/csi-miami/internal/kube"
+	"github.com/greghaskins/csi-miami/internal/metrics"
 	"github.com/greghaskins/csi-miami/internal/mount"
 )
 
@@ -25,6 +29,9 @@ type controllerConfig struct {
 	root       string
 	kubeconfig string
 	deadline   time.Duration
+
+	// metricsAddr is where /metrics and /healthz are served; empty means off.
+	metricsAddr string
 }
 
 // runController parses the flags of `miami controller` and serves CSI until
@@ -39,6 +46,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.root, "transports-root", "/var/lib/miami", "directory to mount transports under; nothing in it needs to survive a restart")
 	fs.StringVar(&cfg.kubeconfig, "kubeconfig", "", "kubeconfig file, for development outside a cluster; in a cluster the service account is used")
 	fs.DurationVar(&cfg.deadline, "deadline", 10*time.Second, "deadline of one API request, of one mount operation and of ListVolumes")
+	fs.StringVar(&cfg.metricsAddr, "metrics-addr", ":9811", "address to serve /metrics and /healthz on; empty turns it off")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -92,17 +100,43 @@ func serveControllerWith(ctx context.Context, cfg controllerConfig, pvs kube.PVR
 	if err != nil {
 		return err
 	}
+	reg := metrics.New()
 	srv, err := csi.NewServer(csi.ServerOptions{
-		Endpoint:   cfg.endpoint,
-		Identity:   csi.NewIdentity(version),
-		Controller: ctrl,
-		Log:        log,
+		Endpoint:     cfg.endpoint,
+		Identity:     csi.NewIdentity(version),
+		Controller:   ctrl,
+		Interceptors: []grpc.UnaryServerInterceptor{reg.MetricsInterceptor()},
+		Log:          log,
 	})
 	if err != nil {
 		return err
 	}
+	if err := srv.Listen(); err != nil {
+		return err
+	}
+	lis, err := listenMetrics(cfg.metricsAddr)
+	if err != nil {
+		return err
+	}
+	// The metrics server outlives the CSI server's graceful stop, so the last
+	// calls are still reported to it.
+	mctx, stopMetrics := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var metricsErr error
+	if lis != nil {
+		wg.Go(func() { metricsErr = reg.Serve(mctx, lis) })
+	}
 	log.Info("controller starting", "version", version, "endpoint", cfg.endpoint)
-	return srv.Run(ctx)
+	err = srv.Serve(ctx)
+	stopMetrics()
+	wg.Wait()
+	if err != nil {
+		return err
+	}
+	if metricsErr != nil {
+		return fmt.Errorf("metrics server: %w", metricsErr)
+	}
+	return nil
 }
 
 // resolveRoot makes the transports root exist and returns it as an absolute,

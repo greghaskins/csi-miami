@@ -34,7 +34,7 @@ func TestRunControllerFlags(t *testing.T) {
 			wantCode: 0,
 			wantStdout: []string{
 				"Usage of miami controller:", "-endpoint", "unix:///csi/csi.sock",
-				"-transports-root", "/var/lib/miami", "-kubeconfig", "-deadline", "10s",
+				"-transports-root", "/var/lib/miami", "-kubeconfig", "-deadline", "10s", "-metrics-addr", ":9811",
 			},
 		},
 		{name: "unknown flag", args: []string{"-nope"}, wantCode: 2, wantStderr: []string{"flag provided but not defined: -nope"}},
@@ -85,7 +85,7 @@ func TestServeControllerWithServesUntilTheContextEnds(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "csi.sock")
-	cfg := controllerConfig{endpoint: "unix://" + sock, root: filepath.Join(dir, "transports-root", "nested"), deadline: time.Second}
+	cfg := controllerConfig{endpoint: "unix://" + sock, root: filepath.Join(dir, "transports-root", "nested"), deadline: time.Second, metricsAddr: "127.0.0.1:0"}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -135,6 +135,7 @@ func TestServeControllerWithErrors(t *testing.T) {
 	}{
 		{"root under a file", controllerConfig{endpoint: "unix://" + filepath.Join(dir, "a.sock"), root: filepath.Join(file, "root")}},
 		{"endpoint that is not a unix socket", controllerConfig{endpoint: "tcp://192.0.2.1:1", root: dir}},
+		{"a bad metrics address", controllerConfig{endpoint: "unix://" + filepath.Join(dir, "b.sock"), root: dir, metricsAddr: "256.0.0.1:1"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
