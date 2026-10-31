@@ -1,3 +1,7 @@
+# Per-agent worktrees created by the orchestration tooling.
+/.claude/worktrees/
+
+# Build and test output.
 /bin/
 coverage.out
 *.tar
