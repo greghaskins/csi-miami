@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
@@ -103,7 +104,11 @@ type Reconciler struct {
 	kinds       map[string]struct{}   // intent kinds reported, so a kind that empties reads 0
 	failedLoad  map[string]struct{}   // load-failure paths already logged
 	warned      map[string]string     // path → kind of the failure last logged at warn level
-	suspended   bool                  // collection is suspended by an unreadable record
+	// starts and ends count the passes begun and finished. Nothing in the loop
+	// reads them; tests use them to wait for a pass that began after a point,
+	// which the metrics seam cannot say.
+	starts, ends atomic.Int64
+	suspended    bool // collection is suspended by an unreadable record
 
 	// newTicker is the timer seam; tests replace it.
 	newTicker func(d time.Duration) (<-chan time.Time, func())
@@ -246,16 +251,19 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 	}
 	id, err := volume.ParseID(in.VolumeID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	if err := in.Context().MatchesID(id); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	if err := in.Context().Validate(); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	if err := in.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	if _, ok := r.items[in.Kind]; !ok {
-		return fmt.Errorf("reconcile: no item handles kind %q", in.Kind)
+		return fmt.Errorf("%w: no item handles kind %q", ErrInvalidRequest, in.Kind)
 	}
 	if !strictlyBelow(r.opts.StageRoot, in.StagePath) {
 		return fmt.Errorf("%w: %s", ErrStagePathOutsideRoot, in.StagePath)

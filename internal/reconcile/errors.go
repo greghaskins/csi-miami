@@ -1,25 +1,125 @@
 package reconcile
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"syscall"
 
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/mount"
 )
 
 // The errors below are what the CSI layer maps to status codes; none of them
-// carries a gRPC code itself. Every one is wrapped with the volume and the
-// path it concerns, so match them with errors.Is. An error can match more
-// than one: a conflict also matches mount.ErrConflict, a hung transport
-// matches both ErrTransportUnavailable and mount.ErrTimeout.
+// carries a gRPC code itself, and this package imports no gRPC. Every one is
+// wrapped with the volume and the path it concerns, so match them with
+// errors.Is, or better, call Classify, which applies the one precedence order
+// below and so gives every error exactly one Class. An error can match more
+// than one sentinel: a conflict also matches mount.ErrConflict, a hung
+// transport matches both ErrTransportUnavailable and mount.ErrTimeout. The
+// order resolves it; no error is built to carry two sentinels that the order
+// would not resolve (an unstage that cannot unmount stops at its first
+// failure, and does not join a conflict with a timeout).
 //
-// Suggested mapping: ErrUnknownVolume to NotFound or FailedPrecondition (the
-// CSI call decides); ErrItemMissing to NotFound; ErrTransportConflict,
-// ErrStageConflict, ErrPublishConflict, ErrItemNotDirectory and
-// ErrStagePathOutsideRoot and ErrTargetOutsideScope to InvalidArgument or
-// FailedPrecondition as the call warrants; mount.ErrTimeout to DeadlineExceeded; mount.ErrBusy,
-// ErrTransportUnavailable and ErrIntentsUnknown to Unavailable.
+// # The mapping
+//
+// Classify tests, in this order, and the first match wins. T7 maps a Class to
+// a gRPC code one to one.
+//
+//	 1. context.Canceled                          ClassCanceled          Canceled
+//	    context.DeadlineExceeded that is not a    ClassDeadlineExceeded  DeadlineExceeded
+//	      mount.ErrTimeout (the caller's own)
+//	 2. ErrTargetOutsideScope,                    ClassInvalidArgument   InvalidArgument
+//	    ErrStagePathOutsideRoot,
+//	    ErrInvalidRequest
+//	 3. ErrItemMissing                            ClassNotFound          NotFound
+//	 4. ErrUnknownVolume                          ClassNotFound          NotFound
+//	 5. ErrStageConflict, ErrPublishConflict,     ClassFailedPrecondition FailedPrecondition
+//	    ErrTransportConflict, ErrItemNotDirectory,
+//	    mount.ErrConflict, mount.ErrNotResolved
+//	 6. ErrSuperseded                             ClassAborted           Aborted
+//	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
+//	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
+//	    mount.ErrBusy, ErrStopped, EBUSY
+//	 9. anything else                             ClassInternal          Internal
+//
+// Consequences worth knowing. A mount.ErrTimeout wraps context.DeadlineExceeded
+// too, but it is the mount's deadline and not the caller's, so it is tested at
+// 7 and not 1: a conflict joined with a timeout is a FailedPrecondition, and
+// an unavailable transport that timed out is a DeadlineExceeded, not an
+// Unavailable. A transport that does not answer and then reports "busy" on the
+// passes after is Unavailable, which is the retry-later answer it is. EBUSY,
+// from an unmount of a mount something still has open, is retryable and so is
+// Unavailable. Errors from the Mounter that are none of these, such as an
+// unexpected errno, are Internal.
+
+// Class is the kind of an error of this package, in the terms the CSI layer
+// maps to status codes. See the mapping above.
+type Class int
+
+// The classes, in the order Classify tests them (after ClassOK and the
+// catch-all ClassInternal, which is the zero value of an unrecognised error).
+const (
+	// ClassInternal is an error this package does not recognise.
+	ClassInternal Class = iota
+	// ClassOK is no error.
+	ClassOK
+	// ClassCanceled is a caller whose context was cancelled.
+	ClassCanceled
+	// ClassDeadlineExceeded is a deadline: the caller's, or a mount's.
+	ClassDeadlineExceeded
+	// ClassInvalidArgument is a request that can never succeed as made.
+	ClassInvalidArgument
+	// ClassNotFound is a volume or an item that does not exist on this node.
+	ClassNotFound
+	// ClassFailedPrecondition is a state of the node that a person has to
+	// change: something else is mounted where the driver needs to mount.
+	ClassFailedPrecondition
+	// ClassAborted is a request overtaken by a later one for the same volume.
+	ClassAborted
+	// ClassUnavailable is a failure that a retry can be expected to cure.
+	ClassUnavailable
+)
+
+func (c Class) String() string {
+	names := [...]string{"Internal", "OK", "Canceled", "DeadlineExceeded", "InvalidArgument", "NotFound", "FailedPrecondition", "Aborted", "Unavailable"}
+	if c < 0 || int(c) >= len(names) {
+		return "Class(" + strconv.Itoa(int(c)) + ")"
+	}
+	return names[c]
+}
+
+// Classify returns the Class of err by the precedence order in the mapping
+// above. nil is ClassOK.
+func Classify(err error) Class {
+	switch {
+	case err == nil:
+		return ClassOK
+	case errors.Is(err, context.Canceled):
+		return ClassCanceled
+	case errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, mount.ErrTimeout):
+		return ClassDeadlineExceeded
+	case errors.Is(err, ErrTargetOutsideScope), errors.Is(err, ErrStagePathOutsideRoot), errors.Is(err, ErrInvalidRequest):
+		return ClassInvalidArgument
+	case errors.Is(err, ErrItemMissing), errors.Is(err, ErrUnknownVolume):
+		return ClassNotFound
+	case errors.Is(err, ErrStageConflict), errors.Is(err, ErrPublishConflict), errors.Is(err, ErrTransportConflict),
+		errors.Is(err, ErrItemNotDirectory), errors.Is(err, mount.ErrConflict), errors.Is(err, mount.ErrNotResolved),
+		errors.Is(err, errTargetGone):
+		return ClassFailedPrecondition
+	case errors.Is(err, ErrSuperseded):
+		return ClassAborted
+	case errors.Is(err, mount.ErrTimeout):
+		return ClassDeadlineExceeded
+	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, mount.ErrBusy),
+		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY):
+		return ClassUnavailable
+	default:
+		return ClassInternal
+	}
+}
+
 var (
 	// ErrTransportConflict is returned when the transport's mount point holds
 	// something other than this transport (a different file system, the same
@@ -80,6 +180,12 @@ var (
 	// last case. The caller of a superseded request is usually gone; one that
 	// is not retries.
 	ErrSuperseded = errors.New("the request was superseded by a later one for the same volume")
+
+	// ErrInvalidRequest is returned by Stage for an intent that fails the
+	// boundary rules of the volume and intent packages (a malformed volume ID,
+	// a transport not in normal form, a record that is not structurally
+	// sound). It wraps the error that says which.
+	ErrInvalidRequest = errors.New("the request is not valid")
 
 	// ErrStopped is returned to requests that were waiting when Run returned,
 	// and to requests made after it did. The intent they wrote is kept, and
