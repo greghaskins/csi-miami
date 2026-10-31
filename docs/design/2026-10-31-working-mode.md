@@ -98,6 +98,9 @@ subagents branch from `main`, never from each other.
 - Design changes go to `docs/design/` in the same PR as the code that
   needs them; the brief's decision log is updated, never rewritten.
 - `make check` before every push, on the task's own branch.
+- Tool pins (Go, linters, scanners, actions, base image tags) are the latest
+  stable release at the time of the PR that adds or bumps them; a pin is
+  bumped in its own commit with the version in the subject.
 
 ## 6. Starting the next session
 
