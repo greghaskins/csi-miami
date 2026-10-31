@@ -153,7 +153,7 @@ and unstage of the same ID across calls.
 |---|---|---|
 | `kind` | yes | `directory` |
 | `transport.kind` | yes | `nfs3` or `local` |
-| `transport.server` | nfs3 | address |
+| `transport.server` | nfs3 | IPv4 literal or host name resolved to IPv4 (decision 21) |
 | `transport.export` | nfs3 | export path |
 | `transport.path` | local | absolute host path |
 | `subdir` | no | optional prefix under the transport with `${pvc.namespace}` and `${pvc.name}` tokens; default none. The volume's own name is always appended (decision 20) |
@@ -168,10 +168,10 @@ be a single non-empty path element. An unresolved or unknown token is
 silently mean the default.
 
 A given server is named one way across all StorageClasses on a cluster (the
-normal form already collapses case and IPv6 spelling). The kernel reports a
-shared NFS superblock under the spelling of whichever mount came first, so
-naming one server by both a host name and an address is unsupported and
-shows as a mount conflict.
+normal form already collapses case). The kernel reports a shared NFS
+superblock under the spelling of whichever mount came first, so naming one
+server by both a host name and an address is unsupported and shows as a
+mount conflict.
 
 The item directory is always `<transport mount>/<subdir>/<volume name>`,
 with the name taken from the volume ID and never from a parameter.
@@ -217,9 +217,10 @@ other than this volume's transport directory. Never `panic` in a handler.
 ## 8. Transports
 
 **`nfs3`.** `mount(2)` with `fstype=nfs`, source `<server>:<export>`, and a
-kernel option string. The driver resolves `addr=` itself (the host network
-resolver, then the literal address), so no helper and no `/etc/services`
-are needed. There is one profile; it is code, not configuration. The data
+kernel option string. The driver resolves `addr=` itself (an IPv4 literal as
+it is, or a host name resolved by the host network resolver to its first
+IPv4 address; decision 21), so no helper and no `/etc/services` are
+needed. There is one profile; it is code, not configuration. The data
 string of `mount(2)` is
 
 ```

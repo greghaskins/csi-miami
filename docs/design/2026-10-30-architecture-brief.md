@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 20 recorded (section 9)
+**Status:** Draft, decisions 1 to 21 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -684,6 +684,10 @@ Recorded:
     two volumes share a directory or nest one inside another: elements
     shaped like a PV name are rejected. The plan's `<transport>/<subdir>`
     with a `${pv.name}` token is withdrawn.
+21. **IPv4 only**: transports are reached over IPv4; an IPv6 server
+    literal is rejected and a host name must resolve to an IPv4 address.
+    The target environments have no IPv6 and the driver carries no IPv6
+    code path.
 
 Pending: none that block M1.
 
