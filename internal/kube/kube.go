@@ -116,13 +116,15 @@ func NewClient(cfg *rest.Config, deadline time.Duration) (*Client, error) {
 
 // GetPV implements PVReader with one GET under the client's deadline.
 //
-// A 404 means "no such PV" only when it is the API server's own answer: a
-// Status object that says NotFound for this resource. A 404 from anything else
-// on the way (an ingress or load balancer answering an unknown path with a
-// page, a proxy) is not that answer, and treating it as one would turn every
-// delete into a success that deletes nothing. client-go marks such a response,
-// one whose body is not a Status, with an UnexpectedServerResponse cause; a
-// real API server's NotFound has none. Such a 404 is an ordinary error.
+// A 404 means "no such PV" only when it is the API server's own answer about
+// this PV: a Status object that says NotFound for the resource persistentvolumes
+// and the name asked for. A 404 from anything else on the way (a load balancer
+// or proxy answering an unknown path with a page) is not that answer, and
+// neither is the API server's own 404 for a path that is not the PV's (a
+// kubeconfig whose server has a path prefix the API server does not serve),
+// which carries no details about a PV. Treating either as "no such PV" would
+// turn every delete into a success that deletes nothing, so each is an ordinary
+// error.
 func (c *Client) GetPV(ctx context.Context, name string) (*PV, error) {
 	if name == "" {
 		return nil, errors.New("kube: a PV name is required")
@@ -132,7 +134,7 @@ func (c *Client) GetPV(ctx context.Context, name string) (*PV, error) {
 
 	obj, err := c.pvs.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		if apierrors.IsNotFound(err) && fromAPIServer(err) {
+		if apierrors.IsNotFound(err) && isPVNotFound(err, name) {
 			return nil, fmt.Errorf("%w: %q", ErrNotFound, name)
 		}
 		return nil, &ReadError{PV: name, Reason: reasonOf(err), err: err}
@@ -163,37 +165,47 @@ func reasonOf(err error) string {
 	case errors.Is(err, context.Canceled):
 		return "the request was cancelled"
 	case errors.As(err, &st):
-		code := st.Status().Code
-		if !fromAPIServer(err) {
-			return fmt.Sprintf("the answer (HTTP %d) was not the API server's", code)
+		status := st.Status()
+		switch {
+		case unexpectedResponse(status):
+			return fmt.Sprintf("the answer (HTTP %d) was not the API server's", status.Code)
+		case apierrors.IsNotFound(err):
+			return fmt.Sprintf("the API server answered HTTP %d, but not about this PV (is the server address right?)", status.Code)
+		case status.Reason != "":
+			return fmt.Sprintf("the API server answered %s (HTTP %d)", status.Reason, status.Code)
 		}
-		if r := st.Status().Reason; r != "" {
-			return fmt.Sprintf("the API server answered %s (HTTP %d)", r, code)
-		}
-		return fmt.Sprintf("the API server answered HTTP %d", code)
+		return fmt.Sprintf("the API server answered HTTP %d", status.Code)
 	default:
 		return "the API server could not be reached"
 	}
 }
 
-// fromAPIServer reports whether err, a NotFound, is a Status the API server
-// itself wrote rather than client-go's stand-in for a response that was not
-// one.
-func fromAPIServer(err error) bool {
+// unexpectedResponse reports whether status is client-go's stand-in for a
+// response whose body was not a Status.
+func unexpectedResponse(status metav1.Status) bool {
+	if status.Details == nil {
+		return false
+	}
+	for _, cause := range status.Details.Causes {
+		if cause.Type == metav1.CauseTypeUnexpectedServerResponse {
+			return true
+		}
+	}
+	return false
+}
+
+// isPVNotFound reports whether err, a NotFound, is a Status the API server
+// itself wrote about the PV called name: details naming the resource
+// persistentvolumes and that name, and not client-go's stand-in for a response
+// that was not a Status.
+func isPVNotFound(err error, name string) bool {
 	var st apierrors.APIStatus
 	if !errors.As(err, &st) {
 		return false
 	}
-	d := st.Status().Details
-	if d == nil {
-		return false
-	}
-	for _, cause := range d.Causes {
-		if cause.Type == metav1.CauseTypeUnexpectedServerResponse {
-			return false
-		}
-	}
-	return true
+	status := st.Status()
+	d := status.Details
+	return d != nil && d.Kind == "persistentvolumes" && d.Name == name && !unexpectedResponse(status)
 }
 
 // decodePV reads the fields of PV out of the object. A field of the wrong

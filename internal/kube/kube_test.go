@@ -85,6 +85,22 @@ func TestGetPV(t *testing.T) {
 			writeJSON(w, 200, badAttr)
 		case "/api/v1/persistentvolumes/gone":
 			writeJSON(w, 404, status(404, metav1.StatusReasonNotFound, "gone"))
+		// The API server's own 404, but not about this PV: no details, details
+		// of another kind, details of another name.
+		case "/api/v1/persistentvolumes/nodetails":
+			st := status(404, metav1.StatusReasonNotFound, "")
+			st.Details = nil
+			writeJSON(w, 404, st)
+		case "/api/v1/persistentvolumes/emptydetails":
+			st := status(404, metav1.StatusReasonNotFound, "")
+			st.Details = &metav1.StatusDetails{}
+			writeJSON(w, 404, st)
+		case "/api/v1/persistentvolumes/otherkind":
+			st := status(404, metav1.StatusReasonNotFound, "otherkind")
+			st.Details.Kind = "pods"
+			writeJSON(w, 404, st)
+		case "/api/v1/persistentvolumes/othername":
+			writeJSON(w, 404, status(404, metav1.StatusReasonNotFound, "another-pv"))
 		case "/api/v1/persistentvolumes/denied":
 			writeJSON(w, 403, status(403, metav1.StatusReasonForbidden, "denied"))
 		// What a load balancer or reverse proxy in front of a wrong endpoint
@@ -128,7 +144,7 @@ func TestGetPV(t *testing.T) {
 	}
 	// Anything else is an unknown answer, and in particular a 404 that is not
 	// the API server's own must never be read as "no such PV".
-	for _, name := range []string{"denied", "broken", "html", "plain", "empty", "jsonnotstatus", "badtype", "badattr"} {
+	for _, name := range []string{"denied", "broken", "html", "plain", "empty", "jsonnotstatus", "nodetails", "emptydetails", "otherkind", "othername", "badtype", "badattr"} {
 		pv, err := c.GetPV(ctx, name)
 		if err == nil || errors.Is(err, ErrNotFound) || pv != nil {
 			t.Errorf("GetPV(%s) = %v, %v; want an error that is not ErrNotFound", name, pv, err)
