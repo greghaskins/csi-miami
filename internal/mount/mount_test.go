@@ -3,6 +3,11 @@ package mount
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -25,12 +30,14 @@ type kcall struct {
 
 // simKernel is a small simulation of the kernel's mount table behind the
 // seam. It is just enough to answer the questions the Mounter asks of
-// mountinfo after its own calls.
+// mountinfo after its own calls. Mounts are made with the parent the kernel
+// would give them, so the table is a real tree.
 type simKernel struct {
 	mu     sync.Mutex
 	table  observe.Table
 	nextID int
 	calls  []kcall
+	lstats int
 
 	// failMount and failUnmount, when set, are consulted before a call takes
 	// effect.
@@ -39,6 +46,15 @@ type simKernel struct {
 	readErr     error
 	statfsOut   unix.Statfs_t
 	statfsErr   error
+
+	// links maps a symlink to its target; missing lists paths that do not
+	// exist; evalErr and lstatErr fail the corresponding call.
+	links    map[string]string
+	missing  map[string]bool
+	evalErr  error
+	lstatErr error
+	// evalErrAt fails evalSymlinks for that one path only.
+	evalErrAt string
 
 	// block, when set to "mount", "unmount" or "statfs", makes that call wait
 	// until release is closed. entered is signalled when it starts waiting;
@@ -64,6 +80,16 @@ func (s *simKernel) callsCopy() []kcall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]kcall(nil), s.calls...)
+}
+
+func (s *simKernel) countOps(op string) int {
+	n := 0
+	for _, c := range s.callsCopy() {
+		if c.op == op {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *simKernel) wait(op string) {
@@ -92,10 +118,12 @@ func (s *simKernel) mount(source, target, fstype string, flags uintptr, data str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
+	parent, _ := s.table.Resolve(target)
 	switch {
 	case flags&unix.MS_REMOUNT != 0:
+		top, _ := s.table.At(target)
 		for i := range s.table {
-			if s.table[i].ID == s.topAt(target) {
+			if s.table[i].ID == top.ID {
 				opts := []string{"rw"}
 				if flags&unix.MS_RDONLY != 0 {
 					opts = []string{"ro"}
@@ -109,36 +137,21 @@ func (s *simKernel) mount(source, target, fstype string, flags uintptr, data str
 			}
 		}
 	case flags&unix.MS_BIND != 0:
-		var container observe.Mount
-		for _, m := range s.table {
-			if strings.HasPrefix(source+"/", m.MountPoint+"/") || m.MountPoint == "/" {
-				if len(m.MountPoint) >= len(container.MountPoint) {
-					container = m
-				}
-			}
-		}
-		rel := strings.TrimPrefix(strings.TrimPrefix(source, container.MountPoint), "/")
-		root := container.Root
-		if rel != "" {
-			root = strings.TrimSuffix(root, "/") + "/" + rel
-		}
+		container, _ := s.table.Resolve(source)
+		rel, _ := filepath.Rel(container.MountPoint, source)
 		s.table = append(s.table, observe.Mount{
-			ID: s.nextID, ParentID: container.ID, Major: container.Major, Minor: container.Minor,
-			Root: root, MountPoint: target, Options: append([]string(nil), container.Options...),
-			FSType: container.FSType, Source: container.Source, SuperOptions: container.SuperOptions,
+			ID: s.nextID, ParentID: parent.ID, Major: container.Major, Minor: container.Minor,
+			Root: filepath.Join(container.Root, rel), MountPoint: target,
+			Options: append([]string(nil), container.Options...),
+			FSType:  container.FSType, Source: container.Source, SuperOptions: container.SuperOptions,
 		})
 	default:
 		s.table = append(s.table, observe.Mount{
-			ID: s.nextID, ParentID: 1, Major: 0, Minor: s.nextID, Root: "/", MountPoint: target,
+			ID: s.nextID, ParentID: parent.ID, Major: 0, Minor: s.nextID, Root: "/", MountPoint: target,
 			Options: []string{"rw"}, FSType: fstype, Source: source, SuperOptions: []string{"rw"},
 		})
 	}
 	return nil
-}
-
-func (s *simKernel) topAt(target string) int {
-	m, _ := s.table.At(target)
-	return m.ID
 }
 
 func (s *simKernel) unmount(target string, flags int) error {
@@ -153,9 +166,9 @@ func (s *simKernel) unmount(target string, flags int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := s.topAt(target)
+	top, _ := s.table.At(target)
 	for i, m := range s.table {
-		if m.ID == id {
+		if m.ID == top.ID {
 			s.table = append(s.table[:i:i], s.table[i+1:]...)
 			break
 		}
@@ -181,8 +194,45 @@ func (s *simKernel) mounts() (observe.Table, error) {
 	return append(observe.Table(nil), s.table...), nil
 }
 
-// add puts a mount into the simulated table and returns it.
+func (s *simKernel) evalSymlinks(p string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.evalErr != nil {
+		return "", s.evalErr
+	}
+	if s.evalErrAt != "" && p == s.evalErrAt {
+		return "", unix.EACCES
+	}
+	if s.missing[p] {
+		return "", fmt.Errorf("lstat %s: %w", p, fs.ErrNotExist)
+	}
+	for l, d := range s.links {
+		if p == l || strings.HasPrefix(p, l+"/") {
+			p = d + strings.TrimPrefix(p, l)
+		}
+	}
+	return p, nil
+}
+
+func (s *simKernel) isSymlink(p string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lstats++
+	if s.lstatErr != nil {
+		return false, s.lstatErr
+	}
+	if s.missing[p] {
+		return false, fmt.Errorf("lstat %s: %w", p, fs.ErrNotExist)
+	}
+	_, ok := s.links[p]
+	return ok, nil
+}
+
+// add puts a mount into the simulated table.
 func (s *simKernel) add(m observe.Mount) {
+	if m.ParentID == 0 {
+		m.ParentID = 1
+	}
 	s.table = append(s.table, m)
 }
 
@@ -216,6 +266,35 @@ func TestPathsMustBeAbsoluteAndClean(t *testing.T) {
 	}
 }
 
+func TestUnmountArguments(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		target  string
+		flags   int
+		wantErr string
+	}{
+		{"root is refused", "/", 0, "refusing to unmount /"},
+		{"force is not accepted", "/mnt/t", unix.MNT_FORCE, "only 0 and MNT_DETACH"},
+		{"expire is not accepted", "/mnt/t", unix.MNT_EXPIRE, "only 0 and MNT_DETACH"},
+		{"detach with another flag is not accepted", "/mnt/t", unix.MNT_DETACH | unix.MNT_FORCE, "only 0 and MNT_DETACH"},
+		{"nofollow is the Mounter's to add", "/mnt/t", unix.UMOUNT_NOFOLLOW, "only 0 and MNT_DETACH"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			k := newSim()
+			err := newMounter(k, time.Second).Unmount(bg(), tt.target, tt.flags)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("got %v, want an error containing %q", err, tt.wantErr)
+			}
+			if n := len(k.callsCopy()); n != 0 {
+				t.Errorf("%d kernel calls before validation failed", n)
+			}
+		})
+	}
+}
+
 func TestMount(t *testing.T) {
 	t.Parallel()
 	const nfs = "198.51.100.10:/export/data"
@@ -230,8 +309,8 @@ func TestMount(t *testing.T) {
 				t.Fatalf("Mount #%d: %v", i+1, err)
 			}
 		}
-		want := []kcall{{"mount", nfs, "/mnt/nfs", "nfs", unix.MS_NOATIME, data}}
-		if got := k.callsCopy(); len(got) != 1 || got[0] != want[0] {
+		want := kcall{"mount", nfs, "/mnt/nfs", "nfs", unix.MS_NOATIME, data}
+		if got := k.callsCopy(); len(got) != 1 || got[0] != want {
 			t.Errorf("kernel calls = %v, want exactly %v", got, want)
 		}
 	})
@@ -300,10 +379,10 @@ func TestMount(t *testing.T) {
 func TestBind(t *testing.T) {
 	t.Parallel()
 	// The simulated root mount is rw,nosuid,nodev,noatime; a new bind inherits
-	// that, and the read-only remount must repeat it.
+	// that, and a read-only remount must repeat it.
 	const keep = unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOATIME
 
-	t.Run("read-write bind is one call", func(t *testing.T) {
+	t.Run("read-write bind of a read-write source is one call", func(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		if err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", false); err != nil {
@@ -328,6 +407,46 @@ func TestBind(t *testing.T) {
 		got := k.callsCopy()
 		if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
 			t.Errorf("kernel calls:\n got %v\nwant %v", got, want)
+		}
+	})
+
+	// A bind inherits the read-only flag of the mount its source lives in, so
+	// the request has to win in both directions, on the first call and on every
+	// retry.
+	t.Run("the requested read-only state wins over what the source mount has", func(t *testing.T) {
+		t.Parallel()
+		for _, srcRO := range []bool{false, true} {
+			for _, wantRO := range []bool{false, true} {
+				t.Run(fmt.Sprintf("source ro=%t, requested ro=%t", srcRO, wantRO), func(t *testing.T) {
+					t.Parallel()
+					k := newSim()
+					opts := []string{"rw", "noatime"}
+					if srcRO {
+						opts = []string{"ro", "noatime"}
+					}
+					k.add(observe.Mount{
+						ID: 50, Major: 0, Minor: 50, Root: "/", MountPoint: "/stage", Options: opts,
+						FSType: "tmpfs", Source: "tmpfs", SuperOptions: []string{"rw"},
+					})
+					m := newMounter(k, time.Second)
+					for try := 1; try <= 2; try++ {
+						if err := m.Bind(bg(), "/stage/dir", "/mnt/pub", wantRO); err != nil {
+							t.Fatalf("try %d: %v", try, err)
+						}
+						tbl, _ := k.mounts()
+						if cur, _ := tbl.At("/mnt/pub"); cur.ReadOnly() != wantRO {
+							t.Errorf("try %d: ReadOnly = %v, want %v", try, cur.ReadOnly(), wantRO)
+						}
+					}
+					wantCalls := 1
+					if srcRO != wantRO {
+						wantCalls = 2 // the bind, then the remount that flips it
+					}
+					if n := len(k.callsCopy()); n != wantCalls {
+						t.Errorf("%d kernel calls over two tries, want %d (the retry is a no-op)", n, wantCalls)
+					}
+				})
+			}
 		}
 	})
 
@@ -376,6 +495,25 @@ func TestBind(t *testing.T) {
 		}
 	})
 
+	t.Run("an overmount is what counts, not the bind it covers", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		// Mount 90 is a bind of /data/b made over mount 91, a bind of /data/a,
+		// and has the lower ID, as when the kernel reuses an ID.
+		k.add(observe.Mount{ID: 91, ParentID: 1, Major: 8, Minor: 1, Root: "/data/a", MountPoint: "/mnt/dst", Options: []string{"rw"}})
+		k.add(observe.Mount{ID: 90, ParentID: 91, Major: 8, Minor: 1, Root: "/data/b", MountPoint: "/mnt/dst", Options: []string{"rw"}})
+		m := newMounter(k, time.Second)
+		if err := m.Bind(bg(), "/data/b", "/mnt/dst", false); err != nil {
+			t.Errorf("bind of what is on top: %v", err)
+		}
+		if err := m.Bind(bg(), "/data/a", "/mnt/dst", false); !errors.Is(err, ErrConflict) {
+			t.Errorf("bind of what is covered: got %v, want ErrConflict", err)
+		}
+		if n := len(k.callsCopy()); n != 0 {
+			t.Errorf("%d kernel calls, want 0", n)
+		}
+	})
+
 	t.Run("a failed first call is returned as is", func(t *testing.T) {
 		t.Parallel()
 		k := newSim()
@@ -389,26 +527,34 @@ func TestBind(t *testing.T) {
 		}
 	})
 
-	t.Run("a failed read-only remount removes the writable bind", func(t *testing.T) {
+	t.Run("a failed remount removes the bind it just made", func(t *testing.T) {
 		t.Parallel()
-		k := newSim()
-		k.failMount = func(c kcall) error {
-			if c.flags&unix.MS_REMOUNT != 0 {
-				return unix.EPERM
+		for _, ro := range []bool{true, false} {
+			k := newSim()
+			if !ro {
+				k.add(observe.Mount{ID: 50, Root: "/", MountPoint: "/stage", Options: []string{"ro"}, FSType: "tmpfs", Source: "tmpfs"})
 			}
-			return nil
-		}
-		m := newMounter(k, time.Second)
-		err := m.Bind(bg(), "/data/src", "/mnt/dst", true)
-		if !errors.Is(err, unix.EPERM) {
-			t.Fatalf("got %v, want EPERM", err)
-		}
-		if tbl, _ := k.mounts(); len(tbl.Under("/mnt")) != 0 {
-			t.Errorf("a writable bind was left behind: %v", tbl.Under("/mnt"))
-		}
-		calls := k.callsCopy()
-		if last := calls[len(calls)-1]; last.op != "unmount" || last.target != "/mnt/dst" {
-			t.Errorf("last kernel call = %+v, want the unmount of /mnt/dst", last)
+			k.failMount = func(c kcall) error {
+				if c.flags&unix.MS_REMOUNT != 0 {
+					return unix.EPERM
+				}
+				return nil
+			}
+			src := "/data/src"
+			if !ro {
+				src = "/stage/dir" // inherits read-only, so asking for read-write needs the remount
+			}
+			err := newMounter(k, time.Second).Bind(bg(), src, "/mnt/dst", ro)
+			if !errors.Is(err, unix.EPERM) {
+				t.Fatalf("read-only=%t: got %v, want EPERM", ro, err)
+			}
+			if tbl, _ := k.mounts(); len(tbl.Under("/mnt")) != 0 {
+				t.Errorf("read-only=%t: a bind was left behind: %v", ro, tbl.Under("/mnt"))
+			}
+			calls := k.callsCopy()
+			if last := calls[len(calls)-1]; last.op != "unmount" || last.target != "/mnt/dst" || last.flags != unix.UMOUNT_NOFOLLOW {
+				t.Errorf("read-only=%t: last kernel call = %+v, want the unmount of /mnt/dst", ro, last)
+			}
 		}
 	})
 
@@ -461,14 +607,10 @@ func TestRemountReadOnly(t *testing.T) {
 		k.calls = nil
 		k.mu.Unlock()
 
-		if err := m.RemountReadOnly(bg(), "/mnt/dst", true); err != nil {
-			t.Fatal(err)
-		}
-		if err := m.RemountReadOnly(bg(), "/mnt/dst", true); err != nil {
-			t.Fatal(err)
-		}
-		if err := m.RemountReadOnly(bg(), "/mnt/dst", false); err != nil {
-			t.Fatal(err)
+		for _, ro := range []bool{true, true, false} {
+			if err := m.RemountReadOnly(bg(), "/mnt/dst", ro); err != nil {
+				t.Fatal(err)
+			}
 		}
 		got := k.callsCopy()
 		const keep = unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOATIME
@@ -500,6 +642,34 @@ func TestRemountReadOnly(t *testing.T) {
 		want := uintptr(unix.MS_REMOUNT | unix.MS_BIND | unix.MS_RDONLY | unix.MS_STRICTATIME)
 		if got := k.callsCopy(); len(got) != 1 || got[0].flags != want {
 			t.Errorf("kernel calls = %v, want one remount with flags %#x", got, want)
+		}
+	})
+
+	t.Run("it acts on the top of a stack", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		k.add(observe.Mount{ID: 61, MountPoint: "/mnt/s", Root: "/a", Options: []string{"rw", "noatime"}, FSType: "tmpfs", Source: "tmpfs"})
+		k.add(observe.Mount{ID: 60, ParentID: 61, MountPoint: "/mnt/s", Root: "/b", Options: []string{"rw", "noatime"}, FSType: "tmpfs", Source: "tmpfs"})
+		if err := newMounter(k, time.Second).RemountReadOnly(bg(), "/mnt/s", true); err != nil {
+			t.Fatal(err)
+		}
+		tbl, _ := k.mounts()
+		if top, _ := tbl.At("/mnt/s"); top.ID != 60 || !top.ReadOnly() {
+			t.Errorf("top = %+v, want mount 60 read-only", top)
+		}
+		for _, m := range tbl {
+			if m.ID == 61 && m.ReadOnly() {
+				t.Error("the covered mount 61 was remounted")
+			}
+		}
+	})
+
+	t.Run("mountinfo unreadable at the moment of the remount", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		k.readErr = errors.New("read failed")
+		if err := newMounter(k, time.Second).remount("/mnt/dst", true); err == nil {
+			t.Error("want an error")
 		}
 	})
 
@@ -536,7 +706,7 @@ func TestUnmount(t *testing.T) {
 		}
 	})
 
-	t.Run("mounted: the flags reach the kernel, and a second call is a no-op", func(t *testing.T) {
+	t.Run("mounted: the flags reach the kernel with nofollow, and a second call is a no-op", func(t *testing.T) {
 		t.Parallel()
 		for _, flags := range []int{0, unix.MNT_DETACH} {
 			k := newSim()
@@ -550,24 +720,34 @@ func TestUnmount(t *testing.T) {
 				}
 			}
 			got := k.callsCopy()
-			if len(got) != 2 || got[1] != (kcall{op: "unmount", target: "/mnt/t", flags: uintptr(flags)}) {
-				t.Errorf("flags %d: kernel calls = %v, want the mount and one unmount", flags, got)
+			want := kcall{op: "unmount", target: "/mnt/t", flags: uintptr(flags | unix.UMOUNT_NOFOLLOW)}
+			if len(got) != 2 || got[1] != want {
+				t.Errorf("flags %d: kernel calls = %v, want the mount and one unmount %+v", flags, got, want)
 			}
 		}
 	})
 
-	t.Run("only the top-most of a stack goes", func(t *testing.T) {
+	t.Run("only the top of a stack goes", func(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		m := newMounter(k, time.Second)
 		k.add(observe.Mount{ID: 70, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "tmpfs"})
-		k.add(observe.Mount{ID: 71, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "tmpfs"})
+		k.add(observe.Mount{ID: 71, ParentID: 70, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "tmpfs"})
 		if err := m.Unmount(bg(), "/mnt/s", 0); err != nil {
 			t.Fatal(err)
 		}
 		tbl, _ := k.mounts()
 		if cur, ok := tbl.At("/mnt/s"); !ok || cur.ID != 70 {
 			t.Errorf("after one unmount At = %v, %v; want the lower mount 70", cur.ID, ok)
+		}
+	})
+
+	t.Run("a path that does not exist is not mounted", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		k.missing = map[string]bool{"/gone": true}
+		if err := newMounter(k, time.Second).Unmount(bg(), "/gone/t", 0); err != nil {
+			t.Errorf("got %v, want nil", err)
 		}
 	})
 
@@ -595,6 +775,124 @@ func TestUnmount(t *testing.T) {
 	})
 }
 
+// mountinfo shows resolved paths, so a path through a symlink would stack a
+// mount on every retry (target) or never match (source).
+func TestSymlinksAreRefused(t *testing.T) {
+	t.Parallel()
+	setup := func() *simKernel {
+		k := newSim()
+		k.links = map[string]string{"/link": "/real", "/mnt/linkdir": "/mnt/realdir"}
+		return k
+	}
+	ops := []struct {
+		name string
+		run  func(m Mounter, target string) error
+	}{
+		{"Mount", func(m Mounter, p string) error { return m.Mount(bg(), "tmpfs", p, "tmpfs", 0, "") }},
+		{"Bind", func(m Mounter, p string) error { return m.Bind(bg(), "/data/src", p, false) }},
+		{"RemountReadOnly", func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) }},
+		{"Unmount", func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) }},
+	}
+	targets := []struct{ name, path, resolved string }{
+		{"target is a symlink", "/link", "/real"},
+		{"a directory above the target is a symlink", "/mnt/linkdir/t", "/mnt/realdir/t"},
+	}
+	for _, op := range ops {
+		for _, tg := range targets {
+			t.Run(op.name+": "+tg.name, func(t *testing.T) {
+				t.Parallel()
+				k := setup()
+				err := op.run(newMounter(k, time.Second), tg.path)
+				if !errors.Is(err, ErrNotResolved) {
+					t.Fatalf("got %v, want ErrNotResolved", err)
+				}
+				if !strings.Contains(err.Error(), tg.resolved) || !strings.Contains(err.Error(), "pass the resolved path") {
+					t.Errorf("error %q must name the resolved path and the rule", err)
+				}
+				if n := len(k.callsCopy()); n != 0 {
+					t.Errorf("%d kernel calls, want 0", n)
+				}
+			})
+		}
+	}
+
+	t.Run("a bind source that is, or is under, a symlink", func(t *testing.T) {
+		t.Parallel()
+		for _, src := range []string{"/link", "/link/sub"} {
+			k := setup()
+			err := newMounter(k, time.Second).Bind(bg(), src, "/mnt/dst", false)
+			if !errors.Is(err, ErrNotResolved) || !strings.Contains(err.Error(), "/real") {
+				t.Errorf("source %s: got %v, want ErrNotResolved naming /real", src, err)
+			}
+			if n := len(k.callsCopy()); n != 0 {
+				t.Errorf("source %s: %d kernel calls, want 0", src, n)
+			}
+		}
+	})
+
+	t.Run("a mount point is not looked at: mountinfo already says it is not a symlink", func(t *testing.T) {
+		t.Parallel()
+		k := setup()
+		m := newMounter(k, time.Second)
+		if err := m.Mount(bg(), "tmpfs", "/mnt/t", "tmpfs", 0, ""); err != nil {
+			t.Fatal(err)
+		}
+		before := k.lstats
+		if err := m.Unmount(bg(), "/mnt/t", 0); err != nil {
+			t.Fatal(err)
+		}
+		if k.lstats != before {
+			t.Errorf("lstat was called on a path that mountinfo shows as a mount point")
+		}
+	})
+
+	t.Run("a path that does not exist yet is left to the kernel", func(t *testing.T) {
+		t.Parallel()
+		k := setup()
+		k.missing = map[string]bool{"/mnt/new": true}
+		if err := newMounter(k, time.Second).Mount(bg(), "tmpfs", "/mnt/new", "tmpfs", 0, ""); err != nil {
+			t.Errorf("got %v, want the call to reach the kernel", err)
+		}
+	})
+
+	t.Run("other errors from resolving are returned", func(t *testing.T) {
+		t.Parallel()
+		k := setup()
+		k.evalErr = unix.EACCES
+		if err := newMounter(k, time.Second).Mount(bg(), "tmpfs", "/mnt/t", "tmpfs", 0, ""); !errors.Is(err, unix.EACCES) {
+			t.Errorf("evalSymlinks error: got %v, want EACCES", err)
+		}
+		k = setup()
+		k.lstatErr = unix.EIO
+		if err := newMounter(k, time.Second).Mount(bg(), "tmpfs", "/mnt/t", "tmpfs", 0, ""); !errors.Is(err, unix.EIO) {
+			t.Errorf("lstat error: got %v, want EIO", err)
+		}
+		k = setup()
+		k.evalErr = unix.EACCES
+		if err := newMounter(k, time.Second).Unmount(bg(), "/mnt/t", 0); !errors.Is(err, unix.EACCES) {
+			t.Errorf("unmount, evalSymlinks error: got %v, want EACCES", err)
+		}
+	})
+
+	t.Run("a symlink target that cannot be resolved is an error", func(t *testing.T) {
+		t.Parallel()
+		k := setup()
+		k.evalErrAt = "/link"
+		if err := newMounter(k, time.Second).Mount(bg(), "tmpfs", "/link", "tmpfs", 0, ""); !errors.Is(err, unix.EACCES) {
+			t.Errorf("got %v, want EACCES", err)
+		}
+	})
+
+	t.Run("a bind source that cannot be resolved is an error", func(t *testing.T) {
+		t.Parallel()
+		k := setup()
+		k.missing = map[string]bool{"/data/src": true}
+		if err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", false); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("got %v, want not-exist", err)
+		}
+	})
+}
+
 func TestStatfs(t *testing.T) {
 	t.Parallel()
 	k := newSim()
@@ -607,6 +905,25 @@ func TestStatfs(t *testing.T) {
 	k.statfsErr = unix.ESTALE
 	if _, err := newMounter(k, time.Second).Statfs(bg(), "/mnt/t"); !errors.Is(err, unix.ESTALE) {
 		t.Errorf("got %v, want ESTALE", err)
+	}
+}
+
+func TestMounts(t *testing.T) {
+	t.Parallel()
+	k := newSim()
+	if err := newMounter(k, time.Second).Mount(bg(), "tmpfs", "/mnt/t", "tmpfs", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := newMounter(k, time.Second).Mounts(bg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tbl.At("/mnt/t"); !ok {
+		t.Errorf("the table does not show the mount: %v", tbl)
+	}
+	k.readErr = errors.New("read failed")
+	if _, err := newMounter(k, time.Second).Mounts(bg()); err == nil || !strings.Contains(err.Error(), observe.MountinfoPath) {
+		t.Errorf("got %v, want an error naming the file", err)
 	}
 }
 
@@ -701,6 +1018,84 @@ func TestDeadline(t *testing.T) {
 	}
 }
 
+// A call that timed out is still running in the kernel. Starting another on
+// the same path would stack mounts or undo the first when they finally ran.
+func TestBusyWhileAPreviousCallIsStillRunning(t *testing.T) {
+	t.Parallel()
+	k := blockedKernel("mount")
+	m := newMounter(k, time.Hour)
+
+	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
+	defer cancel()
+	if err := m.Mount(ctx, "tmpfs", "/mnt/t", "tmpfs", 0, ""); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("first call: got %v, want ErrTimeout", err)
+	}
+	<-k.entered
+
+	// Every operation that changes mounts on that path is refused at once,
+	// without reaching the kernel.
+	for name, run := range map[string]func() error{
+		"Mount":           func() error { return m.Mount(bg(), "tmpfs", "/mnt/t", "tmpfs", 0, "") },
+		"Bind":            func() error { return m.Bind(bg(), "/data/src", "/mnt/t", false) },
+		"RemountReadOnly": func() error { return m.RemountReadOnly(bg(), "/mnt/t", true) },
+		"Unmount":         func() error { return m.Unmount(bg(), "/mnt/t", 0) },
+	} {
+		err := run()
+		if !errors.Is(err, ErrBusy) || errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "/mnt/t") {
+			t.Errorf("%s while busy: got %v, want ErrBusy naming the path", name, err)
+		}
+	}
+	if n := k.countOps("mount"); n != 1 {
+		t.Errorf("%d mount calls reached the kernel, want only the hung one", n)
+	}
+	if n := len(k.callsCopy()); n != 1 {
+		t.Errorf("%d kernel calls in all, want 1", n)
+	}
+
+	// Other paths, statfs of the same path, and reading the table are not held up.
+	if err := m.Unmount(bg(), "/mnt/other", 0); err != nil {
+		t.Errorf("another path: %v", err)
+	}
+	if _, err := m.Statfs(bg(), "/mnt/t"); err != nil {
+		t.Errorf("statfs of the same path: %v", err)
+	}
+	if _, err := m.Mounts(bg()); err != nil {
+		t.Errorf("Mounts: %v", err)
+	}
+
+	// Once the kernel lets the call go, its goroutine releases the path. It
+	// does so just after the call returns, so wait for the release itself.
+	close(k.release)
+	<-k.exited
+	for !m.busy.acquire(mutKey("/mnt/t")) {
+		runtime.Gosched()
+	}
+	m.busy.release(mutKey("/mnt/t"))
+	if err := m.Unmount(bg(), "/mnt/t", 0); err != nil {
+		t.Errorf("after the hung call returned: %v", err)
+	}
+}
+
+func TestStatfsBusyOnlyAgainstAnotherStatfs(t *testing.T) {
+	t.Parallel()
+	k := blockedKernel("statfs")
+	m := newMounter(k, time.Hour)
+	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := m.Statfs(ctx, "/mnt/t"); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	<-k.entered
+	if _, err := m.Statfs(bg(), "/mnt/t"); !errors.Is(err, ErrBusy) {
+		t.Errorf("second statfs: got %v, want ErrBusy", err)
+	}
+	if err := m.Unmount(bg(), "/mnt/t", 0); err != nil {
+		t.Errorf("unmount of the path with a hung statfs: %v", err)
+	}
+	close(k.release)
+	<-k.exited
+}
+
 func TestDefaultTimeoutAppliesWithoutContextDeadline(t *testing.T) {
 	t.Parallel()
 	k := blockedKernel("mount")
@@ -743,6 +1138,23 @@ func TestCancellationIsNotATimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("already expired: a timeout, but nothing was abandoned", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		ctx, cancel := context.WithDeadline(bg(), time.Now().Add(-time.Second))
+		defer cancel()
+		err := newMounter(k, time.Second).Mount(ctx, "tmpfs", "/mnt/t", "tmpfs", 0, "")
+		if !errors.Is(err, ErrTimeout) {
+			t.Errorf("got %v, want ErrTimeout", err)
+		}
+		if strings.Contains(err.Error(), "abandoned") {
+			t.Errorf("error %q says a call was abandoned, but none was started", err)
+		}
+		if n := len(k.callsCopy()); n != 0 {
+			t.Errorf("%d kernel calls, want 0", n)
+		}
+	})
+
 	t.Run("cancelled while hung", func(t *testing.T) {
 		t.Parallel()
 		k := blockedKernel("mount")
@@ -760,12 +1172,32 @@ func TestCancellationIsNotATimeout(t *testing.T) {
 	})
 }
 
+// When the context ends at the same moment as the call, the call's own result
+// is the answer; a plain select would pick one at random.
+func TestAwaitPrefersARealResult(t *testing.T) {
+	t.Parallel()
+	done := make(chan struct{})
+	close(done)
+	for i := 0; i < 200; i++ {
+		ch := make(chan result[int], 1)
+		ch <- result[int]{v: 7}
+		if r, ok := await(done, ch); !ok || r.v != 7 {
+			t.Fatalf("iteration %d: got %+v, %v; want the result", i, r, ok)
+		}
+	}
+	if _, ok := await(done, make(chan result[int], 1)); ok {
+		t.Error("with no result, await must report that the context ended")
+	}
+}
+
 // The real implementation, exercised with calls that cannot change the host:
-// a statfs, an unmount of something that is not mounted, and mounts onto a
-// directory that does not exist.
+// a statfs, an unmount of something that is not mounted, reading the table,
+// and mounts onto paths that are missing or are symlinks.
 func TestReal(t *testing.T) {
 	t.Parallel()
-	const missing = "/nonexistent-miami-test-dir/sub"
+	// Each subtest has its own missing path: they share one Mounter, which
+	// admits one call per path at a time.
+	missing := func(name string) string { return "/nonexistent-miami-test-dir/" + name }
 	m := New(5 * time.Second)
 
 	t.Run("statfs of the root filesystem", func(t *testing.T) {
@@ -777,32 +1209,81 @@ func TestReal(t *testing.T) {
 	})
 	t.Run("statfs of a missing path", func(t *testing.T) {
 		t.Parallel()
-		if _, err := m.Statfs(bg(), missing); !errors.Is(err, unix.ENOENT) {
+		if _, err := m.Statfs(bg(), missing("statfs")); !errors.Is(err, unix.ENOENT) {
 			t.Errorf("got %v, want ENOENT", err)
+		}
+	})
+	t.Run("mounts", func(t *testing.T) {
+		t.Parallel()
+		tbl, err := m.Mounts(bg())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := tbl.At("/"); !ok {
+			t.Error("the table has no mount at /")
 		}
 	})
 	t.Run("unmount of what is not mounted", func(t *testing.T) {
 		t.Parallel()
-		if err := m.Unmount(bg(), missing, 0); err != nil {
+		if err := m.Unmount(bg(), missing("unmount"), 0); err != nil {
 			t.Errorf("got %v, want nil", err)
+		}
+	})
+	t.Run("unmount of / is refused", func(t *testing.T) {
+		t.Parallel()
+		if err := m.Unmount(bg(), "/", 0); err == nil {
+			t.Error("want an error")
 		}
 	})
 	t.Run("mount onto a missing directory fails", func(t *testing.T) {
 		t.Parallel()
-		if err := m.Mount(bg(), "tmpfs", missing, "tmpfs", 0, ""); err == nil {
+		if err := m.Mount(bg(), "tmpfs", missing("mount"), "tmpfs", 0, ""); err == nil {
 			t.Error("want an error")
 		}
 	})
 	t.Run("bind onto a missing directory fails", func(t *testing.T) {
 		t.Parallel()
-		if err := m.Bind(bg(), "/", missing, false); err == nil {
+		if err := m.Bind(bg(), "/", missing("bind"), false); err == nil {
+			t.Error("want an error")
+		}
+	})
+	t.Run("raw mount onto a missing path fails", func(t *testing.T) {
+		t.Parallel()
+		if err := (sysKernel{}).mount("tmpfs", missing("rawmount"), "tmpfs", 0, ""); err == nil {
 			t.Error("want an error")
 		}
 	})
 	t.Run("raw unmount of a missing path fails", func(t *testing.T) {
 		t.Parallel()
-		if err := (sysKernel{}).unmount(missing, 0); err == nil {
+		if err := (sysKernel{}).unmount(missing("raw"), 0); err == nil {
 			t.Error("want an error")
+		}
+	})
+	t.Run("symlinks are refused before any system call", func(t *testing.T) {
+		t.Parallel()
+		dir, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		real := filepath.Join(dir, "real")
+		link := filepath.Join(dir, "link")
+		if err := os.Mkdir(real, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		for name, err := range map[string]error{
+			"mount onto a symlink":        m.Mount(bg(), "tmpfs", link, "tmpfs", 0, ""),
+			"mount under a symlink":       m.Mount(bg(), "tmpfs", filepath.Join(link, "sub"), "tmpfs", 0, ""),
+			"bind from a symlink":         m.Bind(bg(), link, filepath.Join(real, "t"), false),
+			"unmount of a symlink":        m.Unmount(bg(), link, 0),
+			"remount of a symlink":        m.RemountReadOnly(bg(), link, true),
+			"bind onto a symlinked above": m.Bind(bg(), real, filepath.Join(link, "t"), false),
+		} {
+			if !errors.Is(err, ErrNotResolved) {
+				t.Errorf("%s: got %v, want ErrNotResolved", name, err)
+			}
 		}
 	})
 }
