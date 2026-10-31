@@ -31,13 +31,9 @@ import (
 //      or its volume unstaged). Nothing else under kubelet's pod directories
 //      is ever unmounted, whatever it looks like: kubelet and other drivers
 //      mount there too, and a mount at a path the reconciler never heard of
-//      is not its to remove. Derived drops are not computed in a pass in which
-//      a record failed to load, because an unreadable record for a live volume
-//      would otherwise look exactly like an unstaged one and its pods' binds
-//      would be pulled; explicit ones are, because kubelet asked. The previous
-//      pass's targets live in memory only, so a restart forgets them: that
-//      leaves a leak where the alternative is a wrong unmount, and kubelet's
-//      own retry of the Unpublish repairs it.
+//      is not its to remove. The previous pass's targets live in memory only,
+//      so a restart forgets them: that leaves a leak where the alternative is
+//      a wrong unmount, and kubelet's own retry of the Unpublish repairs it.
 //
 //  (c) It is a transport (a mount at exactly <TransportsRoot>/transports/<x>)
 //      that no intent references, that nothing else is mounted from, and that
@@ -50,13 +46,17 @@ import (
 // Garbage is never collected in a pass whose Load of the intent store
 // returned an error: the intents are then unknown, not empty (see runPass).
 //
-// A record that fails to load (corrupt, unreadable) is different: Load says
-// that volume has no intent, and the plan treats its mounts as garbage, so
-// rule (a) removes its stage mount. The harm is bounded and the failure is
-// loud: the pods' publish binds are mounts of their own and keep working
-// (rule (b) is withheld in such a pass, above), nothing is lost, the record is
-// kept on disk, logged once and counted in the load-failure gauge, and the
-// next NodeStage of the volume rewrites the record and binds the stage again.
+// A record that fails to load (corrupt, or one read that failed for a reason
+// that may pass, such as running out of file descriptors) makes that volume's
+// intent unknown, not absent, and garbage is defined as "no intent". So in a
+// pass where any record failed to load nothing is collected at all: not (a),
+// not the derived half of (b), not (c). Only an explicit Unpublish drop still
+// goes, because kubelet asked for that target by name. The failure is logged
+// once per change of the set of failed records, counted in the load-failure
+// gauge, and the file is kept; collection resumes on its own the first pass
+// after every record reads, whether a person fixed it or the error passed.
+// This is the cost of the rule: one record that stays broken suspends
+// collection node-wide, which leaks mounts and does not unmount a pod's data.
 //
 // Unmounts are without MNT_DETACH, because a lazy detach would leave a pod
 // writing into a mount nobody tracks and would hide a busy mount instead of
@@ -93,6 +93,8 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 		refs[dir] = struct{}{}
 	}
 
+	p.collect = failuresClean
+	p.noteSuspended(!failuresClean)
 	if failuresClean {
 		for t, v := range r.lastTargets {
 			if _, claimed := current[t]; claimed {
@@ -140,7 +142,7 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 
 	table, errs := p.unmountRounds(claimedStage)
 	p.finishDrops(batch, table, errs)
-	if table != nil {
+	if table != nil && failuresClean {
 		p.collectIdleTransports(table, refs, refsKnown)
 	}
 }
@@ -221,7 +223,11 @@ func (p *pass) candidates(t observe.Table, claimedStage func(string) bool) ([]ca
 	r := p.r
 	seen := map[string]bool{}
 	var out []candidate
-	for _, m := range t.Below(r.opts.StageRoot) {
+	strays := t.Below(r.opts.StageRoot)
+	if !p.collect {
+		strays = nil // rule (a) is off while any record is unreadable
+	}
+	for _, m := range strays {
 		path := m.MountPoint
 		if seen[path] || claimedStage(path) {
 			continue
@@ -233,7 +239,7 @@ func (p *pass) candidates(t observe.Table, claimedStage func(string) bool) ([]ca
 		out = append(out, candidate{path: path})
 	}
 	for path, d := range r.drops {
-		if seen[path] {
+		if seen[path] || !p.collect && !d.explicit {
 			continue
 		}
 		if _, visible := t.At(path); !visible {
@@ -381,4 +387,19 @@ func dependents(t observe.Table, tm observe.Mount) int {
 // "/".
 func rootWithin(dir, path string) bool {
 	return dir == "/" || path == dir || strings.HasPrefix(path, dir+"/")
+}
+
+// noteSuspended logs when collection is suspended or resumes, once per
+// change, so a record that stays broken is one line and not one per pass.
+func (p *pass) noteSuspended(suspended bool) {
+	r := p.r
+	if suspended == r.suspended {
+		return
+	}
+	r.suspended = suspended
+	if suspended {
+		r.log.Warn("garbage collection is suspended while any intent record cannot be read; mounts are left alone")
+	} else {
+		r.log.Info("every intent record reads again; garbage collection resumes")
+	}
 }

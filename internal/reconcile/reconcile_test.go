@@ -409,18 +409,6 @@ func TestStageKeepsThePublishesOfAStagedVolume(t *testing.T) {
 	}
 }
 
-func TestStageRepairsAnUnreadableRecord(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	e.start()
-	in := e.vol("a", "pvc-1")
-	corrupt(t, e, in.VolumeID)
-	mustNil(t, "Stage", e.r.Stage(bg, in))
-	if _, ok := e.intentOf(in.VolumeID); !ok {
-		t.Error("the record was not replaced")
-	}
-}
-
 // corrupt overwrites a volume's record with junk.
 func corrupt(t *testing.T, e *env, volumeID string) {
 	t.Helper()
@@ -621,34 +609,6 @@ func TestUnstageOfAVolumeWithoutAnIntent(t *testing.T) {
 	e.sim.addMount(stray, "tmpfs", "tmpfs")
 	mustNil(t, "Unstage", e.r.Unstage(bg, "directory:pvc-gone"))
 	waitUntil(t, "the stray to be collected", func() bool { _, ok := e.visible(stray); return !ok })
-}
-
-func TestUnstageDeletesAnUnreadableRecord(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	e.start()
-	in := e.vol("a", "pvc-1")
-	mustNil(t, "Stage", e.r.Stage(bg, in))
-	corrupt(t, e, in.VolumeID)
-	mustNil(t, "Unstage", e.r.Unstage(bg, in.VolumeID))
-	if _, err := os.Stat(filepath.Join(e.store.Dir(), intent.Escape(in.VolumeID)+".json")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("the record is still there: %v", err)
-	}
-	// The stage, now unclaimed and below the staging root, is collected.
-	waitUntil(t, "the stage to be collected", func() bool { _, ok := e.visible(in.StagePath); return !ok })
-}
-
-func TestUnstageWhoseRecordCannotBeRemovedIsAnError(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	e.start()
-	// A directory where the record belongs: it cannot be read, and it
-	// cannot be removed because it is not empty.
-	p := filepath.Join(e.store.Dir(), intent.Escape("directory:pvc-1")+".json")
-	mustNil(t, "mkdir", os.MkdirAll(filepath.Join(p, "x"), 0o700))
-	if err := e.r.Unstage(bg, "directory:pvc-1"); err == nil {
-		t.Error("want an error")
-	}
 }
 
 func TestUnstageWhoseRecordSurvivesTheTeardownIsAnError(t *testing.T) {
@@ -964,32 +924,6 @@ func TestAnUnreadableStoreCollectsNothingAndConvergesNothing(t *testing.T) {
 	e.pass()
 	if _, ok := e.visible(stray); ok {
 		t.Error("garbage collection did not resume")
-	}
-}
-
-func TestARecordThatFailsToLoadIsCountedAndItsPublishesAreKept(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	e.start()
-	in := e.vol("a", "pvc-1")
-	target := e.stageAndPublish(in, "pod1", false)
-	e.stop()
-	corrupt(t, e, in.VolumeID)
-
-	e.pass()
-	if e.metrics.loadFailures != 1 {
-		t.Errorf("load failures = %d", e.metrics.loadFailures)
-	}
-	// What the previous pass knew is not turned into a drop by a record that
-	// merely does not load: a pod may be using the target.
-	if _, ok := e.visible(target); !ok {
-		t.Error("the publish of a volume whose record failed to load was unmounted")
-	}
-	// Repair it, and the volume is whole again.
-	e.restart()
-	mustNil(t, "Stage", e.r.Stage(bg, in))
-	if _, ok := e.visible(target); !ok {
-		t.Error("lost the publish")
 	}
 }
 

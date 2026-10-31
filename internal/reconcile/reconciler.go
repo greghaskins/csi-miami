@@ -100,6 +100,7 @@ type Reconciler struct {
 	reported    map[string]string    // transport dir → kind, for the metrics seam
 	kinds       map[string]struct{}  // intent kinds reported, so a kind that empties reads 0
 	failedLoad  map[string]struct{}  // load-failure paths already logged
+	suspended   bool                 // collection is suspended by an unreadable record
 
 	// newTicker is the timer seam; tests replace it.
 	newTicker func(d time.Duration) (<-chan time.Time, func())
@@ -218,9 +219,14 @@ func strictlyBelow(dir, path string) bool { return path != dir && within(dir, pa
 // Stage is idempotent. in.Publishes is ignored: publishes belong to Publish
 // and Unpublish, and a record that already has some keeps them, so a second
 // NodeStage for a volume that pods are using (kubelet repeats it after its
-// own restart) can never unpublish them. If the existing record cannot be
-// read it is replaced, which is the repair path and loses its publishes; they
-// are recreated by the Publish calls kubelet repeats.
+// own restart) can never unpublish them.
+//
+// A record is overwritten only after it was read successfully. If it cannot
+// be read (corrupt, or a transient I/O error that looks the same), Stage
+// writes nothing and returns an error wrapping ErrIntentsUnknown: rewriting it
+// would drop the publishes of pods that are running, and the pass after would
+// unmount them as targets no intent claims. A record that stays unreadable is
+// for a person to repair or remove; every pass says so (see garbage.go).
 func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 	if in.Version == 0 {
 		in.Version = intent.Version
@@ -250,10 +256,10 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 
 	in.Publishes = nil
 	prev, ok, err := r.store.Get(in.VolumeID)
-	switch {
-	case err != nil:
-		r.log.Warn("replacing an unreadable intent record", "volume", in.VolumeID, "error", err)
-	case ok:
+	if err != nil {
+		return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, in.VolumeID, err)
+	}
+	if ok {
 		in.Publishes = prev.Publishes
 	}
 	if err := r.store.Save(in); err != nil {
@@ -287,7 +293,7 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 
 	_, ok, err := r.store.Get(volumeID)
 	if err != nil {
-		return fmt.Errorf("reading the intent of %s: %w", volumeID, err)
+		return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, volumeID, err)
 	}
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnknownVolume, volumeID)
@@ -319,9 +325,13 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 
 // Unpublish removes a target from the volume's intent and waits until nothing
 // is mounted at it. It is idempotent, and it does the work even when the
-// volume has no intent (already unstaged) or the record cannot be read: the
-// target is the one kubelet is asking to be rid of, and a mount left there
-// would pin the pod's directory.
+// volume has no intent (already unstaged): the target is the one kubelet is
+// asking to be rid of, and a mount left there would pin the pod's directory.
+//
+// If the volume's record cannot be read, Unpublish unmounts nothing and
+// returns an error wrapping ErrIntentsUnknown. The unpublish cannot be
+// recorded, so a target unmounted now would come back as soon as the record
+// reads again, a bind left in a dead pod's directory. Kubelet retries.
 //
 // The result is about the target alone: it does not wait for, or fail
 // because of, the rest of the volume's convergence, so a transport that is
@@ -340,7 +350,7 @@ func (r *Reconciler) Unpublish(ctx context.Context, volumeID, targetPath string)
 
 	in, ok, err := r.store.Get(volumeID)
 	if err != nil {
-		r.log.Warn("unpublishing a volume whose intent record cannot be read", "volume", volumeID, "error", err)
+		return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, volumeID, err)
 	}
 	if ok && hasPublish(in, targetPath) {
 		err := r.store.Update(volumeID, func(in *intent.Intent) error {
@@ -390,8 +400,10 @@ func hasPublish(in intent.Intent, target string) bool {
 //
 // A volume with no intent is already unstaged: Unstage returns nil at once and
 // the loop is nudged so any stray mount it left is collected. A record that
-// cannot be read is deleted: nothing can be torn down from it, and the stage
-// path, being below the staging root, is collected as garbage.
+// cannot be read is neither torn down nor deleted: Unstage returns an error
+// wrapping ErrIntentsUnknown. Telling a corrupt file from a transient read
+// error is not possible from here, and deleting a healthy record on a
+// transient error would forget a volume that is mounted.
 func (r *Reconciler) Unstage(ctx context.Context, volumeID string) error {
 	unlock, err := r.locks.lock(ctx, volumeID)
 	if err != nil {
@@ -401,10 +413,7 @@ func (r *Reconciler) Unstage(ctx context.Context, volumeID string) error {
 
 	_, ok, err := r.store.Get(volumeID)
 	if err != nil {
-		r.log.Warn("removing an unreadable intent record at unstage", "volume", volumeID, "error", err)
-		if derr := r.store.Delete(volumeID); derr != nil {
-			return fmt.Errorf("removing the unreadable intent of %s: %w", volumeID, derr)
-		}
+		return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, volumeID, err)
 	}
 	if !ok {
 		r.nudge()

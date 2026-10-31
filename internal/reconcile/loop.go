@@ -27,6 +27,10 @@ type pass struct {
 	converged   map[string]error    // by volume, for the volumes that were converged
 	dropErr     map[string]error    // by publish target, for the unpublish requests
 
+	// collect is false in a pass where any record failed to load: only
+	// explicit Unpublish drops are carried out (garbage.go).
+	collect bool
+
 	trs  map[string]*trResult // by transport mount point: one observation per pass
 	hung map[string]error     // transport mount point → the timeout it showed in this pass
 }

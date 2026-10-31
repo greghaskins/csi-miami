@@ -291,8 +291,15 @@ unavailable, and the goroutine is abandoned, never joined.
 per volume named by a filesystem-safe form of the ID, written by
 temp-file-and-rename with `fsync` on the file and the directory. Records
 carry `version: 1`. Loading an unreadable record logs it and keeps the file
-for inspection; the volume is treated as having no intent, which means its
-mounts are garbage, so the load failure is also surfaced as a metric.
+for inspection. The volume's intent is then unknown, not absent: its mounts
+are left alone and the failure is surfaced as a metric and a log line, and
+nothing is collected anywhere on the node while any record is unreadable
+(an explicit `NodeUnpublishVolume` still unmounts the target it names). A
+request that would have to read or rewrite that record (`NodeStageVolume`,
+`NodeUnstageVolume`, `NodePublishVolume`, `NodeUnpublishVolume`) fails as
+unavailable and writes and unmounts nothing; collection resumes on its own
+once every record reads, whether a person repaired the file or a transient
+read error passed.
 
 **Observer.** `/proc/self/mountinfo` through a maintained parser; filtered
 to mounts under `--transports-root`, the stage root, and target paths named
