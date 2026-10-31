@@ -4,6 +4,7 @@
 # commits, which is never silently nothing.
 set -euo pipefail
 base=${1:?base}; head=${2:?head}
+git rev-parse -q --verify "$head^{commit}" >/dev/null || { echo "secret-scan: unknown head commit" >&2; exit 1; }
 if [[ "$base" =~ ^0+$ ]] || ! git merge-base --is-ancestor "$base" "$head" 2>/dev/null; then
   range="-n 50 $head"
 else
