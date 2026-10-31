@@ -1,11 +1,13 @@
 package reconcile
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
 )
@@ -115,5 +117,45 @@ func TestTargetChecksNeedTheStore(t *testing.T) {
 	mustNil(t, "remove the store", os.RemoveAll(e.store.Dir()))
 	if err := e.r.Unpublish(bg, in.VolumeID, e.target("pod1")); !errors.Is(err, ErrIntentsUnknown) {
 		t.Errorf("Unpublish = %v, want ErrIntentsUnknown", err)
+	}
+}
+
+// The directory above a root is refused because it contains the root, not
+// because it happens to contain a stage path. With the two roots on separate
+// branches and no records at all, nothing but the root rule can refuse the
+// parent of either, or the one above that.
+func TestTheDirectoryAboveEitherRootIsRefusedWithNoRecords(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	tr := filepath.Join(e.base, "branch-a", "x", "miami")
+	sr := filepath.Join(e.base, "branch-b", "y", "stage")
+	r, err := New(e.store, e.sim, Options{TransportsRoot: tr, StageRoot: sr})
+	mustNil(t, "New", err)
+
+	// No loop runs here, so a request that is not refused would wait for a
+	// pass for ever; the deadline turns that into a failure.
+	ctx, cancel := context.WithTimeout(bg, 50*time.Millisecond)
+	defer cancel()
+
+	for name, target := range map[string]string{
+		"the parent of the transports root":      filepath.Dir(tr),
+		"the grandparent of the transports root": filepath.Dir(filepath.Dir(tr)),
+		"the parent of the staging root":         filepath.Dir(sr),
+		"the grandparent of the staging root":    filepath.Dir(filepath.Dir(sr)),
+		"the common ancestor":                    e.base,
+	} {
+		for op, err := range map[string]error{
+			"Unpublish": r.Unpublish(ctx, "directory:pvc-x", target),
+			"Publish":   r.Publish(ctx, "directory:pvc-x", intent.Publish{TargetPath: target}),
+		} {
+			if !errors.Is(err, ErrTargetOutsideScope) {
+				t.Errorf("%s of %s: %v, want ErrTargetOutsideScope", op, name, err)
+			}
+		}
+	}
+	// A sibling of the roots is none of that: it is accepted, and then waits
+	// for a pass, so the deadline ends it.
+	if err := r.Unpublish(ctx, "directory:pvc-x", filepath.Join(e.base, "branch-a", "pods", "p1")); errors.Is(err, ErrTargetOutsideScope) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a path beside the roots: %v, want it accepted and waiting", err)
 	}
 }
