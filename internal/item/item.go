@@ -65,38 +65,47 @@ var (
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
 )
 
-// maxLayers bounds how many stacked mounts UnmountVisible pops at one path.
-// The driver never stacks, so more than a few means something else is
-// stacking and the caller should see an error rather than loop on it.
-const maxLayers = 8
-
-// UnmountVisible unmounts whatever is visible at path, popping stacked mounts
-// one layer at a time, and returns nil once nothing is visible there. It
-// never detaches lazily (flags 0), so a busy mount is an error and the mount
-// stays. A mount hidden under another mount of a parent directory is not
-// visible and is left alone: no path leads to it.
+// UnmountBind unmounts the mount visible at mountPoint, once, and only if it
+// is a bind of the directory source (observe.Table.IsBindOf). It is how an
+// Item or the reconciler takes down what it made without ever removing what
+// it did not:
 //
-// It reads the table afresh before each layer, because the mount table is the
-// only truth.
-func UnmountVisible(ctx context.Context, m mount.Mounter, path string) error {
-	for range maxLayers {
-		t, err := m.Mounts(ctx)
-		if err != nil {
-			return err
-		}
-		if _, ok := t.At(path); !ok {
-			return nil
-		}
-		if err := m.Unmount(ctx, path, 0); err != nil {
-			return err
-		}
-	}
+//   - Nothing visible at mountPoint, or a mount hidden under another, is
+//     success: there is nothing of ours to remove.
+//   - A visible mount that is not a bind of source is not ours. It is left in
+//     place and the error wraps conflict (ErrStageConflict for a stage path,
+//     the reconciler's ErrPublishConflict for a publish target).
+//   - The unmount is without MNT_DETACH, so a busy mount is an error and stays.
+//   - After it, the table is read again. If something is still visible at
+//     mountPoint, another mount was stacked there; it is not removed and the
+//     error wraps conflict. The driver never stacks, so a loop that popped
+//     layers until the path was clear would be removing mounts it cannot
+//     show it made.
+func UnmountBind(ctx context.Context, m mount.Mounter, mountPoint, source string, conflict error) error {
 	t, err := m.Mounts(ctx)
 	if err != nil {
 		return err
 	}
-	if _, ok := t.At(path); ok {
-		return fmt.Errorf("%s is still mounted after %d layers were unmounted", path, maxLayers)
+	top, ok := t.At(mountPoint)
+	if !ok {
+		return nil
+	}
+	same, err := t.IsBindOf(mountPoint, source)
+	if err != nil {
+		return fmt.Errorf("%s: %w", mountPoint, err)
+	}
+	if !same {
+		return fmt.Errorf("%w: %s is mounted as %s from %q, which is not a bind of %s, and is left in place", conflict, mountPoint, top.FSType, top.Source, source)
+	}
+	if err := m.Unmount(ctx, mountPoint, 0); err != nil {
+		return err
+	}
+	t, err = m.Mounts(ctx)
+	if err != nil {
+		return err
+	}
+	if _, ok := t.At(mountPoint); ok {
+		return fmt.Errorf("%w: another mount is stacked at %s and is left in place", conflict, mountPoint)
 	}
 	return nil
 }

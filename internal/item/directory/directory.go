@@ -191,18 +191,29 @@ func hidden(t observe.Table, path string) bool {
 	return false
 }
 
-// Teardown unmounts the stage path: every mount visible there, one layer at
-// a time, without MNT_DETACH (item.UnmountVisible). It does not check that
-// the mount is a bind of the item directory, on purpose. The stage path is
-// the driver's by the CSI contract and Converge never puts anything else
-// there, so a mount of something else is a leftover or a conflict that
-// Converge already refuses to touch; refusing to unmount it here would make
-// the unstage of the volume fail forever and leave the pod stuck
-// terminating, while unmounting it costs nothing that belongs to anyone else.
-// It does not stat the item directory or touch the transport, so it works
-// when the transport is gone.
+// Teardown unmounts the stage path, once and without MNT_DETACH, but only if
+// the mount there is a bind of the volume's directory (item.UnmountBind).
+// Anything else at the stage path is item.ErrStageConflict and is left where it
+// is, as Converge leaves it: Converge never puts anything but that bind there,
+// so a different mount is someone else's, or a stack on top of ours, and
+// removing what the driver cannot show it made is not the driver's call. The
+// cost is that an Unstage over such a mount fails until a person clears it,
+// which is the loud outcome; the alternative is unmounting something that
+// holds a pod's data.
+//
+// It does not stat the item directory, so it works when the item is gone, but
+// it does need the transport in the mount table to recognise the bind, which
+// the reconciler's converge restores before an Unstage can be retried.
 func (d *Item) Teardown(ctx context.Context, in intent.Intent, _ item.Observed) error {
-	if err := item.UnmountVisible(ctx, d.cfg.Mounter, in.StagePath); err != nil {
+	id, err := in.ID()
+	if err != nil {
+		return fmt.Errorf("directory item: %w", err)
+	}
+	dir, err := in.Context().Dir(d.cfg.Root, id)
+	if err != nil {
+		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+	}
+	if err := item.UnmountBind(ctx, d.cfg.Mounter, in.StagePath, dir, item.ErrStageConflict); err != nil {
 		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
 	}
 	return nil

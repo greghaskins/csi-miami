@@ -61,15 +61,21 @@ func (p *pass) teardown(batch []*request) {
 
 // teardownVolume unmounts the publishes and then the stage path. Each unmount
 // is without MNT_DETACH: a busy mount stays and is an error, because a lazy
-// detach would leave a pod writing into a mount nobody tracks. Publishes are
-// all tried even if one fails, so one stuck pod does not keep the others
-// mounted; the stage path is only unmounted when every publish is gone, since
-// the binds are of it.
+// detach would leave a pod writing into a mount nobody tracks. Each is also
+// once, and only if the table shows the mount to be a bind of what the
+// intent says it should be (item.UnmountBind): a publish target must be a
+// bind of the stage path, the stage path (in the item) a bind of the item
+// directory. Anything else is ErrPublishConflict or ErrStageConflict, left in
+// place and reported, so an Unstage can never unmount a mount the driver did
+// not make; the price is that it fails until a person clears the conflict.
+// Publishes are all tried even if one fails, so one stuck pod does not keep
+// the others mounted; the stage path is only unmounted when every publish is
+// gone, since the binds are of it.
 func (p *pass) teardownVolume(in intent.Intent) error {
 	r := p.r
 	var errs []error
 	for _, pub := range in.Publishes {
-		if err := item.UnmountVisible(p.ctx, r.m, pub.TargetPath); err != nil {
+		if err := item.UnmountBind(p.ctx, r.m, pub.TargetPath, in.StagePath, ErrPublishConflict); err != nil {
 			errs = append(errs, fmt.Errorf("unmounting the publish target %q: %w", pub.TargetPath, err))
 		}
 	}

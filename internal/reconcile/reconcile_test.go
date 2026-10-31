@@ -554,19 +554,61 @@ func TestUnstageThatFailsKeepsTheIntentAndIsRetried(t *testing.T) {
 	}
 }
 
-func TestUnstageRemovesWhateverIsMountedAtTheStagePath(t *testing.T) {
+// Unstage takes down binds the driver made and nothing else: a foreign mount
+// at the stage path or at a publish target is reported, left in place, and
+// keeps the record.
+func TestUnstageLeavesMountsThatAreNotOurs(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t)
-	e.start()
-	in := e.vol("a", "pvc-1")
-	mustNil(t, "save", e.store.Save(in))
-	e.sim.addMount(in.StagePath, "tmpfs", "tmpfs")
-	e.sim.addMount(in.StagePath, "tmpfs", "tmpfs") // stacked
+	t.Run("a foreign mount at the stage path", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t)
+		e.start()
+		in := e.vol("a", "pvc-1")
+		mustNil(t, "save", e.store.Save(in))
+		e.sim.addMount(in.StagePath, "tmpfs", "tmpfs")
+		e.sim.addMount(in.StagePath, "tmpfs", "tmpfs") // stacked
 
-	mustNil(t, "Unstage", e.r.Unstage(bg, in.VolumeID))
-	if _, ok := e.visible(in.StagePath); ok {
-		t.Error("a layer is left at the stage path")
-	}
+		err := e.r.Unstage(bg, in.VolumeID)
+		if !errors.Is(err, ErrStageConflict) {
+			t.Fatalf("got %v, want ErrStageConflict", err)
+		}
+		if n := len(e.sim.table().Under(in.StagePath)); n != 2 {
+			t.Errorf("%d mounts left at the stage path, want both", n)
+		}
+		if _, ok := e.intentOf(in.VolumeID); !ok {
+			t.Error("the record was deleted although the stage was not taken down")
+		}
+	})
+	t.Run("a foreign mount at a publish target", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t)
+		e.start()
+		in := e.vol("a", "pvc-1")
+		mustNil(t, "Stage", e.r.Stage(bg, in))
+		e.mkTargetParent("pod1")
+		target := e.target("pod1")
+		e.sim.addMount(target, "tmpfs", "tmpfs")
+		// The record says the target is published, as after a crash between
+		// the record and the bind.
+		mustNil(t, "update", e.store.Update(in.VolumeID, func(r *intent.Intent) error {
+			r.Publishes = []intent.Publish{{TargetPath: target}}
+			return nil
+		}))
+
+		err := e.r.Unstage(bg, in.VolumeID)
+		if !errors.Is(err, ErrPublishConflict) {
+			t.Fatalf("got %v, want ErrPublishConflict", err)
+		}
+		if m, ok := e.visible(target); !ok || m.FSType != "tmpfs" {
+			t.Error("the foreign mount at the target was removed")
+		}
+		if _, ok := e.visible(in.StagePath); !ok {
+			t.Error("the stage went while a publish was still in the way")
+		}
+		if _, ok := e.intentOf(in.VolumeID); !ok {
+			t.Error("the record was deleted")
+		}
+	})
 }
 
 func TestUnstageOfAVolumeWithoutAnIntent(t *testing.T) {

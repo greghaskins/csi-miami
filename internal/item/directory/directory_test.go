@@ -312,46 +312,101 @@ func TestConvergeStatTimeoutThenBusy(t *testing.T) {
 	}
 }
 
-func TestTeardownUnmountsTheStagePath(t *testing.T) {
-	t.Parallel()
-	p := &popper{Mounter: &fake.Mounter{}, table: observe.Table{rootMount(), transportMount(), stageBind()}}
+func unmounts(f *fake.Mounter) []string {
+	var out []string
+	for _, c := range f.Calls() {
+		if c.Op == fake.OpUnmount {
+			out = append(out, c.Target)
+		}
+	}
+	return out
+}
+
+func newPopperItem(t *testing.T, ms ...observe.Mount) (*Item, *popper) {
+	t.Helper()
+	p := &popper{Mounter: &fake.Mounter{}, table: observe.Table(ms)}
 	p.SetTable(p.table)
 	it, err := New(Config{Root: root, Mounter: p})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return it, p
+}
+
+func TestTeardownUnmountsOurBindOnce(t *testing.T) {
+	t.Parallel()
+	it, p := newPopperItem(t, rootMount(), transportMount(), stageBind())
 	if err := it.Teardown(context.Background(), theIntent(), item.Observed{}); err != nil {
 		t.Fatal(err)
 	}
-	var got []fake.Call
-	for _, c := range p.Calls() {
-		if c.Op == fake.OpUnmount {
-			got = append(got, c)
-		}
-	}
-	if want := []fake.Call{{Op: fake.OpUnmount, Target: stage}}; !slices.Equal(got, want) {
-		t.Errorf("calls = %+v", got)
+	if got := unmounts(p.Mounter); !slices.Equal(got, []string{stage}) {
+		t.Errorf("unmounts = %v", got)
 	}
 	// Nothing to undo is no call.
 	if err := it.Teardown(context.Background(), theIntent(), item.Observed{}); err != nil {
 		t.Fatal(err)
 	}
-	n := 0
-	for _, c := range p.Calls() {
-		if c.Op == fake.OpUnmount {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Errorf("%d unmounts after the second Teardown, want 1", n)
+	if got := unmounts(p.Mounter); len(got) != 1 {
+		t.Errorf("unmounts after the second Teardown = %v", got)
 	}
 }
 
-func TestTeardownFailureIsReported(t *testing.T) {
+// What is not a bind of the volume's directory is not the driver's to remove.
+func TestTeardownLeavesWhatIsNotOurs(t *testing.T) {
 	t.Parallel()
-	fx := newFixture(t, rootMount(), transportMount(), stageBind())
-	fx.f.FailOp(fake.OpUnmount, stage, mount.ErrBusy)
-	if err := fx.item.Teardown(context.Background(), theIntent(), item.Observed{}); !errors.Is(err, mount.ErrBusy) {
+	foreign := stageBind()
+	foreign.Major, foreign.Minor, foreign.FSType = 0, 55, "tmpfs"
+	other := stageBind()
+	other.Root = host + "/pvc-2"
+	stacked := foreign
+	stacked.ID = 4
+	tests := []struct {
+		name  string
+		table []observe.Mount
+		left  int
+	}{
+		{"a foreign file system", []observe.Mount{rootMount(), transportMount(), foreign}, 1},
+		{"a bind of another volume's directory", []observe.Mount{rootMount(), transportMount(), other}, 1},
+		{"something stacked on our bind", []observe.Mount{rootMount(), transportMount(), stageBind(), stacked}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			it, p := newPopperItem(t, tt.table...)
+			err := it.Teardown(context.Background(), theIntent(), item.Observed{})
+			if !errors.Is(err, item.ErrStageConflict) || !errors.Is(err, mount.ErrConflict) {
+				t.Fatalf("got %v, want ErrStageConflict", err)
+			}
+			if got := unmounts(p.Mounter); len(got) != 0 {
+				t.Errorf("unmounted %v", got)
+			}
+			n := 0
+			for _, m := range p.table {
+				if m.MountPoint == stage {
+					n++
+				}
+			}
+			if n != tt.left {
+				t.Errorf("%d mounts at the stage path, want %d left alone", n, tt.left)
+			}
+		})
+	}
+}
+
+func TestTeardownErrors(t *testing.T) {
+	t.Parallel()
+	it, p := newPopperItem(t, rootMount(), transportMount(), stageBind())
+	p.FailOp(fake.OpUnmount, stage, mount.ErrBusy)
+	if err := it.Teardown(context.Background(), theIntent(), item.Observed{}); !errors.Is(err, mount.ErrBusy) {
 		t.Errorf("got %v", err)
+	}
+	bad := theIntent()
+	bad.VolumeID = "pvc-1"
+	if err := it.Teardown(context.Background(), bad, item.Observed{}); err == nil {
+		t.Error("a malformed volume ID was accepted")
+	}
+	bad.VolumeID = "directory:a b"
+	if err := it.Teardown(context.Background(), bad, item.Observed{}); err == nil {
+		t.Error("an invalid volume name was accepted")
 	}
 }
