@@ -1,0 +1,31 @@
+# Scrub: nothing matching the private rule set may enter a file, a path or a
+# commit message. The rule set is NOT in this repository. It reaches gitleaks
+# through GITLEAKS_CONFIG_TOML: an environment variable locally (see README,
+# Development) and a repository secret in CI (.github/workflows/scrub*.yml).
+# gitleaks falls back to its default rules when that variable is unset, so the
+# first hook fails closed rather than letting an unconfigured clone commit.
+#
+# Install once per clone: `mise install` runs `pre-commit install` for both
+# hook types (mise.toml). The same scripts run in CI.
+repos:
+  - repo: local
+    hooks:
+      - id: scrub-config-present
+        name: "scrub: rule set present"
+        entry: hack/scrub/require-config.sh
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit, commit-msg]
+      - id: scrub-staged
+        name: "scrub: staged files and paths"
+        entry: hack/scrub/staged.sh
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: scrub-commit-msg
+        name: "scrub: commit message"
+        entry: hack/scrub/commit-msg.sh
+        language: script
+        stages: [commit-msg]

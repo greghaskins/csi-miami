@@ -1,0 +1,32 @@
+# Scrub: the working tree, every commit's content and message, and the branch
+# name of a pull request, against the private rule set in the repository
+# secret GITLEAKS_CONFIG_TOML. Output never includes matched text.
+name: scrub
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: scrub-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  tree-and-commits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - run: hack/scrub/install.sh
+      - env:
+          GITLEAKS_CONFIG_TOML: ${{ secrets.GITLEAKS_CONFIG_TOML }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          hack/scrub/require-config.sh
+          hack/scrub/tree.sh
+          hack/scrub/range.sh "$BASE" "$HEAD"
+          printf '%s' "$HEAD_REF" | hack/scrub/text.sh "branch name"
