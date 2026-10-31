@@ -328,9 +328,9 @@ func TestPublishCreatesTheTargetTreeButConvergeCreatesOnlyTheLeaf(t *testing.T) 
 	// make the pod's tree again, but must still restore the stage.
 	e.sim.clear()
 	mustNil(t, "remove pod dir", os.RemoveAll(filepath.Join(e.base, "kubelet", "pods")))
-	err := e.converge(in.VolumeID)
-	if err == nil || !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("converge error = %v, want the missing parent", err)
+	mustNil(t, "converge", e.converge(in.VolumeID))
+	if got, _ := e.intentOf(in.VolumeID); len(got.Publishes) != 0 {
+		t.Errorf("publishes = %+v, want the pod's gone with its directory", got.Publishes)
 	}
 	if _, err := os.Stat(filepath.Join(e.base, "kubelet", "pods")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the pod tree was made again: %v", err)
@@ -340,24 +340,72 @@ func TestPublishCreatesTheTargetTreeButConvergeCreatesOnlyTheLeaf(t *testing.T) 
 	}
 }
 
-func TestOneStalePublishDoesNotKeepAnotherFromBinding(t *testing.T) {
+// A NodePublish that failed is never followed by a NodeUnpublish, so a record
+// can name a target whose directory kubelet has already removed. That entry
+// must be pruned and must not fail anything else: not the volume's Stage, not
+// another pod's Publish.
+func TestAStalePublishIsPrunedAndFailsNothingElse(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	in := e.vol("a", "pvc-1")
-	e.mkTargetParent("good")
-	mustNil(t, "mkdir good", os.Mkdir(e.target("good"), 0o750))
-	in.Publishes = []intent.Publish{
-		{TargetPath: filepath.Join(e.base, "gone", "mount")}, // parent missing
-		{TargetPath: e.target("good")},
-	}
+	e.mkTargetParent("live")
+	mustNil(t, "mkdir live", os.Mkdir(e.target("live"), 0o750))
+	stale := filepath.Join(e.base, "kubelet", "pods", "gone", "volumes", "mount")
+	in.Publishes = []intent.Publish{{TargetPath: stale}, {TargetPath: e.target("live")}}
 	mustNil(t, "save", e.store.Save(in))
+	e.start()
 
-	err := e.converge(in.VolumeID)
-	if err == nil {
-		t.Fatal("want the stale publish's error")
+	// Stage, with the stale publish in the record, succeeds.
+	staged := in
+	staged.Publishes = nil
+	mustNil(t, "Stage", e.r.Stage(bg, staged))
+	// Another pod's Publish succeeds.
+	e.mkTargetParent("pod2")
+	mustNil(t, "Publish", e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: e.target("pod2")}))
+
+	got, _ := e.intentOf(in.VolumeID)
+	for _, p := range got.Publishes {
+		if p.TargetPath == stale {
+			t.Error("the stale publish is still in the record")
+		}
 	}
+	if len(got.Publishes) != 2 {
+		t.Errorf("publishes = %+v, want the two live ones", got.Publishes)
+	}
+	if !e.isBind(e.target("live"), in.StagePath) || !e.isBind(e.target("pod2"), in.StagePath) {
+		t.Error("a live publish was not bound")
+	}
+	if n := e.metrics.errCount("publish"); n != 0 {
+		t.Errorf("a pruned publish was counted as %d errors", n)
+	}
+	if len(e.events.reasons(ReasonMountFailed)) != 0 {
+		t.Errorf("a pruned publish raised events: %+v", e.events.all())
+	}
+}
+
+// A Publish hears about its own target only.
+func TestAPublishIsAnsweredWithItsOwnTargetsOutcome(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", "pvc-1")
+	mustNil(t, "Stage", e.r.Stage(bg, in))
+	e.mkTargetParent("bad")
+	e.mkTargetParent("good")
+	e.sim.addMount(e.target("bad"), "tmpfs", "tmpfs")
+
+	if err := e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: e.target("bad")}); !errors.Is(err, ErrPublishConflict) {
+		t.Fatalf("Publish of the target in conflict = %v", err)
+	}
+	// The failing entry stays in the record and fails every pass; the next
+	// pod's Publish and the volume's Stage do not hear of it.
+	mustNil(t, "Publish good", e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: e.target("good")}))
+	mustNil(t, "Stage again", e.r.Stage(bg, in))
 	if !e.isBind(e.target("good"), in.StagePath) {
 		t.Error("the good publish was not bound")
+	}
+	if e.metrics.errCount("publish") == 0 {
+		t.Error("the failing publish was not counted")
 	}
 }
 
@@ -898,7 +946,7 @@ func TestAnUnreadableStoreCollectsNothingAndConvergesNothing(t *testing.T) {
 	e.sim.addMount(stray, "tmpfs", "tmpfs")
 
 	mustNil(t, "remove the store", os.RemoveAll(e.store.Dir()))
-	req := &request{kind: reqConverge, volume: in.VolumeID, done: make(chan error, 1)}
+	req := &request{kind: reqStage, volume: in.VolumeID, done: make(chan error, 1)}
 	e.sim.Reset()
 	e.r.runPass(bg, []*request{req})
 

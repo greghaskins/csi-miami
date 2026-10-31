@@ -79,8 +79,8 @@ func TestASecondVolumeOnAHungTransportIsSkippedInThePass(t *testing.T) {
 	mustNil(t, "save", e.store.Save(v1))
 	mustNil(t, "save", e.store.Save(v2))
 
-	r1 := &request{kind: reqConverge, volume: v1.VolumeID, done: make(chan error, 1)}
-	r2 := &request{kind: reqConverge, volume: v2.VolumeID, done: make(chan error, 1)}
+	r1 := &request{kind: reqStage, volume: v1.VolumeID, done: make(chan error, 1)}
+	r2 := &request{kind: reqStage, volume: v2.VolumeID, done: make(chan error, 1)}
 	e.r.runPass(bg, []*request{r1, r2})
 	err1, err2 := <-r1.done, <-r2.done
 	if !errors.Is(err1, mount.ErrTimeout) {

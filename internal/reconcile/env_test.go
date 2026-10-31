@@ -188,7 +188,7 @@ func (e *env) passOn(r *Reconciler) { r.runPass(context.Background(), nil) }
 // converge runs one pass carrying a converge request for a volume and
 // returns the result that request would be given.
 func (e *env) converge(volumeID string) error {
-	req := &request{kind: reqConverge, volume: volumeID, done: make(chan error, 1)}
+	req := &request{kind: reqStage, volume: volumeID, done: make(chan error, 1)}
 	e.r.runPass(context.Background(), []*request{req})
 	return <-req.done
 }

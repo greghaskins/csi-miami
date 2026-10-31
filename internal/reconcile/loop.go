@@ -22,10 +22,10 @@ type pass struct {
 	// volumes whose unstage succeeded in it.
 	intents map[string]intent.Intent
 
-	unstaging   map[string]struct{} // volumes with an unstage request in this pass
-	teardownErr map[string]error    // by volume, for the unstage requests
-	converged   map[string]error    // by volume, for the volumes that were converged
-	dropErr     map[string]error    // by publish target, for the unpublish requests
+	unstaging   map[string]struct{}      // volumes with an unstage request in this pass
+	teardownErr map[string]error         // by volume, for the unstage requests
+	results     map[string]*volumeResult // by volume, for the volumes that were converged
+	dropErr     map[string]error         // by publish target, for the unpublish requests
 
 	// collect is false in a pass where any record failed to load: only
 	// explicit Unpublish drops are carried out (garbage.go).
@@ -78,7 +78,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 		intents:     loaded.Intents,
 		unstaging:   map[string]struct{}{},
 		teardownErr: map[string]error{},
-		converged:   map[string]error{},
+		results:     map[string]*volumeResult{},
 		dropErr:     map[string]error{},
 		trs:         map[string]*trResult{},
 		hung:        map[string]error{},
@@ -90,17 +90,19 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 	p.answer(batch)
 }
 
-// answer delivers each request its result.
+// answer delivers each request the result of its own step. A Stage hears
+// about the transport and the item, a Publish about its own target, an
+// Unpublish about the unmount of its target and an Unstage about the
+// teardown: none hears about another request's step, so a stale publish of
+// another pod cannot fail them.
 func (p *pass) answer(batch []*request) {
 	for _, req := range batch {
 		var err error
 		switch req.kind {
-		case reqConverge:
-			e, ok := p.converged[req.volume]
-			if !ok {
-				e = fmt.Errorf("%w: %s", ErrUnknownVolume, req.volume)
-			}
-			err = e
+		case reqStage:
+			err = p.stageAnswer(req)
+		case reqPublish:
+			err = p.publishAnswer(req)
 		case reqUnpublish:
 			err = p.dropErr[req.target]
 		case reqUnstage:
@@ -108,6 +110,32 @@ func (p *pass) answer(batch []*request) {
 		}
 		req.done <- err
 	}
+}
+
+// stageAnswer is the answer to a Stage.
+func (p *pass) stageAnswer(req *request) error {
+	res, ok := p.results[req.volume]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownVolume, req.volume)
+	}
+	return res.stage
+}
+
+// publishAnswer is the answer to a Publish: its own target's outcome, or the
+// stage's failure when the stage was not there to bind from.
+func (p *pass) publishAnswer(req *request) error {
+	res, ok := p.results[req.volume]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownVolume, req.volume)
+	}
+	if res.stage != nil {
+		return fmt.Errorf("%q was not attempted because the stage of %s is not ready: %w", req.target, req.volume, res.stage)
+	}
+	err, found := res.publish[req.target]
+	if !found {
+		return fmt.Errorf("%q is not in the record of %s", req.target, req.volume)
+	}
+	return err
 }
 
 // noteLoadFailures reports the records that did not load: the gauge every

@@ -27,8 +27,10 @@ const publishDirMode = 0o700
 type reqKind int
 
 const (
-	// reqConverge waits for the volume's converge result (Stage, Publish).
-	reqConverge reqKind = iota
+	// reqStage waits for the volume's transport and stage bind (Stage).
+	reqStage reqKind = iota
+	// reqPublish waits for one publish target to be bound (Publish).
+	reqPublish
 	// reqUnpublish waits for one publish target to be unmounted.
 	reqUnpublish
 	// reqUnstage waits for the volume's teardown.
@@ -40,7 +42,7 @@ const (
 type request struct {
 	kind   reqKind
 	volume string
-	target string // reqUnpublish: the publish target path
+	target string // reqPublish and reqUnpublish: the publish target path
 	done   chan error
 }
 
@@ -205,9 +207,10 @@ func strictlyBelow(dir, path string) bool { return path != dir && within(dir, pa
 
 // Stage records that a volume should be staged and waits until the stage path
 // is a mount of it (the transport mounted, the item directory present, the
-// bind made), or until ctx ends. The result is the pass's error for the
-// volume: nil when converged, otherwise one of the package's errors wrapping
-// the cause.
+// bind made), or until ctx ends. The result is the outcome of those steps
+// only, nil when they hold, otherwise one of the package's errors wrapping
+// the cause. It is not the outcome of the volume's publishes: one whose pod
+// is gone must not fail the Stage of a volume other pods are using.
 //
 // The intent is validated against the boundary policy (volume.ParseID, the
 // context rules of internal/volume, the structural rules of the intent
@@ -265,13 +268,15 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 	if err := r.store.Save(in); err != nil {
 		return fmt.Errorf("recording the intent of %s: %w", in.VolumeID, err)
 	}
-	return r.await(ctx, &request{kind: reqConverge, volume: in.VolumeID})
+	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID})
 }
 
 // Publish adds a publish (a target path and its read-only flag) to the
 // volume's intent and waits until the target is a bind of the stage path with
-// that flag. Publishing a target that is already published changes its flag
-// and nothing else. A volume with no intent is ErrUnknownVolume: it must be
+// that flag, and the result is the outcome for that target only: a failing
+// publish of another pod is not reported here (it is logged and counted).
+// Publishing a target that is already published changes its flag and nothing
+// else. A volume with no intent is ErrUnknownVolume: it must be
 // staged first.
 //
 // The target directory is created here, with MkdirAll, in the caller's
@@ -320,7 +325,7 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 	if err != nil {
 		return fmt.Errorf("recording the publish of %s: %w", volumeID, err)
 	}
-	return r.await(ctx, &request{kind: reqConverge, volume: volumeID})
+	return r.await(ctx, &request{kind: reqPublish, volume: volumeID, target: p.TargetPath})
 }
 
 // Unpublish removes a target from the volume's intent and waits until nothing

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"sort"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/intent"
@@ -93,6 +95,24 @@ func (p *pass) teardownVolume(in intent.Intent) error {
 	return it.Teardown(p.ctx, in, item.Observed{Mounts: obs})
 }
 
+// volumeResult is what one pass found out about one volume, split by what a
+// request waits for. A request is answered with the result of its own step
+// and never with another's: one publish whose pod is gone must not fail the
+// Stage of the volume or the Publish of a different pod.
+type volumeResult struct {
+	// stage is the outcome of the transport and the item (the stage bind).
+	// When it is not nil the publishes were not attempted.
+	stage error
+	// publish is the outcome of each publish, by target path. A pruned
+	// publish (errTargetGone) is recorded here too.
+	publish map[string]error
+}
+
+// errTargetGone marks a publish whose target's parent directory no longer
+// exists. It never reaches a caller except as the answer to a Publish of that
+// very target.
+var errTargetGone = errors.New("the publish target's parent directory does not exist")
+
 // convergeAll drives every intent not being unstaged toward its desired
 // state, one at a time in volume ID order.
 func (p *pass) convergeAll() {
@@ -100,66 +120,115 @@ func (p *pass) convergeAll() {
 		if _, skip := p.unstaging[id]; skip {
 			continue
 		}
-		in := p.intents[id]
-		reason, err := p.convergeVolume(in)
-		p.converged[id] = err
-		p.noteVolume(id, reason, err)
+		res := p.convergeVolume(p.intents[id])
+		p.results[id] = res
+		p.noteVolume(id, res)
 	}
 }
 
 // convergeVolume brings one volume up: the transport, then the item (its
 // directory and the stage bind), then each publish, each step a no-op when it
-// is already true. A failing step ends the volume's convergence and nothing
-// else, except that the publishes are independent of each other: a stale
-// publish whose target directory is gone must not keep a healthy one from
-// being bound, so all are tried and the errors joined.
+// is already true. A failing step ends the volume's stage convergence, and the
+// publishes are then not attempted. The publishes are independent of each
+// other: one that fails does not keep another from being bound.
 //
-// It returns the event reason for an error.
-func (p *pass) convergeVolume(in intent.Intent) (reason string, err error) {
+// A publish whose target's parent directory does not exist is not a failure.
+// Kubelet owns that directory, and creates it before it publishes, so its
+// absence means the pod is gone (a NodePublish that failed is never followed
+// by a NodeUnpublish). Such a publish is removed from the record, logged at
+// info level, and is not counted as an error: left in, it would be retried and
+// reported on every pass for as long as the volume stays staged.
+func (p *pass) convergeVolume(in intent.Intent) *volumeResult {
+	res := &volumeResult{publish: map[string]error{}}
+	if res.stage = p.convergeStage(in); res.stage != nil {
+		return res
+	}
+	if len(in.Publishes) == 0 {
+		return res
+	}
+	obs, err := p.r.observe(p.ctx)
+	if err != nil {
+		res.stage = fmt.Errorf("volume %s: %w", in.VolumeID, err)
+		return res
+	}
+	dir, _ := in.Transport.MountPoint(p.r.opts.TransportsRoot) // convergeStage validated it
+	for _, pub := range in.Publishes {
+		err := p.publish(in, pub, obs)
+		switch {
+		case errors.Is(err, errTargetGone):
+			p.prune(in, pub.TargetPath)
+		case err != nil:
+			p.noteHung(dir, err)
+			p.count("publish", err)
+		}
+		res.publish[pub.TargetPath] = err
+	}
+	return res
+}
+
+// convergeStage is the transport and the item: everything a Stage waits for.
+func (p *pass) convergeStage(in intent.Intent) error {
 	r := p.r
 	it, ok := r.items[in.Kind]
 	if !ok {
-		return ReasonMountFailed, p.fail("item", fmt.Errorf("volume %s: no item handles kind %q", in.VolumeID, in.Kind))
+		return p.fail("item", fmt.Errorf("volume %s: no item handles kind %q", in.VolumeID, in.Kind))
 	}
 	dir, err := in.Transport.MountPoint(r.opts.TransportsRoot)
 	if err != nil {
-		return ReasonMountFailed, p.fail("transport", fmt.Errorf("volume %s: %w", in.VolumeID, err))
+		return p.fail("transport", fmt.Errorf("volume %s: %w", in.VolumeID, err))
 	}
-
 	if err := p.ensureTransport(in, dir); err != nil {
-		return ReasonTransportUnavailable, fmt.Errorf("volume %s: %w", in.VolumeID, err)
+		return fmt.Errorf("volume %s: %w", in.VolumeID, err)
 	}
 	if herr := p.hung[dir]; herr != nil {
 		// Another volume on this transport timed out earlier in the pass.
 		// Each attempt on a hung mount costs a full deadline and leaves a
 		// goroutine stuck behind it, so the rest wait for the next pass.
-		return ReasonTransportUnavailable, p.fail("transport", fmt.Errorf("volume %s: %w: the transport stopped answering earlier in this pass and is not tried again until the next: %w", in.VolumeID, ErrTransportUnavailable, herr))
+		return p.fail("transport", fmt.Errorf("volume %s: %w: the transport stopped answering earlier in this pass and is not tried again until the next: %w", in.VolumeID, ErrTransportUnavailable, herr))
 	}
-
 	obs, err := r.observe(p.ctx)
 	if err != nil {
-		return ReasonMountFailed, fmt.Errorf("volume %s: %w", in.VolumeID, err)
+		return fmt.Errorf("volume %s: %w", in.VolumeID, err)
 	}
 	if err := it.Converge(p.ctx, in, item.Observed{Mounts: obs}); err != nil {
 		p.noteHung(dir, err)
-		return ReasonMountFailed, p.fail("item", err)
+		return p.fail("item", err)
 	}
+	return nil
+}
 
-	if len(in.Publishes) == 0 {
-		return "", nil
-	}
-	obs, err = r.observe(p.ctx)
-	if err != nil {
-		return ReasonMountFailed, fmt.Errorf("volume %s: %w", in.VolumeID, err)
-	}
-	var errs []error
-	for _, pub := range in.Publishes {
-		if err := p.publish(in, pub, obs); err != nil {
-			p.noteHung(dir, err)
-			errs = append(errs, p.fail("publish", err))
+// errNoChange aborts a store Update that has nothing to write.
+var errNoChange = errors.New("no change")
+
+// prune removes a publish from the volume's record because its target's
+// parent directory is gone. The check is repeated inside the store's
+// read-modify-write: a Publish for the same target that made the directory
+// again and recorded it after this pass loaded the record is kept.
+func (p *pass) prune(in intent.Intent, target string) {
+	r := p.r
+	err := r.store.Update(in.VolumeID, func(rec *intent.Intent) error {
+		if !hasPublish(*rec, target) {
+			return errNoChange
 		}
+		if _, err := os.Stat(filepath.Dir(target)); !errors.Is(err, fs.ErrNotExist) {
+			return errNoChange
+		}
+		kept := rec.Publishes[:0]
+		for _, q := range rec.Publishes {
+			if q.TargetPath != target {
+				kept = append(kept, q)
+			}
+		}
+		rec.Publishes = kept
+		return nil
+	})
+	switch {
+	case err == nil:
+		r.log.Info("removed a publish whose target directory is gone; its pod no longer exists", "volume", in.VolumeID, "target", target)
+	case errors.Is(err, errNoChange):
+	default:
+		r.log.Warn("could not remove a publish whose target directory is gone", "volume", in.VolumeID, "target", target, "error", err)
 	}
-	return ReasonMountFailed, errors.Join(errs...)
 }
 
 // count counts a failed step. A timeout is counted as one too.
@@ -188,8 +257,9 @@ func (p *pass) noteHung(dir string, err error) {
 // starts failing, fails differently, or recovers. A volume that keeps failing
 // the same way is logged at debug level only, so a persistent fault is one
 // event and one warning, not one per pass.
-func (p *pass) noteVolume(id, reason string, err error) {
+func (p *pass) noteVolume(id string, res *volumeResult) {
 	r := p.r
+	err, reason := res.err()
 	prev, had := r.lastErr[id]
 	if err == nil {
 		if had {
@@ -206,6 +276,30 @@ func (p *pass) noteVolume(id, reason string, err error) {
 	r.lastErr[id] = text
 	r.log.Warn("volume did not converge", "volume", id, "error", err)
 	r.events.Event(id, reason, text)
+}
+
+// err joins everything that is wrong with the volume, for logs and events, and
+// names the event reason. A publish that was pruned is not wrong.
+func (res *volumeResult) err() (error, string) {
+	reason := ReasonMountFailed
+	var errs []error
+	if res.stage != nil {
+		errs = append(errs, res.stage)
+		if errors.Is(res.stage, ErrTransportUnavailable) || errors.Is(res.stage, ErrTransportConflict) {
+			reason = ReasonTransportUnavailable
+		}
+	}
+	targets := make([]string, 0, len(res.publish))
+	for t := range res.publish {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+	for _, t := range targets {
+		if err := res.publish[t]; err != nil && !errors.Is(err, errTargetGone) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...), reason
 }
 
 // ensureTransport makes sure the transport at dir is mounted: observed
@@ -303,6 +397,9 @@ func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) 
 			}
 		}
 		if err := r.makeTarget(p.ctx, target); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("volume %s, publish %q: %w: %w", in.VolumeID, target, errTargetGone, err)
+			}
 			return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 		}
 	}
