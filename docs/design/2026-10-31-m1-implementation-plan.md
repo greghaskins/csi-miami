@@ -258,7 +258,14 @@ reports the profile in its own words (`actimeo=30` as the `ac*` options, with
 a default such as `acdirmin=30` left out; `lookupcache=positive` as
 `lookupcache=pos`), and newer kernels add options (`softreval`,
 `fatal_neterrors`) that are not required. The list was taken from a real
-mount by the T4 e2e run. Anything else at the mount point is a conflict,
+mount by the T4 e2e run. Adoption is the profile and nothing that changes
+its meaning, not a byte-exact comparison (`rsize` and `wsize` are
+negotiated, newer kernels add tokens, the MOUNT request adds `mount*`): a
+mount that also has `nocto`, `nosharecache`, `noresvport`, `soft`, `hard`,
+`ro`, an `acdirmin`, `sec`, `lookupcache` or `local_lock` with another
+value, or any per-mount option beyond `rw` and `noatime`, is not adopted.
+The source must match exactly, which is why a server is named one way across
+StorageClasses (section 5). Anything else at the mount point is a conflict,
 reported and never stacked over.
 
 **`local`.** The host path, bind-mounted to `<root>/transports/<ID>` so

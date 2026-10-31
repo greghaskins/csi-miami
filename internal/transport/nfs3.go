@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -39,6 +40,14 @@ const nfs3Profile = "vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupc
 // nfs3Data renders the data string of mount(2): the profile and the address
 // of the server, resolved by the driver so that no helper is needed.
 func nfs3Data(addr string) string { return nfs3Profile + ",addr=" + addr }
+
+// Adoption is "this profile and nothing that changes its meaning", not a
+// byte-exact comparison of the options: rsize and wsize are negotiated with
+// the server, newer kernels add tokens (softreval, fatal_neterrors), and the
+// MOUNT request contributes mountaddr, mountvers, mountport and mountproto.
+// Requiring those would reject this driver's own mount on another kernel or
+// server. So the profile's tokens are required, the tokens that would change
+// its semantics are forbidden, and everything else is ignored.
 
 // nfs3SuperOptions are the tokens that /proc/self/mountinfo must show among a
 // mount's super options for it to be this driver's mount. The kernel reports
@@ -74,9 +83,29 @@ var nfs3SuperOptions = []string{
 	"acdirmax=30",
 }
 
-// nfs3MountOptions are the tokens of the mount's own options (not the super
-// block's) that the profile sets.
-var nfs3MountOptions = []string{"noatime"}
+// nfs3Forbidden are bare super option tokens that change what the profile
+// means, so a mount that has one is not this driver's mount even when every
+// required token is present: no close-to-open consistency (nocto), a
+// superblock not shared with the same export mounted elsewhere
+// (nosharecache), client ports above 1023 (noresvport), and the failure
+// modes the profile exists to avoid (soft, hard) or a read-only super block.
+var nfs3Forbidden = []string{"nocto", "nosharecache", "noresvport", "soft", "hard", "ro"}
+
+// nfs3Pinned are the valued super options, by name, that must have exactly
+// the value the profile gives when they are shown. Absence is fine for
+// acdirmin: the default is not shown, and actimeo=30 lands on it.
+var nfs3Pinned = map[string]string{
+	"acdirmin=":    "acdirmin=30",
+	"sec=":         "sec=sys",
+	"lookupcache=": "lookupcache=pos",
+	"local_lock=":  "local_lock=all",
+}
+
+// nfs3MountOptions are the only tokens the mount's own options (not the super
+// block's) may have, and both must be present: the mount is read-write and
+// noatime, and nosuid, nodev, noexec, ro or any other flag means someone
+// else's mount.
+var nfs3MountOptions = []string{"rw", "noatime"}
 
 // nfs3 is an NFSv3 export mounted with mount(2) at Dir.
 type nfs3 struct {
@@ -88,49 +117,65 @@ func newNFS3(b base) *nfs3 {
 	return &nfs3{base: b, source: b.spec.Server + ":" + b.spec.Export}
 }
 
-// missing lists what the mount lacks of this driver's mount of the export,
-// by token. It is empty when m is that mount. A mount of another file system
-// type or source is reported as that alone: its options say nothing useful.
-func (n *nfs3) missing(m observe.Mount) []string {
-	var out []string
+// differs lists how m differs from this driver's mount of the export; it is
+// empty when m is that mount. A mount of another file system type or source
+// is reported as that alone: its options say nothing useful.
+func (n *nfs3) differs(m observe.Mount) []string {
 	if m.FSType != nfs3FSType {
-		out = append(out, "fstype "+nfs3FSType)
+		return []string{"it is not an " + nfs3FSType + " mount"}
 	}
 	if m.Source != n.source {
-		out = append(out, "source "+n.source)
+		return []string{"its source is not " + n.source + "; a server must be named one way across StorageClasses, so a host name and its address do not match each other"}
 	}
-	if len(out) != 0 {
-		return out
-	}
+	var out []string
 	for _, want := range nfs3SuperOptions {
-		if !hasToken(m.SuperOptions, want) {
-			out = append(out, want)
+		if !slices.Contains(m.SuperOptions, want) {
+			out = append(out, "it lacks "+want)
+		}
+	}
+	for _, tok := range m.SuperOptions {
+		if slices.Contains(nfs3Forbidden, tok) {
+			out = append(out, "it has "+tok)
+			continue
+		}
+		for prefix, allowed := range nfs3Pinned {
+			if strings.HasPrefix(tok, prefix) && tok != allowed {
+				out = append(out, "it has "+tok)
+			}
 		}
 	}
 	for _, want := range nfs3MountOptions {
-		if !hasToken(m.Options, want) {
-			out = append(out, want)
+		if !slices.Contains(m.Options, want) {
+			out = append(out, "it lacks the mount option "+want)
+		}
+	}
+	for _, tok := range m.Options {
+		if !slices.Contains(nfs3MountOptions, tok) {
+			out = append(out, "it has the mount option "+tok)
 		}
 	}
 	return out
 }
 
-func hasToken(tokens []string, want string) bool {
-	for _, t := range tokens {
-		if t == want {
-			return true
-		}
+// judgeTable classifies Dir in t.
+func (n *nfs3) judgeTable(t observe.Table) verdict {
+	v, _ := n.judge(t, func(m observe.Mount) (string, error) {
+		return strings.Join(n.differs(m), ", "), nil
+	})
+	return v
+}
+
+func (n *nfs3) State(ctx context.Context) (State, error) {
+	t, err := n.m.Mounts(ctx)
+	if err != nil {
+		return StateEmpty, err
 	}
-	return false
+	return n.judgeTable(t).state, nil
 }
 
 func (n *nfs3) Mounted(ctx context.Context) (bool, error) {
-	t, err := n.m.Mounts(ctx)
-	if err != nil {
-		return false, err
-	}
-	top, state := n.inspect(t)
-	return state == dirMounted && len(n.missing(top)) == 0, nil
+	s, err := n.State(ctx)
+	return s == StateOurs, err
 }
 
 func (n *nfs3) Mount(ctx context.Context) error {
@@ -138,25 +183,21 @@ func (n *nfs3) Mount(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	top, state := n.inspect(t)
-	switch state {
-	case dirHidden:
-		return n.conflict(top, state, "")
-	case dirMounted:
-		// The Mounter alone would call a mount of the same source a no-op
-		// whatever its options, so the profile is checked here.
-		missing := n.missing(top)
-		if len(missing) == 0 {
-			return nil
-		}
-		return n.conflict(top, state, "it lacks "+strings.Join(missing, ", "))
+	// The Mounter alone would call a mount of the same source a no-op
+	// whatever its options, so the profile is checked here.
+	v := n.judgeTable(t)
+	switch v.state {
+	case StateOurs:
+		return nil
+	case StateForeign, StateHidden:
+		return n.conflict(v)
 	}
 
 	addr, err := n.addr(ctx)
 	if err != nil {
 		return err
 	}
-	if err := n.makeMountPoint(); err != nil {
+	if err := n.makeMountPoint(ctx); err != nil {
 		return err
 	}
 	err = n.m.Mount(ctx, n.source, n.dir, nfs3FSType, nfs3Flags, nfs3Data(addr))
@@ -168,7 +209,9 @@ func (n *nfs3) Mount(ctx context.Context) error {
 
 // addr returns the address for the addr= option: an IP literal as it is, a
 // name resolved by the host resolver under its own deadline, the first
-// address it returns.
+// address it returns. The server name is the key of the lookup in flight:
+// while one that timed out has not returned, the next fails with
+// mount.ErrBusy instead of starting another.
 func (n *nfs3) addr(ctx context.Context) (string, error) {
 	server := n.spec.Server
 	if a, ok := parseIPv6Literal(server); ok {
@@ -178,11 +221,15 @@ func (n *nfs3) addr(ctx context.Context) (string, error) {
 		return a.String(), nil
 	}
 	what := fmt.Sprintf("resolving nfs3 server %q", server)
-	addrs, err := within(ctx, n.opts.ResolveTimeout, what, func(ctx context.Context) ([]net.IPAddr, error) {
-		return n.opts.Resolver.LookupIPAddr(ctx, server)
+	addrs, err := within(ctx, n.opts.ResolveTimeout, what, n.busy, "resolve\x00"+server, func(ctx context.Context) ([]net.IPAddr, error) {
+		a, err := n.opts.Resolver.LookupIPAddr(ctx, server)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", what, err)
+		}
+		return a, nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", what, err)
+		return "", err
 	}
 	if len(addrs) == 0 {
 		return "", fmt.Errorf("%s: the name has no address", what)

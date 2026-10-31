@@ -175,8 +175,8 @@ func TestNFS3FixtureIsAdopted(t *testing.T) {
 	root := t.TempDir()
 	tr := newTransport(t, nfsSpec, root, newFake(nil), Options{})
 	m := kernelNFS3(t, tr.Dir())
-	if got := (&nfs3{base: base{spec: nfsSpec}, source: nfsSource}).missing(m); len(got) != 0 {
-		t.Fatalf("the mount the kernel reports lacks %v; the fixture and the required options disagree", got)
+	if got := (&nfs3{base: base{spec: nfsSpec}, source: nfsSource}).differs(m); len(got) != 0 {
+		t.Fatalf("the mount the kernel reports differs: %v; the fixture and the adoption rule disagree", got)
 	}
 }
 
@@ -942,16 +942,16 @@ func TestResolveDirectory(t *testing.T) {
 
 func TestWithinReturnsAResultThatWonTheRace(t *testing.T) {
 	t.Parallel()
-	got, err := within(context.Background(), time.Minute, "x", func(context.Context) (int, error) { return 7, nil })
+	got, err := within(context.Background(), time.Minute, "x", &inflight{}, "k", func(context.Context) (int, error) { return 7, nil })
 	if err != nil || got != 7 {
 		t.Errorf("got %v, %v; want 7", got, err)
 	}
-	if _, err := within(context.Background(), time.Minute, "x", func(context.Context) (int, error) { return 0, os.ErrClosed }); !errors.Is(err, os.ErrClosed) {
+	if _, err := within(context.Background(), time.Minute, "x", &inflight{}, "k", func(context.Context) (int, error) { return 0, os.ErrClosed }); !errors.Is(err, os.ErrClosed) {
 		t.Errorf("got %v, want the function's error", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := within(ctx, time.Minute, "x", func(context.Context) (int, error) { return 1, nil }); !errors.Is(err, context.Canceled) {
+	if _, err := within(ctx, time.Minute, "x", &inflight{}, "k", func(context.Context) (int, error) { return 1, nil }); !errors.Is(err, context.Canceled) {
 		t.Errorf("got %v, want context.Canceled for a context that is done before the call", err)
 	}
 }

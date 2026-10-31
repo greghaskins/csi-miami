@@ -18,6 +18,13 @@
 // mount at the mount point is a conflict (mount.ErrConflict), never adopted
 // and never stacked over.
 //
+// Adoption is exact about the source: the kernel prints the source of a shared
+// NFS superblock under the spelling of whichever mount came first, so a given
+// server is named one way across all StorageClasses on a cluster (the normal
+// form of a Spec already collapses case and IPv6 spelling). Naming one server
+// by both a host name and an address is unsupported, and shows as a mount
+// conflict.
+//
 // Nothing here execs a helper. Name resolution and host path resolution run
 // under a deadline of their own, and mounting goes through a mount.Mounter,
 // which bounds every system call the same way.
