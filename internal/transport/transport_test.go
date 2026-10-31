@@ -106,11 +106,7 @@ func (r resolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, 
 func ips(addrs ...string) []net.IPAddr {
 	var out []net.IPAddr
 	for _, a := range addrs {
-		zone := ""
-		if i := strings.IndexByte(a, '%'); i >= 0 {
-			a, zone = a[:i], a[i+1:]
-		}
-		out = append(out, net.IPAddr{IP: net.ParseIP(a), Zone: zone})
+		out = append(out, net.IPAddr{IP: net.ParseIP(a)})
 	}
 	return out
 }
@@ -318,7 +314,6 @@ func TestNFS3MountAddr(t *testing.T) {
 		timedOut bool
 	}{
 		{name: "IPv4 literal is used as it is", server: "192.0.2.10", wantAddr: "192.0.2.10"},
-		{name: "IPv6 literal is unbracketed", server: "[2001:db8::1]", wantAddr: "2001:db8::1"},
 		{
 			name: "a name uses the first address", server: "nas.example.com",
 			resolver: resolver(func(_ context.Context, host string) ([]net.IPAddr, error) {
@@ -335,19 +330,21 @@ func TestNFS3MountAddr(t *testing.T) {
 			wantAddr: "198.51.100.7",
 		},
 		{
-			name: "an IPv6 answer", server: "nas.example.com",
-			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return ips("2001:db8::7"), nil }),
-			wantAddr: "2001:db8::7",
+			name: "a dual-stack answer with IPv6 first picks the IPv4 address", server: "nas.example.com",
+			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) {
+				return ips("2001:db8::7", "198.51.100.7"), nil
+			}),
+			wantAddr: "198.51.100.7",
 		},
 		{
-			name: "a scoped IPv6 answer keeps its zone", server: "nas.example.com",
-			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return ips("fe80::7%eth0"), nil }),
-			wantAddr: "fe80::7%eth0",
+			name: "an IPv6-only answer fails", server: "nas.example.com",
+			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return ips("2001:db8::7", "2001:db8::8"), nil }),
+			wantErr:  `"nas.example.com": the name has no IPv4 address`,
 		},
 		{
 			name: "a name with no address", server: "nas.example.com",
 			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return nil, nil }),
-			wantErr:  `"nas.example.com": the name has no address`,
+			wantErr:  `"nas.example.com": the name has no IPv4 address`,
 		},
 		{
 			name: "a failed lookup", server: "nas.example.com",
@@ -404,6 +401,35 @@ func TestNFS3MountAddr(t *testing.T) {
 			}
 			if len(got) == 1 && got[0].Source != spec.Server+":"+spec.Export {
 				t.Errorf("source = %q, want %q", got[0].Source, spec.Server+":"+spec.Export)
+			}
+		})
+	}
+}
+
+// addr must be safe on its own: a Spec that was never validated (built
+// without New) cannot get an IPv6 address through it.
+func TestNFS3AddrRefusesIPv6WithoutValidate(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		server string
+		want   string
+	}{
+		{name: "an IPv6 literal", server: "2001:db8::1", want: "IPv6 is not supported"},
+		{name: "a bracketed IPv6 literal", server: "[2001:db8::1]", want: "no IPv4 address"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res := resolver(func(context.Context, string) ([]net.IPAddr, error) { return nil, nil })
+			n := &nfs3{base: base{
+				spec: Spec{Kind: KindNFS3, Server: tt.server, Export: "/export/data"},
+				opts: Options{Resolver: res, ResolveTimeout: time.Second},
+				busy: &inflight{},
+			}}
+			got, err := n.addr(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("addr() = %q, %v; want an error containing %q", got, err, tt.want)
 			}
 		})
 	}
