@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -105,10 +106,12 @@ func NewServer(o ServerOptions) (*Server, error) {
 	return &Server{path: path, log: log, stopTimeout: stop, grpc: g}, nil
 }
 
-// Listen creates the socket. A stale socket file left by an earlier process
-// is removed first; anything else at the path (a regular file, a directory) is
-// an error and is left alone, because the endpoint is configuration and a
-// mistake in it must not delete data.
+// Listen creates the socket. A stale socket file, one that nothing listens on
+// any more, is removed first. Anything else at the path is an error and is
+// left alone, because the endpoint is configuration and a mistake in it must
+// not delete data or take another process's socket: a regular file or a
+// directory, and a socket that is live (a dial is answered) or that cannot be
+// told to be stale.
 func (s *Server) Listen() error {
 	if s.lis != nil {
 		return errors.New("csi: already listening")
@@ -120,8 +123,8 @@ func (s *Server) Listen() error {
 		if fi.Mode()&fs.ModeSocket == 0 {
 			return fmt.Errorf("csi: %s exists and is not a socket", s.path)
 		}
-		if err := os.Remove(s.path); err != nil {
-			return fmt.Errorf("csi: removing the stale socket: %w", err)
+		if err := removeIfStale(s.path); err != nil {
+			return err
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("csi: %w", err)
@@ -175,4 +178,32 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	return s.Serve(ctx)
+}
+
+// dialTimeout bounds the probe of an existing socket.
+const dialTimeout = 2 * time.Second
+
+// removeIfStale removes the socket file at path if, and only if, connecting to
+// it is refused (ECONNREFUSED): the file is there and nothing listens on it. A
+// connection that succeeds means another process owns the socket, which is an
+// error; any other failure to connect (a permission error, a timeout) leaves
+// it unknown whether the socket is live, and is an error as well.
+func removeIfStale(path string) error {
+	// connect(2) to a file that is not a socket is refused too, so what is
+	// there is checked first, whoever calls.
+	if fi, err := os.Lstat(path); err != nil || fi.Mode()&fs.ModeSocket == 0 {
+		return fmt.Errorf("csi: %s is not a socket, so it is left alone", path)
+	}
+	conn, err := net.DialTimeout("unix", path, dialTimeout)
+	if err == nil {
+		_ = conn.Close()
+		return fmt.Errorf("csi: another process is listening on %s", path)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("csi: cannot tell whether the socket %s is stale, so it is left alone: %w", path, err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("csi: removing the stale socket: %w", err)
+	}
+	return nil
 }

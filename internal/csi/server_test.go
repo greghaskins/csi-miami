@@ -348,3 +348,73 @@ func TestLoggingInterceptorLogsTheVolumeIDAndNothingElse(t *testing.T) {
 		t.Errorf("a successful Probe was logged at info:\n%s", out)
 	}
 }
+
+// A socket that something is listening on belongs to another process: it is
+// not replaced, and it keeps answering.
+func TestListenLeavesALiveSocketAlone(t *testing.T) {
+	t.Parallel()
+	sock := filepath.Join(t.TempDir(), "csi.sock")
+	live, err := NewServer(ServerOptions{Endpoint: "unix://" + sock, Identity: NewIdentity("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := live.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- live.Serve(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	second, err := NewServer(ServerOptions{Endpoint: "unix://" + sock, Identity: NewIdentity("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Listen(); err == nil || !strings.Contains(err.Error(), "another process is listening") {
+		t.Fatalf("Listen over a live socket: %v, want an error saying another process is listening", err)
+	}
+
+	conn, err := grpc.NewClient("unix:"+sock, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	callCtx, callCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer callCancel()
+	info, err := csi.NewIdentityClient(conn).GetPluginInfo(callCtx, &csi.GetPluginInfoRequest{}, grpc.WaitForReady(true))
+	if err != nil || info.GetVendorVersion() != "first" {
+		t.Errorf("the first server no longer answers: %v, %v", info, err)
+	}
+}
+
+// A socket that cannot be told to be stale (here: a connection is refused for
+// a reason other than nobody listening) is left alone too.
+func TestRemoveIfStaleOnlyAfterConnectionRefused(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Not a socket at all: connect(2) to it is refused like a stale socket's,
+	// so the check of what is there is what keeps it.
+	file := filepath.Join(dir, "file")
+	writeFile(t, file, "precious")
+	if err := removeIfStale(file); err == nil || !strings.Contains(err.Error(), "left alone") {
+		t.Errorf("removeIfStale(file) = %v, want an error saying it is left alone", err)
+	}
+	mustExist(t, file)
+
+	// A socket with no listener: connection refused, removed.
+	stale := filepath.Join(dir, "stale.sock")
+	l, err := net.Listen("unix", stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.(*net.UnixListener).SetUnlinkOnClose(false)
+	_ = l.Close()
+	if err := removeIfStale(stale); err != nil {
+		t.Errorf("removeIfStale(stale) = %v", err)
+	}
+	mustNotExist(t, stale)
+}
