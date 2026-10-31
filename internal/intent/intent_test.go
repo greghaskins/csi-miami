@@ -261,3 +261,33 @@ func TestUnescapeRejects(t *testing.T) {
 		})
 	}
 }
+
+// EnsureItem is an informational field: it round-trips, it is left out of the
+// record when false (so the format of every existing record is unchanged and
+// needs no version bump), and a record without it reads false.
+func TestEnsureItemRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := sample("pvc-00000000-0000-4000-8000-000000000001")
+	raw, err := in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "ensureItem") {
+		t.Errorf("a false flag is in the record: %s", raw)
+	}
+	var back Intent
+	if err := back.UnmarshalJSON(raw); err != nil || back.EnsureItem {
+		t.Fatalf("a record without the flag: %v, %v", back.EnsureItem, err)
+	}
+	in.EnsureItem = true
+	raw, err = in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"ensureItem":true`) {
+		t.Errorf("the flag is not in the record: %s", raw)
+	}
+	if err := back.UnmarshalJSON(raw); err != nil || !back.EnsureItem {
+		t.Fatalf("round trip: %v, %v", back.EnsureItem, err)
+	}
+}

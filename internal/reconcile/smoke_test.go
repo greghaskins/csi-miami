@@ -701,3 +701,40 @@ func TestSmokeADerivedDropLeavesAnotherVolumesBindStackedOnOurs(t *testing.T) {
 		t.Errorf("%d mounts at the target, want our bind and the one stacked on it left", c)
 	}
 }
+
+// (7) A local volume whose directory is not there is made by the node at first
+// stage (decision 23), with mode 0755 and without following a symlink on the
+// way; a stage over a directory that is gone is not made again.
+func TestSmokeLocalItemDirectoryIsCreatedAtStage(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+
+	in := n.intent("pvc-00000000-0000-4000-8000-000000000009")
+	in.Subdir = "ns"
+	in.EnsureItem = true // the first stage of a local volume
+	if err := r.Stage(ctx, in); err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	dir := filepath.Join(n.host, "ns", "pvc-00000000-0000-4000-8000-000000000009")
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("the item directory: %v, %v", fi, err)
+	}
+	n.requireBind(in.StagePath, filepath.Join(n.tdir(), "ns", "pvc-00000000-0000-4000-8000-000000000009"), true)
+
+	// A subdir that is a symlink out of the transport is not followed.
+	outside := filepath.Join(n.base, "outside")
+	mkdir(t, outside)
+	if err := os.Symlink(outside, filepath.Join(n.host, "link")); err != nil {
+		t.Fatal(err)
+	}
+	bad := n.intent(pvc2)
+	bad.Subdir = "link"
+	bad.EnsureItem = true
+	if err := r.Stage(ctx, bad); err == nil {
+		t.Fatal("Stage went through a symlink")
+	}
+	if ents, _ := os.ReadDir(outside); len(ents) != 0 {
+		t.Errorf("something was created outside the transport: %v", ents)
+	}
+}

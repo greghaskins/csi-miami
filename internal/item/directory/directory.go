@@ -4,8 +4,14 @@
 // A directory volume lives at <transport mount>/<subdir>/<name>
 // (volume.Context.Dir). Converge checks that it exists and is a directory,
 // then makes the stage path a bind mount of it. The node never creates the
-// directory: the controller does, and a missing one is item.ErrItemMissing,
-// which the CSI layer reports as NotFound. Teardown unmounts the stage path.
+// directory for an nfs3 transport: the controller does, and a missing one is
+// item.ErrItemMissing, which the CSI layer reports as NotFound. For a local
+// transport the controller runs on another node and cannot reach the disk, so
+// the node creates the directory at first stage when it is missing (decision
+// 23; the intent's EnsureItem says it is the first stage, and a later pass that
+// finds the directory missing reports item.ErrItemMissing like nfs3), with mode 0755, relative to descriptors and without following a
+// symlink or crossing a mount. Teardown unmounts the stage path and removes
+// nothing.
 //
 // Nothing is cached. Whether the stage path is already right is decided from
 // the mount table the reconciler hands in, so a restarted process adopts what
@@ -18,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
@@ -25,6 +32,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -53,6 +61,11 @@ type Config struct {
 
 	Stat     func(path string) (fs.FileInfo, error)
 	MkdirAll func(path string, perm fs.FileMode) error
+
+	// Ensure makes the item directory dir below the transport mount mountDir,
+	// with its parents, for a local transport. Nil means a safe creation with
+	// openat2(2) that follows no symlink and crosses no mount.
+	Ensure func(mountDir, dir string) error
 }
 
 // Item is the directory item kind. It is safe for concurrent use.
@@ -81,6 +94,9 @@ func New(cfg Config) (*Item, error) {
 	if cfg.MkdirAll == nil {
 		cfg.MkdirAll = os.MkdirAll
 	}
+	if cfg.Ensure == nil {
+		cfg.Ensure = ensureBeneath
+	}
 	return &Item{cfg: cfg}, nil
 }
 
@@ -90,7 +106,9 @@ func (d *Item) Kind() volume.Kind { return volume.KindDirectory }
 // Converge checks the item directory and makes the stage path a bind of it,
 // each step a no-op when it is already true:
 //
-//  1. The item directory exists and is a directory. The stat runs under the
+//  1. The item directory exists and is a directory; for a local transport a
+//     missing one is created first if in.EnsureItem is set and the stage path
+//     is not yet mounted (see ensure). The stat runs under the
 //     Config.Timeout deadline in its own goroutine, because a stat on a dead
 //     NFS mount never returns; a timeout wraps mount.ErrTimeout, and while
 //     the abandoned stat has not returned the next call fails at once with
@@ -118,7 +136,20 @@ func (d *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed
 		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
 	}
 
-	if err := d.checkDir(ctx, in.VolumeID, dir); err != nil {
+	err = d.checkDir(ctx, in.VolumeID, dir)
+	// Only at first stage (in.EnsureItem, which the node sets when it first
+	// stages a local volume and the reconciler clears once the item has
+	// converged): a directory that is missing later is a disk that is not
+	// mounted, a reboot or a removal, and a new empty directory would put a pod
+	// on an empty volume. A directory that vanishes under a mounted stage is
+	// not made again either: the stage is a bind of the old one.
+	_, staged := obs.Mounts.At(in.StagePath)
+	if errors.Is(err, item.ErrItemMissing) && in.EnsureItem && in.Transport.Kind == transport.KindLocal && !staged {
+		if err = d.ensure(ctx, in, dir); err == nil {
+			err = d.checkDir(ctx, in.VolumeID, dir)
+		}
+	}
+	if err != nil {
 		return err
 	}
 
@@ -159,10 +190,30 @@ func (d *Item) checkDir(ctx context.Context, volumeID, dir string) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("directory item %s: %w: %s", volumeID, item.ErrItemMissing, dir)
+	case errors.Is(err, syscall.ENOTDIR):
+		// An element of the path is a file: the item path is not a directory.
+		return fmt.Errorf("directory item %s: %w: %s", volumeID, item.ErrItemNotDirectory, dir)
 	case err != nil:
 		return fmt.Errorf("directory item %s: %w", volumeID, err)
 	case !fi.IsDir():
 		return fmt.Errorf("directory item %s: %w: %s", volumeID, item.ErrItemNotDirectory, dir)
+	}
+	return nil
+}
+
+// ensure creates the item directory of a local volume, under the same
+// deadline and busy rules as the stat: the controller runs on another node, so
+// the directory is created here at first stage (decision 23).
+func (d *Item) ensure(ctx context.Context, in intent.Intent, dir string) error {
+	mountDir, err := in.Transport.MountPoint(d.cfg.Root)
+	if err != nil {
+		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+	}
+	what := fmt.Sprintf("creating the item directory %q", dir)
+	if _, err := deadline.Run(ctx, d.cfg.Timeout, what, &d.busy, "ensure\x00"+dir, func(context.Context) (struct{}, error) {
+		return struct{}{}, d.cfg.Ensure(mountDir, dir)
+	}); err != nil {
+		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
 	}
 	return nil
 }

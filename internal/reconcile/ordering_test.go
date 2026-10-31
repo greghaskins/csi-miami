@@ -218,9 +218,10 @@ func TestARequestMadeDuringAPassIsServedByTheNextOne(t *testing.T) {
 
 	mustNil(t, "first Stage", <-res1)
 	mustNil(t, "second Stage", <-res2)
-	if got := e.passes(); got < done+2 {
-		t.Errorf("%d passes completed since the second request, want it served by one of its own", got-done)
-	}
+	// A pass reports its duration after it has answered its requests, so the
+	// count can lag the answer by one: wait for it to reach the two passes the
+	// first Stage and the second one's own need.
+	e.waitPasses(done + 2)
 	if !e.isBind(v2.StagePath, e.itemDir("b", pvc2)) {
 		t.Error("the second volume is not staged")
 	}

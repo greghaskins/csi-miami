@@ -52,8 +52,9 @@ type Item interface {
 
 var (
 	// ErrItemMissing is returned when the volume's directory (or file) is not
-	// in the transport. The node never creates it: the controller does. It
-	// wraps fs.ErrNotExist.
+	// in the transport and the node does not create it: the controller does
+	// for nfs3. For a local transport the node creates the directory at first
+	// stage (decision 23). It wraps fs.ErrNotExist.
 	ErrItemMissing = fmt.Errorf("the volume's item does not exist in its transport: %w", fs.ErrNotExist)
 
 	// ErrItemNotDirectory is returned when a directory item's path exists and
@@ -64,6 +65,11 @@ var (
 	// not this volume's. It wraps mount.ErrConflict. Nothing is changed.
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
 )
+
+// ErrNoOpenat2 is returned when the kernel has no openat2(2) (before Linux
+// 5.6), which the creation of an item directory needs to be sure it follows no
+// symlink and crosses no mount. There is no fallback to a path-based creation.
+var ErrNoOpenat2 = errors.New("the node needs openat2(2), which this kernel does not have (Linux 5.6 or newer is required), so nothing is changed")
 
 // ErrObserve is returned when the mount table cannot be read. It is the one
 // error for that, wherever it is found, so that it has one class however the

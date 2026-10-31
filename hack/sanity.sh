@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Runs the csi-sanity suite against the identity and controller services, and
-# the one delete-path guard that needs a second file system.
-# Root only: the delete-path tests mount real file systems and race renames and
-# mounts against the removal; the suite itself runs on a local transport, for
-# which the controller touches no file system. The test binary is built once, then executed under
+# Runs the csi-sanity suite against the identity, controller and node services
+# served together on one socket, and the delete-path guards that need a second
+# file system.
+# Root only: the node half of the suite makes real bind mounts, and the
+# delete-path tests mount real file systems and race renames and mounts against
+# the removal; the suite runs on a local transport, for which the controller
+# touches no file system and the node makes the volume's directory. The test
+# binary is built once, then executed under
 # `unshare --mount --propagation private`, so nothing it mounts is visible
 # outside, or survives it. The test itself fails (never skips) if csi-sanity is
 # not on PATH or it is not root.

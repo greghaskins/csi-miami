@@ -126,6 +126,7 @@ func (e *env) newReconciler(mods ...func(*Options)) *Reconciler {
 func (e *env) dirItem(timeout time.Duration, before func()) (item.Item, error) {
 	return directory.New(directory.Config{
 		Root: e.tRoot, Mounter: e.sim, Timeout: timeout,
+		Ensure: func(_, dir string) error { return os.MkdirAll(e.hostPath(dir), 0o755) }, //nolint:gosec // the mode the directory item makes
 		Stat: func(p string) (fs.FileInfo, error) {
 			if before != nil {
 				before()

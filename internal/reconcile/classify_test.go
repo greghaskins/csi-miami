@@ -31,6 +31,8 @@ func TestClassifyEverySentinel(t *testing.T) {
 		{ErrStagePathOutsideRoot, ClassInvalidArgument},
 		{ErrInvalidRequest, ClassInvalidArgument},
 		{ErrItemMissing, ClassNotFound},
+		{ErrNoOpenat2, ClassUnavailable},
+		{fmt.Errorf("x: %w", ErrNoOpenat2), ClassUnavailable},
 		{fmt.Errorf("x: %w", ErrItemMissing), ClassNotFound},
 		{ErrUnknownVolume, ClassNotFound},
 		{ErrStageConflict, ClassFailedPrecondition},
@@ -169,10 +171,9 @@ func TestTheErrorsThePackageProducesClassifyAsDocumented(t *testing.T) {
 	e.sim.addMount(b.StagePath, "tmpfs", "t")
 	check("a stage over a foreign mount", e.r.Stage(bg, b), ClassFailedPrecondition)
 
-	// An item that is not there, and one that is not a directory.
-	c := e.vol("a", pvc3)
-	mustNil(t, "rm", os.Remove(filepath.Join(e.host("a"), pvc3)))
-	check("a missing item", e.r.Stage(bg, c), ClassNotFound)
+	// An item that is not a directory. (A missing one is made by the node for a
+	// local volume, decision 23, and is the controller's for nfs3: the class of
+	// ErrItemMissing is checked above.)
 	d := e.vol("a", pvc4)
 	mustNil(t, "rm", os.Remove(filepath.Join(e.host("a"), pvc4)))
 	mustNil(t, "file", os.WriteFile(filepath.Join(e.host("a"), pvc4), nil, 0o600))

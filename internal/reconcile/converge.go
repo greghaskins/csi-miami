@@ -250,7 +250,27 @@ func (p *pass) convergeStage(in intent.Intent) error {
 		p.noteHung(dir, err)
 		return p.fail("item", err)
 	}
+	if in.EnsureItem {
+		p.clearEnsureItem(in.VolumeID)
+	}
 	return nil
+}
+
+// clearEnsureItem records that the item has converged once, so that a pass
+// that later finds its directory missing reports it and does not create it. A
+// crash before this keeps the permission; a failure to write it is logged and
+// leaves the permission in place for the next pass to clear.
+func (p *pass) clearEnsureItem(volumeID string) {
+	err := p.r.store.Update(volumeID, func(rec *intent.Intent) error {
+		if !rec.EnsureItem {
+			return errNoChange
+		}
+		rec.EnsureItem = false
+		return nil
+	})
+	if err != nil && !errors.Is(err, errNoChange) {
+		p.r.log.Warn("could not clear the permission to create the item directory", "volume", volumeID, "error", err)
+	}
 }
 
 // errNoChange aborts a store Update that has nothing to write.

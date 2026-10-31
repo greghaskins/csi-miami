@@ -74,6 +74,15 @@ type Intent struct {
 	// "MULTI_NODE_MULTI_WRITER".
 	AccessMode string
 
+	// EnsureItem says the node may create the item directory if it is
+	// missing: set at the first stage of a local volume, cleared after the
+	// item has converged once. A record without it (every record from before
+	// the field) never creates, so a directory that has gone missing from a
+	// disk that was not mounted, or after a reboot, is reported and not
+	// replaced by an empty one. Informational for a version 1 reader, which
+	// ignores it and so never creates: no Version bump.
+	EnsureItem bool
+
 	// Generation counts the writes of the record: the store sets it to one
 	// more than the record it replaces (1 for a new record, whatever the
 	// caller put here), on every Save and Update. It tells a record that was
