@@ -11,4 +11,10 @@
 38 20 8:2 / /mnt/extra rw,relatime shared:7 master:3 propagate_from:2 unbindable - ext4 /dev/sda2 rw
 39 20 0:54 / /srv/odd rw,relatime - fuse.example /srv/with\040space\134back\011tab rw,user_id=0,group_id=0
 40 20 0:40 /vols/pvc-2 /mnt/stage/pvc-2 rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
-41 20 0:55 / /mnt/stage/pvc-2 rw,relatime - tmpfs tmpfs rw,size=64k
+41 40 0:55 / /mnt/stage/pvc-2 rw,relatime - tmpfs tmpfs rw,size=64k
+60 20 0:40 /vols/a /mnt/reuse rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+59 60 0:40 /vols/b /mnt/reuse rw,noatime shared:5 - nfs 198.51.100.10:/export/data rw,vers=3,addr=198.51.100.10
+71 20 0:60 / /mnt/hid rw,noatime - nfs 198.51.100.10:/export/hid rw,vers=3,addr=198.51.100.10
+72 71 0:60 /vols /mnt/hid/vols rw,noatime - nfs 198.51.100.10:/export/hid rw,vers=3,addr=198.51.100.10
+73 71 0:61 / /mnt/hid rw,relatime - tmpfs tmpfs rw,size=64k
+75 37 0:56 / /mnt/scratch/inner rw,relatime - tmpfs tmpfs rw,size=32k

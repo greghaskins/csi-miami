@@ -24,7 +24,7 @@ func loadFixture(t *testing.T) Table {
 func TestParseFixture(t *testing.T) {
 	t.Parallel()
 	tbl := loadFixture(t)
-	if got, want := len(tbl), 14; got != want {
+	if got, want := len(tbl), 20; got != want {
 		t.Fatalf("parsed %d mounts, want %d", got, want)
 	}
 
