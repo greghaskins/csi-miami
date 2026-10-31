@@ -7,9 +7,10 @@
 #
 # The smoke tests live in internal/mount, which they exercise together with
 # internal/observe, in internal/transport, which they exercise on top of both,
-# and in internal/reconcile, which runs the node reconciler on a real local
-# transport. Each package is built as its own test binary and run in its own
-# namespace.
+# in internal/reconcile, which runs the node reconciler on a real local
+# transport, and in cmd/miami, which runs the node command and drives it over
+# its CSI socket. Each package is built as its own test binary and run in its
+# own namespace.
 #
 # If SMOKE_ARTIFACT_DIR is set, a failing test leaves mountinfo-<test>.txt
 # there: the lines of /proc/self/mountinfo for its own temporary paths, and
@@ -41,14 +42,15 @@ fi
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-for pkg in mount transport reconcile; do
-  go test -c -tags smoke -o "$dir/$pkg.test" "./internal/$pkg"
+for path in internal/mount internal/transport internal/reconcile cmd/miami; do
+  pkg="$(basename "$path")"
+  go test -c -tags smoke -o "$dir/$pkg.test" "./$path"
 
   # A renamed test or a changed build tag would make the run below print "no
   # tests to run" and exit 0, so the tests must be listed first.
   listed="$("$dir/$pkg.test" -test.list '^TestSmoke')"
   if ! grep -q '^TestSmoke' <<<"$listed"; then
-    echo "smoke: internal/$pkg has no TestSmoke* test in the smoke build" >&2
+    echo "smoke: $path has no TestSmoke* test in the smoke build" >&2
     exit 1
   fi
 

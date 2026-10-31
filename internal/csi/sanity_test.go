@@ -22,14 +22,20 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
+	"github.com/greghaskins/csi-miami/internal/intent"
 	kubefake "github.com/greghaskins/csi-miami/internal/kube/fake"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/reconcile"
 )
 
 // This test runs the csi-sanity suite (the binary on PATH, pinned in mise.toml)
-// against the identity and controller services served on a real unix socket,
-// on a local transport, for which the controller touches no file system. The
+// against the identity, controller and node services served together on one
+// real unix socket, on a local transport: the controller touches no file system
+// for it, and the node creates the volume's directory at first stage (decision
+// 23), binds it at the stage path and at the publish targets with real mounts,
+// through the same reconciler, intent store and Mounter that `miami node`
+// builds. The
 // tests below it in this file mount real file systems and need root and a
 // private mount namespace, which hack/sanity.sh provides; all of them fail,
 // and do not skip, when they cannot run.
@@ -49,9 +55,10 @@ import (
 //     PV. The harness records the PV after a successful CreateVolume and
 //     forgets it after a successful DeleteVolume.
 //
-// The node service is T7's: the harness serves only NodeGetInfo, which the
-// suite's controller publish lifecycle asks for, and the suite's node specs
-// are skipped.
+// The node service is the real one. The suite reaches it with the volumes the
+// controller made, the context the controller returned and the staging and
+// target paths it chose, which are inside the node's staging root and outside
+// it respectively, as kubelet's are.
 
 const sanityNode = "sanity-node"
 
@@ -63,34 +70,9 @@ var sanitySkips = []string{
 	// (decision 23). Listing what the controller made on a mounted transport is
 	// proved by TestListVolumes with an nfs3 transport.
 	`ListVolumes check the presence of new volumes and absence of deleted ones in the volume list`,
-	// The node service is T7's.
-	`Node Service`,
 	// The controller accepts any node on publish, by design (the volumes need
 	// no attachment), so it cannot tell that a node does not exist.
 	`ControllerPublishVolume should fail when the node does not exist`,
-}
-
-type nodeStub struct{ csi.UnimplementedNodeServer }
-
-func (nodeStub) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	return &csi.NodeGetInfoResponse{
-		NodeId:             sanityNode,
-		AccessibleTopology: &csi.Topology{Segments: map[string]string{TopologyKeyNode: sanityNode}},
-	}, nil
-}
-
-// The suite's cleanup asks the node to unpublish and unstage what it created;
-// the stub has nothing to undo.
-func (nodeStub) NodeUnpublishVolume(context.Context, *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	return &csi.NodeUnpublishVolumeResponse{}, nil
-}
-
-func (nodeStub) NodeUnstageVolume(context.Context, *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	return &csi.NodeUnstageVolumeResponse{}, nil
-}
-
-func (nodeStub) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	return &csi.NodeGetCapabilitiesResponse{}, nil
 }
 
 // provisionerName maps a name the suite chose to the pvc-<uuid> name the
@@ -162,12 +144,15 @@ func TestSanity(t *testing.T) {
 	}
 
 	dir := resolved(t, t.TempDir())
-	root := filepath.Join(dir, "root")
+	root := filepath.Join(dir, "root")          // the controller's transports root
+	nodeRoot := filepath.Join(dir, "node-root") // the node's transports root
+	stageRoot := filepath.Join(dir, "stage-root")
 	// Registered after the temporary directory, so it runs before its removal:
-	// the controller leaves its transports mounted for the life of the process.
-	t.Cleanup(func() { unmountBelow(t, root) })
+	// the controller and the node leave their transports mounted for the life
+	// of the process, and the node its binds if the suite did not clean up.
+	t.Cleanup(func() { unmountBelow(t, dir) })
 	host := filepath.Join(dir, "host")
-	for _, d := range []string{root, host} {
+	for _, d := range []string{root, nodeRoot, stageRoot, host} {
 		if err := os.Mkdir(d, 0o750); err != nil {
 			t.Fatal(err)
 		}
@@ -182,11 +167,35 @@ func TestSanity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mounter := mount.New(10 * time.Second)
+	store, err := intent.Open(filepath.Join(dir, "intents"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := reconcile.New(store, mounter, reconcile.Options{
+		TransportsRoot: nodeRoot, StageRoot: stageRoot, Interval: time.Second, Logger: log,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recCtx, recCancel := context.WithCancel(context.Background())
+	recDone := make(chan error, 1)
+	go func() { recDone <- rec.Run(recCtx) }()
+	defer func() {
+		recCancel()
+		if err := <-recDone; err != nil {
+			t.Errorf("reconciler: %v", err)
+		}
+	}()
+	node, err := NewNode(NodeOptions{NodeID: sanityNode, Reconciler: NodeBackend{Reconciler: rec, Store: store}, Mounter: mounter, Log: log})
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv, err := NewServer(ServerOptions{
 		Endpoint:     "unix://" + sock,
 		Identity:     NewIdentity("sanity"),
 		Controller:   ctrl,
-		Node:         nodeStub{},
+		Node:         node,
 		Interceptors: []grpc.UnaryServerInterceptor{provisionerStandIn(pvs)},
 		Log:          log,
 	})
@@ -210,7 +219,7 @@ func TestSanity(t *testing.T) {
 		"-csi.endpoint=unix://" + sock,
 		"-csi.testvolumeparameters=" + params,
 		"-csi.mountdir=" + filepath.Join(dir, "target"),
-		"-csi.stagingdir=" + filepath.Join(dir, "staging"),
+		"-csi.stagingdir=" + filepath.Join(stageRoot, "staging"),
 		"-ginkgo.skip=" + strings.Join(sanitySkips, "|"),
 		"-ginkgo.v",
 	}

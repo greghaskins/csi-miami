@@ -234,6 +234,31 @@ Choices made in T8 where the plan was silent:
 - A second request for a volume whose first is still running is `Aborted`.
 - `mount_flags` in a capability are ignored: the driver owns the mount options.
 
+Choices made in T7 where the plan was silent:
+
+- A volume ID that does not parse is `InvalidArgument` for stage, unstage and
+  unpublish (a request the driver could never have been given), and `NotFound`
+  for publish and volume stats (a volume that is not staged here).
+- A repeated `NodeStageVolume` is compared with the intent record before the
+  reconciler is called: another volume context or staging path is
+  `AlreadyExists`. A publish whose `staging_target_path` is not the staged
+  record's is `FailedPrecondition`.
+- `NodeGetVolumeStats` answers for the stage path and the publish targets of a
+  staged volume (`NotFound` otherwise). The CSI specification this driver is
+  built against (v1.13) has removed `VolumeCondition` from the response, so a
+  statfs that fails or times out is an answer with no usage and a warning in
+  the log, never an error.
+- `NodeUnpublishVolume` removes the target directory with `rmdir(2)` after the
+  unmount, which csi-sanity asks of a plugin that created it (the reconciler
+  makes it at publish when kubelet has not). A directory that cannot be removed
+  does not fail the call.
+- Events go to the PV named by the volume ID, through the dynamic client
+  rather than client-go's recorder and typed events client: a small recorder
+  that queues, so the converge loop never waits for the API server, and names
+  an event by PV, reason and message so that a repeat bumps its count.
+- The controller serves metrics on `:9811` and the node on `:9810`, both on
+  the host network; an empty `--metrics-addr` turns the endpoint off.
+
 ## 7. Controller
 
 - Stateless. Mounts transports with the same `internal/transport` code
@@ -391,11 +416,14 @@ through a single replacement.
 
 On the node (`--metrics-addr`, default `:9810`, served on the host network):
 
-- `miami_intents{kind}` gauge; `miami_transports{kind,id}` gauge with a
-  `mounted` label.
+- `miami_intents{kind}` gauge; `miami_transports{kind,id}` gauge whose value
+  is 1 when the transport was found mounted and 0 when not (a `mounted` label
+  would leave a stale series at every change).
 - `miami_reconcile_duration_seconds` histogram; `miami_reconcile_errors_total{step}`.
 - `miami_observation_timeouts_total{op}`; `miami_garbage_unmounts_total`.
-- `miami_intent_load_failures_total`.
+- `miami_intent_load_failures`: a gauge, the number of records unreadable in
+  the latest pass (it falls when a person repairs one), not the counter the
+  first draft named.
 - `miami_csi_requests_total{method,code}` and a duration histogram, from a
   gRPC interceptor, on both roles.
 
@@ -419,7 +447,7 @@ documented way to coordinate writers on a directory item; `flock` is not.
 [Persistent]`); ServiceAccounts, ClusterRoles and bindings (controller:
 PV get/list/watch, PVC get/list/watch/update, StorageClass get/list/watch,
 VolumeAttachment and its status, Node get/list/watch, CSINode get/list/watch,
-events, leases; node: Node get, events); the controller Deployment
+events, leases; node: PV get, events create and patch); the controller Deployment
 (provisioner with `--extra-create-metadata --feature-gates=Topology=true`,
 attacher, resizer kept out until M2, livenessprobe); the node DaemonSet
 (registrar, livenessprobe, `Bidirectional` kubelet dir and transports

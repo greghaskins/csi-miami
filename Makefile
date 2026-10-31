@@ -93,13 +93,12 @@ envtest:
 	KUBEBUILDER_ASSETS="$$(setup-envtest use $(ENVTEST_K8S_VERSION) --print path)" \
 		go test -tags envtest -count=1 ./internal/csi
 
-# The csi-sanity suite (pinned in mise.toml) against the identity and
-# controller services, on a local transport, for which the controller touches
-# no file system; and the tests of the delete path that mount real file
-# systems (a tmpfs, bind mounts) and race a rename or a mount against the
+# The csi-sanity suite (pinned in mise.toml) against the identity, controller
+# and node services served together, on a local transport, with real bind
+# mounts for the node half; and the tests of the delete path that mount real
+# file systems (a tmpfs, bind mounts) and race a rename or a mount against the
 # removal. ROOT ONLY: run it as `sudo -E env "PATH=$PATH" make sanity`, with
-# the pinned Go and csi-sanity on PATH. The node service is not part of this run. A
-# separate CI job, not part of `check`. The suite serves on a unix socket under
+# the pinned Go and csi-sanity on PATH. A separate CI job, not part of `check`. The suite serves on a unix socket under
 # TMPDIR, whose path is limited to about 100 bytes: if TMPDIR is long, point it
 # at a short directory (TMPDIR=/tmp) for the run.
 sanity:
