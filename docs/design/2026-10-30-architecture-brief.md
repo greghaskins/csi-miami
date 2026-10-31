@@ -1,8 +1,8 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 5 recorded (section 8)
+**Status:** Draft, decisions 1 to 8 recorded (section 8)
 **Created:** 2026-10-30
-**Updated:** 2026-10-30
+**Updated:** 2026-10-31
 
 MIAMI = Mounting Items Atop My Infrastructure. csi-miami is a Kubernetes
 CSI driver that mounts *items* (an ext4 image file, a node-local image, a
@@ -36,7 +36,8 @@ are stated here as design inputs, not as history.
 | `VolumeCondition`, `GET_VOLUME_STATS` | yes |
 | Multi-arch image (arm64, amd64), kustomize base pinned by tag | yes |
 | `ReadWriteMany` directory item straight on the transport (no loop) | yes, section 4.8 |
-| Writable cross-node Secret directory through FUSE | rejected, section 4.9 |
+| `ReadWriteMany` on an image volume, re-exported from the holder node | milestone 4, section 4.9 |
+| Writable cross-node Secret directory through FUSE | rejected, section 4.10 |
 | Node-local persistent and scratch tiers | future, section 5 |
 | S3-compatible object service built on the driver | future, section 5 |
 
@@ -125,12 +126,15 @@ pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    b
                     ▲                         ▲                             ▲
                   Item                   ImageItem                    DirectoryItem
                     ▲                         ▲                             ▲
-                Transport                       nfs3 / smb / local
+                Transport               nfs3 / smb / local        nfs3 / local / export
+                                                                  (export = a holder node's
+                                                                   re-exported image, 4.9)
 ```
 
 - **Transport**: yields a directory on this node. `nfs3` (server, export,
   driver-owned options), `local` (a host path; also how a pre-mounted SMB or
-  FUSE directory is used), later `smb`. Identified by a short hash of its
+  FUSE directory is used), `export` (another node's re-exported image,
+  NFSv4, section 4.9), later `smb`. Identified by a short hash of its
   canonical config, mounted once per node at `<root>/transports/<id>`.
 - **Item**: a thing inside a transport directory that becomes a mount.
   `image` (sparse ext4 `.img`, optional LUKS2, single-node) and
@@ -202,7 +206,7 @@ the ID, so the controller reads the PV for those two calls (Kubernetes
 no PV succeeds without deleting and logs it). This maximizes flexibility:
 no 128-byte constraint on the ID, a transport change (server address,
 export path) is corrected by editing a PV rather than re-provisioning, and
-static provisioning works, which both migration (4.10) and adopting
+static provisioning works, which both migration (4.11) and adopting
 pre-existing images need. The controller never deletes on doubt: if the
 rebuilt transport config does not contain the named file, it returns
 `Unavailable`.
@@ -225,9 +229,20 @@ idempotent against the file; a size mismatch is `AlreadyExists`.
    `volumesInUse`/`volumesAttached`, and the holder is stale for 30s; or
    the transport is fenceable, the holder node is not Ready, and the holder
    is older than the takeover timeout.
+4. **Two clocks must agree before any timed takeover.** The holder's age
+   is measured on the transport's clock (probe-file mtime minus holder
+   mtime), and the taker must additionally have observed the holder's
+   renewal counter unchanged for the full period on its own monotonic
+   clock. The second condition makes a server clock jump harmless: it
+   cannot make every live holder look stale at once. **Decision 7: no
+   Kubernetes Lease beside the holder.** In the partition that matters
+   (holder reaches the NAS but not the API server) a Lease expires while
+   the holder keeps writing, so a Lease-driven takeover would corrupt the
+   image; in every other partition the holder plus Node status already
+   decide correctly.
 
-The simplification is in **who decides fenceability**. The driver owns a
-named NFSv3 transport profile (`nfsvers=3,proto=tcp,soft,timeo=100,
+The simplification is in **who decides fenceability**. **Decision 8:
+the driver owns mount options.** The driver owns a named NFSv3 transport profile (`nfsvers=3,proto=tcp,soft,timeo=100,
 retrans=3,nolock` plus a small allowlist of NAS-specific extras such as
 `noatime`, `actimeo`), so the NFS major timeout `S` is a constant of the
 profile, the takeover timeout `T` is one driver flag validated against it
@@ -280,7 +295,51 @@ stale-lock rule on the server's mtime. The driver ships a small
 `miami lock` helper (run, hold, release, break-if-older-than) so that
 wrappers around non-cooperating writers do not reinvent it.
 
-### 4.9 Rejected: FUSE-backed Kubernetes object volumes
+### 4.9 `ReadWriteMany` on an image: re-export from the holder node
+
+Two nodes can never loop-mount one ext4 image, so the only honest
+many-node access to an image is for one node to stage it and serve it to
+the others. An image item whose StorageClass sets `export: nfs4` accepts
+`MULTI_NODE_MULTI_WRITER` and works like this:
+
+- **Holder node**: stages the image exactly as in 4.5 (loop, optional
+  dm-crypt, ext4, holder file), then exports the stage mount through the
+  kernel NFS server: one export per volume with its own `fsid`, NFSv4 only
+  (no portmapper, no mountd on the wire), restricted to node addresses.
+  The holder file records the export address.
+- **Other nodes**: stage the volume by mounting the holder's export as an
+  `export` transport (NFSv4.2, driver-owned options) and bind it into pods.
+  Discovery is the holder file on the shared transport; the data path has
+  no API-server dependency.
+- **Semantics**: pods on the holder node get full local ext4 semantics;
+  pods elsewhere get NFSv4 close-to-open semantics, with mode bits intact
+  (the server is a Linux kernel, not NAS firmware) and real cross-node
+  locking. The kernel NFS server takes its locks in the same lock table as
+  local processes, so holder-local pods and remote pods lock coherently
+  against each other.
+- **Lifecycle**: the holder keeps the image staged and exported while any
+  remote node has it mounted, tracked by per-node client markers
+  (`<name>.client.<node>`) beside the holder file; its own pods leaving
+  does not release it. When the holder dies, a client node promotes
+  itself through the normal holder acquisition and fencing path,
+  re-exports, and every other client remounts when it sees the holder
+  file change. Recovery is tear-down-and-reattach, already the normal
+  path.
+- **Cost**: remote writes cross the network twice, and the holder node is
+  load-bearing for that volume until a takeover completes (bounded by the
+  takeover timeout). Documented, and acceptable where the alternative is
+  losing POSIX semantics.
+
+In the layer vocabulary the holder's export is just another transport, so
+an RWX image volume is a directory item on an `export` transport; the CSI
+surface hides that and presents one PVC.
+
+Node prerequisites: the `nfsd` kernel module and the kernel server's
+userspace (`rpc.nfsd`, `rpc.mountd`, `exportfs`) available to the
+DaemonSet, which already runs with host networking. A node without them
+can still be a client.
+
+### 4.10 Rejected: FUSE-backed Kubernetes object volumes
 
 Considered and rejected for v1. A Secret or ConfigMap rendered as a
 writable directory through FUSE, with a lock behind it, solves the
@@ -294,7 +353,7 @@ Secret must remain the source of truth, a sidecar mirroring the file into
 it is simpler than a filesystem. This can be revisited if a consumer
 appears that needs the API-server guarantees specifically.
 
-### 4.10 Migration from an existing file-backed driver
+### 4.11 Migration from an existing file-backed driver
 
 **Decision 4: a rename tool.** Per volume, with the workload scaled to
 zero: set the old PV's `reclaimPolicy` to `Retain`; delete the PVC and the
@@ -306,7 +365,7 @@ the rename it expects, or runs it over the mounted transport when given
 access. Both drivers can be installed side by side during the window;
 nothing forces a flag day.
 
-### 4.11 Observability and security posture
+### 4.12 Observability and security posture
 
 - Prometheus `/metrics` on both roles: staged volumes by kind and
   transport, holder renew latency and failures, transport health, fenced
@@ -371,7 +430,8 @@ RWO volume with takeover; the service is a consumer, not an item kind.
 
 ## 7. Non-goals
 
-- RWX on image items; only directory items are many-node.
+- Mounting one image on two nodes at once; many-node access to an image is
+  only ever through the holder's export (4.9).
 - Online expansion, snapshots, clones, block mode, fsTypes other than ext4.
 - Any cross-node locking guarantee on directory items beyond what `mkdir`
   and `O_EXCL` give.
@@ -387,25 +447,28 @@ Recorded:
 2. **Controller shape**: option A, stateless and privileged, never formats.
 3. **Volume ID**: opaque; all config in the volume context; PV lookup for
    delete and expand. Chosen for flexibility and compatibility.
-4. **Migration**: rename tool with static PVs (4.10).
+4. **Migration**: rename tool with static PVs (4.11).
 5. **License**: GPL-3.0. The sidecars are separate images and the Go
    dependencies (gRPC, CSI spec, kernel-interface libraries) are
    Apache-2.0 or BSD, which flow into GPLv3 without conflict.
 
+6. **FUSE-backed object volumes**: rejected in favour of directory items
+   plus a locking wrapper (4.8, 4.10).
+7. **No Kubernetes Lease** beside the transport-clock holder; timed
+   takeover requires both the transport-clock age and the taker's own
+   observation period (4.5).
+8. **Driver-owned mount options** through named transport profiles (4.5).
+
 Pending:
 
-6. **FUSE-backed object volumes**: rejected in favour of directory items
-   plus a locking wrapper (4.8, 4.9); confirm.
-7. **A Kubernetes Lease alongside the transport-clock holder**: proposed
-   no; the transport clock covers the partition that matters (NAS reachable,
-   API server not).
-8. **Transport profile ownership**: driver-dictated named profiles
-   (proposed) versus raw option strings in StorageClasses.
 9. **Active failed-volume probe** for kernels whose mountinfo shows
    nothing, or document the gap.
-10. **Whether directory items replace a separate NFS CSI driver** in the
-    first deployment or later.
-11. **Which node-local tier comes first** once section 5.1 is scheduled,
+10. **Directory items replace a separate NFS CSI driver**: agreed in
+    principle; decide whether in the first deployment or after M1 settles.
+11. **Re-export server** for RWX images: the kernel NFS server (proposed:
+    lowest overhead, coherent locking with local processes) versus a
+    userspace server that needs no host packages.
+12. **Which node-local tier comes first** once section 5.1 is scheduled,
     and whether it displaces an existing local-path provisioner.
 
 ## 9. Milestones (proposal)
@@ -417,4 +480,7 @@ Pending:
 2. **M2, recovery**: failed-volume detection, shared remediation package
    and VAP, re-stage via the publish secret, canaries, migration tooling.
 3. **M3, directory items** and the `miami lock` helper.
-4. **Later**: node-local tiers (5.1), then the S3 service (5.2).
+4. **M4, RWX images** via holder-node re-export (4.9): `export`
+   transport, client markers, promotion on takeover, e2e with a holder
+   kill while remote clients write.
+5. **Later**: node-local tiers (5.1), then the S3 service (5.2).
