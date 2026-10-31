@@ -26,9 +26,10 @@ type Intent struct {
 	VolumeID  string         `json:"volumeID"`
 	Kind      volume.Kind    `json:"kind"`
 	Transport transport.Spec `json:"transport"`
-	// Name is the item's name inside the transport: the subdirectory of a
-	// directory volume.
-	Name       string    `json:"name"`
+	// Subdir is the optional prefix under the transport; the item's
+	// directory is <transport mount>/<Subdir>/<volume name>. It may be empty
+	// once volume.Context allows that.
+	Subdir     string    `json:"subdir"`
 	StagePath  string    `json:"stagePath"`
 	Publishes  []Publish `json:"publishes,omitempty"`
 	MountFlags []string  `json:"mountFlags,omitempty"`
@@ -37,7 +38,7 @@ type Intent struct {
 
 // Validate reports whether the Intent is a well-formed record: the version is
 // Version, the volume ID parses and agrees with Kind, the transport and the
-// name pass the rules of the transport and volume packages, the stage path is
+// subdir pass the rules of the transport and volume packages, the stage path is
 // absolute and clean, and every publish target is absolute, clean and unique.
 func (in Intent) Validate() error {
 	if in.Version != Version {
@@ -52,9 +53,9 @@ func (in Intent) Validate() error {
 	}
 	// The volume context carries the same three fields under the same
 	// rules; reuse its check rather than restate it.
-	ctx := volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Name}
+	ctx := volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir}
 	if err := ctx.Validate(); err != nil {
-		return fmt.Errorf("kind, transport or name: %w", err)
+		return fmt.Errorf("kind, transport or subdir: %w", err)
 	}
 	if err := checkPath("stagePath", in.StagePath); err != nil {
 		return err
