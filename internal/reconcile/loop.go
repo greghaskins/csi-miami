@@ -164,7 +164,7 @@ func (r *Reconciler) noteLoadFailures(failures []intent.LoadFailure) {
 	for _, f := range failures {
 		now[f.Path] = struct{}{}
 		if _, seen := r.failedLoad[f.Path]; !seen {
-			r.log.Error("an intent record could not be loaded and is ignored; fix or remove the file",
+			r.log.Error("an intent record could not be loaded and is ignored; repair the file or, if the volume is gone, remove it. Removing the record of a volume still in use unmounts it",
 				"path", f.Path, "volume", f.VolumeID, "error", f.Err)
 		}
 	}

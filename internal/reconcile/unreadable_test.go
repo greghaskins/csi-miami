@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -235,5 +236,29 @@ func TestARecordThatIsNotAFileIsUnknownNotAbsent(t *testing.T) {
 	}
 	if err := e.r.Unpublish(bg, id, e.target("p")); !errors.Is(err, ErrIntentsUnknown) {
 		t.Errorf("Unpublish = %v", err)
+	}
+}
+
+// The log line for an unreadable record tells a person what is safe: removing
+// the record of a volume that is still in use unmounts it.
+func TestTheLogLineForAnUnreadableRecordWarnsAboutRemovingIt(t *testing.T) {
+	t.Parallel()
+	lg, buf := logger()
+	e := newEnv(t, func(o *Options) { o.Logger = lg })
+	in := e.vol("a", "pvc-1")
+	mustNil(t, "save", e.store.Save(in))
+	e.breakRecord(in.VolumeID)
+	e.pass()
+	e.pass()
+	out := buf.String()
+	if !strings.Contains(out, "repair the file or, if the volume is gone, remove it") ||
+		!strings.Contains(out, "Removing the record of a volume still in use unmounts it") {
+		t.Errorf("the log does not say what to do:\n%s", out)
+	}
+	if strings.Contains(out, "fix or remove") {
+		t.Error("the old advice is still in the log")
+	}
+	if n := strings.Count(out, "could not be loaded"); n != 1 {
+		t.Errorf("%d lines for one unreadable record over two passes, want 1", n)
 	}
 }

@@ -58,6 +58,10 @@ import (
 // once per change of the set of failed records, counted in the load-failure
 // gauge, and the file is kept; collection resumes on its own the first pass
 // after every record reads, whether a person fixed it or the error passed.
+// What a person should do is repair the file or, if the volume is gone, remove
+// it. Removing the record of a volume that is still in use unmounts it: with
+// the record gone the volume has no intent, and its stage is garbage by rule
+// (a) and its publishes by the derived half of rule (b) on the next pass.
 // This is the cost of the rule: one record that stays broken suspends
 // collection node-wide, which leaks mounts and does not unmount a pod's data.
 //
