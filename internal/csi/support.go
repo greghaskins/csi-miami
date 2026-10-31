@@ -125,8 +125,10 @@ func blocking[T any](ctx context.Context, l *opLimiter, group, key string, fn fu
 	}
 	done := make(chan result, 1)
 	go func() {
-		defer release()
 		v, err := fn()
+		// Released before the result is sent, so that a caller that has its
+		// result can start the next operation on the same key at once.
+		release()
 		done <- result{v, err}
 	}()
 	select {

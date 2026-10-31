@@ -230,3 +230,16 @@ func TestListVolumesFailsWhenTheCallerGivesUp(t *testing.T) {
 		t.Errorf("code = %v, want Canceled", codeOf(err))
 	}
 }
+
+// An operation that has returned its result has released its slot: the next one
+// on the same key, started at once, is never refused.
+func TestBlockingReleasesTheSlotBeforeTheCallerSeesTheResult(t *testing.T) {
+	t.Parallel()
+	var l opLimiter
+	for i := 0; i < 2000; i++ {
+		got, err := blocking(context.Background(), &l, "g", "k", func() (int, error) { return i, nil })
+		if err != nil || got != i {
+			t.Fatalf("call %d: %d, %v", i, got, err)
+		}
+	}
+}
