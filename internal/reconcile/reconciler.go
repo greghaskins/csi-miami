@@ -241,6 +241,10 @@ func strictlyBelow(dir, path string) bool { return path != dir && within(dir, pa
 // errors are InvalidArgument statuses from those packages, or
 // ErrStagePathOutsideRoot.
 //
+// A record that exists decides the intent's EnsureItem (the permission to
+// create a missing item directory, see intent.Intent); a new record takes the
+// caller's.
+//
 // Stage is idempotent. in.Publishes is ignored: publishes belong to Publish
 // and Unpublish, and a record that already has some keeps them, so a second
 // NodeStage for a volume that pods are using (kubelet repeats it after its
@@ -289,6 +293,10 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 	}
 	if ok {
 		in.Publishes = prev.Publishes
+		// Under the volume's lock the record is the truth about whether the
+		// item has converged: a caller that read it earlier must not give the
+		// permission back after the loop took it.
+		in.EnsureItem = prev.EnsureItem
 	}
 	if err := r.store.Save(in); err != nil {
 		return fmt.Errorf("recording the intent of %s: %w", in.VolumeID, err)

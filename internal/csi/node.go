@@ -16,6 +16,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
+	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -251,6 +252,13 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	if ok && (prev.Context() != vc || prev.StagePath != in.StagePath) {
 		return nil, status.Errorf(codes.AlreadyExists, "volume %s is already staged with another volume context or staging path", in.VolumeID)
 	}
+	// The node may create a local volume's directory at its first stage
+	// (decision 23) and never after: a retried stage keeps what the record has.
+	if ok {
+		in.EnsureItem = prev.EnsureItem
+	} else {
+		in.EnsureItem = vc.Transport.Kind == transport.KindLocal
+	}
 	if err := n.rec.Stage(ctx, in); err != nil {
 		return nil, nodeStatus(err)
 	}
@@ -342,10 +350,12 @@ func (n *Node) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVo
 // NodeGetVolumeStats reports the capacity and inode usage of a staged volume's
 // stage path or of one of its publish targets. A volume that is not staged, or
 // a path that is neither, is NotFound. A file system that cannot be read
-// (a statfs that fails or times out) is not an error of the call: the answer
-// carries no usage and the reason is logged. The CSI specification this driver
-// is built against (v1.13) has removed the VolumeCondition field of this
-// response, so an abnormal condition cannot be reported in it.
+// (a statfs that fails or times out) fails the call with the code of its class
+// (DeadlineExceeded for a timeout, Unavailable for a busy path, Internal for
+// an unexpected errno), so that a wedged transport is counted as the failure it
+// is. The CSI specification this driver is built against (v1.13) has removed
+// the VolumeCondition field of this response, so there is nowhere to report an
+// abnormal condition alongside an answer.
 func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, invalidf("volume_id is required")
@@ -371,7 +381,7 @@ func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeSta
 	st, err := n.m.Statfs(sctx, req.GetVolumePath())
 	if err != nil {
 		n.log.Warn("volume stats: the file system could not be read", "volume_id", id.String(), "reason", reason(err), "error", err.Error())
-		return &csi.NodeGetVolumeStatsResponse{}, nil
+		return nil, nodeStatus(fmt.Errorf("volume stats of %s: %w", id, err))
 	}
 	return &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}, nil
 }

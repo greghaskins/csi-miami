@@ -407,14 +407,29 @@ func TestTheItemDirectoryOfALocalVolumeIsCreatedAtStage(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	in := e.vol("a", pvc1)
+	in.EnsureItem = true // the first stage of a local volume (decision 23)
 	mustNil(t, "save", e.store.Save(in))
 	item := filepath.Join(e.host("a"), pvc1)
 	mustNil(t, "remove", os.Remove(item))
-	// A local volume's directory is made by the node at stage (decision 23).
 	mustNil(t, "converge", e.converge(in.VolumeID))
 	if fi, err := os.Stat(item); err != nil || !fi.IsDir() {
 		t.Fatalf("the item directory was not created: %v", err)
 	}
+	// The item has converged once: the permission is spent, and a directory
+	// that is missing later is reported, not made again.
+	if rec, _, _ := e.store.Get(in.VolumeID); rec.EnsureItem {
+		t.Error("the permission to create the item directory was not cleared")
+	}
+	e.sim.remove(in.StagePath)
+	mustNil(t, "remove again", os.Remove(item))
+	if err := e.converge(in.VolumeID); !errors.Is(err, ErrItemMissing) {
+		t.Fatalf("a missing directory after the first converge: %v, want ErrItemMissing", err)
+	}
+	if _, err := os.Stat(item); err == nil {
+		t.Fatal("the directory was made again")
+	}
+	mustNil(t, "restore", os.Mkdir(item, 0o750))
+	mustNil(t, "converge", e.converge(in.VolumeID))
 	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("not bound")
 	}

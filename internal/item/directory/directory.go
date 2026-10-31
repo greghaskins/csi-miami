@@ -8,7 +8,8 @@
 // item.ErrItemMissing, which the CSI layer reports as NotFound. For a local
 // transport the controller runs on another node and cannot reach the disk, so
 // the node creates the directory at first stage when it is missing (decision
-// 23), with mode 0755, relative to descriptors and without following a
+// 23; the intent's EnsureItem says it is the first stage, and a later pass that
+// finds the directory missing reports item.ErrItemMissing like nfs3), with mode 0755, relative to descriptors and without following a
 // symlink or crossing a mount. Teardown unmounts the stage path and removes
 // nothing.
 //
@@ -23,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
@@ -105,8 +107,8 @@ func (d *Item) Kind() volume.Kind { return volume.KindDirectory }
 // each step a no-op when it is already true:
 //
 //  1. The item directory exists and is a directory; for a local transport a
-//     missing one is created first if the stage path is not yet mounted (see
-//     ensure). The stat runs under the
+//     missing one is created first if in.EnsureItem is set and the stage path
+//     is not yet mounted (see ensure). The stat runs under the
 //     Config.Timeout deadline in its own goroutine, because a stat on a dead
 //     NFS mount never returns; a timeout wraps mount.ErrTimeout, and while
 //     the abandoned stat has not returned the next call fails at once with
@@ -135,11 +137,14 @@ func (d *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed
 	}
 
 	err = d.checkDir(ctx, in.VolumeID, dir)
-	// Only at first stage: a directory that vanishes under a stage that is
-	// mounted was removed by someone, and a new empty one would not be the
-	// volume the stage is a bind of.
+	// Only at first stage (in.EnsureItem, which the node sets when it first
+	// stages a local volume and the reconciler clears once the item has
+	// converged): a directory that is missing later is a disk that is not
+	// mounted, a reboot or a removal, and a new empty directory would put a pod
+	// on an empty volume. A directory that vanishes under a mounted stage is
+	// not made again either: the stage is a bind of the old one.
 	_, staged := obs.Mounts.At(in.StagePath)
-	if errors.Is(err, item.ErrItemMissing) && in.Transport.Kind == transport.KindLocal && !staged {
+	if errors.Is(err, item.ErrItemMissing) && in.EnsureItem && in.Transport.Kind == transport.KindLocal && !staged {
 		if err = d.ensure(ctx, in, dir); err == nil {
 			err = d.checkDir(ctx, in.VolumeID, dir)
 		}
@@ -185,6 +190,9 @@ func (d *Item) checkDir(ctx context.Context, volumeID, dir string) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("directory item %s: %w: %s", volumeID, item.ErrItemMissing, dir)
+	case errors.Is(err, syscall.ENOTDIR):
+		// An element of the path is a file: the item path is not a directory.
+		return fmt.Errorf("directory item %s: %w: %s", volumeID, item.ErrItemNotDirectory, dir)
 	case err != nil:
 		return fmt.Errorf("directory item %s: %w", volumeID, err)
 	case !fi.IsDir():

@@ -234,6 +234,7 @@ func TestNodeStageBuildsTheIntent(t *testing.T) {
 	want := intent.Intent{
 		Version: intent.Version, VolumeID: nodeVol, Kind: volume.KindDirectory, Transport: localCtx.Transport, Subdir: "ns",
 		StagePath: stagePath, AccessMode: "MULTI_NODE_MULTI_WRITER", MountFlags: []string{"noatime"},
+		EnsureItem: true, // the first stage of a local volume
 	}
 	if len(rec.staged) != 1 || fmt.Sprint(rec.staged[0]) != fmt.Sprint(want) {
 		t.Errorf("staged %+v, want %+v", rec.staged, want)
@@ -562,13 +563,20 @@ func TestNodeGetVolumeStats(t *testing.T) {
 			t.Errorf("code %v", codeOf(err))
 		}
 	})
-	t.Run("a statfs that fails does not fail the call", func(t *testing.T) {
+	t.Run("a statfs that fails fails the call with the code of its class", func(t *testing.T) {
 		t.Parallel()
-		for _, serr := range []error{unix.ESTALE, mount.ErrTimeout, context.DeadlineExceeded} {
-			sf := &fakeStatfs{err: serr}
+		for _, tt := range []struct {
+			err  error
+			want codes.Code
+		}{
+			{fmt.Errorf("x: %w", mount.ErrTimeout), codes.DeadlineExceeded},
+			{mount.ErrBusy, codes.Unavailable},
+			{unix.ESTALE, codes.Internal},
+		} {
+			sf := &fakeStatfs{err: tt.err}
 			resp, err := newTestNode(t, &fakeRec{record: stagedRecord()}, sf).NodeGetVolumeStats(ctx, req(stagePath))
-			if err != nil || len(resp.GetUsage()) != 0 {
-				t.Errorf("%v: resp %v, err %v", serr, resp, err)
+			if codeOf(err) != tt.want || resp != nil {
+				t.Errorf("%v: resp %v, code %v, want %v", tt.err, resp, codeOf(err), tt.want)
 			}
 		}
 	})
@@ -592,5 +600,38 @@ func TestNodeBackendGetReadsTheStore(t *testing.T) {
 	got, ok, err := b.Get(nodeVol)
 	if err != nil || !ok || got.StagePath != stagePath {
 		t.Fatalf("Get = %+v, %v, %v", got, ok, err)
+	}
+}
+
+// The permission to create a local volume's directory is given at the first
+// stage and only then: a retried stage keeps what the record has, a record
+// without it stays without, and nfs3 never has it.
+func TestNodeStageEnsureItem(t *testing.T) {
+	t.Parallel()
+	nfsReq := stageReq()
+	nfsReq.VolumeContext = volume.Context{Kind: volume.KindDirectory, Transport: nfsSpec}.Encode()
+	withFlag := func(v bool) *intent.Intent { r := stagedRecord(); r.EnsureItem = v; return r }
+	tests := []struct {
+		name   string
+		req    *csi.NodeStageVolumeRequest
+		record *intent.Intent
+		want   bool
+	}{
+		{"first stage of a local volume", stageReq(), nil, true},
+		{"first stage of an nfs3 volume", nfsReq, nil, false},
+		{"a retry before the first converge keeps it", stageReq(), withFlag(true), true},
+		{"a repeat after the first converge does not give it back", stageReq(), withFlag(false), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rec := &fakeRec{record: tt.record}
+			if _, err := newTestNode(t, rec, nil).NodeStageVolume(context.Background(), tt.req); err != nil {
+				t.Fatal(err)
+			}
+			if len(rec.staged) != 1 || rec.staged[0].EnsureItem != tt.want {
+				t.Errorf("staged %+v, want EnsureItem %v", rec.staged, tt.want)
+			}
+		})
 	}
 }

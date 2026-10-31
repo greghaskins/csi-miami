@@ -140,3 +140,23 @@ func TestAnIntentOfAnUnhandledKindFailsOnlyThatVolume(t *testing.T) {
 		t.Errorf("errors = %v", e.metrics.errors)
 	}
 }
+
+// A record that exists decides the permission to create the item directory: a
+// Stage whose caller read the record before the loop cleared the flag cannot
+// give it back, and a new record takes the caller's.
+func TestStageKeepsTheRecordsEnsureItem(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", pvc1)
+	in.EnsureItem = true
+	mustNil(t, "first Stage", e.r.Stage(bg, in))
+	got, _ := e.intentOf(in.VolumeID)
+	if got.EnsureItem {
+		t.Fatal("the flag survived the first converge")
+	}
+	mustNil(t, "second Stage", e.r.Stage(bg, in)) // a caller with a stale read
+	if got, _ = e.intentOf(in.VolumeID); got.EnsureItem {
+		t.Error("a Stage gave the permission back")
+	}
+}

@@ -31,6 +31,8 @@ func TestClassifyEverySentinel(t *testing.T) {
 		{ErrStagePathOutsideRoot, ClassInvalidArgument},
 		{ErrInvalidRequest, ClassInvalidArgument},
 		{ErrItemMissing, ClassNotFound},
+		{ErrNoOpenat2, ClassUnavailable},
+		{fmt.Errorf("x: %w", ErrNoOpenat2), ClassUnavailable},
 		{fmt.Errorf("x: %w", ErrItemMissing), ClassNotFound},
 		{ErrUnknownVolume, ClassNotFound},
 		{ErrStageConflict, ClassFailedPrecondition},

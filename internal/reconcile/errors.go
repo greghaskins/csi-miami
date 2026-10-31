@@ -44,7 +44,7 @@ import (
 //	 6. ErrSuperseded                             ClassAborted           Aborted
 //	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
 //	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
-//	    ErrObserve, mount.ErrBusy, ErrStopped, EBUSY
+//	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, ErrStopped, EBUSY
 //	 9. anything else                             ClassInternal          Internal
 //
 // Consequences worth knowing. A mount.ErrTimeout wraps context.DeadlineExceeded
@@ -115,7 +115,7 @@ func Classify(err error) Class {
 		return ClassAborted
 	case errors.Is(err, mount.ErrTimeout):
 		return ClassDeadlineExceeded
-	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrObserve), errors.Is(err, mount.ErrBusy),
+	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy),
 		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY):
 		return ClassUnavailable
 	default:
@@ -192,6 +192,10 @@ var (
 	// a transport not in normal form, a record that is not structurally
 	// sound). It wraps the error that says which.
 	ErrInvalidRequest = errors.New("the request is not valid")
+
+	// ErrNoOpenat2 is returned when the kernel has no openat2(2), which the
+	// creation of a local volume's directory needs. It is item.ErrNoOpenat2.
+	ErrNoOpenat2 = item.ErrNoOpenat2
 
 	// ErrObserve is returned when the mount table cannot be read (it is
 	// item.ErrObserve). It wraps the read error. Retrying is the remedy.

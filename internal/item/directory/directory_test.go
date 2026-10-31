@@ -8,8 +8,11 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
@@ -256,6 +259,13 @@ func TestConvergeErrors(t *testing.T) {
 				fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
 			},
 			[]error{item.ErrItemMissing, fs.ErrNotExist}},
+		{"an element of the path is a file", []observe.Mount{rootMount(), transportMount()},
+			func(fx *fixture, _ *intent.Intent) {
+				fx.statFn = func(string) (fs.FileInfo, error) {
+					return nil, &fs.PathError{Op: "stat", Path: "x", Err: syscall.ENOTDIR}
+				}
+			},
+			[]error{item.ErrItemNotDirectory}},
 		{"not a directory", []observe.Mount{rootMount(), transportMount()},
 			func(fx *fixture, _ *intent.Intent) {
 				fx.statFn = func(string) (fs.FileInfo, error) { return dirInfo{}, nil }
@@ -481,7 +491,7 @@ func TestConvergeCreatesAMissingLocalItemDirectory(t *testing.T) {
 		return dirInfo{dir: true}, nil
 	}
 	fx.ensure = func(string, string) error { made = true; return nil }
-	if err := fx.converge(theIntent()); err != nil {
+	if err := fx.converge(firstStage()); err != nil {
 		t.Fatal(err)
 	}
 	if want := [][2]string{{tdir(), itemDir()}}; !slices.Equal(fx.ensured, want) {
@@ -495,11 +505,35 @@ func TestConvergeCreatesAMissingLocalItemDirectory(t *testing.T) {
 
 // An nfs3 volume's directory is the controller's to create: missing is
 // ErrItemMissing and nothing is created.
+// The permission to create is the intent's, set at the first stage of a local
+// volume and cleared after the item converged once.
+func firstStage() intent.Intent {
+	in := theIntent()
+	in.EnsureItem = true
+	return in
+}
+
+// A record without the permission (every record from before the field, and
+// every one after its first converge) never creates: a directory that is
+// missing then is a disk that is not mounted or a removal, and a new empty
+// directory would put the pod on an empty volume.
+func TestConvergeNeverCreatesWithoutThePermission(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, rootMount(), transportMount())
+	fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+	if err := fx.converge(theIntent()); !errors.Is(err, item.ErrItemMissing) {
+		t.Fatalf("got %v, want ErrItemMissing", err)
+	}
+	if len(fx.ensured) != 0 || len(fx.binds()) != 0 {
+		t.Errorf("created %v, called %+v", fx.ensured, fx.binds())
+	}
+}
+
 func TestConvergeNeverCreatesAnNFSItemDirectory(t *testing.T) {
 	t.Parallel()
 	fx := newFixture(t, rootMount(), transportMount())
 	fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
-	in := theIntent()
+	in := firstStage()
 	in.Transport = nfsSpec
 	if err := fx.converge(in); !errors.Is(err, item.ErrItemMissing) {
 		t.Fatalf("got %v, want ErrItemMissing", err)
@@ -515,7 +549,7 @@ func TestConvergeDoesNotRecreateUnderAMountedStage(t *testing.T) {
 	t.Parallel()
 	fx := newFixture(t, rootMount(), transportMount(), stageBind())
 	fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
-	if err := fx.converge(theIntent()); !errors.Is(err, item.ErrItemMissing) {
+	if err := fx.converge(firstStage()); !errors.Is(err, item.ErrItemMissing) {
 		t.Fatalf("got %v, want ErrItemMissing", err)
 	}
 	if len(fx.ensured) != 0 {
@@ -530,7 +564,7 @@ func TestConvergeLocalCreationFailures(t *testing.T) {
 		fx := newFixture(t, rootMount(), transportMount())
 		fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
 		fx.ensure = func(string, string) error { return os.ErrPermission }
-		if err := fx.converge(theIntent()); !errors.Is(err, os.ErrPermission) {
+		if err := fx.converge(firstStage()); !errors.Is(err, os.ErrPermission) {
 			t.Fatalf("got %v", err)
 		}
 		if len(fx.binds()) != 0 {
@@ -544,10 +578,10 @@ func TestConvergeLocalCreationFailures(t *testing.T) {
 		fx := newFixture(t, rootMount(), transportMount())
 		fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
 		fx.ensure = func(string, string) error { <-release; return nil }
-		if err := fx.converge(theIntent()); !errors.Is(err, mount.ErrTimeout) {
+		if err := fx.converge(firstStage()); !errors.Is(err, mount.ErrTimeout) {
 			t.Fatalf("got %v, want ErrTimeout", err)
 		}
-		if err := fx.converge(theIntent()); !errors.Is(err, mount.ErrBusy) {
+		if err := fx.converge(firstStage()); !errors.Is(err, mount.ErrBusy) {
 			t.Fatalf("got %v, want ErrBusy", err)
 		}
 	})
@@ -555,7 +589,7 @@ func TestConvergeLocalCreationFailures(t *testing.T) {
 		t.Parallel()
 		fx := newFixture(t, rootMount(), transportMount())
 		fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
-		if err := fx.converge(theIntent()); !errors.Is(err, item.ErrItemMissing) {
+		if err := fx.converge(firstStage()); !errors.Is(err, item.ErrItemMissing) {
 			t.Fatalf("got %v, want ErrItemMissing", err)
 		}
 	})
@@ -630,6 +664,12 @@ func TestEnsureBeneath(t *testing.T) {
 			if err := ensureBeneath(base, dir); err == nil {
 				t.Errorf("%s accepted", dir)
 			}
+		}
+	})
+	t.Run("a kernel without openat2 is ErrNoOpenat2", func(t *testing.T) {
+		t.Parallel()
+		if err := openError("x", unix.ENOSYS); !errors.Is(err, item.ErrNoOpenat2) {
+			t.Errorf("got %v", err)
 		}
 	})
 	t.Run("fails if the mount directory is missing", func(t *testing.T) {

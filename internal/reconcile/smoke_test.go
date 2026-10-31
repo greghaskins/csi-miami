@@ -712,6 +712,7 @@ func TestSmokeLocalItemDirectoryIsCreatedAtStage(t *testing.T) {
 
 	in := n.intent("pvc-00000000-0000-4000-8000-000000000009")
 	in.Subdir = "ns"
+	in.EnsureItem = true // the first stage of a local volume
 	if err := r.Stage(ctx, in); err != nil {
 		t.Fatalf("Stage: %v", err)
 	}
@@ -729,6 +730,7 @@ func TestSmokeLocalItemDirectoryIsCreatedAtStage(t *testing.T) {
 	}
 	bad := n.intent(pvc2)
 	bad.Subdir = "link"
+	bad.EnsureItem = true
 	if err := r.Stage(ctx, bad); err == nil {
 		t.Fatal("Stage went through a symlink")
 	}

@@ -18,6 +18,9 @@ type wireIntent struct {
 	Publishes  []Publish       `json:"publishes,omitempty"`
 	MountFlags []string        `json:"mountFlags,omitempty"`
 	AccessMode string          `json:"accessMode"`
+	// EnsureItem is informational for a version 1 reader, which ignores it
+	// (and then never creates a directory); a record without it reads false.
+	EnsureItem bool `json:"ensureItem,omitempty"`
 	// Generation is informational for a version 1 reader, which ignores it;
 	// a record without it reads as 0.
 	Generation uint64 `json:"generation"`
@@ -49,6 +52,7 @@ func toWire(in Intent) wireIntent {
 		Publishes:  in.Publishes,
 		MountFlags: in.MountFlags,
 		AccessMode: in.AccessMode,
+		EnsureItem: in.EnsureItem,
 		Generation: in.Generation,
 	}
 }
@@ -69,6 +73,7 @@ func fromWire(w wireIntent) Intent {
 		Publishes:  w.Publishes,
 		MountFlags: w.MountFlags,
 		AccessMode: w.AccessMode,
+		EnsureItem: w.EnsureItem,
 		Generation: w.Generation,
 	}
 }

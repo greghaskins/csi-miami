@@ -66,6 +66,11 @@ var (
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
 )
 
+// ErrNoOpenat2 is returned when the kernel has no openat2(2) (before Linux
+// 5.6), which the creation of an item directory needs to be sure it follows no
+// symlink and crosses no mount. There is no fallback to a path-based creation.
+var ErrNoOpenat2 = errors.New("the node needs openat2(2), which this kernel does not have (Linux 5.6 or newer is required), so nothing is changed")
+
 // ErrObserve is returned when the mount table cannot be read. It is the one
 // error for that, wherever it is found, so that it has one class however the
 // request that met it came by it. Retrying is the remedy.

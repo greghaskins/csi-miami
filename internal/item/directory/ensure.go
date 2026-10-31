@@ -102,6 +102,8 @@ func openOrMake(dirfd int, name string) (int, error) {
 // has to fix.
 func openError(name string, err error) error {
 	switch {
+	case errors.Is(err, unix.ENOSYS):
+		return item.ErrNoOpenat2
 	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.EXDEV), errors.Is(err, unix.ENOTDIR):
 		return fmt.Errorf("%w: %s is a symlink, a mount point or not a directory", item.ErrItemNotDirectory, name)
 	default:
