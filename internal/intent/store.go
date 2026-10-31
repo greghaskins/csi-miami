@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 )
@@ -208,6 +209,36 @@ func (s *Store) Delete(volumeID string) error {
 		return fmt.Errorf("intent store: delete: %w", err)
 	}
 	return syncDir(s.dir)
+}
+
+// DeleteIf removes the record for a volume only if it is still exactly want,
+// under the Store's lock, and reports whether it did. A caller that decided to
+// delete on the strength of a record it read earlier uses it so that a change
+// made since, by a Save or an Update, is never deleted unseen. A record that
+// has changed, and a record that is already gone, are (false, nil); a record
+// that cannot be read is an error, because it is not known to be the one the
+// caller read. The directory is synced after the unlink.
+func (s *Store) DeleteIf(volumeID string, want Intent) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, ok, err := s.getLocked(volumeID)
+	if err != nil {
+		return false, err
+	}
+	if !ok || !reflect.DeepEqual(cur, want) {
+		return false, nil
+	}
+	if err := os.Remove(filepath.Join(s.dir, s.fileName(volumeID))); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("intent store: delete: %w", err)
+	}
+	if err := syncDir(s.dir); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // Load reads every *.json record in the directory and removes stale temp

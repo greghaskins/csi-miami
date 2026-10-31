@@ -288,6 +288,57 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteIf(t *testing.T) {
+	t.Parallel()
+	s, _ := openStore(t)
+	a := sample("pvc-a")
+	mustSave(t, s, a)
+	mustSave(t, s, sample("pvc-b"))
+
+	// A record changed since it was read is kept.
+	changed := a
+	changed.Publishes = []Publish{{TargetPath: "/pods/p1/mount"}}
+	mustSave(t, s, changed)
+	if ok, err := s.DeleteIf(a.VolumeID, a); err != nil || ok {
+		t.Fatalf("DeleteIf of a stale copy = %v, %v; want false, nil", ok, err)
+	}
+	if _, ok, _ := s.Get(a.VolumeID); !ok {
+		t.Fatal("a changed record was deleted")
+	}
+
+	// The record as it is goes, and only it.
+	if ok, err := s.DeleteIf(a.VolumeID, changed); err != nil || !ok {
+		t.Fatalf("DeleteIf = %v, %v; want true, nil", ok, err)
+	}
+	if _, ok, _ := s.Get(a.VolumeID); ok {
+		t.Error("the record is still there")
+	}
+	if _, ok, _ := s.Get("directory:pvc-b"); !ok {
+		t.Error("another volume's record went")
+	}
+
+	// Gone already is not an error and not a deletion.
+	if ok, err := s.DeleteIf(a.VolumeID, changed); err != nil || ok {
+		t.Errorf("DeleteIf of a missing record = %v, %v; want false, nil", ok, err)
+	}
+}
+
+func TestDeleteIfUnreadableRecord(t *testing.T) {
+	t.Parallel()
+	s, dir := openStore(t)
+	a := sample("pvc-a")
+	mustSave(t, s, a)
+	if err := os.WriteFile(filepath.Join(dir, "directory%3Apvc-a.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.DeleteIf(a.VolumeID, a); err == nil || ok {
+		t.Fatalf("DeleteIf = %v, %v; want an error and no deletion", ok, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "directory%3Apvc-a.json")); err != nil {
+		t.Errorf("the unreadable record was removed: %v", err)
+	}
+}
+
 func TestDeleteError(t *testing.T) {
 	t.Parallel()
 	s, dir := openStore(t)
