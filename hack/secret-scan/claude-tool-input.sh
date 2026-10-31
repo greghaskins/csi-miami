@@ -5,7 +5,6 @@
 # GitHub-publishing calls are scanned, and for those a missing config
 # blocks rather than passes.
 set -euo pipefail
-. "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 input=$(cat)
 tool=$(jq -r '.tool_name // ""' <<<"$input")
 case "$tool" in
@@ -15,10 +14,12 @@ case "$tool" in
     grep -q -E '(^|[;&| ])gh +(pr|issue|release|api|repo) ' <<<"$cmd" || exit 0 ;;
   *) exit 0 ;;
 esac
-if ! command -v gitleaks >/dev/null || [[ -z "${GITLEAKS_CONFIG_TOML:-}" ]]; then
+# Only now, for a GitHub-publishing call: a missing config blocks the call.
+if ! (. "$(dirname "${BASH_SOURCE[0]}")/env.sh") 2>/dev/null || ! command -v gitleaks >/dev/null; then
   echo "secret-scan: gitleaks and GITLEAKS_CONFIG_TOML (or its _B64 form) are required before publishing to GitHub" >&2
   exit 2
 fi
+. "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 if ! jq -r '.tool_input' <<<"$input" | gitleaks stdin --redact --no-banner --exit-code 1 >/dev/null 2>&1; then
   echo "secret-scan: the tool input matched secret scanning; not sent" >&2
   exit 2
