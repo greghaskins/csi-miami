@@ -43,7 +43,9 @@ For each row of the plan's work breakdown (section 15):
    row, its acceptance check, and pointers to the brief and plan sections
    it touches. The brief is the only context the subagent has; it must be
    self-contained.
-2. Branch name `m1/tNN-<slug>` from current `main`. The subagent writes
+2. Branch name `m1/tNN-<slug>` from current `main`; the orchestrator may
+   instead base a task on an unmerged predecessor's branch when the wave
+   needs it, and says so in the PR. The subagent writes
    code and tests, runs `make check`, pushes, opens the PR with a body that
    states what the acceptance check proved, and reports back.
 3. The orchestrator reviews every PR itself and runs an independent
@@ -73,7 +75,8 @@ At most three subagents at a time, in the plan's dependency order:
 | 8 | T11, T12 | last |
 
 A wave starts when every PR of the previous wave it depends on is merged;
-subagents branch from `main`, never from each other.
+subagents branch from `main`; the orchestrator may base a task on an
+unmerged predecessor's branch when the wave needs it, and says so in the PR.
 
 ## 4. Models
 

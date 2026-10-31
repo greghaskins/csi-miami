@@ -335,7 +335,8 @@ Sidecars pinned by digest. Resource requests and limits on every container.
   (`E2E_TRANSPORT=local|nfs3`), `image`, `check` (everything CI runs,
   minus the per-arch and manifest steps). `make check` is what a PR must
   pass locally.
-- `mise.toml` grows: `go` (pinned, also the `toolchain` in `go.mod`),
+- `mise.toml` grows: `go` (pinned; `go.mod` carries the same `go`
+  directive and `GOTOOLCHAIN=local` keeps that toolchain the only one),
   `golangci-lint`, `kind`, `kubectl`, `csi-sanity`, `setup-envtest`.
 
 ## 14. CI
@@ -348,7 +349,8 @@ Workflows, all pinned by SHA with least permissions:
   `unshare --mount`: transport survives a plugin restart, bind adoption,
   garbage unmount, simulated reboot via a fresh mount namespace),
   `sanity` (matrix), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
-  on arm64), `manifest` (`main` only), `ci-ok`.
+  on arm64), `manifest` (every PR: the multi-arch index from the digests
+  the build legs ran), `publish` (`main` only: the sha alias), `ci-ok`.
 - `secret-scan.yml` and `secret-scan-text.yml`: already present.
 - Path filters skip heavy jobs for docs-only changes; `ci-ok` still runs.
 - No retries. Failure uploads mountinfo, plugin logs and kind logs.
