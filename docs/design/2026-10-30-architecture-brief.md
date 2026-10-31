@@ -487,12 +487,13 @@ digest-pinned musl distribution that installs `e2fsprogs` and `cryptsetup`;
 a script computes the shared-library closure of exactly the binaries the
 driver calls. Stage two is `scratch` with that closure and the Go binary,
 cross-compiled from `TARGETARCH` with `CGO_ENABLED=0`. No shell, no package
-manager, no `busybox`; roughly 10 to 15 MB per architecture. Multi-arch is
-one `buildx --platform=linux/amd64,linux/arm64` invocation: emulation is
-used only to run the package install for arm64, which is file extraction
-and takes seconds; the Go compile is never emulated. `buildx` emits the
-SBOM and provenance attestations. The controller is the same image with a
-different subcommand.
+manager, no `busybox`; roughly 10 to 15 MB per architecture. Each
+architecture is built natively on its own runner (`ubuntu-latest` for
+amd64, GitHub's arm64 Ubuntu runner for arm64), so nothing is ever
+emulated, and a separate job combines the two per-arch tags into the
+multi-arch manifest with `buildx imagetools create`. `buildx` emits the
+SBOM and provenance attestations per architecture. The controller is the
+same image with a different subcommand.
 
 Updates are ordinary dependency bumps: the dependency bot moves the pinned
 base digest, CI rebuilds and scans, the PR merges. There is no separately
@@ -540,24 +541,27 @@ Runtime posture:
   dependency updates for Go modules, GitHub Actions and sidecar images by
   automated PRs. Actions are pinned by commit SHA, and every workflow
   declares the least `permissions:` it needs.
-- Multi-arch (`linux/amd64`, `linux/arm64`) is one `buildx` invocation;
-  no job compiles under emulation. Native arm64 runners, when available,
-  run the arm64 smoke test rather than the build.
+- Multi-arch (`linux/amd64`, `linux/arm64`) is two native builds and one
+  manifest job; nothing runs under emulation, and the arm64 binary is
+  smoke-tested on arm64 hardware before it is published. GitHub's hosted
+  arm64 runners are free for public repositories and billed for private
+  ones, which matters only until the repository is public.
 
 ### 7.3 CI: fast by parallelism, robust by running the real thing
 
 Every PR runs the full set below as parallel jobs; nothing waits for
 `main`. The target is under ten minutes wall clock.
 
-| Job | What it proves | Needs |
+| Job | What it proves | Runs on |
 |---|---|---|
-| `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | cache |
-| `unit` | `go test -race -shuffle=on ./...` with coverage | cache |
-| `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | setup-envtest cache |
-| `build` | `buildx` for both platforms from the one Dockerfile, image tarball uploaded as an artifact | buildx and Go caches |
-| `smoke` | root on the runner: loop devices, ext4, LUKS2, `unshare --mount` plugin replacement, simulated reboot | the image artifact |
-| `sanity` | csi-sanity against the binary | the image artifact |
-| `e2e` matrix `local`, `nfs3`, `nfs4` | kind cluster, real NFS server container (kernel server for `nfs3` and `nfs4`), fault injection: server restart, partition, plugin restart, force detach, surge rollout, holder kill with remote writers | the image artifact |
+| `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | amd64 |
+| `unit` | `go test -race -shuffle=on ./...` with coverage | amd64 |
+| `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | amd64 |
+| `build` (matrix) | native `buildx` from the one Dockerfile, per-arch image pushed as `:<sha>-<arch>` on `main`, uploaded as an artifact on PRs | amd64 and arm64 |
+| `smoke` (matrix) | root on the runner: loop devices, ext4, LUKS2, `unshare --mount` plugin replacement, simulated reboot | amd64 and arm64, from that arch's image |
+| `sanity` (matrix) | csi-sanity against the binary | amd64 and arm64 |
+| `e2e` matrix `local`, `nfs3`, `nfs4` | kind cluster, real NFS server container (kernel server for `nfs3` and `nfs4`), fault injection: server restart, partition, plugin restart, force detach, surge rollout, holder kill with remote writers | amd64; `nfs3` also on arm64 |
+| `manifest` | `buildx imagetools create` combining the per-arch tags into the multi-arch tag, then signing | `main` and releases only |
 | `ci-ok` | a single required check that depends on all of the above | nothing |
 
 Rules that keep it honest:
@@ -570,18 +574,19 @@ Rules that keep it honest:
   use explicit hooks (a debug endpoint that pauses renewals, a controllable
   clock) rather than sleeps, and every wait polls a condition with a
   deadline.
-- **Build once, test everywhere.** The image is built one time per PR and
-  every downstream job consumes the artifact, so smoke, sanity and e2e all
-  test the bytes that would ship.
+- **Build once per architecture, test everywhere.** Each architecture's
+  image is built one time per PR and every downstream job for that
+  architecture consumes the artifact, so smoke, sanity and e2e all test
+  the bytes that would ship, on the hardware they would ship to.
 - **Superseded runs are cancelled** (concurrency group per branch), job
   timeouts are set, and on failure every job uploads mountinfo, `losetup`,
   dm state, kernel log excerpts and the plugin's logs as artifacts.
 - `make check` runs the same targets locally with the same flags, so a
   green local run predicts CI.
-- On `main` and nightly: the multi-arch build, the `nfs4` and arm64 smoke
-  variants if they were path-filtered, and the release pipeline (PR-driven:
-  cut-release opens a release PR, merging it tags, builds, signs and
-  publishes).
+- On `main` and nightly: the manifest job, any variants that were
+  path-filtered, and the release pipeline (PR-driven: cut-release opens a
+  release PR, merging it tags, runs the two native builds and the manifest
+  job, signs and publishes).
 
 ## 8. Non-goals
 
@@ -629,7 +634,9 @@ Recorded:
 13. **Image**: one multi-stage Dockerfile built with `buildx`: `scratch`
     plus the static Go binary, `e2fsprogs`, `cryptsetup` and their library
     closure from a digest-pinned builder; no shell, no mount helpers, no
-    separately maintained base image (7.1).
+    separately maintained base image. Built natively per architecture on
+    amd64 and arm64 runners, never emulated, combined by a manifest job
+    (7.1, 7.3).
 14. **Syscalls and ioctls over shell-outs** for NFS mounts, loop devices,
     fencing and probes (7.1), each proven on real NFSv3 in CI.
 15. **CI shape**: parallel jobs on every PR including smoke, sanity and
