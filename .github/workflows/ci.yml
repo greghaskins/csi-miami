@@ -9,31 +9,37 @@ on:
     branches: [main]
 permissions:
   contents: read
+# Pull request runs are superseded by the next push to the same ref. Runs on
+# main are never cancelled: each commit's images and manifest must complete.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   static:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The Go version comes from go.mod, which mise.toml pins to the same
       # release; the Makefile sets GOTOOLCHAIN=local so no other is used.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
-      # golangci-lint is installed at the exact version mise.toml pins, so
-      # CI and `make lint` locally run the same release.
-      - name: Install golangci-lint
-        env:
-          GOTOOLCHAIN: local
+      # golangci-lint is the official release binary at the exact version
+      # mise.toml pins, so CI and `make lint` locally run the same binary.
+      - name: Read the golangci-lint version from mise.toml
+        id: lint
         run: |
           version="$(sed -n 's/^golangci-lint = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$version"
-          go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${version}"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "version=v${version}" >> "$GITHUB_OUTPUT"
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ steps.lint.outputs.version }}
+          install-only: true
       - run: make fmt-check vet lint tidy-check vuln
 
   unit:
@@ -41,24 +47,73 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
-      - run: make test-race GOTESTFLAGS="-covermode=atomic -coverprofile=coverage.out"
-      - run: go tool cover -func=coverage.out | tail -n 1
+      - run: make cover
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage
           path: coverage.out
           if-no-files-found: error
 
+  # Builds the image natively on each architecture (no emulation), runs it,
+  # and exports an OCI archive. It never publishes, so it needs no more than
+  # read access.
   build:
     name: build (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
-    # packages: write is used only on pushes to main, to publish the
-    # per-architecture images.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The docker-container driver is needed for OCI output. The BuildKit
+      # image is pinned by digest (moby/buildkit v0.34.1).
+      - name: Create builder
+        run: |
+          docker buildx create --name ci --driver docker-container --use \
+            --driver-opt image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+      - name: Build and run the image
+        run: |
+          docker buildx build --platform "linux/${{ matrix.arch }}" \
+            --build-arg "VERSION=${{ github.sha }}" \
+            --load -t "miami:ci" .
+          test "$(docker run --rm miami:ci version)" = "${{ github.sha }}"
+      - name: Export OCI archive
+        run: |
+          docker buildx build --platform "linux/${{ matrix.arch }}" \
+            --build-arg "VERSION=${{ github.sha }}" \
+            --output "type=oci,dest=miami-${{ matrix.arch }}.tar" .
+      - name: Upload OCI archive
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: miami-${{ matrix.arch }}.tar
+          if-no-files-found: error
+
+  # Publishes the per-architecture images from main, and only there. This is
+  # the one job that can write packages. The binary is built with
+  # CGO_ENABLED=0 and -trimpath from a context without VCS data, so it is the
+  # same binary the build job ran.
+  publish:
+    name: publish (${{ matrix.arch }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -74,47 +129,31 @@ jobs:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Each leg builds natively for its own architecture; there is no
-      # emulation. The docker-container driver is needed for OCI output,
-      # attestations and pushing.
-      - name: Create builder
-        run: docker buildx create --name ci --driver docker-container --use
-      - name: Build and run the image
-        run: |
-          docker buildx build --platform "linux/${{ matrix.arch }}" \
-            --build-arg "VERSION=${{ github.sha }}" \
-            --load -t "miami:ci" .
-          test "$(docker run --rm miami:ci version)" = "${{ github.sha }}"
-      - name: Export OCI archive
-        if: github.event_name == 'pull_request'
-        run: |
-          docker buildx build --platform "linux/${{ matrix.arch }}" \
-            --build-arg "VERSION=${{ github.sha }}" \
-            --output "type=oci,dest=miami-${{ matrix.arch }}.tar" .
-      - name: Upload OCI archive
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: image-${{ matrix.arch }}
-          path: miami-${{ matrix.arch }}.tar
-          if-no-files-found: error
+          persist-credentials: false
+      - name: Create builder
+        run: |
+          docker buildx create --name ci --driver docker-container --use \
+            --driver-opt image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
       - name: Log in to ghcr.io
-        if: github.event_name == 'push'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      # SBOM generator: docker/buildkit-syft-scanner 1.12.1, pinned by digest.
       - name: Push image
-        if: github.event_name == 'push'
         run: |
           docker buildx build --platform "linux/${{ matrix.arch }}" \
             --build-arg "VERSION=${{ github.sha }}" \
-            --provenance=true --sbom=true \
+            --provenance=true \
+            --attest "type=sbom,generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315" \
             --push -t "${IMAGE}:${{ github.sha }}-${{ matrix.arch }}" .
 
+  # Per-commit tags are the contract. There is deliberately no moving tag
+  # here: runs on main can overlap and finish out of order.
   manifest:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: build
+    needs: publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -132,21 +171,22 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t "${IMAGE}:${{ github.sha }}" \
-            -t "${IMAGE}:main" \
             "${IMAGE}:${{ github.sha }}-amd64" \
             "${IMAGE}:${{ github.sha }}-arm64"
 
   ci-ok:
     if: always()
-    needs: [static, unit, build, manifest]
+    needs: [static, unit, build, publish, manifest]
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions: {}
     steps:
       - name: Require every job to have succeeded
         env:
           STATIC: ${{ needs.static.result }}
           UNIT: ${{ needs.unit.result }}
           BUILD: ${{ needs.build.result }}
+          PUBLISH: ${{ needs.publish.result }}
           MANIFEST: ${{ needs.manifest.result }}
           PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
@@ -157,15 +197,18 @@ jobs:
               fail=1
             fi
           done
-          # manifest only runs when publishing from main; skipped is expected
-          # everywhere else, and a failure to run it on main is a failure.
+          # publish and manifest only run when publishing from main; skipped
+          # is expected everywhere else, and a failure to run them on main is
+          # a failure.
           if [ "$PUBLISHING" = "true" ]; then
             want="success"
           else
             want="skipped"
           fi
-          if [ "$MANIFEST" != "$want" ]; then
-            echo "::error::manifest was $MANIFEST, expected $want"
-            fail=1
-          fi
+          for pair in "publish=$PUBLISH" "manifest=$MANIFEST"; do
+            if [ "${pair#*=}" != "$want" ]; then
+              echo "::error::${pair%%=*} was ${pair#*=}, expected $want"
+              fail=1
+            fi
+          done
           exit "$fail"
