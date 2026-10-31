@@ -545,7 +545,7 @@ Runtime posture:
   manifest job; nothing runs under emulation, and the arm64 binary is
   smoke-tested on arm64 hardware before it is published. GitHub's hosted
   arm64 runners are free for public repositories and billed for private
-  ones, which matters only until the repository is public.
+  ones; the repository is public, so they cost nothing.
 
 ### 7.3 CI: fast by parallelism, robust by running the real thing
 

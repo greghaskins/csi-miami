@@ -167,6 +167,12 @@ be a single non-empty path element. An unresolved or unknown token is
 `InvalidArgument`. Unknown parameters are `InvalidArgument` so a typo cannot
 silently mean the default.
 
+A given server is named one way across all StorageClasses on a cluster (the
+normal form already collapses case and IPv6 spelling). The kernel reports a
+shared NFS superblock under the spelling of whichever mount came first, so
+naming one server by both a host name and an address is unsupported and
+shows as a mount conflict.
+
 The item directory is always `<transport mount>/<subdir>/<volume name>`,
 with the name taken from the volume ID and never from a parameter.
 
@@ -213,11 +219,14 @@ other than this volume's transport directory. Never `panic` in a handler.
 **`nfs3`.** `mount(2)` with `fstype=nfs`, source `<server>:<export>`, and a
 kernel option string. The driver resolves `addr=` itself (the host network
 resolver, then the literal address), so no helper and no `/etc/services`
-are needed. There is one profile; it is code, not configuration:
+are needed. There is one profile; it is code, not configuration. The data
+string of `mount(2)` is
 
 ```
-vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30,noatime
+vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30,addr=<ip>
 ```
+
+and `noatime` is the generic mount flag `MS_NOATIME`, not a data option.
 
 | option | reason |
 |---|---|
@@ -238,6 +247,26 @@ whether the NAS accepts the set without `actimeo` and `noatime` ("protocol
 not supported" usually means a missing `vers=3`), and whether `softerr`
 mounts on every node kernel. Either outcome changes the profile by a code
 change, with a version bump.
+
+**Adoption.** After a restart the transport is still on the host table, and
+`Mounted` answers true only for a mount that is exactly this transport: file
+system type `nfs`, the source `<server>:<export>`, per-mount `noatime`, and
+these super options among those the kernel reports: `rw`, `vers=3`,
+`proto=tcp`, `softerr`, `timeo=100`, `retrans=3`, `nolock`, `local_lock=all`,
+`lookupcache=pos`, `acregmin=30`, `acregmax=30`, `acdirmax=30`. The kernel
+reports the profile in its own words (`actimeo=30` as the `ac*` options, with
+a default such as `acdirmin=30` left out; `lookupcache=positive` as
+`lookupcache=pos`), and newer kernels add options (`softreval`,
+`fatal_neterrors`) that are not required. The list was taken from a real
+mount by the T4 e2e run. Adoption is the profile and nothing that changes
+its meaning, not a byte-exact comparison (`rsize` and `wsize` are
+negotiated, newer kernels add tokens, the MOUNT request adds `mount*`): a
+mount that also has `nocto`, `nosharecache`, `noresvport`, `soft`, `hard`,
+`ro`, an `acdirmin`, `sec`, `lookupcache` or `local_lock` with another
+value, or any per-mount option beyond `rw` and `noatime`, is not adopted.
+The source must match exactly, which is why a server is named one way across
+StorageClasses (section 5). Anything else at the mount point is a conflict,
+reported and never stacked over.
 
 **`local`.** The host path, bind-mounted to `<root>/transports/<ID>` so
 that every transport looks the same to the item and observer code. It
@@ -398,8 +427,10 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
   kernels: retired by the `nfs3` e2e variant in T4, before any node-agent
   code depends on it, and by the first real-cluster mount.
 - **`Bidirectional` propagation and adoption across a plugin restart**: the
-  reason the transports root is a hostPath; retired by the T4 smoke under
-  `unshare --mount` and by exit criterion 4 on a real cluster.
+  reason the transports root is a hostPath; adoption across a process
+  restart is retired by the T4 smoke (one private mount namespace, so it
+  does not exercise propagation); propagation is proven by the e2e on a real
+  cluster in T10 and by exit criterion 4.
 - **Kubelet path differences across distributions**: one replacement in
   the kustomize base, checked by a render test in T9.
 - **A hung NFS mount blocking the reconciler**: every observation has a
