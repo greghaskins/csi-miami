@@ -124,17 +124,19 @@ for node in $(kubectl get nodes -o name); do
   echo "kind: CSINode ${node#node/} lists $driver"
 done
 
-# The sidecars' leader election takes a Lease each: proof that the controller's
-# RBAC covers it.
-for sidecar in provisioner attacher; do
+# The sidecars' leader election takes a Lease each, which shows that the
+# controller's RBAC covers them: the provisioner's is named for the driver, the
+# attacher's has a prefix.
+lease_name="${driver//./-}"
+for lease in "$lease_name" "external-attacher-leader-$lease_name"; do
   end=$((SECONDS + metrics_deadline))
-  until kubectl -n "$ns" get lease -o name | grep -q "$sidecar"; do
+  until kubectl -n "$ns" get lease "$lease" >/dev/null 2>&1; do
     if [ "$SECONDS" -gt "$end" ]; then
-      echo "kind: no $sidecar lease within ${metrics_deadline}s" >&2
+      echo "kind: no lease $lease within ${metrics_deadline}s" >&2
       exit 1
     fi
   done
-  echo "kind: a $sidecar leader election lease exists"
+  echo "kind: leader election lease $lease exists"
 done
 
 # scrape <component> <port>: /healthz answers, and /metrics has miami_ series.
