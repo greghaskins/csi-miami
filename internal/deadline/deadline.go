@@ -1,4 +1,4 @@
-package transport
+package deadline
 
 import (
 	"context"
@@ -10,15 +10,16 @@ import (
 	"github.com/greghaskins/csi-miami/internal/mount"
 )
 
-// inflight is the set of keys with a call that has not returned. A call on a
-// path that hangs ignores its context and keeps an OS thread, so a caller that
-// polls must not start another while the last one is still stuck.
-type inflight struct {
+// Set is the set of keys with a call that has not returned. A call on a path
+// that hangs ignores its context and keeps an OS thread, so a caller that
+// polls must not start another while the last one is still stuck. The zero
+// value is an empty set, ready to use, and safe for concurrent use.
+type Set struct {
 	mu   sync.Mutex
 	keys map[string]struct{}
 }
 
-func (f *inflight) acquire(key string) bool {
+func (f *Set) acquire(key string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, busy := f.keys[key]; busy {
@@ -31,13 +32,13 @@ func (f *inflight) acquire(key string) bool {
 	return true
 }
 
-func (f *inflight) release(key string) {
+func (f *Set) release(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.keys, key)
 }
 
-// within runs fn in its own goroutine and waits for it, for ctx, or for d,
+// Run runs fn in its own goroutine and waits for it, for ctx, or for d,
 // whichever comes first. It exists for calls that can hang without honouring
 // a context (resolving a path on a dead NFS mount, a resolver stuck on a
 // socket): when the deadline passes the goroutine is abandoned, never joined,
@@ -48,7 +49,7 @@ func (f *inflight) release(key string) {
 // once, wrapping mount.ErrBusy, and starts nothing: the stuck goroutine is
 // the only one there will ever be per key. The goroutine releases its key
 // when fn returns, however it returns.
-func within[T any](ctx context.Context, d time.Duration, what string, g *inflight, key string, fn func(context.Context) (T, error)) (T, error) {
+func Run[T any](ctx context.Context, d time.Duration, what string, g *Set, key string, fn func(context.Context) (T, error)) (T, error) {
 	var zero T
 	ctx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()

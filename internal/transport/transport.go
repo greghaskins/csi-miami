@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
@@ -148,7 +149,7 @@ func New(spec Spec, root string, m mount.Mounter, opts Options) (Transport, erro
 	if opts.ResolveHostPath == nil {
 		opts.ResolveHostPath = ResolveDirectory
 	}
-	b := base{spec: spec, dir: dir, m: m, opts: opts, busy: &inflight{}}
+	b := base{spec: spec, dir: dir, m: m, opts: opts, busy: &deadline.Set{}}
 	if spec.Kind == KindLocal {
 		return &local{base: b}, nil
 	}
@@ -180,7 +181,7 @@ type base struct {
 	dir  string
 	m    mount.Mounter
 	opts Options
-	busy *inflight // hang-prone resolutions in flight, by key
+	busy *deadline.Set // hang-prone resolutions in flight, by key
 }
 
 func (b *base) Spec() Spec  { return b.spec }
@@ -257,7 +258,7 @@ func (b *base) makeMountPoint(ctx context.Context) error {
 		existing = parent
 	}
 	what := fmt.Sprintf("resolving %q", existing)
-	resolved, err := within(ctx, b.opts.ResolveTimeout, what, b.busy, "mountpoint\x00"+existing, func(context.Context) (string, error) {
+	resolved, err := deadline.Run(ctx, b.opts.ResolveTimeout, what, b.busy, "mountpoint\x00"+existing, func(context.Context) (string, error) {
 		r, err := filepath.EvalSymlinks(existing)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", what, err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
 
@@ -18,7 +19,7 @@ type local struct {
 // returned, the next fails with mount.ErrBusy instead of starting another.
 func (l *local) resolve(ctx context.Context) (string, error) {
 	what := fmt.Sprintf("resolving local path %q", l.spec.Path)
-	return within(ctx, l.opts.ResolveTimeout, what, l.busy, "hostpath\x00"+l.spec.Path, func(context.Context) (string, error) {
+	return deadline.Run(ctx, l.opts.ResolveTimeout, what, l.busy, "hostpath\x00"+l.spec.Path, func(context.Context) (string, error) {
 		resolved, err := l.opts.ResolveHostPath(l.spec.Path)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", what, err)
