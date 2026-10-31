@@ -315,6 +315,17 @@ func (e *env) waitPasses(n int) {
 	})
 }
 
+// freshPass runs trigger and waits for a pass that began after it to finish.
+// Counting finished passes cannot say that: the pass that answered the last
+// request may not have finished yet, and would be taken for the new one.
+func (e *env) freshPass(trigger func()) {
+	e.t.Helper()
+	began := e.r.starts.Load()
+	trigger()
+	waitUntil(e.t, "a pass to begin", func() bool { return e.r.starts.Load() > began })
+	waitUntil(e.t, "the loop to be quiet", func() bool { return e.r.ends.Load() == e.r.starts.Load() })
+}
+
 func (e *env) passes() int {
 	e.metrics.mu.Lock()
 	defer e.metrics.mu.Unlock()

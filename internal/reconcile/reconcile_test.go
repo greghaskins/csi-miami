@@ -1076,9 +1076,7 @@ func TestTimerPassRepairsAVolume(t *testing.T) {
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 
 	e.sim.remove(in.StagePath) // something unmounted it behind our back
-	n := e.passes()
-	ticks <- time.Time{}
-	e.waitPasses(n + 1)
+	e.freshPass(func() { ticks <- time.Time{} })
 	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
 		t.Error("the timer pass did not restore the stage")
 	}

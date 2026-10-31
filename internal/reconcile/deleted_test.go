@@ -84,8 +84,6 @@ func TestUnstageWithTheTransportGoneSaysSoAndRetriesOnceItIsBack(t *testing.T) {
 	}
 
 	// The next pass remounts the transport; the retry then succeeds.
-	n := e.passes()
-	e.r.nudge()
-	e.waitPasses(n + 1)
+	e.freshPass(e.r.nudge)
 	mustNil(t, "Unstage again", e.r.Unstage(bg, in.VolumeID))
 }

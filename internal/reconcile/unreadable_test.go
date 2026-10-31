@@ -67,9 +67,7 @@ func TestStageDoesNotRewriteAnUnreadableRecord(t *testing.T) {
 	if now, _ := os.ReadFile(e.recordPath(in.VolumeID)); !bytes.Equal(now, junk) {
 		t.Error("Stage wrote a record over one it could not read")
 	}
-	n := e.passes()
-	e.r.nudge()
-	e.waitPasses(n + 1)
+	e.freshPass(e.r.nudge)
 	if _, ok := e.visible(target); !ok {
 		t.Fatalf("the pod's publish was unmounted; events %+v", e.events.all())
 	}
@@ -102,9 +100,7 @@ func TestStageAfterAPassThatSawAnUnreadableRecord(t *testing.T) {
 	target := e.stageAndPublish(in, "pod1", false)
 	e.breakRecord(in.VolumeID)
 
-	n := e.passes()
-	e.r.nudge()
-	e.waitPasses(n + 1)
+	e.freshPass(e.r.nudge)
 	if _, ok := e.visible(in.StagePath); !ok {
 		t.Error("the failure pass unmounted the stage")
 	}

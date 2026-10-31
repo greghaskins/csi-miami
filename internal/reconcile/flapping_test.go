@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
@@ -151,5 +152,45 @@ func TestShutdownRaisesNoEvents(t *testing.T) {
 	e.pass()
 	if len(e.events.all()) != 1 {
 		t.Errorf("events = %+v, want the real failure", e.events.all())
+	}
+}
+
+// The publish half of the event key: a publish that stays in conflict is one
+// event however many passes find it, and one that fails differently is
+// another.
+func TestAPersistentPublishFailureRaisesOneEventUntilItChanges(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	in := e.vol("a", "pvc-1")
+	e.mkTargetParent("pod1")
+	target := e.target("pod1")
+	e.sim.addMount(target, "tmpfs", "t")
+	in.Publishes = []intent.Publish{{TargetPath: target}}
+	mustNil(t, "save", e.store.Save(in))
+
+	for range 5 {
+		e.pass()
+	}
+	if evs := e.events.reasons(ReasonMountFailed); len(evs) != 1 {
+		t.Fatalf("%d events for a publish that stays in conflict, want 1: %+v", len(evs), evs)
+	}
+	if n := e.metrics.errCount("publish"); n != 5 {
+		t.Errorf("publish errors = %d, want one per pass", n)
+	}
+
+	// The foreign mount goes; now the bind itself reports busy. A new
+	// condition, a new event, and then quiet again.
+	e.sim.remove(target)
+	e.sim.FailOp(fake.OpBind, target, mount.ErrBusy)
+	for range 4 {
+		e.pass()
+	}
+	if evs := e.events.reasons(ReasonMountFailed); len(evs) != 2 {
+		t.Fatalf("%d events after the publish failed differently, want 2: %+v", len(evs), evs)
+	}
+
+	// The stage is fine throughout, and says so: a Stage hears nothing of it.
+	if res := e.converge(in.VolumeID); res != nil {
+		t.Errorf("the stage answer = %v, want nil: the publish is not its business", res)
 	}
 }

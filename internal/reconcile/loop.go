@@ -63,7 +63,11 @@ type trResult struct {
 //  4. Collect garbage (garbage.go), from the intents as they stand after 2.
 func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 	began := time.Now()
-	defer func() { r.metrics.ObserveReconcile(time.Since(began)) }()
+	r.starts.Add(1)
+	defer func() {
+		r.metrics.ObserveReconcile(time.Since(began))
+		r.ends.Add(1)
+	}()
 
 	loaded, err := r.store.Load()
 	if err != nil {

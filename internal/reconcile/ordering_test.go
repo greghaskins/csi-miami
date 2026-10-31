@@ -144,9 +144,7 @@ func TestUnstageDoesNotDeleteAnIdenticalStageWrittenDuringTheTeardown(t *testing
 		t.Errorf("generation %d did not move past %d", got.Generation, loaded.Generation)
 	}
 	e.hook.Store(nil)
-	n := e.passes()
-	e.r.nudge()
-	e.waitPasses(n + 1)
+	e.freshPass(e.r.nudge)
 	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
 		t.Error("the volume was not restored")
 	}
@@ -181,9 +179,7 @@ func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
 	}
 	// The next pass brings the volume back, stage and the late publish.
 	e.hook.Store(nil)
-	n := e.passes()
-	e.r.nudge()
-	e.waitPasses(n + 1)
+	e.freshPass(e.r.nudge)
 	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) || !e.isBind(late, in.StagePath) {
 		t.Error("the volume was not restored from the newer record")
 	}
