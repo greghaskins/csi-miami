@@ -5,8 +5,10 @@
 # outside, or survives it. The test itself fails (never skips) if it is not
 # root or the namespace is not private.
 #
-# All smoke tests live in internal/mount because they exercise it together
-# with internal/observe.
+# The smoke tests live in internal/mount, which they exercise together with
+# internal/observe, and in internal/transport, which they exercise on top of
+# both. Each package is built as its own test binary and run in its own
+# namespace.
 #
 # If SMOKE_ARTIFACT_DIR is set, a failing test leaves mountinfo-<test>.txt
 # there: the lines of /proc/self/mountinfo for its own temporary paths, and
@@ -38,9 +40,11 @@ fi
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-go test -c -tags smoke -o "$dir/mount.test" ./internal/mount
+for pkg in mount transport; do
+  go test -c -tags smoke -o "$dir/$pkg.test" "./internal/$pkg"
 
-# The test compares its own mount namespace with the one we are leaving.
-SMOKE_PARENT_MNT_NS="$(readlink /proc/self/ns/mnt)" \
-unshare --mount --propagation private \
-  "$dir/mount.test" -test.run '^TestSmoke' -test.v -test.count=1
+  # The test compares its own mount namespace with the one we are leaving.
+  SMOKE_PARENT_MNT_NS="$(readlink /proc/self/ns/mnt)" \
+  unshare --mount --propagation private \
+    "$dir/$pkg.test" -test.run '^TestSmoke' -test.v -test.count=1
+done
