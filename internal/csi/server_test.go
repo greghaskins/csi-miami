@@ -366,7 +366,9 @@ func TestListenLeavesALiveSocketAlone(t *testing.T) {
 	go func() { done <- live.Serve(ctx) }()
 	defer func() {
 		cancel()
-		<-done
+		if err := <-done; err != nil {
+			t.Errorf("Serve: %v", err)
+		}
 	}()
 
 	second, err := NewServer(ServerOptions{Endpoint: "unix://" + sock, Identity: NewIdentity("second")})
