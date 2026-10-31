@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 	"github.com/greghaskins/csi-miami/internal/observe"
@@ -425,7 +426,7 @@ func TestNFS3AddrRefusesIPv6WithoutValidate(t *testing.T) {
 			n := &nfs3{base: base{
 				spec: Spec{Kind: KindNFS3, Server: tt.server, Export: "/export/data"},
 				opts: Options{Resolver: res, ResolveTimeout: time.Second},
-				busy: &inflight{},
+				busy: &deadline.Set{},
 			}}
 			got, err := n.addr(context.Background())
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
