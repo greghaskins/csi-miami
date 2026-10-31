@@ -24,7 +24,6 @@ func TestValidate(t *testing.T) {
 		{"nfs3 hyphen and digits", Spec{Kind: "nfs3", Server: "nas-1.example.com", Export: "/x"}, ""},
 		{"nfs3 digits in last label of a name", Spec{Kind: "nfs3", Server: "nas.example2", Export: "/x"}, ""},
 		{"nfs3 IPv4 literal", Spec{Kind: "nfs3", Server: "192.0.2.10", Export: "/export/data"}, ""},
-		{"nfs3 IPv6 literal", Spec{Kind: "nfs3", Server: "[2001:db8::1]", Export: "/export/data"}, ""},
 		{"nfs3 63 byte label", Spec{Kind: "nfs3", Server: label63 + ".example.com", Export: "/x"}, ""},
 		{"nfs3 255 byte element", Spec{Kind: "nfs3", Server: "nas", Export: "/" + long}, ""},
 		{"local", Spec{Kind: "local", Path: "/export/data"}, ""},
@@ -41,15 +40,15 @@ func TestValidate(t *testing.T) {
 		{"nfs3 server with slash", Spec{Kind: "nfs3", Server: "nas/example", Export: "/x"}, "'/'"},
 		{"nfs3 server with port", Spec{Kind: "nfs3", Server: "nas.example.com:2049", Export: "/x"}, "':'"},
 		{"nfs3 unbracketed IPv6", Spec{Kind: "nfs3", Server: "2001:db8::1", Export: "/x"}, "':'"},
+		{"nfs3 IPv6 literal", Spec{Kind: "nfs3", Server: "[2001:db8::1]", Export: "/export/data"}, "IPv6 is not supported; use an IPv4 address or a host name"},
+		{"nfs3 IPv4-mapped IPv6 literal", Spec{Kind: "nfs3", Server: "[::ffff:192.0.2.10]", Export: "/x"}, "IPv6 is not supported"},
 		{"nfs3 bracket in the middle", Spec{Kind: "nfs3", Server: "nas[1]", Export: "/x"}, "'[' or ']'"},
 		{"nfs3 trailing bracket", Spec{Kind: "nfs3", Server: "nas]", Export: "/x"}, "'[' or ']'"},
-		{"nfs3 brackets around a name", Spec{Kind: "nfs3", Server: "[nas.example.com]", Export: "/x"}, "IPv6 literal"},
-		{"nfs3 brackets around IPv4", Spec{Kind: "nfs3", Server: "[192.0.2.10]", Export: "/x"}, "IPv6 literal"},
-		{"nfs3 IPv6 with zone", Spec{Kind: "nfs3", Server: "[fe80::1%eth0]", Export: "/x"}, "IPv6 literal"},
-		{"nfs3 unclosed bracket", Spec{Kind: "nfs3", Server: "[2001:db8::1", Export: "/x"}, "IPv6 literal"},
-		{"nfs3 empty brackets", Spec{Kind: "nfs3", Server: "[]", Export: "/x"}, "IPv6 literal"},
-		{"nfs3 IPv6 not shortest", Spec{Kind: "nfs3", Server: "[2001:db8:0:0::1]", Export: "/x"}, "shortest"},
-		{"nfs3 IPv6 upper case", Spec{Kind: "nfs3", Server: "[2001:DB8::1]", Export: "/x"}, "shortest"},
+		{"nfs3 brackets around a name", Spec{Kind: "nfs3", Server: "[nas.example.com]", Export: "/x"}, "IPv6 is not supported"},
+		{"nfs3 brackets around IPv4", Spec{Kind: "nfs3", Server: "[192.0.2.10]", Export: "/x"}, "IPv6 is not supported"},
+		{"nfs3 IPv6 with zone", Spec{Kind: "nfs3", Server: "[fe80::1%eth0]", Export: "/x"}, "IPv6 is not supported"},
+		{"nfs3 unclosed bracket", Spec{Kind: "nfs3", Server: "[2001:db8::1", Export: "/x"}, "IPv6 is not supported"},
+		{"nfs3 empty brackets", Spec{Kind: "nfs3", Server: "[]", Export: "/x"}, "IPv6 is not supported"},
 		{"nfs3 upper case host", Spec{Kind: "nfs3", Server: "NAS.example.com", Export: "/x"}, "lower case"},
 		{"nfs3 Kelvin sign", Spec{Kind: "nfs3", Server: "Kas.example.com", Export: "/x"}, "may contain only"},
 		{"nfs3 non-ASCII", Spec{Kind: "nfs3", Server: "näs.example.com", Export: "/x"}, "may contain only"},
@@ -122,7 +121,6 @@ func TestCanonical(t *testing.T) {
 		{"nfs3", Spec{Kind: "nfs3", Server: "nas.example.com", Export: "/export/data"}, "nfs3://nas.example.com/export/data"},
 		{"nfs3 server lower-cased", Spec{Kind: "nfs3", Server: "NAS.Example.COM", Export: "/export/data"}, "nfs3://nas.example.com/export/data"},
 		{"nfs3 export cleaned", Spec{Kind: "nfs3", Server: "nas.example.com", Export: "/export//data/./"}, "nfs3://nas.example.com/export/data"},
-		{"nfs3 IPv6 shortest form", Spec{Kind: "nfs3", Server: "[2001:DB8:0:0::1]", Export: "/x"}, "nfs3://[2001:db8::1]/x"},
 		{"nfs3 Kelvin sign is not folded", Spec{Kind: "nfs3", Server: "K", Export: "/x"}, "nfs3://K/x"},
 		{"local", Spec{Kind: "local", Path: "/export/data"}, "local:///export/data"},
 		{"local cleaned", Spec{Kind: "local", Path: "/export/data/"}, "local:///export/data"},
@@ -186,12 +184,6 @@ func TestIDEquivalentSpecs(t *testing.T) {
 		if s.ID() != base.ID() {
 			t.Errorf("ID of %+v = %s, want %s", s, s.ID(), base.ID())
 		}
-	}
-
-	v6a := Spec{Kind: "nfs3", Server: "[2001:db8::1]", Export: "/x"}
-	v6b := Spec{Kind: "nfs3", Server: "[2001:DB8:0:0:0:0:0:1]", Export: "/x"}
-	if v6a.ID() != v6b.ID() {
-		t.Errorf("IPv6 spellings differ: %s vs %s", v6a.ID(), v6b.ID())
 	}
 
 	different := []Spec{
@@ -279,13 +271,6 @@ func TestParseSpec(t *testing.T) {
 			want: Spec{Kind: "nfs3", Server: "nas.example.com", Export: "/export/data"},
 		},
 		{
-			name: "IPv6 is shortened",
-			params: map[string]string{
-				"transport.kind": "nfs3", "transport.server": "[2001:DB8:0:0::1]", "transport.export": "/x",
-			},
-			want: Spec{Kind: "nfs3", Server: "[2001:db8::1]", Export: "/x"},
-		},
-		{
 			name:   "local, other keys ignored",
 			params: map[string]string{"transport.kind": "local", "transport.path": "/data/", "kind": "directory", "subdir": "x"},
 			want:   Spec{Kind: "local", Path: "/data"},
@@ -295,6 +280,7 @@ func TestParseSpec(t *testing.T) {
 		{name: "local with export", params: map[string]string{"transport.kind": "local", "transport.path": "/x", "transport.export": "/y"}, wantErr: true},
 		{name: "dot dot is not cleaned away", params: map[string]string{"transport.kind": "local", "transport.path": "/a/../b"}, wantErr: true},
 		{name: "root is refused", params: map[string]string{"transport.kind": "local", "transport.path": "//"}, wantErr: true},
+		{name: "IPv6 literal is refused", params: map[string]string{"transport.kind": "nfs3", "transport.server": "[2001:db8::1]", "transport.export": "/x"}, wantErr: true},
 		{name: "Kelvin sign is refused", params: map[string]string{"transport.kind": "nfs3", "transport.server": "K", "transport.export": "/x"}, wantErr: true},
 	}
 	for _, tc := range tests {

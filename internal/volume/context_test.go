@@ -71,7 +71,7 @@ func TestContextRoundTrip(t *testing.T) {
 	tests := []Context{
 		{Kind: KindDirectory, Transport: validSpec(), Subdir: "team-a/data"},
 		{Kind: KindDirectory, Transport: validSpec()},
-		{Kind: KindDirectory, Transport: transport.Spec{Kind: "nfs3", Server: "[2001:db8::1]", Export: "/export/data"}, Subdir: "x"},
+		{Kind: KindDirectory, Transport: transport.Spec{Kind: "nfs3", Server: "192.0.2.10", Export: "/export/data"}, Subdir: "x"},
 		{Kind: KindDirectory, Transport: transport.Spec{Kind: "local", Path: "/export/data"}, Subdir: "x"},
 	}
 	for _, c := range tests {
@@ -158,7 +158,7 @@ func TestDecodeContext(t *testing.T) {
 		// is not exactly what NewContext produces is refused, not repaired.
 		{name: "uncleaned export", in: nfsContext(map[string]string{"miami/transport.export": "/export/data/"}), wantErr: "cleaned"},
 		{name: "upper-case server", in: nfsContext(map[string]string{"miami/transport.server": "NAS.example.com"}), wantErr: "lower case"},
-		{name: "IPv6 not shortest", in: nfsContext(map[string]string{"miami/transport.server": "[2001:db8:0:0::1]"}), wantErr: "shortest"},
+		{name: "IPv6 literal", in: nfsContext(map[string]string{"miami/transport.server": "[2001:db8::1]"}), wantErr: "IPv6 is not supported"},
 		{name: "trailing slash in subdir", in: nfsContext(map[string]string{"miami/subdir": "a/"}), wantErr: "cleaned"},
 		{name: "doubled slash in subdir", in: nfsContext(map[string]string{"miami/subdir": "a//b"}), wantErr: "cleaned"},
 		{name: "dot element in subdir", in: nfsContext(map[string]string{"miami/subdir": "./a"}), wantErr: "cleaned"},
