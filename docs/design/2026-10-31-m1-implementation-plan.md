@@ -416,7 +416,7 @@ Workflows, all pinned by SHA with least permissions:
   content-addressed per-arch tags pushed from the PR, sha alias on `main`), `smoke` (matrix, root, under
   `unshare --mount`: transport survives a plugin restart, bind adoption,
   garbage unmount, simulated reboot via a fresh mount namespace),
-  `sanity` (matrix), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
+  `sanity` (matrix; amd64 only in T8, arm64 joins in T10), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
   on arm64), `manifest` (every PR: the multi-arch index from the digests
   the build legs ran), `publish` (`main` only: the sha alias), `ci-ok`.
 - `secret-scan.yml` and `secret-scan-text.yml`: already present.
@@ -443,7 +443,7 @@ acceptance check. Order matters only where stated.
 | T5 | `internal/intent`: record format, atomic write, load with failure accounting | unit tests including a corrupt record |
 | T6 | `internal/reconcile` with the `directory` item: converge, garbage, per-volume serialization, request queue | unit tests with fake observers; smoke: plugin restart with mounts live, reboot simulation |
 | T7 | `internal/csi` node server over the reconciler; `internal/metrics`; gRPC interceptor | `csi-sanity` node half; metrics scraped in smoke |
-| T8 | `internal/kube` (PV read) and the controller server; `CreateVolume`, `DeleteVolume` with PV lookup, publish/unpublish, list | envtest for the PV paths; `csi-sanity` full |
+| T8 | `internal/kube` (PV read) and the controller server; `CreateVolume`, `DeleteVolume` with PV lookup, publish/unpublish, list | envtest for the PV paths; `csi-sanity` for the identity and controller services (full run in T10) |
 | T9 | `deploy/kustomize/base` and `e2e` overlay; `deploy/policy_test.go`; Dockerfile from scratch | `kubectl apply -k` on kind; both pods Ready |
 | T10 | `test/e2e`: the exit criteria 1 to 6 as tests, `local` and `nfs3` variants; `smoke` and `sanity` and `e2e` jobs wired into `ci.yml` | `ci-ok` green with the full matrix |
 | T11 | `miami lock` and its test against the `nfs3` e2e transport | two pods on two nodes serialize through it; a stale lock is broken |

@@ -25,12 +25,12 @@ const dirMode = 0o755
 func fsStatus(what string, err error) error {
 	switch {
 	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
-		return status.Errorf(codes.ResourceExhausted, "%s: %v", what, err)
+		return status.Errorf(codes.ResourceExhausted, "%s: %s", what, reason(err))
 	case errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.EACCES),
 		errors.Is(err, syscall.EPERM), errors.Is(err, syscall.EROFS):
-		return status.Errorf(codes.FailedPrecondition, "%s: %v", what, err)
+		return status.Errorf(codes.FailedPrecondition, "%s: %s", what, reason(err))
 	default:
-		return unavailable("%s: %v", what, err)
+		return unavailable("%s: %s", what, reason(err))
 	}
 }
 

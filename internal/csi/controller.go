@@ -108,7 +108,7 @@ func NewController(o ControllerOptions) (*Controller, error) {
 		root:    o.Root,
 		mounter: o.Mounter,
 		pvs:     o.PVs,
-		mounts:  newMounts(o.Root, o.Mounter, o.Transport),
+		mounts:  newMounts(log, o.Root, o.Mounter, o.Transport),
 		log:     log,
 
 		deadline: deadline,

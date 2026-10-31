@@ -2,11 +2,14 @@ package csi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -15,6 +18,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	"github.com/greghaskins/csi-miami/internal/mount/fake"
 )
 
 func TestIdentity(t *testing.T) {
@@ -419,4 +424,58 @@ func TestRemoveIfStaleOnlyAfterConnectionRefused(t *testing.T) {
 		t.Errorf("removeIfStale(stale) = %v", err)
 	}
 	mustNotExist(t, stale)
+}
+
+// Failures are logged and sent with the volume ID and the step that failed,
+// and not with the server and export of the transport, a path, or the address
+// of the API server, however the underlying errors spell them.
+func TestFailuresCarryNoPathsOrAddresses(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	logs := &syncBuffer{}
+	ctrl, err := NewController(ControllerOptions{
+		Root: e.root, Mounter: e.mounter, PVs: e.pvs,
+		Log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := runServer(t, ServerOptions{
+		Identity: NewIdentity("x"), Controller: ctrl,
+		Log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cc := csi.NewControllerClient(conn)
+
+	// The transport cannot be mounted, and the error says where.
+	e.mounter.FailOp(fake.OpMount, e.mountDir(), fmt.Errorf("mount 192.0.2.10:/export/data on %s: %w", e.mountDir(), &os.PathError{Op: "mkdir", Path: e.mountDir(), Err: syscall.EIO}))
+	_, createErr := cc.CreateVolume(ctx, &csi.CreateVolumeRequest{
+		Name: nameA, VolumeCapabilities: rwx(), Parameters: e.params(),
+	})
+	// The PV cannot be read, and the error says where the API server is.
+	e.pvs.FailOn(nameB, fmt.Errorf(`Get "https://198.51.100.9:6443/api/v1/persistentvolumes/%s": dial tcp 198.51.100.9:6443: connect: refused`, nameB))
+	_, deleteErr := cc.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: "directory:" + nameB})
+
+	for name, err := range map[string]error{"create": createErr, "delete": deleteErr} {
+		if codeOf(err) != codes.Unavailable {
+			t.Errorf("%s: code = %v (%v), want Unavailable", name, codeOf(err), err)
+		}
+	}
+	if !strings.Contains(createErr.Error(), nameA+"") && !strings.Contains(createErr.Error(), "cannot be mounted") {
+		t.Errorf("create error %q does not say what failed", createErr)
+	}
+	if !strings.Contains(deleteErr.Error(), nameB) {
+		t.Errorf("delete error %q does not name the volume", deleteErr)
+	}
+
+	everything := createErr.Error() + deleteErr.Error() + logs.String()
+	for _, forbidden := range []string{"192.0.2.10", "/export/data", "198.51.100.9", "6443", e.root, e.mountDir()} {
+		if strings.Contains(everything, forbidden) {
+			t.Errorf("%q appears in an error or the log:\n%s\n%v\n%v", forbidden, logs.String(), createErr, deleteErr)
+		}
+	}
+	if !strings.Contains(logs.String(), "volume_id=") {
+		t.Errorf("the log does not carry the volume ID:\n%s", logs.String())
+	}
 }

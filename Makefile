@@ -97,7 +97,9 @@ envtest:
 # controller services, with a local transport that is really bind-mounted.
 # ROOT ONLY: run it as `sudo -E env "PATH=$PATH" make sanity`, with the pinned
 # Go and csi-sanity on PATH. The node service is not part of this run. A
-# separate CI job, not part of `check`.
+# separate CI job, not part of `check`. The suite serves on a unix socket under
+# TMPDIR, whose path is limited to about 100 bytes: if TMPDIR is long, point it
+# at a short directory (TMPDIR=/tmp) for the run.
 sanity:
 	hack/sanity.sh
 

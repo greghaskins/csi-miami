@@ -132,6 +132,24 @@ func TestGetPV(t *testing.T) {
 		pv, err := c.GetPV(ctx, name)
 		if err == nil || errors.Is(err, ErrNotFound) || pv != nil {
 			t.Errorf("GetPV(%s) = %v, %v; want an error that is not ErrNotFound", name, pv, err)
+			continue
+		}
+		// The message names the PV and a reason, and not where the API
+		// server is; the full error is still there to unwrap.
+		host := strings.TrimPrefix(cfg.Host, "http://")
+		var re *ReadError
+		switch name {
+		case "badtype", "badattr":
+		default:
+			if !errors.As(err, &re) || re.PV != name || re.Reason == "" {
+				t.Errorf("GetPV(%s) error = %#v, want a *ReadError with a reason", name, err)
+			}
+			if strings.Contains(err.Error(), host) || strings.Contains(err.Error(), "http") {
+				t.Errorf("GetPV(%s) error %q names the server or the URL", name, err)
+			}
+			if re != nil && errors.Unwrap(re) == nil {
+				t.Errorf("GetPV(%s): the underlying error is lost", name)
+			}
 		}
 	}
 	if _, err := c.GetPV(ctx, ""); err == nil {
@@ -162,6 +180,9 @@ func TestGetPVHonoursTheDeadline(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "timed out") || strings.Contains(err.Error(), strings.TrimPrefix(cfg.Host, "http://")) {
+		t.Errorf("error = %q, want a timeout reason without the server's address", err)
 	}
 }
 

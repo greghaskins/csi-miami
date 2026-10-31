@@ -135,9 +135,45 @@ func (c *Client) GetPV(ctx context.Context, name string) (*PV, error) {
 		if apierrors.IsNotFound(err) && fromAPIServer(err) {
 			return nil, fmt.Errorf("%w: %q", ErrNotFound, name)
 		}
-		return nil, fmt.Errorf("kube: reading PV %q: %w", name, err)
+		return nil, &ReadError{PV: name, Reason: reasonOf(err), err: err}
 	}
 	return decodePV(obj)
+}
+
+// ReadError is the error GetPV returns when it cannot tell whether the PV
+// exists. Its message names the PV and says in a few words why, and carries
+// nothing else: client-go's own message includes the URL, and so the address
+// of the API server, which does not belong in a log or a gRPC status. The
+// full error is available through Unwrap.
+type ReadError struct {
+	PV     string
+	Reason string
+	err    error
+}
+
+func (e *ReadError) Error() string { return fmt.Sprintf("kube: reading PV %q: %s", e.PV, e.Reason) }
+func (e *ReadError) Unwrap() error { return e.err }
+
+// reasonOf describes err without the address of the server or the request.
+func reasonOf(err error) string {
+	var st apierrors.APIStatus
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the request timed out"
+	case errors.Is(err, context.Canceled):
+		return "the request was cancelled"
+	case errors.As(err, &st):
+		code := st.Status().Code
+		if !fromAPIServer(err) {
+			return fmt.Sprintf("the answer (HTTP %d) was not the API server's", code)
+		}
+		if r := st.Status().Reason; r != "" {
+			return fmt.Sprintf("the API server answered %s (HTTP %d)", r, code)
+		}
+		return fmt.Sprintf("the API server answered HTTP %d", code)
+	default:
+		return "the API server could not be reached"
+	}
 }
 
 // fromAPIServer reports whether err, a NotFound, is a Status the API server

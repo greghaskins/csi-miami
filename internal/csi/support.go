@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
@@ -74,6 +77,31 @@ func (l *opLimiter) acquire(group, key string) (release func(), ok bool) {
 // the same transport or the same directory has not returned.
 func errStuck() error {
 	return unavailable("a previous operation on this transport has not returned, so this one was not started; it will be retried")
+}
+
+// reason says what went wrong in a few words that are safe to log and to send
+// to the caller: the text of the system error for one, a class for the mount
+// package's, and never a path, an address or an export, which the underlying
+// error's own text carries. The full error is logged at debug level where it
+// is caught.
+func reason(err error) string {
+	var errno syscall.Errno
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, mount.ErrTimeout):
+		return "timed out"
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case errors.Is(err, mount.ErrBusy):
+		return "a previous call on it has not returned"
+	case errors.Is(err, mount.ErrConflict):
+		return "something else is mounted at its mount point"
+	case errors.Is(err, mount.ErrNotResolved):
+		return "its path goes through a symlink"
+	case errors.As(err, &errno):
+		return errno.Error()
+	default:
+		return "failed"
+	}
 }
 
 // blocking runs fn, which makes a system call that can hang on a dead network
@@ -220,6 +248,7 @@ func sameContext(a, b map[string]string) bool {
 // the guard against piling up name lookups that hang lives as long as the
 // process.
 type mounts struct {
+	log  *slog.Logger
 	root string
 	m    mount.Mounter
 	opts transport.Options
@@ -233,8 +262,8 @@ type mountEntry struct {
 	sem chan struct{} // one token: held while Mount runs
 }
 
-func newMounts(root string, m mount.Mounter, opts transport.Options) *mounts {
-	return &mounts{root: root, m: m, opts: opts, entries: map[string]*mountEntry{}}
+func newMounts(log *slog.Logger, root string, m mount.Mounter, opts transport.Options) *mounts {
+	return &mounts{log: log, root: root, m: m, opts: opts, entries: map[string]*mountEntry{}}
 }
 
 func (c *mounts) entry(spec transport.Spec) (*mountEntry, error) {
@@ -264,7 +293,7 @@ func (c *mounts) entry(spec transport.Spec) (*mountEntry, error) {
 func (c *mounts) ensure(ctx context.Context, spec transport.Spec) (transport.Transport, error) {
 	e, err := c.entry(spec)
 	if err != nil {
-		return nil, unavailable("transport cannot be set up: %v", err)
+		return nil, unavailable("transport cannot be set up: %s", reason(err))
 	}
 	select {
 	case e.sem <- struct{}{}:
@@ -277,7 +306,8 @@ func (c *mounts) ensure(ctx context.Context, spec transport.Spec) (transport.Tra
 		if ctx.Err() != nil {
 			return nil, contextStatus(ctx.Err())
 		}
-		return nil, unavailable("transport %s cannot be mounted: %v", spec.Canonical(), err)
+		c.log.Debug("mounting a transport failed", "transport", spec.ID(), "error", err)
+		return nil, unavailable("transport %s cannot be mounted: %s", spec.ID(), reason(err))
 	}
 	return e.tr, nil
 }
@@ -291,4 +321,14 @@ func parseVolumeID(s string) (volume.ID, error) {
 		return volume.ID{}, errNoSuchVolume
 	}
 	return id, nil
+}
+
+// readReason describes a failure to read a PV: the message of kube's
+// ReadError, which names a reason and no address, or the generic reason.
+func readReason(err error) string {
+	var re *kube.ReadError
+	if errors.As(err, &re) {
+		return re.Reason
+	}
+	return reason(err)
 }

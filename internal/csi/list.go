@@ -58,7 +58,7 @@ func (c *Controller) ListVolumes(ctx context.Context, req *csi.ListVolumesReques
 		if ctx.Err() != nil {
 			return nil, contextStatus(ctx.Err())
 		}
-		return nil, unavailable("cannot read the mount table: %v", err)
+		return nil, unavailable("cannot read the mount table: %s", reason(err))
 	}
 	transports := filepath.Join(c.root, "transports")
 	seen := map[string]bool{}

@@ -79,7 +79,8 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 		if ctx.Err() != nil {
 			return nil, contextStatus(ctx.Err())
 		}
-		return nil, unavailable("cannot read the PV of volume %q, so its location is unknown: %v", id.Name, err)
+		c.log.Debug("reading a PV failed", "volume_id", id.String(), "error", err)
+		return nil, unavailable("cannot read the PV of volume %q, so its location is unknown: %s", id.Name, readReason(err))
 	}
 
 	vctx, err := contextOfPV(pv, id)
@@ -246,7 +247,7 @@ func removeItemDirWith(ctx context.Context, m treeReader, r *treeRemover, mountD
 	// 2. Nothing mounted inside.
 	table, err := m.Mounts(ctx)
 	if err != nil {
-		return false, unavailable("cannot read the mount table, so nothing is deleted: %v", err)
+		return false, unavailable("cannot read the mount table, so nothing is deleted: %s", reason(err))
 	}
 	if inside := table.Under(dir); len(inside) > 0 {
 		return false, unavailable("a mount is at or below the directory of volume %q, so nothing is deleted", name)
