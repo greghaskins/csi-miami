@@ -1,8 +1,12 @@
 # Scrub for text GitHub stores outside git: issue and pull request titles and
 # bodies, review bodies, comments, discussions and releases. A comment that
-# matches is deleted outright (editing would leave the original visible in
-# its edit history); a title or body that matches fails this check and gets a
-# one-line notice, since those can only be edited by their author.
+# matches is deleted outright. A title or body that matches is overwritten
+# with a placeholder at once and the check fails. Overwriting clears the
+# page, search, the squash-merge message source and future notifications,
+# but GitHub keeps the previous revision in the item's edit history, which
+# any reader can query and which only the web UI can delete, one revision at
+# a time; a title change also leaves an undeletable timeline event. The
+# notice says so. Prevention at the source is the real control.
 #
 # pull_request_target runs with the base branch checked out and never
 # executes anything from the pull request. Event text is read from the event
@@ -51,8 +55,13 @@ jobs:
           script: |
             const {owner, repo} = context.repo;
             const ev = context.payload;
+            const kind = process.env.KIND;
             const notice = 'The scrub check matched this text against the repository rule set.';
-            if (process.env.KIND === 'comment') {
+            const number = (ev.issue || ev.pull_request || {}).number;
+            const say = async (text) => {
+              if (number) await github.rest.issues.createComment({owner, repo, issue_number: number, body: text});
+            };
+            if (kind === 'comment') {
               if (context.eventName === 'issue_comment') {
                 await github.rest.issues.deleteComment({owner, repo, comment_id: ev.comment.id});
               } else if (context.eventName === 'pull_request_review_comment') {
@@ -61,17 +70,25 @@ jobs:
                 await github.graphql('mutation($id: ID!) { deleteDiscussionComment(input: {id: $id}) { clientMutationId } }',
                   {id: ev.comment.node_id});
               }
-              const number = (ev.issue || ev.pull_request || {}).number;
-              if (number) {
-                await github.rest.issues.createComment({owner, repo, issue_number: number,
-                  body: notice + ' A comment was removed.'});
-              }
+              await say(notice + ' A comment was removed.');
               core.setFailed('comment removed');
-            } else {
-              const number = (ev.issue || ev.pull_request || {}).number;
-              if (number) {
-                await github.rest.issues.createComment({owner, repo, issue_number: number,
-                  body: notice + ' Edit the title or body; this check fails until it passes.'});
-              }
-              core.setFailed('title or body must be edited');
+              return;
             }
+            // Title or body: overwrite first, explain second, fail third.
+            const title = '[scrubbed]';
+            const body = 'Scrubbed by the scrub-text workflow. Rewrite this text, then delete the previous revision from the edit history (the "edited" menu).';
+            const remains = ' The previous revision is still in the edit history and must be deleted there by hand; a changed title also stays in the timeline.';
+            if (context.eventName === 'pull_request_target') {
+              await github.rest.pulls.update({owner, repo, pull_number: ev.pull_request.number, title, body});
+            } else if (context.eventName === 'issues') {
+              await github.rest.issues.update({owner, repo, issue_number: ev.issue.number, title, body});
+            } else if (context.eventName === 'pull_request_review') {
+              await github.rest.pulls.updateReview({owner, repo, pull_number: ev.pull_request.number, review_id: ev.review.id, body});
+            } else if (context.eventName === 'release') {
+              await github.rest.repos.updateRelease({owner, repo, release_id: ev.release.id, name: title, body});
+            } else if (context.eventName === 'discussion') {
+              await github.graphql('mutation($id: ID!, $title: String!, $body: String!) { updateDiscussion(input: {discussionId: $id, title: $title, body: $body}) { clientMutationId } }',
+                {id: ev.discussion.node_id, title, body});
+            }
+            await say(notice + ' The title and body were overwritten.' + remains);
+            core.setFailed('title or body overwritten; edit history needs manual cleanup');
