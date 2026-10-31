@@ -66,9 +66,17 @@ func TestClassifyEverySentinel(t *testing.T) {
 // the order, and the two that can arise are pinned here.
 func TestClassifyMixedErrors(t *testing.T) {
 	t.Parallel()
+	timeout := realMountTimeout(t)
+	// A real mount timeout wraps the context's deadline error as well, which
+	// is what makes the order matter: without the rule that the caller's own
+	// deadline is one that is not a mount's, every timeout below would be
+	// taken for the caller's at step 1.
+	if !errors.Is(timeout, mount.ErrTimeout) || !errors.Is(timeout, context.DeadlineExceeded) {
+		t.Fatalf("the fixture is not a real mount timeout: %v", timeout)
+	}
 	// A transport that did not answer within the deadline: unavailable, and a
 	// timeout. The timeout is the more specific answer.
-	hung := fmt.Errorf("%w: mounting x: %w", ErrTransportUnavailable, fmt.Errorf("bind: %w (call abandoned): %w", mount.ErrTimeout, context.DeadlineExceeded))
+	hung := fmt.Errorf("%w: mounting x: %w", ErrTransportUnavailable, timeout)
 	if got := Classify(hung); got != ClassDeadlineExceeded {
 		t.Errorf("an unavailable transport that timed out = %v, want DeadlineExceeded", got)
 	}
@@ -78,7 +86,7 @@ func TestClassifyMixedErrors(t *testing.T) {
 		t.Errorf("an unavailable transport that is busy = %v, want Unavailable", got)
 	}
 	// A conflict joined with a timeout is the conflict: a person has to act.
-	both := errors.Join(fmt.Errorf("%w: at x", ErrStageConflict), fmt.Errorf("%w: y", mount.ErrTimeout))
+	both := errors.Join(fmt.Errorf("%w: at x", ErrStageConflict), timeout)
 	if got := Classify(both); got != ClassFailedPrecondition {
 		t.Errorf("a conflict joined with a timeout = %v, want FailedPrecondition", got)
 	}
@@ -87,6 +95,19 @@ func TestClassifyMixedErrors(t *testing.T) {
 	if got := Classify(callers); got != ClassDeadlineExceeded {
 		t.Errorf("the caller's deadline over a conflict = %v, want DeadlineExceeded", got)
 	}
+}
+
+// realMountTimeout is a timeout as the Mounter reports it, with the context's
+// deadline error wrapped beside mount.ErrTimeout, from a call that hangs.
+func realMountTimeout(t *testing.T) error {
+	t.Helper()
+	f := &fake.Mounter{DefaultTimeout: 10 * time.Millisecond}
+	f.Block("/blocked")
+	err := f.Bind(bg, "/source", "/blocked/target", false)
+	if err == nil {
+		t.Fatal("a blocked bind returned")
+	}
+	return err
 }
 
 // The errors the package actually produces classify as the table says, so no

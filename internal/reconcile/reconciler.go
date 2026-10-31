@@ -311,6 +311,16 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 // gone belongs to a pod kubelet has already torn down, and creating the whole
 // tree again would leave kubelet's cleanup of the orphaned pod directory
 // failing on it for as long as the bind exists.
+//
+// The publish is recorded before the wait, so that a caller that gives up
+// still gets its bind. If the caller's context ends before the answer, the
+// target stays in the record whatever the pass finds, including a target that
+// turns out to be held by a mount that is not ours. That is harmless: the
+// ownership test (publishOwnership) means nothing but the driver's own bind is
+// ever unmounted for it, a later pass reports the conflict, and the entry goes
+// when kubelet unpublishes or unstages, or when the pod's directory is gone and
+// the entry is pruned. A caller that stays for the answer and gets a conflict
+// has the entry removed.
 func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publish) error {
 	if err := r.checkTargetPath("publish", p.TargetPath); err != nil {
 		return err
