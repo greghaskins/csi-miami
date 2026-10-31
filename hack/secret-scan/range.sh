@@ -14,6 +14,6 @@ fail=0
 gitleaks git --redact --no-banner --exit-code 1 --log-opts="$range" . || fail=1
 # shellcheck disable=SC2086
 for c in $(git rev-list $range); do
-  git log -1 --format=%B "$c" | hack/scrub/text.sh "commit message $c" || fail=1
+  git log -1 --format=%B "$c" | hack/secret-scan/text.sh "commit message $c" || fail=1
 done
 exit $fail

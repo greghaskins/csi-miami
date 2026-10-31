@@ -12,10 +12,10 @@ case "$ev" in
   pull_request_review)  kind=text; q='[.review.body]' ;;
   release)              kind=text; q='[.release.tag_name, .release.name, .release.body]' ;;
   discussion)           kind=text; q='[.discussion.title, .discussion.body]' ;;
-  *) echo "scrub: unhandled event $ev" >&2; exit 1 ;;
+  *) echo "secret-scan: unhandled event $ev" >&2; exit 1 ;;
 esac
 hit=false
-if ! jq -r "$q | map(select(. != null)) | join(\"\n\")" "$path" | hack/scrub/text.sh "$ev text"; then
+if ! jq -r "$q | map(select(. != null)) | join(\"\n\")" "$path" | hack/secret-scan/text.sh "$ev text"; then
   hit=true
 fi
 { echo "hit=$hit"; echo "kind=$kind"; } >>"${GITHUB_OUTPUT:-/dev/null}"

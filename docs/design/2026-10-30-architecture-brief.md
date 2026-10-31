@@ -554,7 +554,7 @@ Every PR runs the full set below as parallel jobs; nothing waits for
 
 | Job | What it proves | Runs on |
 |---|---|---|
-| `scrub` | the tree, every commit's content and message in the PR range, and the branch name, against a private rule set held in a repository secret; a second workflow scans issue, PR, review, comment, discussion and release text as it is posted and deletes matching comments | amd64 |
+| `secret-scan` | gitleaks over the tree, every commit's content and message in the PR range, and the branch name, with the config held in a repository secret; a second workflow scans issue, PR, review, comment, discussion and release text as it is posted and removes what matches | amd64 |
 | `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | amd64 |
 | `unit` | `go test -race -shuffle=on ./...` with coverage | amd64 |
 | `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | amd64 |
@@ -584,8 +584,8 @@ Rules that keep it honest:
   dm state, kernel log excerpts and the plugin's logs as artifacts.
 - `make check` runs the same targets locally with the same flags, so a
   green local run predicts CI.
-- The scrub runs as git hooks locally (`pre-commit`, installed by `mise
-  install`) with the same scripts CI uses, fed the rule set from an
+- Secret scanning runs as git hooks locally (`pre-commit`, installed by
+  `mise install`) with the same scripts CI uses, fed the config from an
   environment variable instead of the secret, and refuses to run without it.
 - On `main` and nightly: the manifest job, any variants that were
   path-filtered, and the release pipeline (PR-driven: cut-release opens a
