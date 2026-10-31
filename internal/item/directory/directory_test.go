@@ -393,6 +393,39 @@ func TestTeardownLeavesWhatIsNotOurs(t *testing.T) {
 	}
 }
 
+// A stage that is mounted while its transport is not cannot be recognised.
+// Teardown says so, and does not call the driver's own mount a foreign one.
+func TestTeardownWithTheTransportNotMounted(t *testing.T) {
+	t.Parallel()
+	it, p := newPopperItem(t, rootMount(), stageBind())
+	err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: p.table})
+	if !errors.Is(err, item.ErrTransportNotMounted) || errors.Is(err, item.ErrStageConflict) {
+		t.Fatalf("got %v, want ErrTransportNotMounted and not a conflict", err)
+	}
+	if got := unmounts(p.Mounter); len(got) != 0 {
+		t.Errorf("unmounted %v", got)
+	}
+	// Nothing staged: nothing to say.
+	it, p = newPopperItem(t, rootMount())
+	if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: p.table}); err != nil {
+		t.Errorf("got %v", err)
+	}
+}
+
+// The stage bind of a directory that has been removed is the driver's.
+func TestTeardownUnmountsABindOfARemovedDirectory(t *testing.T) {
+	t.Parallel()
+	gone := stageBind()
+	gone.Deleted = true
+	it, p := newPopperItem(t, rootMount(), transportMount(), gone)
+	if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: p.table}); err != nil {
+		t.Fatal(err)
+	}
+	if got := unmounts(p.Mounter); len(got) != 1 {
+		t.Errorf("unmounts = %v", got)
+	}
+}
+
 func TestTeardownErrors(t *testing.T) {
 	t.Parallel()
 	it, p := newPopperItem(t, rootMount(), transportMount(), stageBind())

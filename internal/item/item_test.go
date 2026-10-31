@@ -121,6 +121,46 @@ func TestUnmountBind(t *testing.T) {
 	}
 }
 
+// A directory that was removed while it was bind-mounted leaves a mount whose
+// root the kernel marks deleted. It is still ours to unmount.
+func TestUnmountBindRecognisesABindOfARemovedDirectory(t *testing.T) {
+	t.Parallel()
+	gone := bindOf(2, source)
+	gone.Deleted = true
+	p := newPopper(rootMount(), gone)
+	if err := UnmountBind(context.Background(), p, mountPoint, source, errConflict); err != nil {
+		t.Fatalf("got %v", err)
+	}
+	if p.unmounts() != 1 {
+		t.Errorf("%d unmounts, want 1", p.unmounts())
+	}
+	// A deleted root of some other directory is still not ours.
+	other := bindOf(2, "/export/data/pvc-2")
+	other.Deleted = true
+	p = newPopper(rootMount(), other)
+	if err := UnmountBind(context.Background(), p, mountPoint, source, errConflict); !errors.Is(err, errConflict) {
+		t.Errorf("got %v, want the conflict", err)
+	}
+}
+
+func TestUnmountIfUsesTheOwnershipItIsGiven(t *testing.T) {
+	t.Parallel()
+	no := func(observe.Table, observe.Mount) (bool, error) { return false, nil }
+	yes := func(observe.Table, observe.Mount) (bool, error) { return true, nil }
+	boom := func(observe.Table, observe.Mount) (bool, error) { return false, errors.New("boom") }
+
+	p := newPopper(rootMount(), bindOf(2, source))
+	if err := UnmountIf(context.Background(), p, mountPoint, no, "x", errConflict); !errors.Is(err, errConflict) || p.unmounts() != 0 {
+		t.Errorf("not ours: %v, %d unmounts", err, p.unmounts())
+	}
+	if err := UnmountIf(context.Background(), p, mountPoint, boom, "x", errConflict); err == nil || errors.Is(err, errConflict) || p.unmounts() != 0 {
+		t.Errorf("cannot tell: %v, %d unmounts", err, p.unmounts())
+	}
+	if err := UnmountIf(context.Background(), p, mountPoint, yes, "x", errConflict); err != nil || p.unmounts() != 1 {
+		t.Errorf("ours: %v, %d unmounts", err, p.unmounts())
+	}
+}
+
 func TestUnmountBindErrors(t *testing.T) {
 	t.Parallel()
 	p := newPopper(rootMount(), bindOf(2, source))

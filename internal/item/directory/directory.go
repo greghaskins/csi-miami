@@ -201,10 +201,13 @@ func hidden(t observe.Table, path string) bool {
 // which is the loud outcome; the alternative is unmounting something that
 // holds a pod's data.
 //
-// It does not stat the item directory, so it works when the item is gone, but
-// it does need the transport in the mount table to recognise the bind, which
-// the reconciler's converge restores before an Unstage can be retried.
-func (d *Item) Teardown(ctx context.Context, in intent.Intent, _ item.Observed) error {
+// It does not stat the item directory, and it recognises the bind of a
+// directory that has since been removed, so a volume whose directory was
+// deleted while it was staged can still be unstaged. It does need the
+// transport in the mount table to recognise the bind; without it Teardown
+// returns item.ErrTransportNotMounted, and the reconciler's converge restores
+// the transport before the unstage is retried.
+func (d *Item) Teardown(ctx context.Context, in intent.Intent, obs item.Observed) error {
 	id, err := in.ID()
 	if err != nil {
 		return fmt.Errorf("directory item: %w", err)
@@ -212,6 +215,19 @@ func (d *Item) Teardown(ctx context.Context, in intent.Intent, _ item.Observed) 
 	dir, err := in.Context().Dir(d.cfg.Root, id)
 	if err != nil {
 		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+	}
+	// The bind is recognised by the transport it was made from. If the stage
+	// is mounted and the transport is not, say that, rather than calling the
+	// stage a foreign mount: it is the driver's, and the next pass remounts the
+	// transport.
+	if _, staged := obs.Mounts.At(in.StagePath); staged {
+		tdir, err := in.Transport.MountPoint(d.cfg.Root)
+		if err != nil {
+			return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+		}
+		if _, mounted := obs.Mounts.At(tdir); !mounted {
+			return fmt.Errorf("directory item %s: %w", in.VolumeID, item.ErrTransportNotMounted)
+		}
 	}
 	if err := item.UnmountBind(ctx, d.cfg.Mounter, in.StagePath, dir, item.ErrStageConflict); err != nil {
 		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)

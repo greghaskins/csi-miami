@@ -159,6 +159,25 @@ func (t Table) collect(prefix string, includeAt bool) Table {
 // so a caller adopting a transport must verify the source string and super
 // options itself as well; that is the transport's job, not this table's.
 func (t Table) IsBindOf(mountPoint, sourceDir string) (bool, error) {
+	return t.isBindOf(mountPoint, sourceDir, false)
+}
+
+// IsBindOfIncludingDeleted is IsBindOf for the one question it must answer
+// differently: whether a mount is still a bind of a directory that has since
+// been removed. When a directory that is bind-mounted is removed, the kernel
+// marks the mount's root deleted, and IsBindOf then says false for it, which
+// is right for deciding whether a mount is usable. A caller deciding whether
+// a mount is the one it made, so that it may unmount it, needs the other
+// answer: the mount still has the same device and the same root path as the
+// source had, deleted or not, and nothing else could have been mounted there
+// under that path since. The Deleted flag is ignored on both sides; everything
+// else, including the rule that the mount containing the source is not a bind
+// of it, is as in IsBindOf.
+func (t Table) IsBindOfIncludingDeleted(mountPoint, sourceDir string) (bool, error) {
+	return t.isBindOf(mountPoint, sourceDir, true)
+}
+
+func (t Table) isBindOf(mountPoint, sourceDir string, deletedOK bool) (bool, error) {
 	if !filepath.IsAbs(mountPoint) {
 		return false, fmt.Errorf("observe: mount point %q is not absolute", mountPoint)
 	}
@@ -175,7 +194,7 @@ func (t Table) IsBindOf(mountPoint, sourceDir string) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("observe: no mount contains %q", sourceDir)
 	}
-	if container.ID == target.ID || target.Deleted || container.Deleted {
+	if container.ID == target.ID || !deletedOK && (target.Deleted || container.Deleted) {
 		return false, nil
 	}
 	rel, err := filepath.Rel(container.MountPoint, sourceDir)

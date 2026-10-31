@@ -65,23 +65,49 @@ var (
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
 )
 
+// ErrTransportNotMounted is returned by an Item's Teardown when the stage path
+// is mounted but the transport it was made from is not, so the stage mount
+// cannot be told from a foreign one. Nothing is unmounted. The reconciler
+// remounts the transport on its next pass, after which the unstage can be
+// retried.
+var ErrTransportNotMounted = errors.New("the transport is not mounted, so the stage mount cannot be recognised as the driver's own")
+
+// Owned says whether the visible mount top at a mount point is one the driver
+// made. It decides from the table alone.
+type Owned func(t observe.Table, top observe.Mount) (bool, error)
+
+// BindOf is the Owned test for a mount that must be a bind of the directory
+// source: same device and same root path, including when the directory has
+// since been removed (observe.Table.IsBindOfIncludingDeleted). A volume whose
+// directory was deleted while it was staged must still be unstageable.
+func BindOf(source string) Owned {
+	return func(t observe.Table, top observe.Mount) (bool, error) {
+		return t.IsBindOfIncludingDeleted(top.MountPoint, source)
+	}
+}
+
 // UnmountBind unmounts the mount visible at mountPoint, once, and only if it
-// is a bind of the directory source (observe.Table.IsBindOf). It is how an
-// Item or the reconciler takes down what it made without ever removing what
-// it did not:
+// is a bind of the directory source (BindOf). See UnmountIf.
+func UnmountBind(ctx context.Context, m mount.Mounter, mountPoint, source string, conflict error) error {
+	return UnmountIf(ctx, m, mountPoint, BindOf(source), "a bind of "+source, conflict)
+}
+
+// UnmountIf is how an Item or the reconciler takes down what it made without
+// ever removing what it did not:
 //
 //   - Nothing visible at mountPoint, or a mount hidden under another, is
 //     success: there is nothing of ours to remove.
-//   - A visible mount that is not a bind of source is not ours. It is left in
+//   - A visible mount for which owned says false is not ours. It is left in
 //     place and the error wraps conflict (ErrStageConflict for a stage path,
-//     the reconciler's ErrPublishConflict for a publish target).
-//   - The unmount is without MNT_DETACH, so a busy mount is an error and stays.
+//     the reconciler's ErrPublishConflict for a publish target). what says
+//     what it should have been, for the message.
+//   - The unmount is once and without MNT_DETACH, so a busy mount is an error
+//     and stays.
 //   - After it, the table is read again. If something is still visible at
 //     mountPoint, another mount was stacked there; it is not removed and the
-//     error wraps conflict. The driver never stacks, so a loop that popped
-//     layers until the path was clear would be removing mounts it cannot
-//     show it made.
-func UnmountBind(ctx context.Context, m mount.Mounter, mountPoint, source string, conflict error) error {
+//     error wraps conflict. The driver never stacks, so popping layers until
+//     the path is clear would remove mounts it cannot show it made.
+func UnmountIf(ctx context.Context, m mount.Mounter, mountPoint string, owned Owned, what string, conflict error) error {
 	t, err := m.Mounts(ctx)
 	if err != nil {
 		return err
@@ -90,12 +116,12 @@ func UnmountBind(ctx context.Context, m mount.Mounter, mountPoint, source string
 	if !ok {
 		return nil
 	}
-	same, err := t.IsBindOf(mountPoint, source)
+	ours, err := owned(t, top)
 	if err != nil {
 		return fmt.Errorf("%s: %w", mountPoint, err)
 	}
-	if !same {
-		return fmt.Errorf("%w: %s is mounted as %s from %q, which is not a bind of %s, and is left in place", conflict, mountPoint, top.FSType, top.Source, source)
+	if !ours {
+		return fmt.Errorf("%w: %s is mounted as %s from %q, which is not %s, and is left in place", conflict, mountPoint, top.FSType, top.Source, what)
 	}
 	if err := m.Unmount(ctx, mountPoint, 0); err != nil {
 		return err
