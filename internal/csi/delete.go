@@ -186,7 +186,11 @@ type treeReader interface {
 // a held directory descriptor for the first elements of the path.
 //
 // removeItemDir runs file system calls that can hang on a dead transport; the
-// caller runs it with blocking.
+// caller runs it with blocking. If the request's context ends first, the call
+// is abandoned and may still finish removing after DeleteVolume has returned
+// DeadlineExceeded or Canceled; a retry then finds the directory gone or
+// removes what is left, and a name is never reused for a new volume (it is the
+// PV's name, a fresh UUID), so the late removal cannot hit a new volume.
 func removeItemDir(ctx context.Context, m treeReader, mountDir, dir, name string) (bool, error) {
 	// 1. The shape of the path.
 	elems, ok := relativeTo(mountDir, dir)
