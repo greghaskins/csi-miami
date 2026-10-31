@@ -6,13 +6,32 @@
 # It reads only the index (mode, blob hash and path of each tracked file), so
 # it is identical on every runner and every architecture.
 #
-# The paths below are exactly the allowlist in .dockerignore, plus the
-# Dockerfile and .dockerignore themselves. Keep the two lists in agreement.
+# The inputs are the Dockerfile, the build context allowlisted in
+# .dockerignore (go.mod, go.sum, cmd, internal) and the two scripts that
+# decide how the image is built and hashed. Keep this list in agreement with
+# .dockerignore. `--paths` prints the list, one path per line, for
+# hack/image-build.sh.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-entries="$(git ls-files -s -- Dockerfile .dockerignore go.mod go.sum cmd internal)"
+paths=(
+  Dockerfile
+  .dockerignore
+  go.mod
+  go.sum
+  cmd
+  internal
+  hack/content-hash.sh
+  hack/image-build.sh
+)
+
+if [ "${1:-}" = "--paths" ]; then
+  printf '%s\n' "${paths[@]}"
+  exit 0
+fi
+
+entries="$(git ls-files -s -- "${paths[@]}")"
 if [ -z "$entries" ]; then
   echo "content-hash: no tracked build inputs found" >&2
   exit 1

@@ -43,7 +43,9 @@ vet:
 # build output) cannot change the answer. gofmt's exit status is checked as
 # well as its output.
 fmt-check:
-	@out="$$(gofmt -s -l $$(git ls-files '*.go'))" || { echo "$$out"; exit 1; }; \
+	@files="$$(git ls-files '*.go')"; \
+	if [ -z "$$files" ]; then echo "fmt-check: no Go files"; exit 0; fi; \
+	out="$$(gofmt -s -l $$files)" || { echo "$$out"; exit 1; }; \
 	if [ -n "$$out" ]; then echo "gofmt -s needed on:"; echo "$$out"; exit 1; fi
 
 fmt:
@@ -62,16 +64,17 @@ tidy-check:
 vuln:
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
-# Images are tagged, and report their version, by the hash of their build
-# inputs (hack/content-hash.sh), the same identity CI uses.
 content-hash:
 	@hack/content-hash.sh
 
-IMAGE_TAG ?= c-$(shell hack/content-hash.sh)
-
-# Image for the host architecture, loaded into the local Docker daemon.
+# Image for the host architecture, loaded into the local Docker daemon. It is
+# built by hack/image-build.sh, the script CI uses, and tagged and versioned
+# c-<content hash>. A working tree whose build inputs differ from the index
+# gets "-dirty" on the tag and version, so a local build is never labelled as
+# the committed hash. Local builds carry no attestations.
 image:
-	docker buildx build --load --build-arg VERSION=$(IMAGE_TAG) -t $(IMAGE):$(IMAGE_TAG) .
+	@hash="$$(hack/content-hash.sh)" || exit 1; \
+	hack/image-build.sh --arch "$$(go env GOARCH)" --tag "$(IMAGE):c-$$hash" --load
 
 # Exactly what CI runs: the static job runs fmt-check vet lint tidy-check vuln
 # and the unit job runs cover.
