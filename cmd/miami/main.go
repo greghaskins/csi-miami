@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -39,12 +40,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprint(stdout, usage)
 		return 0
 	case "version":
-		return runCommand("version", args[1:], stderr, func() {
+		return runCommand("version", args[1:], stdout, stderr, func() {
 			_, _ = fmt.Fprintln(stdout, version)
 		})
 	case "node", "controller", "lock":
 		name := args[0]
-		return runCommand(name, args[1:], stderr, func() {
+		return runCommand(name, args[1:], stdout, stderr, func() {
 			_, _ = fmt.Fprintf(stdout, "miami %s %s\n", name, version)
 		})
 	default:
@@ -54,14 +55,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 // runCommand parses the flags of one subcommand and, if they are valid, runs
-// action.
-func runCommand(name string, args []string, stderr io.Writer, action func()) int {
+// action. Help goes to stdout and exits 0, like the top-level -h; flag errors
+// go to stderr and exit 2.
+func runCommand(name string, args []string, stdout, stderr io.Writer, action func()) int {
+	var out bytes.Buffer
 	fs := flag.NewFlagSet("miami "+name, flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs.SetOutput(&out)
+
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			_, _ = stdout.Write(out.Bytes())
 			return 0
 		}
+		_, _ = stderr.Write(out.Bytes())
 		return 2
 	}
 	if fs.NArg() > 0 {

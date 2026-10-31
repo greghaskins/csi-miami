@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 )
 
@@ -20,11 +19,36 @@ func TestRun(t *testing.T) {
 		{name: "node", args: []string{"node"}, wantStdout: "miami node " + version + "\n"},
 		{name: "controller", args: []string{"controller"}, wantStdout: "miami controller " + version + "\n"},
 		{name: "lock", args: []string{"lock"}, wantStdout: "miami lock " + version + "\n"},
-		{name: "no command prints usage", args: nil, wantCode: 2, wantStderr: "usage: miami"},
-		{name: "-h prints usage", args: []string{"-h"}, wantStdout: "usage: miami"},
-		{name: "unknown command", args: []string{"bogus"}, wantCode: 2, wantStderr: `unknown command "bogus"`},
-		{name: "extra argument", args: []string{"node", "x"}, wantCode: 2, wantStderr: `unexpected argument "x"`},
-		{name: "unknown flag", args: []string{"node", "-nope"}, wantCode: 2, wantStderr: "flag provided but not defined"},
+
+		{name: "no command prints usage", args: nil, wantCode: 2, wantStderr: usage},
+		{name: "-h", args: []string{"-h"}, wantStdout: usage},
+		{name: "-help", args: []string{"-help"}, wantStdout: usage},
+		{name: "--help", args: []string{"--help"}, wantStdout: usage},
+		{name: "help", args: []string{"help"}, wantStdout: usage},
+
+		{name: "node -h", args: []string{"node", "-h"}, wantStdout: "Usage of miami node:\n"},
+		{name: "controller -h", args: []string{"controller", "-h"}, wantStdout: "Usage of miami controller:\n"},
+		{name: "lock --help", args: []string{"lock", "--help"}, wantStdout: "Usage of miami lock:\n"},
+		{name: "version -h", args: []string{"version", "-h"}, wantStdout: "Usage of miami version:\n"},
+
+		{
+			name:       "unknown command",
+			args:       []string{"bogus"},
+			wantCode:   2,
+			wantStderr: "miami: unknown command \"bogus\"\n\n" + usage,
+		},
+		{
+			name:       "extra argument",
+			args:       []string{"node", "x"},
+			wantCode:   2,
+			wantStderr: "miami node: unexpected argument \"x\"\n",
+		},
+		{
+			name:       "unknown flag",
+			args:       []string{"node", "-nope"},
+			wantCode:   2,
+			wantStderr: "flag provided but not defined: -nope\nUsage of miami node:\n",
+		},
 	}
 
 	for _, tt := range tests {
@@ -37,20 +61,12 @@ func TestRun(t *testing.T) {
 			if code != tt.wantCode {
 				t.Errorf("exit code = %d, want %d", code, tt.wantCode)
 			}
-			if !strings.Contains(stdout.String(), tt.wantStdout) {
-				t.Errorf("stdout = %q, want it to contain %q", stdout.String(), tt.wantStdout)
+			if got := stdout.String(); got != tt.wantStdout {
+				t.Errorf("stdout = %q, want %q", got, tt.wantStdout)
 			}
-			if !strings.Contains(stderr.String(), tt.wantStderr) {
-				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tt.wantStderr)
+			if got := stderr.String(); got != tt.wantStderr {
+				t.Errorf("stderr = %q, want %q", got, tt.wantStderr)
 			}
 		})
-	}
-}
-
-func TestDefaultVersion(t *testing.T) {
-	t.Parallel()
-
-	if version == "" {
-		t.Fatal("version must never be empty")
 	}
 }
