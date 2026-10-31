@@ -1,5 +1,17 @@
 // Package csi serves the Container Storage Interface over a unix socket: the
-// identity service, the controller service, and the plumbing that runs them.
+// identity service, the controller service, the node service, and the plumbing
+// that runs them.
+//
+// The node service is thin. NodeStageVolume, NodeUnstageVolume,
+// NodePublishVolume and NodeUnpublishVolume validate the request and hand it
+// to the reconciler (internal/reconcile), which writes the intent and waits
+// for the kernel to match it; the handlers mount nothing themselves. A repeated
+// stage with another volume context or staging path is AlreadyExists, a publish
+// whose staging path is not the volume's is FailedPrecondition, and the
+// reconciler's errors become the gRPC code of their class (nodeStatus, one
+// function for all of them). NodeGetVolumeStats answers for the stage path and
+// the publish targets of a staged volume only, and a file system that cannot be
+// read costs the answer its usage, not the call its success.
 //
 // The controller is stateless. It holds no record of the volumes it made; the
 // directory on the transport is the volume, and the PersistentVolume that
