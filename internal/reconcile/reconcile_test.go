@@ -715,7 +715,9 @@ func TestIdleTransportIsUnmountedOnlyAfterTheTTL(t *testing.T) {
 	if e.metrics.garbage != 1 {
 		t.Errorf("garbage unmounts = %d", e.metrics.garbage)
 	}
-	if len(e.events.reasons(ReasonGarbageUnmounted)) != 1 {
+	// An idle transport names no volume, so there is nothing for an event to
+	// attach to: it is logged, not an event.
+	if len(e.events.all()) != 0 {
 		t.Errorf("events = %+v", e.events.all())
 	}
 	// Labelled by kind when this process had mounted it, "unknown" if not.

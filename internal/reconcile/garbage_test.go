@@ -52,7 +52,8 @@ func TestStrayMountsBelowTheStageRootAreUnmountedDeepestFirst(t *testing.T) {
 	if len(e.sim.table()) != 1 {
 		t.Errorf("table = %+v", e.sim.table())
 	}
-	if e.metrics.garbage != 3 || len(e.events.reasons(ReasonGarbageUnmounted)) != 3 {
+	// Strays name no volume, so they are counted and logged but raise no event.
+	if e.metrics.garbage != 3 || len(e.events.all()) != 0 {
 		t.Errorf("garbage = %d, events = %+v", e.metrics.garbage, e.events.all())
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
@@ -141,6 +143,11 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 	}
 
 	table, errs := p.unmountRounds(claimedStage)
+	for path := range r.warned {
+		if _, failing := errs[path]; !failing && !within(r.opts.TransportsRoot, path) {
+			delete(r.warned, path) // it came off, or is no longer wanted off
+		}
+	}
 	p.finishDrops(batch, table, errs)
 	if table != nil && failuresClean {
 		p.collectIdleTransports(table, refs, refsKnown)
@@ -178,7 +185,7 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 					delete(errs, path)
 					continue
 				}
-				r.log.Warn("garbage mount could not be removed; the next pass retries", "path", path, "error", err)
+				p.warnOnChange(path, err, "garbage mount could not be removed; the next pass retries")
 				r.metrics.IncReconcileError("garbage")
 				if errors.Is(err, mount.ErrTimeout) {
 					r.metrics.IncObservationTimeout("garbage")
@@ -194,13 +201,17 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 				continue
 			}
 			if c.drop == nil || !c.drop.explicit {
-				v := ""
-				if c.drop != nil {
-					v = c.drop.volume
-				}
 				r.metrics.IncGarbageUnmount()
-				r.log.Info("unmounted a mount no intent claims", "path", c.path, "volume", v)
-				r.events.Event(v, ReasonGarbageUnmounted, "unmounted "+c.path+", which no intent claims")
+				if c.drop != nil {
+					// A publish target of a volume the reconciler knew: an event
+					// has something to attach to. A stray below the staging root
+					// names no volume (the stage directory is a hash of the ID),
+					// so it is logged and not made an event.
+					r.log.Info("unmounted a publish target no intent claims", "path", c.path, "volume", c.drop.volume)
+					r.events.Event(c.drop.volume, ReasonGarbageUnmounted, "unmounted "+c.path+", which no intent claims")
+				} else {
+					r.log.Info("unmounted a mount below the staging root that no intent claims", "path", c.path)
+				}
 			}
 		}
 	}
@@ -340,7 +351,7 @@ func (p *pass) collectIdleTransports(t observe.Table, refs map[string]struct{}, 
 			if errors.Is(err, mount.ErrTimeout) {
 				r.metrics.IncObservationTimeout("garbage")
 			}
-			r.log.Warn("an idle transport could not be unmounted; the next pass retries", "dir", dir, "error", err)
+			p.warnOnChange(dir, err, "an idle transport could not be unmounted; the next pass retries")
 			continue
 		}
 		delete(r.idleSince, dir)
@@ -350,12 +361,17 @@ func (p *pass) collectIdleTransports(t observe.Table, refs map[string]struct{}, 
 		}
 		r.metrics.SetTransport(kind, filepath.Base(dir), false)
 		r.metrics.IncGarbageUnmount()
+		delete(r.warned, dir)
 		r.log.Info("unmounted an idle transport", "dir", dir)
-		r.events.Event("", ReasonGarbageUnmounted, "unmounted the idle transport "+filepath.Base(dir))
 	}
 	for dir := range r.idleSince {
 		if !seen[dir] {
 			delete(r.idleSince, dir)
+		}
+	}
+	for dir := range r.warned {
+		if within(r.opts.TransportsRoot, dir) && !seen[dir] {
+			delete(r.warned, dir)
 		}
 	}
 }
@@ -401,5 +417,32 @@ func (p *pass) noteSuspended(suspended bool) {
 		r.log.Warn("garbage collection is suspended while any intent record cannot be read; mounts are left alone")
 	} else {
 		r.log.Info("every intent record reads again; garbage collection resumes")
+	}
+}
+
+// warnOnChange logs a failure to remove a mount at warn level the first time,
+// and again only when its kind changes (busy, unresponsive, anything else),
+// so a mount that stays busy for an hour is one line and not one per pass. The
+// error counter still counts every pass.
+func (p *pass) warnOnChange(path string, err error, msg string) {
+	r := p.r
+	kind := failureKind(err)
+	if r.warned[path] == kind {
+		r.log.Debug(msg, "path", path, "error", err)
+		return
+	}
+	r.warned[path] = kind
+	r.log.Warn(msg, "path", path, "error", err)
+}
+
+// failureKind names the kind of an unmount failure, without its wording.
+func failureKind(err error) string {
+	switch {
+	case errors.Is(err, unix.EBUSY):
+		return "busy"
+	case errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
+		return "unresponsive"
+	default:
+		return "failed"
 	}
 }

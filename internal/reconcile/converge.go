@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/intent"
@@ -302,6 +303,10 @@ func (p *pass) noteHung(dir string, err error) {
 // event and one warning, not one per pass.
 func (p *pass) noteVolume(id string, res *volumeResult) {
 	r := p.r
+	if p.ctx.Err() != nil {
+		// Shutting down: the steps that failed were cancelled, not broken.
+		return
+	}
 	err, reason := res.err()
 	prev, had := r.lastErr[id]
 	if err == nil {
@@ -311,14 +316,61 @@ func (p *pass) noteVolume(id string, res *volumeResult) {
 		}
 		return
 	}
-	text := err.Error()
-	if had && prev == text {
+	key := res.key()
+	if had && prev == key {
 		r.log.Debug("volume still not converged", "volume", id, "error", err)
 		return
 	}
-	r.lastErr[id] = text
+	r.lastErr[id] = key
 	r.log.Warn("volume did not converge", "volume", id, "error", err)
-	r.events.Event(id, reason, text)
+	r.events.Event(id, reason, err.Error())
+}
+
+// key names the condition of a volume by the kind of each thing that is wrong
+// and where, never by the wording of an error, which can change from pass to
+// pass while the condition does not: a hung transport is a timeout on one pass
+// and "a previous call has not returned" on the next, and is one condition.
+// Events and warnings fire when the key changes.
+func (res *volumeResult) key() string {
+	set := map[string]struct{}{}
+	if res.stage != nil {
+		set["stage:"+conditionOf(res.stage)] = struct{}{}
+	}
+	for _, err := range res.publish {
+		if err != nil && !errors.Is(err, errTargetGone) {
+			set["publish:"+conditionOf(err)] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+// conditionOf classifies an error by the sentinel it wraps. A transport or a
+// path that does not answer, however it is first reported (a timeout, or busy
+// because an earlier call is still stuck), is one condition.
+func conditionOf(err error) string {
+	switch {
+	case errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
+		return "unresponsive"
+	case errors.Is(err, ErrTransportConflict):
+		return "transport-conflict"
+	case errors.Is(err, ErrStageConflict):
+		return "stage-conflict"
+	case errors.Is(err, ErrPublishConflict):
+		return "publish-conflict"
+	case errors.Is(err, ErrItemMissing):
+		return "item-missing"
+	case errors.Is(err, ErrItemNotDirectory):
+		return "item-not-directory"
+	case errors.Is(err, ErrTransportUnavailable):
+		return "transport-unavailable"
+	default:
+		return "failed"
+	}
 }
 
 // err joins everything that is wrong with the volume, for logs and events, and
@@ -398,6 +450,9 @@ func (p *pass) ensureTransport(in intent.Intent, dir string) error {
 // transportFor returns the Transport for spec, making it the first time. The
 // object is kept because it carries the guard that stops a hung name lookup
 // or path resolution from being repeated every pass; it holds no mount state.
+// The cache is keyed by Spec and never evicted: the number of distinct
+// transports a node sees is the number of StorageClasses in use, which is
+// small and bounded by configuration, so M1 does not bound it further.
 func (r *Reconciler) transportFor(spec transport.Spec) (transport.Transport, error) {
 	if tr, ok := r.transports[spec]; ok {
 		return tr, nil

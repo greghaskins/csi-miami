@@ -102,6 +102,7 @@ type Reconciler struct {
 	reported    map[string]string    // transport dir → kind, for the metrics seam
 	kinds       map[string]struct{}  // intent kinds reported, so a kind that empties reads 0
 	failedLoad  map[string]struct{}  // load-failure paths already logged
+	warned      map[string]string    // path → kind of the failure last logged at warn level
 	suspended   bool                 // collection is suspended by an unreadable record
 
 	// newTicker is the timer seam; tests replace it.
@@ -161,6 +162,7 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		reported:    map[string]string{},
 		kinds:       map[string]struct{}{},
 		failedLoad:  map[string]struct{}{},
+		warned:      map[string]string{},
 		newTicker:   realTicker,
 	}
 	if r.log == nil {
