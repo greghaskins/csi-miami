@@ -163,16 +163,6 @@ func TestConvergeStopsAtTheFirstFailingStepForThatVolume(t *testing.T) {
 			wantStep: "transport",
 		},
 		{
-			name: "the volume's directory is missing",
-			prepare: func(e *env, _ intent.Intent) {
-				mustNil(t, "remove", os.Remove(filepath.Join(e.host("a"), pvc1)))
-			},
-			want:     []error{ErrItemMissing, fs.ErrNotExist},
-			noBinds:  true,
-			reason:   ReasonMountFailed,
-			wantStep: "item",
-		},
-		{
 			name: "the volume's path is a file",
 			prepare: func(e *env, _ intent.Intent) {
 				p := filepath.Join(e.host("a"), pvc1)
@@ -1164,7 +1154,12 @@ func TestEventsFireOnAChangeNotOnEveryPass(t *testing.T) {
 	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	item := filepath.Join(e.host("a"), pvc1)
-	mustNil(t, "remove", os.Remove(item))
+	// A fault the node cannot repair: the item's path is a file.
+	fault := func() {
+		mustNil(t, "remove", os.Remove(item))
+		mustNil(t, "file", os.WriteFile(item, nil, 0o600))
+	}
+	fault()
 
 	for range 3 {
 		e.pass()
@@ -1172,9 +1167,10 @@ func TestEventsFireOnAChangeNotOnEveryPass(t *testing.T) {
 	if n := len(e.events.reasons(ReasonMountFailed)); n != 1 {
 		t.Fatalf("%d events for a fault that did not change, want 1", n)
 	}
+	mustNil(t, "remove", os.Remove(item))
 	mustNil(t, "restore", os.Mkdir(item, 0o750))
 	e.pass() // recovered
-	mustNil(t, "remove", os.Remove(item))
+	fault()
 	e.pass() // failing again
 	if n := len(e.events.reasons(ReasonMountFailed)); n != 2 {
 		t.Errorf("%d events after a recovery and a new failure, want 2", n)

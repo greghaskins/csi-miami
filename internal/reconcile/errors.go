@@ -149,7 +149,9 @@ var (
 	ErrPublishConflict = fmt.Errorf("the publish target is mounted from something else: %w", mount.ErrConflict)
 
 	// ErrItemMissing is returned when the volume's directory does not exist in
-	// its transport; the node never creates it. It wraps fs.ErrNotExist.
+	// its transport and the transport is nfs3: the controller creates those, the
+	// node does not. (For a local transport the node creates the directory at
+	// first stage.) It wraps fs.ErrNotExist.
 	ErrItemMissing = item.ErrItemMissing
 
 	// ErrItemNotDirectory is returned when the volume's path in its transport

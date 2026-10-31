@@ -52,8 +52,9 @@ type Item interface {
 
 var (
 	// ErrItemMissing is returned when the volume's directory (or file) is not
-	// in the transport. The node never creates it: the controller does. It
-	// wraps fs.ErrNotExist.
+	// in the transport and the node does not create it: the controller does
+	// for nfs3. For a local transport the node creates the directory at first
+	// stage (decision 23). It wraps fs.ErrNotExist.
 	ErrItemMissing = fmt.Errorf("the volume's item does not exist in its transport: %w", fs.ErrNotExist)
 
 	// ErrItemNotDirectory is returned when a directory item's path exists and

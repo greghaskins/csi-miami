@@ -403,18 +403,18 @@ func (l *lyingMounter) Unmount(_ context.Context, target string, _ int) error {
 
 // ---- the directory item through the reconciler ----
 
-func TestTheStageMountIsRestoredIfItsDirectoryReturns(t *testing.T) {
+func TestTheItemDirectoryOfALocalVolumeIsCreatedAtStage(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	item := filepath.Join(e.host("a"), pvc1)
 	mustNil(t, "remove", os.Remove(item))
-	if err := e.converge(in.VolumeID); !errors.Is(err, ErrItemMissing) {
-		t.Fatalf("got %v", err)
-	}
-	mustNil(t, "restore", os.Mkdir(item, 0o750))
+	// A local volume's directory is made by the node at stage (decision 23).
 	mustNil(t, "converge", e.converge(in.VolumeID))
+	if fi, err := os.Stat(item); err != nil || !fi.IsDir() {
+		t.Fatalf("the item directory was not created: %v", err)
+	}
 	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("not bound")
 	}

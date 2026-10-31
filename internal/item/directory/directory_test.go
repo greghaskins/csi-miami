@@ -35,6 +35,8 @@ const (
 
 var spec = transport.Spec{Kind: transport.KindLocal, Path: host}
 
+var nfsSpec = transport.Spec{Kind: transport.KindNFS3, Server: "192.0.2.10", Export: "/export/data"}
+
 func tdir() string {
 	d, err := spec.MountPoint(root)
 	if err != nil {
@@ -105,6 +107,10 @@ type fixture struct {
 	made   []string
 	statFn func(string) (fs.FileInfo, error)
 	mkdir  func(string, fs.FileMode) error
+	// ensure, when set, replaces the creation of an item directory; ensured
+	// lists the (mountDir, dir) pairs it was called with.
+	ensure  func(mountDir, dir string) error
+	ensured [][2]string
 }
 
 func newFixture(t *testing.T, table ...observe.Mount) *fixture {
@@ -121,6 +127,16 @@ func newFixture(t *testing.T, table ...observe.Mount) *fixture {
 			fn := fx.statFn
 			fx.mu.Unlock()
 			return fn(p)
+		},
+		Ensure: func(mountDir, dir string) error {
+			fx.mu.Lock()
+			fx.ensured = append(fx.ensured, [2]string{mountDir, dir})
+			fn := fx.ensure
+			fx.mu.Unlock()
+			if fn != nil {
+				return fn(mountDir, dir)
+			}
+			return nil
 		},
 		MkdirAll: func(p string, m fs.FileMode) error {
 			fx.made = append(fx.made, p)
@@ -234,8 +250,9 @@ func TestConvergeErrors(t *testing.T) {
 		mod   func(*fixture, *intent.Intent)
 		want  []error
 	}{
-		{"missing", []observe.Mount{rootMount(), transportMount()},
-			func(fx *fixture, _ *intent.Intent) {
+		{"missing on nfs3", []observe.Mount{rootMount(), transportMount()},
+			func(fx *fixture, in *intent.Intent) {
+				in.Transport = nfsSpec
 				fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
 			},
 			[]error{item.ErrItemMissing, fs.ErrNotExist}},
@@ -449,4 +466,177 @@ func TestTeardownErrors(t *testing.T) {
 	if err := it.Teardown(context.Background(), bad, item.Observed{}); err == nil {
 		t.Error("an invalid volume name was accepted")
 	}
+}
+
+// A local volume's directory is created at first stage, with the transport's
+// mount directory as the base, and then checked and bound like any other.
+func TestConvergeCreatesAMissingLocalItemDirectory(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, rootMount(), transportMount())
+	var made bool
+	fx.statFn = func(string) (fs.FileInfo, error) {
+		if !made {
+			return nil, fs.ErrNotExist
+		}
+		return dirInfo{dir: true}, nil
+	}
+	fx.ensure = func(string, string) error { made = true; return nil }
+	if err := fx.converge(theIntent()); err != nil {
+		t.Fatal(err)
+	}
+	if want := [][2]string{{tdir(), itemDir()}}; !slices.Equal(fx.ensured, want) {
+		t.Errorf("ensure calls = %v, want %v", fx.ensured, want)
+	}
+	want := []fake.Call{{Op: fake.OpBind, Source: itemDir(), Target: stage, ReadOnly: false}}
+	if got := fx.binds(); !slices.Equal(got, want) {
+		t.Errorf("calls = %+v", got)
+	}
+}
+
+// An nfs3 volume's directory is the controller's to create: missing is
+// ErrItemMissing and nothing is created.
+func TestConvergeNeverCreatesAnNFSItemDirectory(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, rootMount(), transportMount())
+	fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+	in := theIntent()
+	in.Transport = nfsSpec
+	if err := fx.converge(in); !errors.Is(err, item.ErrItemMissing) {
+		t.Fatalf("got %v, want ErrItemMissing", err)
+	}
+	if len(fx.ensured) != 0 || len(fx.binds()) != 0 {
+		t.Errorf("created %v, called %+v", fx.ensured, fx.binds())
+	}
+}
+
+// A directory that vanished under a mounted stage is not made again: the
+// stage is a bind of the one that was removed.
+func TestConvergeDoesNotRecreateUnderAMountedStage(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, rootMount(), transportMount(), stageBind())
+	fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+	if err := fx.converge(theIntent()); !errors.Is(err, item.ErrItemMissing) {
+		t.Fatalf("got %v, want ErrItemMissing", err)
+	}
+	if len(fx.ensured) != 0 {
+		t.Errorf("created %v", fx.ensured)
+	}
+}
+
+func TestConvergeLocalCreationFailures(t *testing.T) {
+	t.Parallel()
+	t.Run("the creation fails", func(t *testing.T) {
+		t.Parallel()
+		fx := newFixture(t, rootMount(), transportMount())
+		fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+		fx.ensure = func(string, string) error { return os.ErrPermission }
+		if err := fx.converge(theIntent()); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("got %v", err)
+		}
+		if len(fx.binds()) != 0 {
+			t.Errorf("calls = %+v", fx.binds())
+		}
+	})
+	t.Run("the creation hangs, then is busy", func(t *testing.T) {
+		t.Parallel()
+		release := make(chan struct{})
+		defer close(release)
+		fx := newFixture(t, rootMount(), transportMount())
+		fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+		fx.ensure = func(string, string) error { <-release; return nil }
+		if err := fx.converge(theIntent()); !errors.Is(err, mount.ErrTimeout) {
+			t.Fatalf("got %v, want ErrTimeout", err)
+		}
+		if err := fx.converge(theIntent()); !errors.Is(err, mount.ErrBusy) {
+			t.Fatalf("got %v, want ErrBusy", err)
+		}
+	})
+	t.Run("still missing after the creation", func(t *testing.T) {
+		t.Parallel()
+		fx := newFixture(t, rootMount(), transportMount())
+		fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+		if err := fx.converge(theIntent()); !errors.Is(err, item.ErrItemMissing) {
+			t.Fatalf("got %v, want ErrItemMissing", err)
+		}
+	})
+}
+
+func TestEnsureBeneath(t *testing.T) {
+	t.Parallel()
+	mk := func(t *testing.T) string {
+		t.Helper()
+		d, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	t.Run("creates the directory and its parents with mode 0755", func(t *testing.T) {
+		t.Parallel()
+		base := mk(t)
+		dir := filepath.Join(base, "ns", "claim", pvc1)
+		if err := ensureBeneath(base, dir); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{filepath.Join(base, "ns"), dir} {
+			fi, err := os.Stat(p)
+			if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
+				t.Errorf("%s: %v %v", p, fi, err)
+			}
+		}
+	})
+	t.Run("adopts an existing directory", func(t *testing.T) {
+		t.Parallel()
+		base := mk(t)
+		dir := filepath.Join(base, pvc1)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureBeneath(base, dir); err != nil {
+			t.Fatal(err)
+		}
+		if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+			t.Errorf("mode of an adopted directory changed to %v", fi.Mode().Perm())
+		}
+	})
+	t.Run("refuses a file", func(t *testing.T) {
+		t.Parallel()
+		base := mk(t)
+		dir := filepath.Join(base, pvc1)
+		if err := os.WriteFile(dir, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureBeneath(base, dir); !errors.Is(err, item.ErrItemNotDirectory) {
+			t.Fatalf("got %v, want ErrItemNotDirectory", err)
+		}
+	})
+	t.Run("does not follow a symlink", func(t *testing.T) {
+		t.Parallel()
+		base, outside := mk(t), mk(t)
+		if err := os.Symlink(outside, filepath.Join(base, "ns")); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureBeneath(base, filepath.Join(base, "ns", pvc1)); !errors.Is(err, item.ErrItemNotDirectory) {
+			t.Fatalf("got %v, want ErrItemNotDirectory", err)
+		}
+		if ents, _ := os.ReadDir(outside); len(ents) != 0 {
+			t.Errorf("something was created outside: %v", ents)
+		}
+	})
+	t.Run("refuses a path that is not below the mount", func(t *testing.T) {
+		t.Parallel()
+		base := mk(t)
+		for _, dir := range []string{base, filepath.Dir(base), filepath.Join(filepath.Dir(base), "x")} {
+			if err := ensureBeneath(base, dir); err == nil {
+				t.Errorf("%s accepted", dir)
+			}
+		}
+	})
+	t.Run("fails if the mount directory is missing", func(t *testing.T) {
+		t.Parallel()
+		base := mk(t)
+		if err := ensureBeneath(filepath.Join(base, "gone"), filepath.Join(base, "gone", pvc1)); err == nil {
+			t.Fatal("no error")
+		}
+	})
 }
