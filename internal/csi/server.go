@@ -123,7 +123,7 @@ func (s *Server) Listen() error {
 		if fi.Mode()&fs.ModeSocket == 0 {
 			return fmt.Errorf("csi: %s exists and is not a socket", s.path)
 		}
-		if err := removeIfStale(s.path); err != nil {
+		if err := removeIfStale(s.path, dialUnix); err != nil {
 			return err
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -183,18 +183,21 @@ func (s *Server) Run(ctx context.Context) error {
 // dialTimeout bounds the probe of an existing socket.
 const dialTimeout = 2 * time.Second
 
+// dialUnix connects to the socket at path, for the probe in removeIfStale.
+func dialUnix(path string) (net.Conn, error) { return net.DialTimeout("unix", path, dialTimeout) }
+
 // removeIfStale removes the socket file at path if, and only if, connecting to
 // it is refused (ECONNREFUSED): the file is there and nothing listens on it. A
 // connection that succeeds means another process owns the socket, which is an
 // error; any other failure to connect (a permission error, a timeout) leaves
 // it unknown whether the socket is live, and is an error as well.
-func removeIfStale(path string) error {
+func removeIfStale(path string, dial func(path string) (net.Conn, error)) error {
 	// connect(2) to a file that is not a socket is refused too, so what is
 	// there is checked first, whoever calls.
 	if fi, err := os.Lstat(path); err != nil || fi.Mode()&fs.ModeSocket == 0 {
 		return fmt.Errorf("csi: %s is not a socket, so it is left alone", path)
 	}
-	conn, err := net.DialTimeout("unix", path, dialTimeout)
+	conn, err := dial(path)
 	if err == nil {
 		_ = conn.Close()
 		return fmt.Errorf("csi: another process is listening on %s", path)

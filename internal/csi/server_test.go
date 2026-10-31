@@ -407,8 +407,8 @@ func TestRemoveIfStaleOnlyAfterConnectionRefused(t *testing.T) {
 	// so the check of what is there is what keeps it.
 	file := filepath.Join(dir, "file")
 	writeFile(t, file, "precious")
-	if err := removeIfStale(file); err == nil || !strings.Contains(err.Error(), "left alone") {
-		t.Errorf("removeIfStale(file) = %v, want an error saying it is left alone", err)
+	if err := removeIfStale(file, dialUnix); err == nil || !strings.Contains(err.Error(), "left alone") {
+		t.Errorf("removeIfStale(file, dialUnix) = %v, want an error saying it is left alone", err)
 	}
 	mustExist(t, file)
 
@@ -420,8 +420,8 @@ func TestRemoveIfStaleOnlyAfterConnectionRefused(t *testing.T) {
 	}
 	l.(*net.UnixListener).SetUnlinkOnClose(false)
 	_ = l.Close()
-	if err := removeIfStale(stale); err != nil {
-		t.Errorf("removeIfStale(stale) = %v", err)
+	if err := removeIfStale(stale, dialUnix); err != nil {
+		t.Errorf("removeIfStale(stale, dialUnix) = %v", err)
 	}
 	mustNotExist(t, stale)
 }
@@ -477,5 +477,32 @@ func TestFailuresCarryNoPathsOrAddresses(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "volume_id=") {
 		t.Errorf("the log does not carry the volume ID:\n%s", logs.String())
+	}
+}
+
+// Any failure to connect other than a refusal leaves it unknown whether the
+// socket is live, and the file is left alone.
+func TestRemoveIfStaleLeavesASocketAloneWhenTheDialFailsOtherwise(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	for name, dialErr := range map[string]error{
+		"permission denied": &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.EACCES)},
+		"would block":       &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.EAGAIN)},
+		"timed out":         &net.OpError{Op: "dial", Net: "unix", Err: os.ErrDeadlineExceeded},
+		"no such file":      &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.ENOENT)},
+	} {
+		sock := filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".sock")
+		l, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.(*net.UnixListener).SetUnlinkOnClose(false)
+		_ = l.Close() // a socket file nothing listens on, which a refusal would call stale
+
+		err = removeIfStale(sock, func(string) (net.Conn, error) { return nil, dialErr })
+		if err == nil || !strings.Contains(err.Error(), "left alone") {
+			t.Errorf("%s: removeIfStale = %v, want an error saying it is left alone", name, err)
+		}
+		mustExist(t, sock)
 	}
 }
