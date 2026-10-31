@@ -138,9 +138,15 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 // (pvc-<uuid>, which is also the PV's name). The request is validated before
 // anything is touched: StorageClass parameters (volume.NewContext), the
 // capabilities (mount access only, no fsType, an accepted access mode), the
-// capacity range and, for a local transport, the node. Then the transport is
-// mounted under the controller's root and the directory made with mkdir -p
-// semantics, mode 0755, never through a symlink.
+// capacity range and, for a local transport, the node. For an nfs3 transport
+// the transport is then mounted under the controller's root and the directory
+// made with mkdir -p semantics, mode 0755, never through a symlink.
+//
+// A local transport's volume belongs to one node's disk, and the controller
+// runs on whichever node it runs on (in the scratch image the host path is not
+// even there), so for local nothing on any file system is touched: the volume
+// context and the node's topology are returned, and the node creates the
+// directory at first stage if it is missing (decision 23).
 //
 // It is idempotent: an existing directory is adopted. A path that exists and
 // is not a directory is AlreadyExists, and so is a name this process already
@@ -194,23 +200,30 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 		return nil, status.Errorf(codes.AlreadyExists, "volume %q already exists with other parameters or capacity", id.Name)
 	}
 
-	tr, err := c.mounts.ensure(ctx, vctx.Transport)
-	if err != nil {
-		return nil, err
-	}
-	dir, err := vctx.Dir(c.root, id)
-	if err != nil {
-		return nil, err
-	}
-	made, err := blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) { return ensureItemDir(tr.Dir(), dir) })
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, contextStatus(ctx.Err())
+	// A local transport's directory is on the disk of the node the volume is
+	// for, not of the node this controller runs on, so the controller makes
+	// nothing for it: no mount, no directory. The node creates the directory
+	// at first stage when it is missing (decision 23).
+	made := false
+	if vctx.Transport.Kind != transport.KindLocal {
+		tr, err := c.mounts.ensure(ctx, vctx.Transport)
+		if err != nil {
+			return nil, err
 		}
-		return nil, asStatus(err)
+		dir, err := vctx.Dir(c.root, id)
+		if err != nil {
+			return nil, err
+		}
+		made, err = blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) { return ensureItemDir(tr.Dir(), dir) })
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, contextStatus(ctx.Err())
+			}
+			return nil, asStatus(err)
+		}
 	}
 	c.seen.put(id.Name, created{context: encoded, capacity: capacity})
-	c.log.Info("volume ready", "volume_id", id.String(), "created", made)
+	c.log.Info("volume ready", "volume_id", id.String(), "created", made, "transport_kind", vctx.Transport.Kind)
 
 	return &csi.CreateVolumeResponse{Volume: &csi.Volume{
 		VolumeId:           id.String(),

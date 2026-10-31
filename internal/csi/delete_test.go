@@ -47,7 +47,6 @@ func TestDeleteVolumeRemovesTheDirectoryAndOnlyIt(t *testing.T) {
 	mustNotExist(t, dir)
 	mustExist(t, filepath.Join(sibling, "keep.txt"))
 	mustExist(t, e.mountDir())
-	mustExist(t, e.host)
 	if got := e.pvs.Calls(); len(got) != 1 || got[0] != nameA {
 		t.Errorf("PV lookups = %v, want one for %s", got, nameA)
 	}
@@ -133,19 +132,19 @@ func TestDeleteVolumeNeverDeletesOnDoubt(t *testing.T) {
 		{"unknown miami key", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/extra"] = "x" }, codes.Unavailable, "do not decode"},
 		{"missing kind", func(_ *env, pv *kube.PV) { delete(pv.VolumeAttributes, "miami/kind") }, codes.Unavailable, "do not decode"},
 		{"unknown kind", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/kind"] = "image" }, codes.Unavailable, "do not decode"},
-		{"relative transport path", func(_ *env, pv *kube.PV) {
-			pv.VolumeAttributes["miami/transport.path"] = "rel"
+		{"relative transport export", func(_ *env, pv *kube.PV) {
+			pv.VolumeAttributes["miami/transport.export"] = "rel"
 		}, codes.Unavailable, "do not decode"},
-		{"path that is not cleaned", func(e *env, pv *kube.PV) {
-			pv.VolumeAttributes["miami/transport.path"] = e.host + "/"
+		{"export that is not cleaned", func(_ *env, pv *kube.PV) {
+			pv.VolumeAttributes["miami/transport.export"] += "/"
 		}, codes.Unavailable, "do not decode"},
 		{"subdir with ..", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/subdir"] = "../x" }, codes.Unavailable, "do not decode"},
 		{"absolute subdir", func(_ *env, pv *kube.PV) { pv.VolumeAttributes["miami/subdir"] = "/x" }, codes.Unavailable, "do not decode"},
-		{"nfs3 attributes on a local path", func(_ *env, pv *kube.PV) {
-			pv.VolumeAttributes["miami/transport.server"] = "192.0.2.10"
+		{"a local path on an nfs3 transport", func(_ *env, pv *kube.PV) {
+			pv.VolumeAttributes["miami/transport.path"] = "/x"
 		}, codes.Unavailable, "do not decode"},
 		{"transport cannot be mounted", func(e *env, _ *kube.PV) {
-			e.mounter.FailOp(fake.OpBind, e.mountDir(), errors.New("boom"))
+			e.mounter.FailOp(fake.OpMount, e.mountDir(), errors.New("boom"))
 		}, codes.Unavailable, "cannot be mounted"},
 		{"mount table unreadable while mounting", func(e *env, _ *kube.PV) {
 			e.mounter.SetMountsError(errors.New("no mountinfo"))
@@ -360,7 +359,7 @@ func TestContextOfPV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if vctx.Transport.Path != e.host || vctx.Kind != volume.KindDirectory {
+	if vctx.Transport != nfsSpec || vctx.Kind != volume.KindDirectory {
 		t.Errorf("context = %+v", vctx)
 	}
 
@@ -384,7 +383,8 @@ func TestDeleteVolumeNeverTreatsASubdirAsAVolume(t *testing.T) {
 	spoof.Name = "team-a"
 	spoof.VolumeHandle = "directory:team-a"
 	spoof.VolumeAttributes = map[string]string{
-		"miami/kind": "directory", "miami/transport.kind": "local", "miami/transport.path": e.host,
+		"miami/kind": "directory", "miami/transport.kind": "nfs3",
+		"miami/transport.server": "192.0.2.10", "miami/transport.export": "/export/data",
 	}
 	e.pvs.Add(spoof)
 
@@ -459,4 +459,43 @@ func TestDeleteVolumeWhenTheMountTableFailsAfterTheMount(t *testing.T) {
 	}
 	mustExist(t, filepath.Join(dir, "a.txt"))
 	mustExist(t, filepath.Join(sibling, "keep.txt"))
+}
+
+// The controller cannot reach the disk of the node a local volume was for: the
+// call succeeds, says so in a warning, and touches nothing (decision 23).
+func TestDeleteVolumeOfALocalVolumeSucceedsAndDeletesNothing(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	req := e.createReq(nameA)
+	req.Parameters = e.localParams()
+	resp, err := e.ctrl.CreateVolume(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pvs.Add(pvFor(resp))
+	// A directory at the path the node would use, in the controller's own
+	// file system: nothing may remove it.
+	keep := filepath.Join(e.host, nameA, "keep")
+	writeFile(t, keep, "x")
+
+	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(resp.GetVolume().GetVolumeId())); err != nil {
+		t.Fatal(err)
+	}
+	mustExist(t, keep)
+	if calls := e.mounter.Calls(); len(calls) != 0 {
+		t.Errorf("the mounter was called: %v", calls)
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "local volume") {
+		t.Errorf("no warning about the local volume:\n%s", logs)
+	}
+
+	// A local volume's PV is held to the same standard as any other: a handle
+	// of another volume is still Unavailable.
+	pv, _ := e.pvs.GetPV(context.Background(), nameA)
+	pv.VolumeHandle = "directory:" + nameB
+	e.pvs.Add(pv)
+	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(resp.GetVolume().GetVolumeId())); codeOf(err) != codes.Unavailable {
+		t.Errorf("handle of another volume: code = %v, want Unavailable", codeOf(err))
+	}
 }

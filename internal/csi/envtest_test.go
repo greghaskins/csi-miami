@@ -23,7 +23,6 @@ import (
 
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
-	"github.com/greghaskins/csi-miami/internal/transport"
 )
 
 // These tests run the PV paths against a real API server and etcd started by
@@ -86,7 +85,6 @@ func TestEnvtestPVPaths(t *testing.T) {
 	ctx := context.Background()
 
 	root := resolved(t, t.TempDir())
-	host := resolved(t, t.TempDir())
 	logs := &syncBuffer{}
 	ctrl, err := NewController(ControllerOptions{
 		Root: root, Mounter: &fake.Mounter{}, PVs: c,
@@ -95,7 +93,7 @@ func TestEnvtestPVPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	params := map[string]string{"kind": "directory", "transport.kind": "local", "transport.path": host}
+	params := map[string]string{"kind": "directory", "transport.kind": "nfs3", "transport.server": "192.0.2.10", "transport.export": "/export/data"}
 	create := func(name string) *csi.CreateVolumeResponse {
 		t.Helper()
 		resp, err := ctrl.CreateVolume(ctx, &csi.CreateVolumeRequest{
@@ -125,7 +123,7 @@ func TestEnvtestPVPaths(t *testing.T) {
 		const name = "pvc-00000000-0000-4000-8000-000000000002"
 		resp := create(name)
 		createPV(t, cfg, apiPV(name, resp.GetVolume().GetVolumeId(), resp.GetVolume().GetVolumeContext()))
-		dir := filepath.Join(root, "transports", mountID(host), name)
+		dir := filepath.Join(root, "transports", mountID(), name)
 		writeFile(t, filepath.Join(dir, "x"), "x")
 
 		if _, err := ctrl.DeleteVolume(ctx, delReq(name)); err != nil {
@@ -141,9 +139,9 @@ func TestEnvtestPVPaths(t *testing.T) {
 		for k, v := range resp.GetVolume().GetVolumeContext() {
 			bad[k] = v
 		}
-		bad["miami/transport.path"] = "not/absolute"
+		bad["miami/transport.export"] = "not/absolute"
 		createPV(t, cfg, apiPV(name, resp.GetVolume().GetVolumeId(), bad))
-		dir := filepath.Join(root, "transports", mountID(host), name)
+		dir := filepath.Join(root, "transports", mountID(), name)
 		writeFile(t, filepath.Join(dir, "x"), "x")
 
 		_, err := ctrl.DeleteVolume(ctx, delReq(name))
@@ -157,7 +155,7 @@ func TestEnvtestPVPaths(t *testing.T) {
 		const name = "pvc-00000000-0000-4000-8000-000000000004"
 		resp := create(name)
 		createPV(t, cfg, apiPV(name, "directory:pvc-00000000-0000-4000-8000-000000000099", resp.GetVolume().GetVolumeContext()))
-		dir := filepath.Join(root, "transports", mountID(host), name)
+		dir := filepath.Join(root, "transports", mountID(), name)
 
 		_, err := ctrl.DeleteVolume(ctx, delReq(name))
 		if codeOf(err) != codes.Unavailable {
@@ -169,7 +167,7 @@ func TestEnvtestPVPaths(t *testing.T) {
 	t.Run("no PV is success with a warning and nothing is deleted", func(t *testing.T) {
 		const name = "pvc-00000000-0000-4000-8000-000000000005"
 		create(name)
-		dir := filepath.Join(root, "transports", mountID(host), name)
+		dir := filepath.Join(root, "transports", mountID(), name)
 		writeFile(t, filepath.Join(dir, "x"), "x")
 
 		if _, err := ctrl.DeleteVolume(ctx, delReq(name)); err != nil {
@@ -182,8 +180,5 @@ func TestEnvtestPVPaths(t *testing.T) {
 	})
 }
 
-// mountID is the directory name of the local transport for host under
-// <root>/transports.
-func mountID(host string) string {
-	return transport.Spec{Kind: transport.KindLocal, Path: host}.ID()
-}
+// mountID is the directory name of the nfs3 transport under <root>/transports.
+func mountID() string { return nfsSpec.ID() }

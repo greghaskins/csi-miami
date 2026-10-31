@@ -49,7 +49,7 @@ func TestListVolumes(t *testing.T) {
 
 	// Things that are not volumes, or not found by design.
 	writeFile(t, filepath.Join(mp, "a-file"), "x")
-	mustSymlink(t, e.host, filepath.Join(mp, "a-link"))
+	mustSymlink(t, resolved(t, t.TempDir()), filepath.Join(mp, "a-link"))
 	writeFile(t, filepath.Join(mp, nameA, "data", "inner", "x"), "x") // a volume's own data is not listed, whatever its names
 	writeFile(t, filepath.Join(mp, "bad name", "x"), "x")             // not a valid name, but descended into
 	if err := os.MkdirAll(filepath.Join(mp, "bad name", "pvc-in-a-subdir"), 0o750); err != nil {

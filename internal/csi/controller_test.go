@@ -128,7 +128,7 @@ func TestCreateVolumeInvalidArgument(t *testing.T) {
 		}, codes.InvalidArgument, "snapshot"},
 		{"unknown parameter", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["typo"] = "x" }, codes.InvalidArgument, "unknown parameter"},
 		{"no kind", func(_ *env, r *csi.CreateVolumeRequest) { delete(r.Parameters, "kind") }, codes.InvalidArgument, "kind"},
-		{"relative path", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["transport.path"] = "rel" }, codes.InvalidArgument, "absolute"},
+		{"relative export", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["transport.export"] = "rel" }, codes.InvalidArgument, "absolute"},
 		{"unresolved subdir token", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["subdir"] = "${pvc.namespace}" }, codes.InvalidArgument, "extra-create-metadata"},
 		{"negative capacity", func(_ *env, r *csi.CreateVolumeRequest) {
 			r.CapacityRange = &csi.CapacityRange{RequiredBytes: -1}
@@ -139,8 +139,11 @@ func TestCreateVolumeInvalidArgument(t *testing.T) {
 		{"required above limit", func(_ *env, r *csi.CreateVolumeRequest) {
 			r.CapacityRange = &csi.CapacityRange{RequiredBytes: 10, LimitBytes: 5}
 		}, codes.OutOfRange, "limit"},
-		{"local without topology", func(_ *env, r *csi.CreateVolumeRequest) { r.AccessibilityRequirements = nil }, codes.InvalidArgument, "WaitForFirstConsumer"},
-		{"local with topology of no node", func(_ *env, r *csi.CreateVolumeRequest) {
+		{"local without topology", func(e *env, r *csi.CreateVolumeRequest) {
+			r.Parameters, r.AccessibilityRequirements = e.localParams(), nil
+		}, codes.InvalidArgument, "WaitForFirstConsumer"},
+		{"local with topology of no node", func(e *env, r *csi.CreateVolumeRequest) {
+			r.Parameters = e.localParams()
 			r.AccessibilityRequirements = &csi.TopologyRequirement{
 				Preferred: []*csi.Topology{{Segments: map[string]string{"other/key": "x"}}},
 			}
@@ -191,7 +194,7 @@ func TestCreateVolumeAcceptsEveryAcceptedAccessMode(t *testing.T) {
 	}
 }
 
-func TestCreateVolumeLocal(t *testing.T) {
+func TestCreateVolumeNFS3(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	req := e.createReq(nameA)
@@ -208,7 +211,8 @@ func TestCreateVolumeLocal(t *testing.T) {
 		t.Errorf("capacity = %d, want the required bytes echoed", v.GetCapacityBytes())
 	}
 	wantCtx := map[string]string{
-		"miami/kind": "directory", "miami/transport.kind": "local", "miami/transport.path": e.host,
+		"miami/kind": "directory", "miami/transport.kind": "nfs3",
+		"miami/transport.server": "192.0.2.10", "miami/transport.export": "/export/data",
 	}
 	if len(v.GetVolumeContext()) != len(wantCtx) {
 		t.Errorf("volume context = %v, want %v", v.GetVolumeContext(), wantCtx)
@@ -218,8 +222,8 @@ func TestCreateVolumeLocal(t *testing.T) {
 			t.Errorf("volume context[%s] = %q, want %q", k, got, want)
 		}
 	}
-	if topo := v.GetAccessibleTopology(); len(topo) != 1 || topo[0].GetSegments()[TopologyKeyNode] != "node-a" || len(topo[0].GetSegments()) != 1 {
-		t.Errorf("topology = %v, want one segment %s=node-a", topo, TopologyKeyNode)
+	if topo := v.GetAccessibleTopology(); len(topo) != 0 {
+		t.Errorf("topology = %v, want none for nfs3", topo)
 	}
 
 	dir := filepath.Join(e.mountDir(), nameA)
@@ -231,14 +235,62 @@ func TestCreateVolumeLocal(t *testing.T) {
 		t.Errorf("directory mode = %o, want 755", mode)
 	}
 
-	var bound []fake.Call
+	var mounted []fake.Call
 	for _, c := range e.mounter.Calls() {
-		if c.Op == fake.OpBind {
-			bound = append(bound, c)
+		if c.Op == fake.OpMount {
+			mounted = append(mounted, c)
 		}
 	}
-	if len(bound) != 1 || bound[0].Source != e.host || bound[0].Target != e.mountDir() || bound[0].ReadOnly {
-		t.Errorf("bind calls = %+v, want one read-write bind of %s on %s", bound, e.host, e.mountDir())
+	if len(mounted) != 1 || mounted[0].Source != "192.0.2.10:/export/data" || mounted[0].FSType != "nfs" || mounted[0].Target != e.mountDir() {
+		t.Errorf("mount calls = %+v, want one nfs mount of 192.0.2.10:/export/data on %s", mounted, e.mountDir())
+	}
+}
+
+// The controller makes nothing for a local transport: the directory is on the
+// disk of the node the volume is for (decision 23). No mount, no directory
+// anywhere, and the host path need not even exist here.
+func TestCreateVolumeLocalTouchesNothing(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	if err := os.Remove(e.host); err != nil { // not even there, as in the scratch image
+		t.Fatal(err)
+	}
+	req := e.createReq(nameA)
+	req.Parameters = e.localParams()
+	req.CapacityRange = &csi.CapacityRange{RequiredBytes: 1 << 20}
+	resp, err := e.ctrl.CreateVolume(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := resp.GetVolume()
+	if v.GetVolumeId() != "directory:"+nameA || v.GetCapacityBytes() != 1<<20 {
+		t.Errorf("volume = %+v", v)
+	}
+	wantCtx := map[string]string{"miami/kind": "directory", "miami/transport.kind": "local", "miami/transport.path": e.host}
+	for k, want := range wantCtx {
+		if got := v.GetVolumeContext()[k]; got != want {
+			t.Errorf("volume context[%s] = %q, want %q", k, got, want)
+		}
+	}
+	if topo := v.GetAccessibleTopology(); len(topo) != 1 || topo[0].GetSegments()[TopologyKeyNode] != "node-a" || len(topo[0].GetSegments()) != 1 {
+		t.Errorf("topology = %v, want one segment %s=node-a", topo, TopologyKeyNode)
+	}
+	if calls := e.mounter.Calls(); len(calls) != 0 {
+		t.Errorf("the mounter was called: %v", calls)
+	}
+	mustNotExist(t, filepath.Join(e.root, "transports"))
+	mustNotExist(t, e.host)
+
+	// Repeated, it is the same; with other parameters it is AlreadyExists.
+	if _, err := e.ctrl.CreateVolume(context.Background(), req); err != nil {
+		t.Errorf("repeat: %v", err)
+	}
+	req2 := e.createReq(nameA)
+	req2.Parameters = e.localParams()
+	req2.Parameters["subdir"] = "other"
+	req2.CapacityRange = req.CapacityRange
+	if _, err := e.ctrl.CreateVolume(context.Background(), req2); codeOf(err) != codes.AlreadyExists {
+		t.Errorf("other subdir: code = %v, want AlreadyExists", codeOf(err))
 	}
 }
 
@@ -268,6 +320,7 @@ func TestCreateVolumeTopologyChoice(t *testing.T) {
 			t.Parallel()
 			e := newEnv(t)
 			req := e.createReq(nameA)
+			req.Parameters = e.localParams()
 			req.AccessibilityRequirements = tt.req
 			resp, err := e.ctrl.CreateVolume(context.Background(), req)
 			if err != nil {
@@ -278,33 +331,6 @@ func TestCreateVolumeTopologyChoice(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestCreateVolumeNFS3HasNoTopologyAndMountsTheExport(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	req := e.createReq(nameA)
-	req.Parameters = map[string]string{
-		"kind": "directory", "transport.kind": "nfs3",
-		"transport.server": "192.0.2.10", "transport.export": "/export/data",
-	}
-	resp, err := e.ctrl.CreateVolume(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if topo := resp.GetVolume().GetAccessibleTopology(); len(topo) != 0 {
-		t.Errorf("topology = %v, want none for nfs3", topo)
-	}
-	var mounted []fake.Call
-	for _, c := range e.mounter.Calls() {
-		if c.Op == fake.OpMount {
-			mounted = append(mounted, c)
-		}
-	}
-	if len(mounted) != 1 || mounted[0].Source != "192.0.2.10:/export/data" || mounted[0].FSType != "nfs" {
-		t.Errorf("mount calls = %+v, want one nfs mount of 192.0.2.10:/export/data", mounted)
-	}
-	mustExist(t, filepath.Join(mounted[0].Target, nameA))
 }
 
 func TestCreateVolumeIsIdempotentAndAdoptsADirectory(t *testing.T) {
@@ -447,7 +473,7 @@ func TestCreateVolumeRepeatedNameWithOtherParameters(t *testing.T) {
 		second func(r *csi.CreateVolumeRequest)
 	}{
 		{"other subdir", func(r *csi.CreateVolumeRequest) { r.Parameters["subdir"] = "other" }},
-		{"other transport path", func(r *csi.CreateVolumeRequest) { r.Parameters["transport.path"] = os.TempDir() }},
+		{"other export", func(r *csi.CreateVolumeRequest) { r.Parameters["transport.export"] = "/export/other" }},
 		{"other capacity", func(r *csi.CreateVolumeRequest) { r.CapacityRange = &csi.CapacityRange{RequiredBytes: 2048} }},
 	}
 	for _, tt := range tests {
@@ -502,13 +528,12 @@ func TestCreateVolumeMountFailures(t *testing.T) {
 		name  string
 		setup func(e *env)
 	}{
-		{"bind fails", func(e *env) { e.mounter.FailOp(fake.OpBind, e.mountDir(), errors.New("boom")) }},
+		{"mount fails", func(e *env) { e.mounter.FailOp(fake.OpMount, e.mountDir(), errors.New("boom")) }},
 		{"conflicting mount", func(e *env) {
 			e.mounter.SetTable(tableWithMountAt(e.mountDir()))
 		}},
 		{"mount table unreadable", func(e *env) { e.mounter.SetMountsError(errors.New("no mountinfo")) }},
-		{"mounter busy", func(e *env) { e.mounter.FailOp(fake.OpBind, e.mountDir(), mount.ErrBusy) }},
-		{"host path missing", func(e *env) { _ = os.Remove(e.host) }},
+		{"mounter busy", func(e *env) { e.mounter.FailOp(fake.OpMount, e.mountDir(), mount.ErrBusy) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

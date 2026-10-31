@@ -29,9 +29,10 @@ import (
 
 // This test runs the csi-sanity suite (the binary on PATH, pinned in mise.toml)
 // against the identity and controller services served on a real unix socket,
-// with the real Mounter: the local transport is bind-mounted, so it needs root
-// and a private mount namespace, which hack/sanity.sh provides. It fails, and
-// does not skip, when it cannot run.
+// on a local transport, for which the controller touches no file system. The
+// tests below it in this file mount real file systems and need root and a
+// private mount namespace, which hack/sanity.sh provides; all of them fail,
+// and do not skip, when they cannot run.
 //
 // The suite expects a cluster around the driver in two places, and the
 // harness stands in for the part of it that the controller depends on:
@@ -57,6 +58,11 @@ const sanityNode = "sanity-node"
 // sanitySkips are the specs that cannot pass, and why. Each is matched as a
 // regular expression against the full spec text.
 var sanitySkips = []string{
+	// The suite provisions on a local transport (nfs3 needs a server), and the
+	// controller makes nothing for a local volume and so has nothing to list
+	// (decision 23). Listing what the controller made on a mounted transport is
+	// proved by TestListVolumes with an nfs3 transport.
+	`ListVolumes check the presence of new volumes and absence of deleted ones in the volume list`,
 	// The node service is T7's.
 	`Node Service`,
 	// The controller accepts any node on publish, by design (the volumes need

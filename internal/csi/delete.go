@@ -15,6 +15,7 @@ import (
 
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -31,20 +32,27 @@ import (
 //   - A volume ID that does not parse is one this driver could not have
 //     issued: nothing of ours can be at it, so the answer is success, and the
 //     request is logged. Nothing is deleted.
+//
 //   - No PV of that name: success, logged at warning. From Kubernetes 1.31 the
 //     PV outlives DeleteVolume, so on those clusters this means the volume was
 //     already deleted (or never bound); on older clusters the PV may be gone
 //     before the call arrives and the directory is left behind. That leak is a
 //     documented limitation, preferred to guessing where the directory is.
+//
 //   - A PV that cannot be read, that is not this driver's, whose volume handle
 //     is not the requested ID, or whose attributes do not decode to exactly
 //     what CreateVolume would have produced: Unavailable. The PV is the only
 //     statement of where the directory is, so a PV that cannot be trusted
 //     means the location is unknown.
 //
-// Then the transport is mounted, and the directory is removed under the
-// guards of removeItemDir. A directory that is already gone is success, which
-// makes the call idempotent.
+//   - A PV of a local transport: success, logged at warning, nothing deleted.
+//     The directory is on the disk of the node the volume was for, which the
+//     controller cannot reach; it remains there until the node-local tier
+//     (M4) removes it. That is a documented limitation (decision 23).
+//
+// Then, for an nfs3 volume, the transport is mounted, and the directory is
+// removed under the guards of removeItemDir. A directory that is already gone
+// is success, which makes the call idempotent.
 func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
@@ -77,6 +85,15 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 	vctx, err := contextOfPV(pv, id)
 	if err != nil {
 		return nil, unavailable("the PV of volume %q cannot be trusted, so nothing is deleted: %v", id.Name, err)
+	}
+
+	// A local volume's directory is on the disk of the node it was for, which
+	// the controller cannot reach: nothing is deleted and the call succeeds, as
+	// it does without a PV, with the same limitation (decision 23).
+	if vctx.Transport.Kind == transport.KindLocal {
+		c.log.Warn("the directory of a local volume is on its node's disk and is not removed; it remains until the node-local tier deletes it", "volume_id", id.String())
+		c.seen.forget(id.Name)
+		return &csi.DeleteVolumeResponse{}, nil
 	}
 
 	tr, err := c.mounts.ensure(ctx, vctx.Transport)

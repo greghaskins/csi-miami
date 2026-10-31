@@ -90,27 +90,33 @@ func newEnv(t *testing.T) *env {
 	return e
 }
 
-func (e *env) localSpec() transport.Spec {
-	return transport.Spec{Kind: transport.KindLocal, Path: e.host}
-}
+// nfsSpec is the env's transport: an NFSv3 export that the fake mounter
+// "mounts" by recording the call, which leaves a plain directory at the mount
+// point for the controller to work in. A local transport is not created by the
+// controller at all (decision 23), so it is the nfs3 transport that exercises
+// the directories.
+var nfsSpec = transport.Spec{Kind: transport.KindNFS3, Server: "192.0.2.10", Export: "/export/data"}
+
+func (e *env) spec() transport.Spec { return nfsSpec }
 
 // mountDir is where the local transport is mounted.
 func (e *env) mountDir() string {
 	e.t.Helper()
-	d, err := e.localSpec().MountPoint(e.root)
+	d, err := e.spec().MountPoint(e.root)
 	if err != nil {
 		e.t.Fatal(err)
 	}
 	return d
 }
 
-// params are StorageClass parameters for the local transport, plus extra
+// params are StorageClass parameters for the nfs3 transport, plus extra
 // key, value pairs.
 func (e *env) params(extra ...string) map[string]string {
 	p := map[string]string{
-		"kind":           "directory",
-		"transport.kind": "local",
-		"transport.path": e.host,
+		"kind":             "directory",
+		"transport.kind":   "nfs3",
+		"transport.server": "192.0.2.10",
+		"transport.export": "/export/data",
 	}
 	for i := 0; i+1 < len(extra); i += 2 {
 		p[extra[i]] = extra[i+1]
@@ -133,7 +139,12 @@ func onNode(node string) *csi.TopologyRequirement {
 	return &csi.TopologyRequirement{Preferred: []*csi.Topology{{Segments: map[string]string{TopologyKeyNode: node}}}}
 }
 
-// createReq is a valid CreateVolume request for the local transport.
+// localParams are StorageClass parameters for a local transport.
+func (e *env) localParams() map[string]string {
+	return map[string]string{"kind": "directory", "transport.kind": "local", "transport.path": e.host}
+}
+
+// createReq is a valid CreateVolume request for the nfs3 transport.
 func (e *env) createReq(name string, extra ...string) *csi.CreateVolumeRequest {
 	return &csi.CreateVolumeRequest{
 		Name:                      name,

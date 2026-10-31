@@ -330,7 +330,7 @@ func TestLoggingInterceptorLogsTheVolumeIDAndNothingElse(t *testing.T) {
 	}
 
 	out := logs.String()
-	for _, secret := range []string{"s3cret-value", "very-private-subdir", e.host} {
+	for _, secret := range []string{"s3cret-value", "very-private-subdir", "192.0.2.10", "/export/data"} {
 		if strings.Contains(out, secret) {
 			t.Errorf("the log contains %q:\n%s", secret, out)
 		}

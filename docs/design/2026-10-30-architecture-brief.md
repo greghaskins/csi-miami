@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 22 recorded (section 9)
+**Status:** Draft, decisions 1 to 23 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -692,6 +692,15 @@ Recorded:
     `pvc-<uuid>`; the driver refuses any other name at every boundary, so no
     subdir element can ever be a volume and no volume can nest in another.
     Static PVs (migration, adoption) keep or receive such names.
+23. **Local volumes are created by the node**: the controller runs on one
+    node and a `local` transport's directory belongs to another, so for
+    `local` the controller's `CreateVolume` validates and returns the volume
+    context and the node topology and touches no file system; the node
+    creates the item directory at first stage when it is missing.
+    `DeleteVolume` for a `local` volume cannot reach the node's disk: it
+    succeeds, logs at warning, and the directory remains on the node until
+    the node-local tier (M4) deletes it, a documented limitation. `nfs3`
+    volumes are created and deleted by the controller.
 
 Pending: none that block M1.
 

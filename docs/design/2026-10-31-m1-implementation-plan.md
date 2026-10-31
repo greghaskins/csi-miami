@@ -207,10 +207,12 @@ Choices made in T8 where the plan was silent:
   `ValidateVolumeCapabilities` and `ControllerPublishVolume` answer
   `NotFound`; `ControllerUnpublishVolume` and `DeleteVolume` answer success
   (the CSI specification's idempotent reading), and delete deletes nothing.
-- `ListVolumes` lists directories two levels below each mounted transport
-  whose names are valid volume names, does not descend into a directory named
-  like a PV, ignores `max_entries`, and answers `Aborted` to any starting
-  token. It is for operators and the sanity suite, not for completeness.
+- `ListVolumes` lists directories two levels below each transport the
+  controller has mounted whose names are PV names (pvc-<uuid>), enters the
+  other directories as subdir elements, ignores `max_entries`, and answers
+  `Aborted` to any starting token. It has a deadline of its own and leaves out
+  a transport that does not answer. It is for operators and the sanity suite,
+  not for completeness.
 - The controller remembers, in memory and bounded, what each `CreateVolume`
   name answered, so a repeat with other parameters or capacity is
   `AlreadyExists`. A restart forgets it; nothing else depends on it.
@@ -222,12 +224,19 @@ Choices made in T8 where the plan was silent:
 - Stateless. Mounts transports with the same `internal/transport` code
   into its own mount namespace under `--transports-root` (an `emptyDir`;
   statelessness is the point, nothing must survive a restart).
-- `CreateVolume`: validate, resolve `subdir`, mount the transport, `mkdir
-  -p <transport>/<subdir>/<name>` (idempotent: an existing directory is adopted), return ID and
-  context, and for `local` the node topology. Capacity is echoed back; a
-  directory has no size.
-- `DeleteVolume`: PV lookup (section 4), mount, `rm -r` the directory.
-  Idempotent: a missing directory is success.
+- `CreateVolume`: validate, resolve `subdir`. For `nfs3`: mount the
+  transport, `mkdir -p <transport>/<subdir>/<name>` (idempotent: an existing
+  directory is adopted), return ID and context. For `local` (decision 23):
+  return ID, context and the node topology and touch no file system, because
+  the directory is on the disk of the node the volume is for, not of the node
+  the controller runs on; the node creates it at first stage if it is
+  missing. Capacity is echoed back; a directory has no size.
+- `DeleteVolume`: PV lookup (section 4). For `nfs3`: mount, then remove the
+  directory relative to descriptors (no symlink or mount crossed). Idempotent:
+  a missing directory is success. For `local` the controller cannot reach the
+  node's disk: success, logged at warning, nothing deleted; the directory
+  remains on the node until M4's node-local tier removes it (a documented
+  limitation, as on a cluster older than 1.31 without a PV).
 - `ControllerPublishVolume` and unpublish: accept and record nothing.
 - Needs `hostNetwork` on clusters whose NAS export ACLs admit node
   addresses only; `privileged: false` with `SYS_ADMIN` only, read-only root
@@ -320,8 +329,10 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 **Converge, for a directory item.**
 
 1. Transport mounted (adopt or mount).
-2. `<transport>/<subdir>/<name>` exists and is a directory (adopt; create only in
-   the controller; a missing directory at stage is `NotFound`).
+2. `<transport>/<subdir>/<name>` exists and is a directory (adopt). For
+   `nfs3` the controller created it, and a missing directory at stage is
+   `NotFound`; for `local` the controller creates nothing (decision 23), so
+   the node creates the directory here, with mode 0755, when it is missing.
 3. Stage path is a bind mount of that directory (adopt if mountinfo shows
    exactly that source; `FailedPrecondition` if it shows something else;
    bind if absent).
