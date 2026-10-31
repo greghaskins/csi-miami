@@ -12,9 +12,9 @@
 # desired count equals its ready count, which is the number of nodes (it
 # tolerates every taint); every node's CSINode lists the driver; and each pod's
 # /healthz and /metrics, fetched through the API server's pod proxy, answer
-# with miami_ metrics present. Nothing here sleeps for a fixed time: waits are
-# `kubectl wait`, or one loop with a deadline for the metrics, which appear
-# only after the first calls.
+# with miami_ metrics present. Nothing here waits for a fixed time: waits are
+# `kubectl wait`, or a loop with a deadline and a one-second interval for the
+# leases and the metrics, which appear only after the first calls.
 #
 # The cluster is deleted at the end. On failure, first, DEPLOY_ARTIFACT_DIR
 # (if set) receives `kind export logs`, both pods' logs, `kubectl describe` of
@@ -135,6 +135,7 @@ for lease in "$lease_name" "external-attacher-leader-$lease_name"; do
       echo "kind: no lease $lease within ${metrics_deadline}s" >&2
       exit 1
     fi
+    sleep 1
   done
   echo "kind: leader election lease $lease exists"
 done
@@ -152,6 +153,7 @@ scrape() {
         echo "kind: $pod /metrics has no miami_ series after ${metrics_deadline}s" >&2
         exit 1
       fi
+      sleep 1
     done
     echo "kind: $pod /metrics answered 200 with $(grep -c '^miami_' <<<"$body") miami_ series, for example:"
     grep '^miami_' <<<"$body" | head -3 | sed 's/^/kind:   /'
