@@ -167,6 +167,12 @@ be a single non-empty path element. An unresolved or unknown token is
 `InvalidArgument`. Unknown parameters are `InvalidArgument` so a typo cannot
 silently mean the default.
 
+A given server is named one way across all StorageClasses on a cluster (the
+normal form already collapses case and IPv6 spelling). The kernel reports a
+shared NFS superblock under the spelling of whichever mount came first, so
+naming one server by both a host name and an address is unsupported and
+shows as a mount conflict.
+
 The item directory is always `<transport mount>/<subdir>/<volume name>`,
 with the name taken from the volume ID and never from a parameter.
 
@@ -414,8 +420,10 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
   kernels: retired by the `nfs3` e2e variant in T4, before any node-agent
   code depends on it, and by the first real-cluster mount.
 - **`Bidirectional` propagation and adoption across a plugin restart**: the
-  reason the transports root is a hostPath; retired by the T4 smoke under
-  `unshare --mount` and by exit criterion 4 on a real cluster.
+  reason the transports root is a hostPath; adoption across a process
+  restart is retired by the T4 smoke (one private mount namespace, so it
+  does not exercise propagation); propagation is proven by the e2e on a real
+  cluster in T10 and by exit criterion 4.
 - **Kubelet path differences across distributions**: one replacement in
   the kustomize base, checked by a render test in T9.
 - **A hung NFS mount blocking the reconciler**: every observation has a
