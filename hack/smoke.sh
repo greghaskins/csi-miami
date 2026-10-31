@@ -6,8 +6,9 @@
 # root or the namespace is not private.
 #
 # The smoke tests live in internal/mount, which they exercise together with
-# internal/observe, and in internal/transport, which they exercise on top of
-# both. Each package is built as its own test binary and run in its own
+# internal/observe, in internal/transport, which they exercise on top of both,
+# and in internal/reconcile, which runs the node reconciler on a real local
+# transport. Each package is built as its own test binary and run in its own
 # namespace.
 #
 # If SMOKE_ARTIFACT_DIR is set, a failing test leaves mountinfo-<test>.txt
@@ -40,7 +41,7 @@ fi
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-for pkg in mount transport; do
+for pkg in mount transport reconcile; do
   go test -c -tags smoke -o "$dir/$pkg.test" "./internal/$pkg"
 
   # A renamed test or a changed build tag would make the run below print "no
