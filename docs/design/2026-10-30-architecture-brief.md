@@ -108,8 +108,8 @@ design treats them as constraints.
 - **Volumes are self-describing.** Enough transport config rides in the
   volume ID or volume context for any component to find the item without a
   registry, a cache or a PV lookup.
-- **The driver owns the transport profile.** Users name a server and an
-  export; the driver chooses mount options it knows how to fence.
+- **The driver owns the mount options.** Users name a server and an
+  export; the driver mounts with the one option set it knows how to fence.
 - **Exclusivity is layered and both layers are on by default.**
 - **Small privileged surface, explicit grants**, each mirrored by an
   admission policy.
@@ -243,14 +243,14 @@ idempotent against the file; a size mismatch is `AlreadyExists`.
    decide correctly.
 
 The simplification is in **who decides fenceability**. **Decision 8:
-the driver owns mount options.** The driver owns a named NFSv3 transport profile (`nfsvers=3,proto=tcp,soft,timeo=100,
-retrans=3,nolock` plus a small allowlist of NAS-specific extras such as
-`noatime`, `actimeo`), so the NFS major timeout `S` is a constant of the
-profile, the takeover timeout `T` is one driver flag validated against it
-at startup, and `FenceAfter = T - S - margin` and `ResetAfter = T - margin`
-are derived once. No per-StorageClass validation of raw option strings, no
-"not fenceable because of option X" branches. A profile the driver cannot
-fence (NFSv4, `hard`, `local`) is non-fenceable by name and gets taint-only
+the driver owns mount options.** The driver mounts NFSv3 with one fixed option set
+(`vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,
+actimeo=30,noatime`; the reasons are in the M1 plan, section 8), so the NFS
+major timeout `S` is a constant, the takeover timeout `T` is one driver
+flag validated against it at startup, and `FenceAfter = T - S - margin` and
+`ResetAfter = T - margin` are derived once. No per-StorageClass option
+strings, no `hard` variant, no "not fenceable because of option X"
+branches. `local` transports are non-fenceable by kind and get taint-only
 takeover. Self-fencing: ext4 shutdown ioctl at `FenceAfter`, TCP reset of
 the NFS socket (`ss -K`, probed at startup) at `ResetAfter`, direct-I/O
 loops always on NFS transports.
@@ -621,7 +621,7 @@ Recorded:
 7. **No Kubernetes Lease** beside the transport-clock holder; timed
    takeover requires both the transport-clock age and the taker's own
    observation period (4.5).
-8. **Driver-owned mount options** through named transport profiles (4.5).
+8. **Driver-owned mount options**: one fixed NFSv3 option set, no `hard` variant (4.5; M1 plan section 8).
 
 9. **Active failed-volume probe**: yes, in addition to passive detection
    (4.6).

@@ -68,7 +68,6 @@ type Spec struct {              // what a StorageClass describes
     Kind    string              // "nfs3" | "local"
     Server  string              // nfs3
     Export  string              // nfs3: absolute export path
-    Profile string              // nfs3: named option set, default "soft"
     Path    string              // local: absolute host path
 }
 func (s Spec) ID() string       // short hash of the canonical form
@@ -138,7 +137,6 @@ and unstage of the same ID across calls.
 | `miami/transport.kind` | `nfs3` or `local` |
 | `miami/transport.server` | nfs3 server |
 | `miami/transport.export` | nfs3 export path |
-| `miami/transport.profile` | nfs3 profile name |
 | `miami/transport.path` | local host path |
 | `miami/subdir` | resolved subdirectory under the transport (tokens expanded) |
 
@@ -157,7 +155,6 @@ and unstage of the same ID across calls.
 | `transport.kind` | yes | `nfs3` or `local` |
 | `transport.server` | nfs3 | address |
 | `transport.export` | nfs3 | export path |
-| `transport.profile` | no | `soft` (default) or `hard`; the option sets are in section 8 |
 | `transport.path` | local | absolute host path |
 | `subdir` | no | path under the transport with `${pvc.namespace}`, `${pvc.name}`, `${pv.name}` tokens; default `${pv.name}` |
 
@@ -208,17 +205,31 @@ other than this volume's transport directory. Never `panic` in a handler.
 **`nfs3`.** `mount(2)` with `fstype=nfs`, source `<server>:<export>`, and a
 kernel option string. The driver resolves `addr=` itself (the host network
 resolver, then the literal address), so no helper and no `/etc/services`
-are needed. Profiles:
+are needed. There is one profile; it is code, not configuration:
 
-| profile | options | fenceable (M2) |
-|---|---|---|
-| `soft` (default) | `vers=3,proto=tcp,soft,timeo=100,retrans=3,nolock,noatime,actimeo=30` | yes |
-| `hard` | `vers=3,proto=tcp,hard,nolock,noatime,actimeo=30` | no |
+```
+vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30,noatime
+```
 
-Profiles are code, not configuration. A StorageClass names one; it cannot
-pass raw options. `actimeo` and `noatime` are in both because some NAS
-firmware rejects a minimal option set with "protocol not supported"; a
-later profile may drop them.
+| option | reason |
+|---|---|
+| `vers=3,proto=tcp` | the protocol the target NAS speaks; TCP so a socket reset is a real fence (M2) |
+| `softerr,timeo=100,retrans=3` | bounded failure: retries at 10, 20, 30 and 40 seconds, about 100s in all, so the major timeout is a constant the fence math (M2) can use. `softerr` returns `ETIMEDOUT` instead of `EIO`, so a NAS stall is distinguishable from a disk error. Needs kernel 5.3+; on `EINVAL` the mount fails with an explicit message, never a silent fallback to `soft` or `hard` |
+| `nolock` | locks are node-local; cross-node coordination uses `mkdir` and `O_EXCL`, which are server round-trips regardless; no NLM, no lockd state to hang |
+| `lookupcache=positive` | never cache a negative lookup, so a file or lock directory created on another node is seen on the next lookup |
+| `actimeo=30` | attribute cache; file contents are unaffected because close-to-open revalidates on every `open` (also how M2 reads another node's holder mtime fresh); directory listings lag by at most 30s |
+| `noatime` | believed inert on an NFS client; kept because the option set known to work on the target NAS has it |
+
+`hard` is deliberately absent: an unbounded wait is the D-state node and
+the shutdown hang, and it makes fencing impossible, so a `hard` volume
+could only ever be taken over by a taint. Resuming after an outage is
+handled instead by bounded failure plus automatic re-stage (M2).
+
+Two empirical checks belong to the first real-cluster deployment, not CI:
+whether the NAS accepts the set without `actimeo` and `noatime` ("protocol
+not supported" usually means a missing `vers=3`), and whether `softerr`
+mounts on every node kernel. Either outcome changes the profile by a code
+change, with a version bump.
 
 **`local`.** The host path, bind-mounted to `<root>/transports/<ID>` so
 that every transport looks the same to the item and observer code. It
@@ -358,7 +369,7 @@ acceptance check. Order matters only where stated.
 | T1 | Scaffold: module, `cmd/miami` with subcommands that print version, Makefile, mise.toml, golangci config, `ci.yml` with `static`, `unit`, `build` (both arches), `manifest`, `ci-ok` | `ci-ok` green on an empty driver |
 | T2 | `internal/volume`: ID and context encode/decode/validate; `internal/transport.Spec` with ID and canonical form; subdir token resolution | unit tests, including the `InvalidArgument` cases |
 | T3 | `internal/mount` and `internal/observe`: `mount(2)` wrappers with deadlines, mountinfo parser, bind and read-only remount | unit tests against fixture mountinfo; smoke under `unshare --mount` |
-| T4 | `internal/transport`: `local` and `nfs3` with profiles; adopt-from-mountinfo | smoke: mount, restart the process, adopt, unmount; e2e harness `hack/nfs-server` and `make e2e E2E_TRANSPORT=nfs3` mounting by hand |
+| T4 | `internal/transport`: `local` and `nfs3` with the one option set; adopt-from-mountinfo | smoke: mount, restart the process, adopt, unmount; e2e harness `hack/nfs-server` and `make e2e E2E_TRANSPORT=nfs3` mounting by hand |
 | T5 | `internal/intent`: record format, atomic write, load with failure accounting | unit tests including a corrupt record |
 | T6 | `internal/reconcile` with the `directory` item: converge, garbage, per-volume serialization, request queue | unit tests with fake observers; smoke: plugin restart with mounts live, reboot simulation |
 | T7 | `internal/csi` node server over the reconciler; `internal/metrics`; gRPC interceptor | `csi-sanity` node half; metrics scraped in smoke |
@@ -373,8 +384,9 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
 
 ## 16. Risks and the check that retires each
 
-- **`mount(2)` NFSv3 without a helper** on the target kernels: retired by
-  the `nfs3` e2e variant in T4, before any node-agent code depends on it.
+- **`mount(2)` NFSv3 without a helper, and `softerr`** on the target
+  kernels: retired by the `nfs3` e2e variant in T4, before any node-agent
+  code depends on it, and by the first real-cluster mount.
 - **`Bidirectional` propagation and adoption across a plugin restart**: the
   reason the transports root is a hostPath; retired by the T4 smoke under
   `unshare --mount` and by exit criterion 4 on a real cluster.
