@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 12 recorded (section 8)
+**Status:** Draft, decisions 1 to 15 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -394,9 +394,7 @@ nothing forces a flag day.
 - Events on the PVC and pod for every state change a human would ask about.
 - Every API write the node agent can perform is enumerated in RBAC and
   mirrored by a VAP.
-- Image: slim Debian for the image role (`e2fsprogs`, `util-linux`,
-  `cryptsetup`, `nfs-common`, `iproute2`; build-assert `netbase`),
-  distroless for roles that need no shell. CI mounts NFSv3 for real.
+- Image and supply chain: section 7.
 
 ## 5. Storage tiers
 
@@ -460,7 +458,110 @@ consumer, not an item kind.
   plugin restart, force detach, surge rollout.
 - csi-sanity for both driver names.
 
-## 7. Non-goals
+## 7. Image, supply chain and CI
+
+### 7.1 A bare-minimum image
+
+The goal is an image with nothing in it that the driver does not call.
+Three choices get most of the way there:
+
+- **No mount helpers.** NFS mounts go through the `mount(2)` syscall with
+  a kernel-ready option string (`addr=` resolved by the driver, `vers=3`,
+  the profile's options). The kernel has performed the NFSv3 MOUNT request
+  itself for a long time, so `mount.nfs`, `nfs-common`, `rpcbind` and
+  `/etc/services` are not needed in the image. This removes the class of
+  bug where the image mounts NFSv4 fine and NFSv3 not at all. CI proves it
+  on a real NFSv3 server (7.3); if a kernel in the field disagrees, the
+  helper comes back behind a flag, not by default.
+- **No `losetup`, no `ss`.** Loop devices are driven by ioctl
+  (`LOOP_CTL_GET_FREE`, `LOOP_CONFIGURE` with direct I/O and sector size,
+  `LOOP_CLR_FD`) and observed through sysfs and `/proc/self/mountinfo`;
+  the NFS transport reset is a netlink `SOCK_DESTROY`, not a shell-out.
+  `util-linux` and `iproute2` are gone.
+- **Only two external tools remain**: `e2fsprogs` (`mkfs.ext4`, `e2fsck`,
+  `resize2fs`) and `cryptsetup`. Reimplementing either is out of scope.
+
+The image is therefore built `FROM scratch`: the static Go binary plus
+those tools and their shared libraries, copied from a pinned musl-based
+builder stage (statically linked where the distribution provides it; the
+builder's package set is the whole dependency list and is pinned by
+digest). No shell, no package manager, no `busybox`, no `/etc/passwd`
+beyond what the tools need. The controller runs the same image with a
+different subcommand; a separate controller-only image is a later
+optimization if size matters. Target: well under 50 MB per architecture.
+
+Runtime posture:
+
+- Node DaemonSet: `privileged: true` is unavoidable (kubelet allows
+  `Bidirectional` mount propagation only for privileged containers, and
+  loop and dm need device access), so the rest is tightened:
+  `readOnlyRootFilesystem: true` with an `emptyDir` for the few paths that
+  must be writable, no `hostPID`, `hostNetwork` only because NAS ACLs admit
+  node addresses, `automountServiceAccountToken` true only for the node
+  role, resource requests and limits set.
+- Controller Deployment: not privileged. `capabilities: add: [SYS_ADMIN]`
+  for the mount, `drop: [ALL]` otherwise, `readOnlyRootFilesystem`,
+  `seccompProfile: RuntimeDefault` (the default profile permits `mount`
+  under `CAP_SYS_ADMIN`), `hostNetwork` for the NAS ACL, `runAsUser: 0`
+  because `mount(2)` requires it.
+- Sidecar images (provisioner, resizer, attacher, registrar, livenessprobe)
+  are pinned by digest in the kustomize base, with automated bump PRs.
+
+### 7.2 Supply chain
+
+- Images are signed with keyless cosign from the release workflow's OIDC
+  identity, carry an SBOM (syft) and build provenance attestations, and the
+  kustomize base references them by tag with the digest recorded alongside.
+- `govulncheck` on every PR; container scanning on every built image;
+  dependency updates for Go modules, GitHub Actions and sidecar images by
+  automated PRs. Actions are pinned by commit SHA, and every workflow
+  declares the least `permissions:` it needs.
+- Multi-arch (`linux/amd64`, `linux/arm64`) without emulated compilation:
+  the Go binary cross-compiles with `CGO_ENABLED=0`, and the two tools are
+  taken as prebuilt packages for each architecture from the pinned builder,
+  so no job compiles under QEMU. Native arm64 runners, when available, run
+  the arm64 smoke test rather than the build.
+
+### 7.3 CI: fast by parallelism, robust by running the real thing
+
+Every PR runs the full set below as parallel jobs; nothing waits for
+`main`. The target is under ten minutes wall clock.
+
+| Job | What it proves | Needs |
+|---|---|---|
+| `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | cache |
+| `unit` | `go test -race -shuffle=on ./...` with coverage | cache |
+| `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | setup-envtest cache |
+| `build` | binary and image for the PR's architecture, uploaded as an artifact | buildx cache |
+| `smoke` | root on the runner: loop devices, ext4, LUKS2, `unshare --mount` plugin replacement, simulated reboot | the image artifact |
+| `sanity` | csi-sanity against the binary | the image artifact |
+| `e2e` matrix `local`, `nfs3`, `nfs4` | kind cluster, real NFS server container (kernel server for `nfs3` and `nfs4`), fault injection: server restart, partition, plugin restart, force detach, surge rollout, holder kill with remote writers | the image artifact |
+| `ci-ok` | a single required check that depends on all of the above | nothing |
+
+Rules that keep it honest:
+
+- **One required check.** Branch protection requires only `ci-ok`. Path
+  filters may skip heavy jobs for docs-only changes, but `ci-ok` still
+  runs and still passes, so a skipped job can never masquerade as a pass
+  and a filtered job can never block a merge.
+- **No retries on failure.** A flaky test is a bug. Fault-injection tests
+  use explicit hooks (a debug endpoint that pauses renewals, a controllable
+  clock) rather than sleeps, and every wait polls a condition with a
+  deadline.
+- **Build once, test everywhere.** The image is built one time per PR and
+  every downstream job consumes the artifact, so smoke, sanity and e2e all
+  test the bytes that would ship.
+- **Superseded runs are cancelled** (concurrency group per branch), job
+  timeouts are set, and on failure every job uploads mountinfo, `losetup`,
+  dm state, kernel log excerpts and the plugin's logs as artifacts.
+- `make check` runs the same targets locally with the same flags, so a
+  green local run predicts CI.
+- On `main` and nightly: the multi-arch build, the `nfs4` and arm64 smoke
+  variants if they were path-filtered, and the release pipeline (PR-driven:
+  cut-release opens a release PR, merging it tags, builds, signs and
+  publishes).
+
+## 8. Non-goals
 
 - Mounting one image on two nodes at once; many-node access to an image is
   only ever through the holder's export (4.9).
@@ -469,7 +570,7 @@ consumer, not an item kind.
   and `O_EXCL` give.
 - Nodes that cannot reach the NAS from the host network.
 
-## 8. Decisions
+## 9. Decisions
 
 Recorded:
 
@@ -503,15 +604,24 @@ Recorded:
     **Node-local persistent** is an image item on the `local` transport
     with topology and a move operation (5.2), scheduled after RWX images.
 
+13. **Image**: `FROM scratch` with the static binary, `e2fsprogs` and
+    `cryptsetup` only; no shell, no mount helpers (7.1).
+14. **Syscalls over shell-outs**: `mount(2)` for NFS, loop ioctls, netlink
+    socket destroy (7.1), each proven on real NFSv3 in CI.
+15. **CI shape**: parallel jobs on every PR including smoke, sanity and
+    the kind e2e matrix, one required `ci-ok` check, no retries, build once
+    (7.3).
+
 Pending: none that block M1.
 
-## 9. Milestones
+## 10. Milestones
 
 1. **M1, directory items on NFSv3 and local**: the binary, controller and
    DaemonSet; transports on the host mount table with driver-owned
-   profiles; intent store and reconciler; opaque IDs with PV lookup;
-   metrics; the `miami lock` helper; kind e2e on NFSv3. Proves the plumbing
-   with nothing but `mkdir` and bind mounts.
+   profiles via `mount(2)`; intent store and reconciler; opaque IDs with PV
+   lookup; metrics; the `miami lock` helper; the scratch-from-scratch image
+   and the full CI shape of 7.3 with the `local` and `nfs3` e2e variants.
+   Proves the plumbing with nothing but `mkdir` and bind mounts.
 2. **M2, image items**: loop, ext4, LUKS2, offline expand, holder plus
    attach exclusivity, fencing, the active and passive probes, the shared
    remediation package and VAP, re-stage via the publish secret, canaries,
