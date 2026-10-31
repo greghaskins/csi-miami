@@ -32,6 +32,10 @@ type pass struct {
 	// explicit Unpublish drops are carried out (garbage.go).
 	collect bool
 
+	// conflicts holds the publish targets this pass found held by a mount the
+	// driver did not make, by path.
+	conflicts map[string]error
+
 	trs  map[string]*trResult // by transport mount point: one observation per pass
 	hung map[string]error     // transport mount point → the timeout it showed in this pass
 }
@@ -79,6 +83,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 		intents:     loaded.Intents,
 		unstaging:   map[string]struct{}{},
 		superseded:  map[*request]bool{},
+		conflicts:   map[string]error{},
 		teardownErr: map[string]error{},
 		results:     map[string]*volumeResult{},
 		dropErr:     map[string]error{},

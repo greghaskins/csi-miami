@@ -218,13 +218,91 @@ func TestUnpublishOfAVolumeWithNoIntentStillUnmountsTheTarget(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
+	in := e.vol("a", "pvc-1")
+	target := e.stageAndPublish(in, "pod1", false)
+	// The record is gone (unstaged, or removed by hand): the volume has no
+	// intent, so the stage path is unknown. The target is still recognised as
+	// the driver's, a bind of a directory in one of its transports.
+	mustNil(t, "delete", e.store.Delete(in.VolumeID))
+
+	mustNil(t, "Unpublish", e.r.Unpublish(bg, in.VolumeID, target))
+	if _, ok := e.visible(target); ok {
+		t.Error("the target is still mounted")
+	}
+}
+
+func TestUnpublishDoesNotUnmountWhatIsNotOurs(t *testing.T) {
+	t.Parallel()
+	t.Run("a foreign mount", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t)
+		e.start()
+		e.mkTargetParent("pod1")
+		target := e.target("pod1")
+		e.sim.addMount(target, "tmpfs", "t")
+		err := e.r.Unpublish(bg, "directory:pvc-gone", target)
+		if !errors.Is(err, ErrPublishConflict) {
+			t.Fatalf("Unpublish = %v, want ErrPublishConflict", err)
+		}
+		if m, ok := e.visible(target); !ok || m.FSType != "tmpfs" {
+			t.Error("the foreign mount was removed")
+		}
+		// It is not retried by later passes.
+		e.sim.Reset()
+		e.pass()
+		e.pass()
+		if c := e.unmountCalls(); len(c) != 0 {
+			t.Errorf("later passes unmounted %v", c)
+		}
+		if len(e.r.drops) != 0 {
+			t.Errorf("the refused drop was kept: %v", e.r.drops)
+		}
+	})
+	t.Run("our bind with foreign mounts stacked on it", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t)
+		e.start()
+		in := e.vol("a", "pvc-1")
+		target := e.stageAndPublish(in, "pod1", false)
+		e.sim.addMount(target, "tmpfs", "t")
+		e.sim.addMount(target, "tmpfs", "t")
+		before := len(e.sim.table())
+
+		err := e.r.Unpublish(bg, in.VolumeID, target)
+		if !errors.Is(err, ErrPublishConflict) {
+			t.Fatalf("Unpublish = %v, want ErrPublishConflict", err)
+		}
+		if n := len(e.sim.table()); n != before {
+			t.Errorf("%d mounts after, %d before: a stack was popped", n, before)
+		}
+		if c := e.unmountCalls(); len(c) != 0 {
+			t.Errorf("unmounted %v", c)
+		}
+	})
+}
+
+// A derived drop is held to the same test: a publish that was recorded over a
+// mount that is not ours is not unmounted when its record goes.
+func TestADerivedDropDoesNotUnmountWhatIsNotOurs(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	in := e.vol("a", "pvc-1")
 	e.mkTargetParent("pod1")
 	target := e.target("pod1")
 	e.sim.addMount(target, "tmpfs", "t")
+	in.Publishes = []intent.Publish{{TargetPath: target}}
+	mustNil(t, "save", e.store.Save(in))
+	e.pass() // the pass sees the target claimed; it conflicts
 
-	mustNil(t, "Unpublish", e.r.Unpublish(bg, "directory:pvc-gone", target))
-	if _, ok := e.visible(target); ok {
-		t.Error("the target is still mounted")
+	mustNil(t, "delete", e.store.Delete(in.VolumeID))
+	e.sim.Reset()
+	e.pass()
+	e.pass()
+	if m, ok := e.visible(target); !ok || m.FSType != "tmpfs" {
+		t.Error("the foreign mount was unmounted as a target no intent claims")
+	}
+	if len(e.r.drops) != 0 {
+		t.Errorf("the refused drop was kept: %v", e.r.drops)
 	}
 }
 
@@ -287,7 +365,9 @@ func TestUnpublishOfATargetAnotherIntentClaimsLeavesItMounted(t *testing.T) {
 	mustNil(t, "save", e.store.Save(other))
 	req := &request{kind: reqUnpublish, volume: "directory:pvc-x", target: target, done: make(chan error, 1)}
 	e.r.runPass(bg, []*request{req})
-	mustNil(t, "pass", <-req.done)
+	if err := <-req.done; !errors.Is(err, ErrPublishConflict) {
+		t.Errorf("answer = %v, want the conflict, not success", err)
+	}
 	if _, ok := e.visible(target); !ok {
 		t.Error("a claimed target was unmounted")
 	}

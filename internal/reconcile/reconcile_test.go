@@ -425,6 +425,20 @@ func TestPublishConflicts(t *testing.T) {
 	if m, ok := e.visible(e.target("pod1")); !ok || m.FSType != "tmpfs" {
 		t.Errorf("the foreign mount was disturbed: %+v", m)
 	}
+	// The record names only targets the driver bound.
+	if got, _ := e.intentOf(in.VolumeID); len(got.Publishes) != 0 {
+		t.Errorf("a publish that was refused is recorded: %+v", got.Publishes)
+	}
+	// And a publish that was bound and is later in conflict stays recorded.
+	e.mkTargetParent("pod3")
+	mustNil(t, "Publish", e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: e.target("pod3")}))
+	e.sim.addMount(e.target("pod3"), "tmpfs", "tmpfs")
+	if err := e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: e.target("pod3"), ReadOnly: true}); !errors.Is(err, ErrPublishConflict) {
+		t.Fatalf("Publish over a stack = %v", err)
+	}
+	if got, _ := e.intentOf(in.VolumeID); len(got.Publishes) != 1 {
+		t.Errorf("publishes = %+v, want the bound one kept", got.Publishes)
+	}
 }
 
 func TestPublishOfAnUnknownVolume(t *testing.T) {
@@ -596,6 +610,7 @@ func TestUnstageLeavesMountsThatAreNotOurs(t *testing.T) {
 		mustNil(t, "save", e.store.Save(in))
 		e.sim.addMount(in.StagePath, "tmpfs", "tmpfs")
 		e.sim.addMount(in.StagePath, "tmpfs", "tmpfs") // stacked
+		e.pass()                                       // the transport comes up; the stage is in conflict
 
 		err := e.r.Unstage(bg, in.VolumeID)
 		if !errors.Is(err, ErrStageConflict) {

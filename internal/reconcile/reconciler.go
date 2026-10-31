@@ -95,15 +95,15 @@ type Reconciler struct {
 
 	// Loop-only state: touched by runPass and Run, never by a request.
 	transports  map[transport.Spec]transport.Transport
-	lastTargets map[string]string    // publish targets of the previous pass → volume
-	drops       map[string]dropped   // targets to unmount once they are no longer claimed
-	idleSince   map[string]time.Time // unreferenced transport dir → first pass that saw it
-	lastErr     map[string]string    // volume → text of its last error, for dedup
-	reported    map[string]string    // transport dir → kind, for the metrics seam
-	kinds       map[string]struct{}  // intent kinds reported, so a kind that empties reads 0
-	failedLoad  map[string]struct{}  // load-failure paths already logged
-	warned      map[string]string    // path → kind of the failure last logged at warn level
-	suspended   bool                 // collection is suspended by an unreadable record
+	lastTargets map[string]targetInfo // publish targets of the previous pass
+	drops       map[string]dropped    // targets to unmount once they are no longer claimed
+	idleSince   map[string]time.Time  // unreferenced transport dir → first pass that saw it
+	lastErr     map[string]string     // volume → text of its last error, for dedup
+	reported    map[string]string     // transport dir → kind, for the metrics seam
+	kinds       map[string]struct{}   // intent kinds reported, so a kind that empties reads 0
+	failedLoad  map[string]struct{}   // load-failure paths already logged
+	warned      map[string]string     // path → kind of the failure last logged at warn level
+	suspended   bool                  // collection is suspended by an unreadable record
 
 	// newTicker is the timer seam; tests replace it.
 	newTicker func(d time.Duration) (<-chan time.Time, func())
@@ -113,7 +113,14 @@ type Reconciler struct {
 // unmounted.
 type dropped struct {
 	volume   string
-	explicit bool // an Unpublish asked; false means it was derived (garbage)
+	stage    string // the volume's stage path, "" if the reconciler no longer knows it
+	explicit bool   // an Unpublish asked; false means it was derived (garbage)
+}
+
+// targetInfo is what the reconciler remembers of a publish target between
+// passes: whose it was, and the stage path it was a bind of.
+type targetInfo struct {
+	volume, stage string
 }
 
 // New returns a Reconciler over an intent store and a Mounter. It fails if
@@ -155,7 +162,7 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		events:      opts.Events,
 		wake:        make(chan struct{}, 1),
 		transports:  map[transport.Spec]transport.Transport{},
-		lastTargets: map[string]string{},
+		lastTargets: map[string]targetInfo{},
 		drops:       map[string]dropped{},
 		idleSince:   map[string]time.Time{},
 		lastErr:     map[string]string{},
@@ -314,12 +321,14 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 	}); err != nil {
 		return fmt.Errorf("publishing %s: %w", volumeID, err)
 	}
+	existed := false
 	err = r.store.Update(volumeID, func(in *intent.Intent) error {
 		if in.VolumeID == "" {
 			return fmt.Errorf("%w: %s", ErrUnknownVolume, volumeID)
 		}
 		for i := range in.Publishes {
 			if in.Publishes[i].TargetPath == p.TargetPath {
+				existed = true
 				in.Publishes[i] = p
 				return nil
 			}
@@ -330,7 +339,37 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 	if err != nil {
 		return fmt.Errorf("recording the publish of %s: %w", volumeID, err)
 	}
-	return r.await(ctx, &request{kind: reqPublish, volume: volumeID, target: p.TargetPath})
+	err = r.await(ctx, &request{kind: reqPublish, volume: volumeID, target: p.TargetPath})
+	if errors.Is(err, ErrPublishConflict) && !existed {
+		// The record must only name targets the driver bound. The intent is
+		// written before the wait so that a caller that gives up still
+		// converges, but a target held by a mount that is not ours was never
+		// bound, and a record of it would have a later pass unmount, as "no
+		// longer claimed", whatever sits there.
+		r.unrecordPublish(volumeID, p.TargetPath)
+	}
+	return err
+}
+
+// unrecordPublish removes a publish from the volume's record, best effort. The
+// caller holds the volume's lock.
+func (r *Reconciler) unrecordPublish(volumeID, target string) {
+	err := r.store.Update(volumeID, func(in *intent.Intent) error {
+		if !hasPublish(*in, target) {
+			return errNoChange
+		}
+		kept := in.Publishes[:0]
+		for _, q := range in.Publishes {
+			if q.TargetPath != target {
+				kept = append(kept, q)
+			}
+		}
+		in.Publishes = kept
+		return nil
+	})
+	if err != nil && !errors.Is(err, errNoChange) {
+		r.log.Warn("could not remove a publish that was never bound from the record", "volume", volumeID, "target", target, "error", err)
+	}
 }
 
 // Unpublish removes a target from the volume's intent and waits until nothing

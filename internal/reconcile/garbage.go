@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
@@ -78,14 +79,14 @@ type candidate struct {
 func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 	r := p.r
 
-	current := map[string]string{} // publish target → volume, over the intents
+	current := map[string]targetInfo{} // publish target → owner, over the intents
 	var stages []string
 	refs := map[string]struct{}{} // transport mount points the intents reference
 	refsKnown := true
 	for _, in := range p.intents {
 		stages = append(stages, in.StagePath)
 		for _, pub := range in.Publishes {
-			current[pub.TargetPath] = in.VolumeID
+			current[pub.TargetPath] = targetInfo{volume: in.VolumeID, stage: in.StagePath}
 		}
 		dir, err := in.Transport.MountPoint(r.opts.TransportsRoot)
 		if err != nil {
@@ -98,12 +99,12 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 	p.collect = failuresClean
 	p.noteSuspended(!failuresClean)
 	if failuresClean {
-		for t, v := range r.lastTargets {
+		for t, info := range r.lastTargets {
 			if _, claimed := current[t]; claimed {
 				continue
 			}
 			if _, have := r.drops[t]; !have {
-				r.drops[t] = dropped{volume: v}
+				r.drops[t] = dropped{volume: info.volume, stage: info.stage}
 			}
 		}
 	}
@@ -111,11 +112,14 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 		if req.kind != reqUnpublish {
 			continue
 		}
-		if v, claimed := current[req.target]; claimed {
-			r.log.Warn("an unpublish names a target that another intent claims; leaving it mounted", "volume", req.volume, "claimed_by", v)
+		if owner, claimed := current[req.target]; claimed {
+			// Publish and Unpublish refuse this at request time; a claim made
+			// since is the same conflict.
+			r.log.Warn("an unpublish names a target that another intent claims; leaving it mounted", "volume", req.volume, "claimed_by", owner.volume)
+			p.dropErr[req.target] = fmt.Errorf("%w: %s is claimed by the publish of %s", ErrPublishConflict, req.target, owner.volume)
 			continue
 		}
-		r.drops[req.target] = dropped{volume: req.volume, explicit: true}
+		r.drops[req.target] = dropped{volume: req.volume, stage: p.intents[req.volume].StagePath, explicit: true}
 	}
 	for t := range r.drops {
 		if _, claimed := current[t]; claimed {
@@ -128,8 +132,8 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 	if failuresClean {
 		r.lastTargets = current
 	} else {
-		for t, v := range current {
-			r.lastTargets[t] = v
+		for t, info := range current {
+			r.lastTargets[t] = info
 		}
 	}
 
@@ -199,8 +203,12 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 		prev = len(table)
 		errs = map[string]error{}
 		for _, c := range cands {
-			if err := r.m.Unmount(p.ctx, c.path, 0); err != nil {
-				errs[c.path] = err
+			if err := p.unmountCandidate(c); err != nil {
+				if errors.Is(err, ErrPublishConflict) {
+					p.refuse(c, err)
+				} else {
+					errs[c.path] = err
+				}
 				continue
 			}
 			if c.drop == nil || !c.drop.explicit {
@@ -217,6 +225,64 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 				}
 			}
 		}
+	}
+}
+
+// unmountCandidate unmounts one candidate. A stray below the staging root is
+// unmounted outright (the area is the driver's own). A publish target goes
+// through the same ownership check as an unstage: it is unmounted, once, only
+// if it is a bind of the volume's stage path (or, with the stage gone, of a
+// directory in one of the driver's transports), whether it was named by an
+// Unpublish or found by comparing passes. Anything else, a foreign mount at
+// the target or one stacked on our bind, is ErrPublishConflict and is left.
+func (p *pass) unmountCandidate(c candidate) error {
+	r := p.r
+	if c.drop == nil {
+		return r.m.Unmount(p.ctx, c.path, 0)
+	}
+	return item.UnmountIf(p.ctx, r.m, c.path, r.publishOwned(c.drop.stage),
+		"a bind of the volume's stage path or of a directory in one of the driver's transports", ErrPublishConflict)
+}
+
+// refuse records that a publish target is held by something the driver did not
+// make. It is logged once per path (further passes see no candidate: the drop
+// is discarded here so it is not retried forever, a foreign mount being a
+// person's to clear), counted, and the Unpublish that named it is answered
+// with the conflict.
+func (p *pass) refuse(c candidate, err error) {
+	r := p.r
+	delete(r.drops, c.path)
+	p.conflicts[c.path] = err
+	p.warnOnChange(c.path, err, "a publish target is held by a mount the driver did not make; it is left in place and not retried")
+	r.metrics.IncReconcileError("garbage")
+}
+
+// publishOwned is the ownership test for a publish target of a volume whose
+// stage path is stage ("" if unknown). While the stage is mounted the target
+// must be a bind of it. With the stage gone (the volume was unstaged first,
+// or its record is) the target must be a bind of a directory inside one of the
+// transports the driver mounts: the same device, with a root inside the
+// transport's. A mount of any other file system is not the driver's.
+func (r *Reconciler) publishOwned(stage string) item.Owned {
+	return func(t observe.Table, top observe.Mount) (bool, error) {
+		if stage != "" {
+			if _, mounted := t.At(stage); mounted {
+				return t.IsBindOfIncludingDeleted(top.MountPoint, stage)
+			}
+		}
+		base := filepath.Join(r.opts.TransportsRoot, "transports")
+		for _, tm := range t {
+			if filepath.Dir(tm.MountPoint) != base || tm.ID == top.ID {
+				continue
+			}
+			if _, visible := t.At(tm.MountPoint); !visible {
+				continue
+			}
+			if tm.Major == top.Major && tm.Minor == top.Minor && rootWithin(tm.Root, top.Root) {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
 }
 
@@ -293,6 +359,10 @@ func (p *pass) finishDrops(batch []*request, t observe.Table, errs map[string]er
 	}
 	for _, req := range batch {
 		if req.kind != reqUnpublish {
+			continue
+		}
+		if cerr, refused := p.conflicts[req.target]; refused {
+			p.dropErr[req.target] = fmt.Errorf("unpublishing %q: %w", req.target, cerr)
 			continue
 		}
 		if _, still := r.drops[req.target]; still {

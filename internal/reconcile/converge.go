@@ -114,19 +114,20 @@ func (p *pass) deleteRecord(in intent.Intent) error {
 // directory. Anything else is ErrPublishConflict or ErrStageConflict, left in
 // place and reported, so an Unstage can never unmount a mount the driver did
 // not make; the price is that it fails until a person clears the conflict.
-// Publishes are all tried even if one fails, so one stuck pod does not keep
-// the others mounted; the stage path is only unmounted when every publish is
-// gone, since the binds are of it.
+// The first publish that fails ends the teardown with that one error, so what
+// reaches the caller has one meaning; the stage path is only unmounted when
+// every publish is gone, since the binds are of it.
 func (p *pass) teardownVolume(in intent.Intent) error {
 	r := p.r
-	var errs []error
 	for _, pub := range in.Publishes {
-		if err := item.UnmountBind(p.ctx, r.m, pub.TargetPath, in.StagePath, ErrPublishConflict); err != nil {
-			errs = append(errs, fmt.Errorf("unmounting the publish target %q: %w", pub.TargetPath, err))
+		err := item.UnmountIf(p.ctx, r.m, pub.TargetPath, r.publishOwned(in.StagePath),
+			"a bind of the stage path or of a directory in one of the driver's transports", ErrPublishConflict)
+		if err != nil {
+			// The first failure ends it: the stage is not unmounted while a
+			// bind of it is in the way, and the error that reaches the caller
+			// is one error with one meaning, not a join of several (Classify).
+			return fmt.Errorf("unmounting the publish target %q: %w", pub.TargetPath, err)
 		}
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
 	}
 	it, ok := r.items[in.Kind]
 	if !ok {
@@ -136,7 +137,11 @@ func (p *pass) teardownVolume(in intent.Intent) error {
 	if err != nil {
 		return err
 	}
-	return it.Teardown(p.ctx, in, item.Observed{Mounts: obs})
+	err = it.Teardown(p.ctx, in, item.Observed{Mounts: obs})
+	if errors.Is(err, item.ErrTransportNotMounted) {
+		err = fmt.Errorf("%w: %w", ErrTransportUnavailable, err)
+	}
+	return err
 }
 
 // volumeResult is what one pass found out about one volume, split by what a

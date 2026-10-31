@@ -490,6 +490,15 @@ func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
 	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: target}); !errors.Is(err, reconcile.ErrPublishConflict) {
 		t.Fatalf("Publish over a foreign mount = %v, want ErrPublishConflict", err)
 	}
+	// The refused publish was not recorded. A record that names the target
+	// anyway, as a crash between the record and the bind would leave, is
+	// what the Unstage has to cope with.
+	if err := n.store.Update(in.VolumeID, func(rec *intent.Intent) error {
+		rec.Publishes = []intent.Publish{{TargetPath: target}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Unstage(ctx, in.VolumeID); !errors.Is(err, reconcile.ErrPublishConflict) {
 		t.Fatalf("Unstage = %v, want ErrPublishConflict", err)
 	}
@@ -502,5 +511,155 @@ func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
 	}
 	if _, ok, err := n.store.Get(in.VolumeID); err != nil || !ok {
 		t.Errorf("the record was deleted: %v, %v", ok, err)
+	}
+}
+
+// runPass makes the reconciler run a pass and waits for it to finish.
+func (n *node) runPass(r *reconcile.Reconciler) {
+	n.t.Helper()
+	for len(n.passes) > 0 {
+		<-n.passes
+	}
+	if err := r.Unstage(context.Background(), "directory:pvc-nothing"); err != nil { // nudges
+		n.t.Fatal(err)
+	}
+	n.waitPass()
+}
+
+func (n *node) mountsAt(path string) int {
+	n.t.Helper()
+	c := 0
+	for _, m := range currentTable(n.t) {
+		if m.MountPoint == path {
+			c++
+		}
+	}
+	return c
+}
+
+// (5) DeleteVolume can win the race against a lagging NodeUnstageVolume. The
+// kernel then shows the stage (and any publish) with a root marked deleted,
+// and the Unstage must still be able to take them down.
+func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+
+	// Everything unpublished first, then the directory removed.
+	a := n.intent("pvc-1")
+	if err := r.Stage(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	ta := n.target("pod1")
+	if err := r.Publish(ctx, a.VolumeID, intent.Publish{TargetPath: ta}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Unpublish(ctx, a.VolumeID, ta); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(n.host, "pvc-1")); err != nil {
+		t.Fatal(err)
+	}
+	if m, ok := currentTable(t).At(a.StagePath); !ok || !m.Deleted {
+		t.Fatalf("the stage is not shown as deleted: %+v, %v", m, ok)
+	}
+	if err := r.Unstage(ctx, a.VolumeID); err != nil {
+		t.Fatalf("Unstage of a volume whose directory is gone: %v", err)
+	}
+	if _, ok := currentTable(t).At(a.StagePath); ok {
+		t.Error("the stage is still mounted")
+	}
+	if _, ok, err := n.store.Get(a.VolumeID); err != nil || ok {
+		t.Errorf("the record is still there: %v, %v", ok, err)
+	}
+
+	// With the publish still mounted, too.
+	b := n.intent("pvc-2")
+	if err := r.Stage(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	tb := n.target("pod2")
+	if err := r.Publish(ctx, b.VolumeID, intent.Publish{TargetPath: tb}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(n.host, "pvc-2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Unstage(ctx, b.VolumeID); err != nil {
+		t.Fatalf("Unstage with a publish of a deleted directory: %v", err)
+	}
+	for _, p := range []string{tb, b.StagePath} {
+		if _, ok := currentTable(t).At(p); ok {
+			t.Errorf("%s is still mounted", p)
+		}
+	}
+}
+
+// (6) An unpublish, or a drop found by comparing passes, removes the driver's
+// bind and nothing else, and never a stack.
+func TestSmokeUnpublishAndDropsLeaveWhatIsNotOurs(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+	in := n.intent("pvc-1")
+	if err := r.Stage(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+
+	// Our bind with two foreign file systems stacked on it.
+	target := n.target("pod1")
+	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: target}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := unix.Mount("tmpfs", target, "tmpfs", 0, "size=1m"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Unpublish(ctx, in.VolumeID, target); !errors.Is(err, reconcile.ErrPublishConflict) {
+		t.Fatalf("Unpublish over a stack = %v, want ErrPublishConflict", err)
+	}
+	if c := n.mountsAt(target); c != 3 {
+		t.Fatalf("%d mounts at the target, want all three left", c)
+	}
+	for range 2 {
+		if err := unix.Unmount(target, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Unpublish(ctx, in.VolumeID, target); err != nil {
+		t.Fatalf("Unpublish of our bind: %v", err)
+	}
+
+	// A publish over a foreign mount is refused and is not recorded; and a
+	// record that names such a target does not get it unmounted when it goes.
+	foreign := n.target("pod2")
+	mkdir(t, foreign)
+	if err := unix.Mount("tmpfs", foreign, "tmpfs", 0, "size=1m"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: foreign}); !errors.Is(err, reconcile.ErrPublishConflict) {
+		t.Fatalf("Publish over a foreign mount = %v, want ErrPublishConflict", err)
+	}
+	if got, _, _ := n.store.Get(in.VolumeID); len(got.Publishes) != 0 {
+		t.Errorf("the record names %+v", got.Publishes)
+	}
+	// Written by hand, as a crash between the record and the bind would.
+	if err := n.store.Update(in.VolumeID, func(rec *intent.Intent) error {
+		rec.Publishes = []intent.Publish{{TargetPath: foreign}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n.runPass(r) // the pass sees it claimed (and in conflict)
+	if err := n.store.Update(in.VolumeID, func(rec *intent.Intent) error {
+		rec.Publishes = nil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n.runPass(r) // now it is a target no intent claims
+	if m, ok := currentTable(t).At(foreign); !ok || m.FSType != "tmpfs" {
+		t.Error("the foreign mount was unmounted as a target no intent claims")
 	}
 }

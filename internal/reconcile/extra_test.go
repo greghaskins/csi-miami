@@ -37,8 +37,10 @@ func TestUnstageWithABusyPublishKeepsTheStageAndTheIntent(t *testing.T) {
 	if _, ok := e.visible(busy); !ok {
 		t.Error("the busy publish went")
 	}
-	if _, ok := e.visible(other); ok {
-		t.Error("the other publish was not unmounted")
+	// The first failure ends the teardown: one error, and nothing else is
+	// touched while a bind of the stage is still in the way.
+	if _, ok := e.visible(other); !ok {
+		t.Error("a publish after the failing one was unmounted")
 	}
 	if _, ok := e.intentOf(in.VolumeID); !ok {
 		t.Error("the intent was deleted")
