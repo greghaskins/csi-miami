@@ -39,7 +39,7 @@ exportfs -ra
 log "starting mountd"
 rpc.mountd -p 20048 --no-nfs-version 2 --no-nfs-version 4
 log "starting nfsd"
-rpc.nfsd --no-nfs-version 2 --no-nfs-version 4 "$threads"
+rpc.nfsd --no-nfs-version 4 "$threads"
 
 exportfs -v
 rpcinfo -p 127.0.0.1
