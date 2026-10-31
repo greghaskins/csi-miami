@@ -43,6 +43,14 @@ trap 'rm -rf "$dir"' EXIT
 for pkg in mount transport; do
   go test -c -tags smoke -o "$dir/$pkg.test" "./internal/$pkg"
 
+  # A renamed test or a changed build tag would make the run below print "no
+  # tests to run" and exit 0, so the tests must be listed first.
+  listed="$("$dir/$pkg.test" -test.list '^TestSmoke')"
+  if ! grep -q '^TestSmoke' <<<"$listed"; then
+    echo "smoke: internal/$pkg has no TestSmoke* test in the smoke build" >&2
+    exit 1
+  fi
+
   # The test compares its own mount namespace with the one we are leaving.
   SMOKE_PARENT_MNT_NS="$(readlink /proc/self/ns/mnt)" \
   unshare --mount --propagation private \

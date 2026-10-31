@@ -69,8 +69,16 @@ echo "e2e: NFS server at $server"
 
 go test -c -tags e2e -o "$dir/transport.test" ./internal/transport
 
+# A renamed test or a changed build tag would make the run below print "no
+# tests to run" and exit 0, so the test must be listed first.
+if ! grep -qx 'TestE2ENFS3' <<<"$("$dir/transport.test" -test.list '^TestE2E')"; then
+  echo "e2e: the e2e build of internal/transport does not list TestE2ENFS3" >&2
+  exit 1
+fi
+
 # The test compares its own mount namespace with the one we are leaving.
 MIAMI_E2E_NFS_SERVER="$server" \
+MIAMI_E2E_NFS_EXPORT="${NFS_EXPORT:-/export}" \
 SMOKE_ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-}" \
 SMOKE_PARENT_MNT_NS="$(readlink /proc/self/ns/mnt)" \
 unshare --mount --propagation private \
