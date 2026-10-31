@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 17 recorded (section 9)
+**Status:** Draft, decisions 1 to 19 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -558,11 +558,12 @@ Every PR runs the full set below as parallel jobs; nothing waits for
 | `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | amd64 |
 | `unit` | `go test -race -shuffle=on ./...` with coverage | amd64 |
 | `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | amd64 |
-| `build` (matrix) | native `buildx` from the one Dockerfile, per-arch image pushed as `:<sha>-<arch>` on `main`, uploaded as an artifact on PRs | amd64 and arm64 |
+| `build` (matrix) | native `buildx` from the one Dockerfile; per-arch image pushed as `:x-<hash>-<arch>` only when that content tag is missing, and run from the registry on every PR | amd64 and arm64 |
 | `smoke` (matrix) | root on the runner: loop devices, ext4, LUKS2, `unshare --mount` plugin replacement, simulated reboot | amd64 and arm64, from that arch's image |
 | `sanity` (matrix) | csi-sanity against the binary | amd64 and arm64 |
 | `e2e` matrix `local`, `nfs3`, `nfs4` | kind cluster, real NFS server container (kernel server for `nfs3` and `nfs4`), fault injection: server restart, partition, plugin restart, force detach, surge rollout, holder kill with remote writers | amd64; `nfs3` also on arm64 |
-| `manifest` | `buildx imagetools create` combining the per-arch tags into the multi-arch tag, then signing | `main` and releases only |
+| `manifest` | creates the multi-arch index `x-<hash>` from the digests the build legs ran, and verifies it lists exactly those two platforms; runs on every PR | amd64 |
+| `publish` | aliases the commit sha to the verified index; later, signing; `main` only | amd64 |
 | `ci-ok` | a single required check that depends on all of the above | nothing |
 
 Rules that keep it honest:
@@ -576,19 +577,22 @@ Rules that keep it honest:
   clock) rather than sleeps, and every wait polls a condition with a
   deadline.
 - **Build once per architecture, test everywhere.** Each architecture's
-  image is built one time per PR and every downstream job for that
-  architecture consumes the artifact, so smoke, sanity and e2e all test
-  the bytes that would ship, on the hardware they would ship to.
-- **Superseded runs are cancelled** (concurrency group per branch), job
-  timeouts are set, and on failure every job uploads mountinfo, `losetup`,
+  image is built at most once per content hash and every downstream job for that
+  architecture pulls `x-<hash>-<arch>` from the registry, so smoke, sanity
+  and e2e all test the bytes that would ship, on the hardware they would
+  ship to.
+- **Superseded runs are cancelled** for pull requests: the next push to the
+  same PR cancels the previous run. Runs on `main` are keyed by commit and
+  never cancelled. Job timeouts are set, and on failure every job uploads mountinfo, `losetup`,
   dm state, kernel log excerpts and the plugin's logs as artifacts.
 - `make check` runs the same targets locally with the same flags, so a
   green local run predicts CI.
 - Secret scanning runs as git hooks locally (`pre-commit`, installed by
   `mise install`) with the same scripts CI uses, fed the config from an
   environment variable instead of the secret, and refuses to run without it.
-- On `main` and nightly: the manifest job, any variants that were
-  path-filtered, and the release pipeline (PR-driven: cut-release opens a
+- On `main` and nightly: `manifest` runs on every PR; `main` runs `publish`
+  (the sha alias) and, later, signing and release. Also any variants that
+  were path-filtered, and the release pipeline (PR-driven: cut-release opens a
   release PR, merging it tags, runs the two native builds and the manifest
   job, signs and publishes).
 
@@ -651,6 +655,28 @@ Recorded:
     `resize2fs` are the real tools; no embedded template, no fsck-free
     mounts (7.1).
 17. **LUKS2 through `cryptsetup`**, not a Go implementation (7.1).
+18. **Merge commits, not squash**, on `main`: the merge commit message is
+    the pull request title only; squash and rebase merges are disabled.
+    Squash forces a rebase of every stacked branch on each merge; merge
+    commits keep branch history and make stacking cheap. The PR body never
+    enters git history either way.
+19. **Content-addressed images**: CI tags images by a hash of the build
+    inputs (the Dockerfile, its allowlisted context, the module files, and
+    the scripts that hash and build). A pull request builds and pushes
+    `x-<hash>-<arch>` only when that tag does not exist, every run proves
+    the image starts, and the multi-arch index `x-<hash>` is created from
+    exactly the two digests the runs started and verified. A push to `main`
+    normally only adds the commit sha as an alias of that index; when
+    `main`'s content hash was never built (two PRs merged in sequence can
+    produce a tree no PR run built), the `main` run builds it like any other
+    run. The binary's version string is the content hash, so identical
+    inputs have one identity across commits. Fork pull requests are
+    unsupported because the push needs package write access. Trust
+    boundary, accepted: anyone who can push a branch can publish bytes under
+    a content tag, which is the same set of people who can merge; a `main`
+    run re-runs the image before aliasing, and the alias is created from the
+    index that `main`'s own run verified. Provenance describes the run that
+    built the tag, which may be a pull request merge ref.
 
 Pending: none that block M1.
 

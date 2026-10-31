@@ -12,3 +12,10 @@ with `[extend] useDefault = true`), or as `GITLEAKS_CONFIG_TOML_B64` where a
 setting cannot hold a multi-line value, before committing; without it the hooks
 refuse to run rather than passing silently. CI reads the same content from
 a repository secret of the same name.
+
+## Build
+
+`make check` runs everything CI's `static` and `unit` jobs run (format, vet,
+lint, tidy, vulnerability scan and race tests). `make build` builds
+`bin/miami`, and `make image` builds the container image for the host
+architecture.

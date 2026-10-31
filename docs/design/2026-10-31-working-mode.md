@@ -24,9 +24,14 @@ Done once by the repository owner; the session checks, never assumes.
    shared `.git` directory, so every worktree is covered once the variable
    is present.
 3. A ruleset on `main`: pull request required; required checks `ci-ok`
-   (once `ci.yml` exists, task T1) and `secret-scan`; squash merge with the
-   default message set to pull request title only, so a PR body never
-   becomes a commit message.
+   (once `ci.yml` exists, task T1) and `secret-scan`; merge commits (squash
+   and rebase disabled), with the merge commit message set to the pull
+   request title only, so a PR body never becomes a commit message and the
+   branch's own commits stay on `main` with their bodies. Squash makes
+   stacked pull requests expensive, because every merge forces a rebase of
+   everything stacked on it, while a merge commit keeps the branch history
+   intact so a later task branch can be based on an unmerged predecessor
+   when a wave needs it.
 4. `mise install` has been run in the checkout at least once (installs the
    hooks). In a worktree, hooks are already shared.
 
@@ -38,7 +43,9 @@ For each row of the plan's work breakdown (section 15):
    row, its acceptance check, and pointers to the brief and plan sections
    it touches. The brief is the only context the subagent has; it must be
    self-contained.
-2. Branch name `m1/tNN-<slug>` from current `main`. The subagent writes
+2. Branch name `m1/tNN-<slug>` from current `main`; the orchestrator may
+   instead base a task on an unmerged predecessor's branch when the wave
+   needs it, and says so in the PR. The subagent writes
    code and tests, runs `make check`, pushes, opens the PR with a body that
    states what the acceptance check proved, and reports back.
 3. The orchestrator reviews every PR itself and runs an independent
@@ -68,7 +75,8 @@ At most three subagents at a time, in the plan's dependency order:
 | 8 | T11, T12 | last |
 
 A wave starts when every PR of the previous wave it depends on is merged;
-subagents branch from `main`, never from each other.
+subagents branch from `main`; the orchestrator may base a task on an
+unmerged predecessor's branch when the wave needs it, and says so in the PR.
 
 ## 4. Models
 
@@ -93,6 +101,9 @@ subagents branch from `main`, never from each other.
 - Design changes go to `docs/design/` in the same PR as the code that
   needs them; the brief's decision log is updated, never rewritten.
 - `make check` before every push, on the task's own branch.
+- Tool pins (Go, linters, scanners, actions, base image tags) are the latest
+  stable release at the time of the PR that adds or bumps them; a pin is
+  bumped in its own commit with the version in the subject.
 
 ## 6. Starting the next session
 
