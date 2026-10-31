@@ -69,12 +69,12 @@ content-hash:
 
 # Image for the host architecture, loaded into the local Docker daemon. It is
 # built by hack/image-build.sh, the script CI uses, and tagged and versioned
-# c-<content hash>. A working tree whose build inputs differ from the index
+# x-<content hash>. A working tree whose build inputs differ from the index
 # gets "-dirty" on the tag and version, so a local build is never labelled as
 # the committed hash. Local builds carry no attestations.
 image:
 	@hash="$$(hack/content-hash.sh)" || exit 1; \
-	hack/image-build.sh --arch "$$(go env GOARCH)" --tag "$(IMAGE):c-$$hash" --load
+	hack/image-build.sh --arch "$$(go env GOARCH)" --tag "$(IMAGE):x-$$hash" --load
 
 # Exactly what CI runs: the static job runs fmt-check vet lint tidy-check vuln
 # and the unit job runs cover.

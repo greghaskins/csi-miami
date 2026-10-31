@@ -9,7 +9,7 @@
 # so the command cannot change without the content hash changing. CI's build
 # job and `make image` both call it.
 #
-# The image's version is c-<content hash>, computed here.
+# The image's version is x-<content hash>, computed here.
 #
 # rebuild-salt: 1
 # Bumping the salt changes the content hash, which forces a rebuild of every
@@ -57,7 +57,7 @@ if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
   echo "image-build: unexpected content hash: $hash" >&2
   exit 1
 fi
-version="c-${hash}"
+version="x-${hash}"
 
 mapfile -t paths < <(hack/content-hash.sh --paths)
 if [ -n "$(git status --porcelain -- "${paths[@]}")" ]; then
