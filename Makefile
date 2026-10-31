@@ -34,17 +34,20 @@ test-race:
 
 cover:
 	$(MAKE) test-race GOTESTFLAGS="-covermode=atomic -coverprofile=coverage.out"
-	go tool cover -func=coverage.out | tail -n 1
+	go tool cover -func=coverage.out
 
 vet:
 	go vet ./...
 
+# Only tracked Go files are checked, so untracked trees (other worktrees,
+# build output) cannot change the answer. gofmt's exit status is checked as
+# well as its output.
 fmt-check:
-	@out="$$(gofmt -s -l .)"; \
+	@out="$$(gofmt -s -l $$(git ls-files '*.go'))" || { echo "$$out"; exit 1; }; \
 	if [ -n "$$out" ]; then echo "gofmt -s needed on:"; echo "$$out"; exit 1; fi
 
 fmt:
-	gofmt -s -w .
+	gofmt -s -w $$(git ls-files '*.go')
 
 lint:
 	golangci-lint run ./...
@@ -52,18 +55,9 @@ lint:
 tidy:
 	go mod tidy
 
+# -diff exits non-zero on drift or on error, and never writes.
 tidy-check:
-	@cp go.mod go.mod.orig; \
-	if [ -f go.sum ]; then cp go.sum go.sum.orig; fi; \
-	go mod tidy; \
-	status=0; \
-	cmp -s go.mod go.mod.orig || status=1; \
-	if [ -f go.sum.orig ]; then cmp -s go.sum go.sum.orig || status=1; \
-	elif [ -f go.sum ]; then status=1; fi; \
-	mv go.mod.orig go.mod; \
-	if [ -f go.sum.orig ]; then mv go.sum.orig go.sum; fi; \
-	if [ $$status -ne 0 ]; then echo "go mod tidy changes go.mod or go.sum; run make tidy"; fi; \
-	exit $$status
+	go mod tidy -diff
 
 vuln:
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
@@ -72,4 +66,6 @@ vuln:
 image:
 	docker buildx build --load --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
 
-check: fmt-check vet lint tidy-check vuln test-race
+# Exactly what CI runs: the static job runs fmt-check vet lint tidy-check vuln
+# and the unit job runs cover.
+check: fmt-check vet lint tidy-check vuln cover
