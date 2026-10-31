@@ -364,8 +364,8 @@ jobs:
   # Passes when both pods are Ready on every node, the driver is registered in
   # every CSINode and /healthz and /metrics answer through the API server. A
   # failing run uploads kind's logs, the pods' logs and descriptions and each
-  # node's mountinfo. kind and kubectl are built at the versions mise.toml pins;
-  # kubectl 1.N.P is the module k8s.io/kubectl v0.N.P.
+  # node's mountinfo. kind is built, and kubectl downloaded and checked against its
+  # published checksum, at the versions mise.toml pins.
   deploy:
     needs: build
     runs-on: ubuntu-24.04
@@ -386,10 +386,13 @@ jobs:
           GOTOOLCHAIN: local
         run: |
           kind="$(sed -n 's/^kind = "\(.*\)"$/\1/p' mise.toml)"
-          kubectl="$(sed -n 's/^kubectl = "1\.\(.*\)"$/\1/p' mise.toml)"
+          kubectl="$(sed -n 's/^kubectl = "\(.*\)"$/\1/p' mise.toml)"
           test -n "$kind" && test -n "$kubectl"
           GOBIN="${RUNNER_TEMP}/bin" go install "sigs.k8s.io/kind@v${kind}"
-          GOBIN="${RUNNER_TEMP}/bin" go install "k8s.io/kubectl/cmd/kubectl@v0.${kubectl}"
+          url="https://dl.k8s.io/release/v${kubectl}/bin/linux/amd64/kubectl"
+          curl -fsSL --retry 0 -o "${RUNNER_TEMP}/bin/kubectl" "$url"
+          printf '%s  %s\n' "$(curl -fsSL "${url}.sha256")" "${RUNNER_TEMP}/bin/kubectl" | sha256sum --check -
+          chmod +x "${RUNNER_TEMP}/bin/kubectl"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
       - name: Pull the image the build job pushed
         id: image
