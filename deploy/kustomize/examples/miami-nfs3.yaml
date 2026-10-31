@@ -1,0 +1,16 @@
+# A directory on an NFSv3 export. The server is an IPv4 address or a host name
+# that resolves to one.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: miami-nfs3
+provisioner: miami.csi.greghaskins.com
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+parameters:
+  kind: directory
+  transport.kind: nfs3
+  transport.server: 192.0.2.10
+  transport.export: /export
+  # Optional: a prefix under the export, one directory per namespace and claim.
+  subdir: ${pvc.namespace}/${pvc.name}

@@ -460,9 +460,12 @@ documented way to coordinate writers on a directory item; `flock` is not.
 `deploy/kustomize/base/`: Namespace; CSIDriver (`attachRequired: true`,
 `podInfoOnMount: false`, `fsGroupPolicy: File`, `volumeLifecycleModes:
 [Persistent]`); ServiceAccounts, ClusterRoles and bindings (controller:
-PV get/list/watch, PVC get/list/watch/update, StorageClass get/list/watch,
-VolumeAttachment and its status, Node get/list/watch, CSINode get/list/watch,
-events, leases; node: PV get, events get, create and patch: the recorder reads an event before it bumps its
+PV get/list/watch/create/patch/delete (the provisioner creates and deletes PVs
+and the attacher patches them; added in T9 from the pinned sidecars' own RBAC),
+PVC get/list/watch/update, StorageClass get/list/watch, VolumeAttachment
+get/list/watch/update/patch and its status patch, Node get/list/watch, CSINode
+get/list/watch, events list/watch/create/update/patch, leases get/create/update/delete;
+node: PV get, events get, create and patch: the recorder reads an event before it bumps its
 count); the controller Deployment
 (provisioner with `--extra-create-metadata --feature-gates=Topology=true`,
 attacher, resizer kept out until M2, livenessprobe); the node DaemonSet
@@ -470,6 +473,12 @@ attacher, resizer kept out until M2, livenessprobe); the node DaemonSet
 root, host `/dev` not needed in M1); an example StorageClass per transport.
 Sidecars pinned by digest. Resource requests and limits on every container.
 `deploy/policy_test.go` asserts the RBAC rule set is exactly the list above.
+The sidecars are csi-provisioner v6.4.0, csi-attacher v4.13.0,
+csi-node-driver-registrar v2.18.0 and livenessprobe v2.20.0. The kubelet
+directory is one literal in the node manifest, kept in agreement by a render
+test. The e2e overlay and `hack/e2e-overlay.sh` set the driver image and the
+NFS server address per run; `hack/kind.sh` (`make deploy-check`, the `deploy`
+CI job) is the deploy check on a control plane and two workers.
 
 ## 13. Build
 

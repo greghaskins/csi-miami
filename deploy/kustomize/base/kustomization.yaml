@@ -1,0 +1,20 @@
+# The driver's deployment, one resource per file. `kubectl apply -k` on this
+# directory creates the namespace, the CSIDriver, the RBAC, the controller and
+# the node DaemonSet, and no StorageClass (see ../examples).
+#
+# The driver image below is a placeholder; every overlay sets the real one with
+# `images:`. The sidecar images carry a tag for the reader and the digest of the
+# multi-arch index for the runtime.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - csidriver.yaml
+  - serviceaccount-controller.yaml
+  - serviceaccount-node.yaml
+  - clusterrole-controller.yaml
+  - clusterrole-node.yaml
+  - clusterrolebinding-controller.yaml
+  - clusterrolebinding-node.yaml
+  - deployment-controller.yaml
+  - daemonset-node.yaml

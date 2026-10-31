@@ -1,0 +1,50 @@
+# What the deploy check and the end-to-end tests apply on kind: the base, the
+# two example StorageClasses, and the driver image loaded into the kind nodes
+# and never pulled.
+#
+# Two values vary per run, and the harness sets both with
+# hack/e2e-overlay.sh, which writes a throwaway kustomization that uses this
+# directory as its base:
+#
+#   hack/e2e-overlay.sh --image <ref> [--nfs-server <ipv4>] --out <dir>
+#   kubectl apply -k <dir>
+#
+#   image       the driver image reference (name:tag or name@digest); it
+#               replaces the `images:` entry below.
+#   nfs server  the IPv4 address of the NFS server container; it replaces
+#               transport.server of StorageClass miami-nfs3 (the RFC 5737
+#               placeholder below when not given).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - ../../examples
+images:
+  - name: ghcr.io/greghaskins/csi-miami
+    newName: ghcr.io/greghaskins/csi-miami
+    newTag: e2e
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: miami-controller
+        namespace: miami-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: miami
+                imagePullPolicy: IfNotPresent
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: miami-node
+        namespace: miami-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: miami
+                imagePullPolicy: IfNotPresent

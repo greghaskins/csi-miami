@@ -1,0 +1,6 @@
+# Example StorageClasses, one per transport. Not part of the base.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - miami-local.yaml
+  - miami-nfs3.yaml
