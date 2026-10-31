@@ -3,6 +3,8 @@
 go = "1.27.3"
 golangci-lint = "2.15.0"
 gitleaks = "8.30.1"
+# Read by the secret-scan hooks (hack/secret-scan/range.sh).
+jq = "1.8.2"
 "pipx:pre-commit" = "4.7.0"
 
 [hooks]
