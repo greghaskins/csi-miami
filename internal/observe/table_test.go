@@ -137,11 +137,11 @@ func TestUnderAndBelow(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := ids(tbl.Under(tt.prefix)); !(len(got) == 0 && len(tt.under) == 0) && !reflect.DeepEqual(got, tt.under) {
+			if got := ids(tbl.Under(tt.prefix)); (len(got) != 0 || len(tt.under) != 0) && !reflect.DeepEqual(got, tt.under) {
 				t.Errorf("Under(%q) = %v, want %v", tt.prefix, got, tt.under)
 			}
 			got := ids(tbl.Below(tt.prefix))
-			if !(len(got) == 0 && len(tt.below) == 0) && !reflect.DeepEqual(got, tt.below) {
+			if (len(got) != 0 || len(tt.below) != 0) && !reflect.DeepEqual(got, tt.below) {
 				t.Errorf("Below(%q) = %v, want %v", tt.prefix, got, tt.below)
 			}
 		})

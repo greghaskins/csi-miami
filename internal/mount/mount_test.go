@@ -1265,21 +1265,21 @@ func TestReal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		real := filepath.Join(dir, "real")
+		realDir := filepath.Join(dir, "real")
 		link := filepath.Join(dir, "link")
-		if err := os.Mkdir(real, 0o755); err != nil {
+		if err := os.Mkdir(realDir, 0o750); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(real, link); err != nil {
+		if err := os.Symlink(realDir, link); err != nil {
 			t.Fatal(err)
 		}
 		for name, err := range map[string]error{
 			"mount onto a symlink":        m.Mount(bg(), "tmpfs", link, "tmpfs", 0, ""),
 			"mount under a symlink":       m.Mount(bg(), "tmpfs", filepath.Join(link, "sub"), "tmpfs", 0, ""),
-			"bind from a symlink":         m.Bind(bg(), link, filepath.Join(real, "t"), false),
+			"bind from a symlink":         m.Bind(bg(), link, filepath.Join(realDir, "t"), false),
 			"unmount of a symlink":        m.Unmount(bg(), link, 0),
 			"remount of a symlink":        m.RemountReadOnly(bg(), link, true),
-			"bind onto a symlinked above": m.Bind(bg(), real, filepath.Join(link, "t"), false),
+			"bind onto a symlinked above": m.Bind(bg(), realDir, filepath.Join(link, "t"), false),
 		} {
 			if !errors.Is(err, ErrNotResolved) {
 				t.Errorf("%s: got %v, want ErrNotResolved", name, err)
