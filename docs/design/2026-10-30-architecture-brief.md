@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 19 recorded (section 9)
+**Status:** Draft, decisions 1 to 20 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -554,7 +554,7 @@ Every PR runs the full set below as parallel jobs; nothing waits for
 
 | Job | What it proves | Runs on |
 |---|---|---|
-| `secret-scan` | gitleaks over the tree, every commit's content and message in the PR range, and the branch name, with the config held in a repository secret; a second workflow scans issue, PR, review, comment, discussion and release text as it is posted and removes what matches | amd64 |
+| `secret-scan` | gitleaks over the tree, every commit's content and message in the PR range, and the branch name, with the config held in a repository secret; a second workflow scans issue, PR, review, comment, discussion and release text as it is posted from accounts with write access (bot accounts by an owner-held list of account IDs) and removes what matches | amd64 |
 | `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | amd64 |
 | `unit` | `go test -race -shuffle=on ./...` with coverage | amd64 |
 | `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | amd64 |
@@ -677,6 +677,13 @@ Recorded:
     run re-runs the image before aliasing, and the alias is created from the
     index that `main`'s own run verified. Provenance describes the run that
     built the tag, which may be a pull request merge ref.
+20. **One directory per volume**: a directory item lives at
+    `<transport>/<subdir>/<name>`, where `subdir` is an optional per-class
+    prefix built from `${pvc.namespace}` and `${pvc.name}` and `name` is
+    always the volume's own name from the volume ID. No template can make
+    two volumes share a directory or nest one inside another: elements
+    shaped like a PV name are rejected. The plan's `<transport>/<subdir>`
+    with a `${pv.name}` token is withdrawn.
 
 Pending: none that block M1.
 
