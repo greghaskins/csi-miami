@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/transport"
@@ -36,6 +38,11 @@ func TestE2ENFS3(t *testing.T) {
 	}
 	base, m := kernelEnv(t)
 	ctx := context.Background()
+
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		t.Logf("kernel: %s", unix.ByteSliceToString(uts.Release[:]))
+	}
 
 	spec := transport.Spec{Kind: transport.KindNFS3, Server: server, Export: export}
 	rootA, rootB := filepath.Join(base, "a"), filepath.Join(base, "b")

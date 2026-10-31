@@ -29,8 +29,12 @@ fi
 # The server needs nfsd; the mounts under test need the NFS client. Loading a
 # module that is built in or already loaded is not an error; what matters is
 # that the file system type is registered afterwards.
+log "kernel $(uname -r)"
 for fstype in nfsd nfs; do
-  if ! grep -qw "$fstype" /proc/filesystems; then
+  if grep -qw "$fstype" /proc/filesystems; then
+    log "$fstype is already available"
+  else
+    log "loading $fstype"
     modprobe "$fstype" >&2 || true
   fi
   if ! grep -qw "$fstype" /proc/filesystems; then
@@ -38,6 +42,7 @@ for fstype in nfsd nfs; do
     log "this harness needs the kernel NFS server (nfsd) and client (nfs); it will not substitute a user-space server"
     exit 1
   fi
+  log "$fstype is available"
 done
 
 docker rm -f "$name" >/dev/null 2>&1 || true
