@@ -2,6 +2,12 @@
 # command the Dockerfile needs), so what passes locally is what passes here.
 # `ci-ok` is the single required check: it fails if any job failed, was
 # cancelled, or was skipped when it should have run.
+#
+# Images are content-addressed: they are tagged by hack/content-hash.sh, a
+# hash of the build inputs, not by commit. A commit whose inputs are
+# unchanged rebuilds nothing, and a push to main only adds its sha as an alias
+# of the existing index. The registry is the artifact store, so this
+# repository takes no fork pull requests (their token cannot push).
 name: ci
 on:
   pull_request:
@@ -10,10 +16,12 @@ on:
 permissions:
   contents: read
 # Pull request runs are superseded by the next push to the same ref. Runs on
-# main are never cancelled: each commit's images and manifest must complete.
+# main are never cancelled: each commit's alias must be created.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 jobs:
   static:
     runs-on: ubuntu-latest
@@ -60,58 +68,12 @@ jobs:
           path: coverage.out
           if-no-files-found: error
 
-  # Builds the image natively on each architecture (no emulation), runs it,
-  # and exports an OCI archive. It never publishes, so it needs no more than
-  # read access.
+  # Builds and pushes c-<hash>-<arch> natively on each architecture (no
+  # emulation) unless that tag already exists, then runs the image from the
+  # registry, so every run proves the image that will be used starts, whether
+  # or not this run built it.
   build:
     name: build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # The docker-container driver is needed for OCI output. The BuildKit
-      # image is pinned by digest (moby/buildkit v0.34.1).
-      - name: Create builder
-        run: |
-          docker buildx create --name ci --driver docker-container --use \
-            --driver-opt image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
-      - name: Build and run the image
-        run: |
-          docker buildx build --platform "linux/${{ matrix.arch }}" \
-            --build-arg "VERSION=${{ github.sha }}" \
-            --load -t "miami:ci" .
-          test "$(docker run --rm miami:ci version)" = "${{ github.sha }}"
-      - name: Export OCI archive
-        run: |
-          docker buildx build --platform "linux/${{ matrix.arch }}" \
-            --build-arg "VERSION=${{ github.sha }}" \
-            --output "type=oci,dest=miami-${{ matrix.arch }}.tar" .
-      - name: Upload OCI archive
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: image-${{ matrix.arch }}
-          path: miami-${{ matrix.arch }}.tar
-          if-no-files-found: error
-
-  # Publishes the per-architecture images from main, and only there. This is
-  # the one job that can write packages. The binary is built with
-  # CGO_ENABLED=0 and -trimpath from a context without VCS data, so it is the
-  # same binary the build job ran.
-  publish:
-    name: publish (${{ matrix.arch }})
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
@@ -125,12 +87,15 @@ jobs:
             runner: ubuntu-latest
           - arch: arm64
             runner: ubuntu-24.04-arm
-    env:
-      IMAGE: ghcr.io/${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Compute the content hash
+        id: hash
+        run: echo "hash=$(hack/content-hash.sh)" >> "$GITHUB_OUTPUT"
+      # The docker-container driver is needed for attestations and pushing.
+      # The BuildKit image is pinned by digest (moby/buildkit v0.34.1).
       - name: Create builder
         run: |
           docker buildx create --name ci --driver docker-container --use \
@@ -141,42 +106,108 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
       # SBOM generator: docker/buildkit-syft-scanner 1.12.1, pinned by digest.
-      - name: Push image
+      - name: Build and push the image unless it exists
+        env:
+          HASH: ${{ steps.hash.outputs.hash }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          docker buildx build --platform "linux/${{ matrix.arch }}" \
-            --build-arg "VERSION=${{ github.sha }}" \
-            --provenance=true \
-            --attest "type=sbom,generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315" \
-            --push -t "${IMAGE}:${{ github.sha }}-${{ matrix.arch }}" .
+          tag="${IMAGE}:c-${HASH}-${ARCH}"
+          if docker buildx imagetools inspect "$tag" > /dev/null 2>&1; then
+            echo "$tag already exists; not rebuilding"
+          else
+            echo "$tag does not exist; building"
+            docker buildx build --platform "linux/${ARCH}" \
+              --build-arg "VERSION=c-${HASH}" \
+              --provenance=true \
+              --attest "type=sbom,generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315" \
+              --push -t "$tag" .
+          fi
+      - name: Run the image from the registry
+        env:
+          HASH: ${{ steps.hash.outputs.hash }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          tag="${IMAGE}:c-${HASH}-${ARCH}"
+          got="$(docker run --rm --platform "linux/${ARCH}" "$tag" version)"
+          echo "$tag reports version $got"
+          test "$got" = "c-${HASH}"
 
-  # Per-commit tags are the contract. There is deliberately no moving tag
-  # here: runs on main can overlap and finish out of order.
+  # Creates the multi-arch index c-<hash> once, from the two per-arch tags,
+  # and verifies that it lists both platforms.
   manifest:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: publish
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
-    env:
-      IMAGE: ghcr.io/${{ github.repository }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compute the content hash
+        id: hash
+        run: echo "hash=$(hack/content-hash.sh)" >> "$GITHUB_OUTPUT"
       - name: Log in to ghcr.io
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Create multi-arch manifest
+      - name: Create the multi-arch index unless it exists
+        env:
+          HASH: ${{ steps.hash.outputs.hash }}
         run: |
-          docker buildx imagetools create \
-            -t "${IMAGE}:${{ github.sha }}" \
-            "${IMAGE}:${{ github.sha }}-amd64" \
-            "${IMAGE}:${{ github.sha }}-arm64"
+          index="${IMAGE}:c-${HASH}"
+          if docker buildx imagetools inspect "$index" > /dev/null 2>&1; then
+            echo "$index already exists; not recreating"
+          else
+            docker buildx imagetools create -t "$index" \
+              "${index}-amd64" "${index}-arm64"
+          fi
+      - name: Verify the index lists both platforms
+        env:
+          HASH: ${{ steps.hash.outputs.hash }}
+        run: |
+          out="$(docker buildx imagetools inspect "${IMAGE}:c-${HASH}")"
+          echo "$out"
+          for platform in linux/amd64 linux/arm64; do
+            echo "$out" | grep -Eq "^[[:space:]]*Platform:[[:space:]]+${platform}$" || {
+              echo "::error::index does not list ${platform}"
+              exit 1
+            }
+          done
+
+  # On main only: add the commit sha as an alias of the content index.
+  # Idempotent, so a re-run or an out-of-order main job is harmless.
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compute the content hash
+        id: hash
+        run: echo "hash=$(hack/content-hash.sh)" >> "$GITHUB_OUTPUT"
+      - name: Log in to ghcr.io
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Alias the commit sha to the content index
+        env:
+          HASH: ${{ steps.hash.outputs.hash }}
+          SHA: ${{ github.sha }}
+        run: docker buildx imagetools create -t "${IMAGE}:${SHA}" "${IMAGE}:c-${HASH}"
 
   ci-ok:
     if: always()
-    needs: [static, unit, build, publish, manifest]
+    needs: [static, unit, build, manifest, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -186,29 +217,26 @@ jobs:
           STATIC: ${{ needs.static.result }}
           UNIT: ${{ needs.unit.result }}
           BUILD: ${{ needs.build.result }}
-          PUBLISH: ${{ needs.publish.result }}
           MANIFEST: ${{ needs.manifest.result }}
+          PUBLISH: ${{ needs.publish.result }}
           PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           fail=0
-          for pair in "static=$STATIC" "unit=$UNIT" "build=$BUILD"; do
+          for pair in "static=$STATIC" "unit=$UNIT" "build=$BUILD" "manifest=$MANIFEST"; do
             if [ "${pair#*=}" != "success" ]; then
               echo "::error::${pair%%=*} was ${pair#*=}, expected success"
               fail=1
             fi
           done
-          # publish and manifest only run when publishing from main; skipped
-          # is expected everywhere else, and a failure to run them on main is
-          # a failure.
+          # publish only runs when publishing from main; skipped is expected
+          # everywhere else, and a failure to run it on main is a failure.
           if [ "$PUBLISHING" = "true" ]; then
             want="success"
           else
             want="skipped"
           fi
-          for pair in "publish=$PUBLISH" "manifest=$MANIFEST"; do
-            if [ "${pair#*=}" != "$want" ]; then
-              echo "::error::${pair%%=*} was ${pair#*=}, expected $want"
-              fail=1
-            fi
-          done
+          if [ "$PUBLISH" != "$want" ]; then
+            echo "::error::publish was $PUBLISH, expected $want"
+            fail=1
+          fi
           exit "$fail"
