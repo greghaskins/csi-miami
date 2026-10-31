@@ -216,6 +216,16 @@ Choices made in T8 where the plan was silent:
 - The controller remembers, in memory and bounded, what each `CreateVolume`
   name answered, so a repeat with other parameters or capacity is
   `AlreadyExists`. A restart forgets it; nothing else depends on it.
+- `DeleteVolume` treats a 404 for the PV as "no PV" only when the API server
+  itself answered it (a `Status`); a 404 from a proxy or load balancer in
+  front of a wrong endpoint is an unknown answer, `Unavailable`. It also
+  refuses a PV whose reclaim policy is not `Delete`.
+- Removal of a directory is relative to descriptors (`openat2` with
+  `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_XDEV`), so it needs
+  Linux 5.6; there is no fallback to removing by path.
+- File system operations against one transport are bounded (one per
+  directory, eight per transport); beyond that a call is `Unavailable` at
+  once, so a hung transport costs a bounded number of threads.
 - A second request for a volume whose first is still running is `Aborted`.
 - `mount_flags` in a capability are ignored: the driver owns the mount options.
 
