@@ -213,11 +213,14 @@ other than this volume's transport directory. Never `panic` in a handler.
 **`nfs3`.** `mount(2)` with `fstype=nfs`, source `<server>:<export>`, and a
 kernel option string. The driver resolves `addr=` itself (the host network
 resolver, then the literal address), so no helper and no `/etc/services`
-are needed. There is one profile; it is code, not configuration:
+are needed. There is one profile; it is code, not configuration. The data
+string of `mount(2)` is
 
 ```
-vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30,noatime
+vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30,addr=<ip>
 ```
+
+and `noatime` is the generic mount flag `MS_NOATIME`, not a data option.
 
 | option | reason |
 |---|---|
@@ -238,6 +241,19 @@ whether the NAS accepts the set without `actimeo` and `noatime` ("protocol
 not supported" usually means a missing `vers=3`), and whether `softerr`
 mounts on every node kernel. Either outcome changes the profile by a code
 change, with a version bump.
+
+**Adoption.** After a restart the transport is still on the host table, and
+`Mounted` answers true only for a mount that is exactly this transport: file
+system type `nfs`, the source `<server>:<export>`, per-mount `noatime`, and
+these super options among those the kernel reports: `rw`, `vers=3`,
+`proto=tcp`, `softerr`, `timeo=100`, `retrans=3`, `nolock`, `local_lock=all`,
+`lookupcache=pos`, `acregmin=30`, `acregmax=30`, `acdirmax=30`. The kernel
+reports the profile in its own words (`actimeo=30` as the `ac*` options, with
+a default such as `acdirmin=30` left out; `lookupcache=positive` as
+`lookupcache=pos`), and newer kernels add options (`softreval`,
+`fatal_neterrors`) that are not required. The list was taken from a real
+mount by the T4 e2e run. Anything else at the mount point is a conflict,
+reported and never stacked over.
 
 **`local`.** The host path, bind-mounted to `<root>/transports/<ID>` so
 that every transport looks the same to the item and observer code. It

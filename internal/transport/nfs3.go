@@ -42,11 +42,23 @@ func nfs3Data(addr string) string { return nfs3Profile + ",addr=" + addr }
 
 // nfs3SuperOptions are the tokens that /proc/self/mountinfo must show among a
 // mount's super options for it to be this driver's mount. The kernel reports
-// the profile in its own words, not the ones it was given (nolock appears as
-// local_lock=all, actimeo=30 as the four ac* options, those left at their
-// default left out), so these were taken from a real mount, not from the
-// profile. addr is not among them: the name may resolve differently later,
-// and the source string is what names the server.
+// the profile in its own words, not the ones it was given, so these were taken
+// from a real mount (testdata/mountinfo_nfs3.txt, from the e2e run against a
+// kernel server), not from the profile:
+//
+//	rw,vers=3,rsize=1048576,wsize=1048576,namlen=255,
+//	acregmin=30,acregmax=30,acdirmax=30,softerr,softreval,nolock,
+//	fatal_neterrors=none,proto=tcp,timeo=100,retrans=3,sec=sys,
+//	mountaddr=<ip>,mountvers=3,mountproto=tcp,lookupcache=pos,
+//	local_lock=all,addr=<ip>
+//
+// actimeo=30 shows as three of the four ac* options (acdirmin is 30 by
+// default, and a default is not shown); lookupcache=positive shows as
+// lookupcache=pos. softreval and fatal_neterrors come from newer kernels than
+// softerr does, rsize and wsize are negotiated with the server, and sec and
+// the mount* options describe the MOUNT request, so none of those is
+// required. addr is not either: a name may resolve differently later, and the
+// source string is what names the server.
 var nfs3SuperOptions = []string{
 	"rw",
 	"vers=3",
@@ -54,7 +66,9 @@ var nfs3SuperOptions = []string{
 	"softerr",
 	"timeo=100",
 	"retrans=3",
+	"nolock",
 	"local_lock=all",
+	"lookupcache=pos",
 	"acregmin=30",
 	"acregmax=30",
 	"acdirmax=30",

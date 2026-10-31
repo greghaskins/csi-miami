@@ -41,9 +41,9 @@ func TestNFS3DataIsPinned(t *testing.T) {
 
 // ---- fixtures ----
 
-var nfsSpec = Spec{Kind: KindNFS3, Server: "192.0.2.10", Export: "/export/data"}
+var nfsSpec = Spec{Kind: KindNFS3, Server: "192.0.2.10", Export: "/export"}
 
-const nfsSource = "192.0.2.10:/export/data"
+const nfsSource = "192.0.2.10:/export"
 
 // rootMount is the mount that contains everything else.
 func rootMount() observe.Mount {
@@ -199,7 +199,7 @@ func TestNFS3Mounted(t *testing.T) {
 		{"exact match", func(*observe.Mount) {}, nil, true},
 		{"wrong fstype", func(m *observe.Mount) { m.FSType = "nfs4" }, nil, false},
 		{"wrong source: other export", func(m *observe.Mount) { m.Source = "192.0.2.10:/export/other" }, nil, false},
-		{"wrong source: other server", func(m *observe.Mount) { m.Source = "192.0.2.11:/export/data" }, nil, false},
+		{"wrong source: other server", func(m *observe.Mount) { m.Source = "192.0.2.11:/export" }, nil, false},
 		{"wrong version", func(m *observe.Mount) {
 			m.SuperOptions = slices.Clone(m.SuperOptions)
 			for i, o := range m.SuperOptions {
