@@ -52,7 +52,7 @@ func TestGet(t *testing.T) {
 	mustSave(t, s, in)
 
 	got, ok, err := s.Get(in.VolumeID)
-	if err != nil || !ok || !reflect.DeepEqual(got, in) {
+	if err != nil || !ok || !reflect.DeepEqual(got, gen(in, 1)) {
 		t.Fatalf("Get = %+v, %v, %v; want the saved record", got, ok, err)
 	}
 
@@ -98,7 +98,7 @@ func TestUpdate(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, ok, err := s.Get(want.VolumeID)
-		if err != nil || !ok || !reflect.DeepEqual(got, want) {
+		if err != nil || !ok || !reflect.DeepEqual(got, gen(want, 1)) {
 			t.Fatalf("Get = %+v, %v, %v", got, ok, err)
 		}
 	})
@@ -109,7 +109,7 @@ func TestUpdate(t *testing.T) {
 		old := sample("pvc-1")
 		mustSave(t, s, old)
 		err := s.Update(old.VolumeID, func(in *Intent) error {
-			if !reflect.DeepEqual(*in, old) {
+			if !reflect.DeepEqual(*in, gen(old, 1)) {
 				t.Errorf("fn got %+v, want the stored record", *in)
 			}
 			in.Publishes = append(in.Publishes, Publish{TargetPath: "/pods/a/mount"})
@@ -141,7 +141,7 @@ func TestUpdate(t *testing.T) {
 			t.Fatalf("Update = %v, want the sentinel unchanged", err)
 		}
 		got, _, _ := s.Get(old.VolumeID)
-		if !reflect.DeepEqual(got, old) {
+		if !reflect.DeepEqual(got, gen(old, 1)) {
 			t.Fatalf("record changed to %+v", got)
 		}
 		// Aborting a create writes nothing either.
@@ -166,7 +166,7 @@ func TestUpdate(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "stagePath") {
 			t.Fatalf("Update = %v, want a stagePath error", err)
 		}
-		if got, _, _ := s.Get(old.VolumeID); !reflect.DeepEqual(got, old) {
+		if got, _, _ := s.Get(old.VolumeID); !reflect.DeepEqual(got, gen(old, 1)) {
 			t.Fatalf("record changed to %+v", got)
 		}
 	})

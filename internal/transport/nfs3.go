@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
 
@@ -223,7 +224,7 @@ func (n *nfs3) addr(ctx context.Context) (string, error) {
 		return a.String(), nil
 	}
 	what := fmt.Sprintf("resolving nfs3 server %q", server)
-	addrs, err := within(ctx, n.opts.ResolveTimeout, what, n.busy, "resolve\x00"+server, func(ctx context.Context) ([]net.IPAddr, error) {
+	addrs, err := deadline.Run(ctx, n.opts.ResolveTimeout, what, n.busy, "resolve\x00"+server, func(ctx context.Context) ([]net.IPAddr, error) {
 		a, err := n.opts.Resolver.LookupIPAddr(ctx, server)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", what, err)
