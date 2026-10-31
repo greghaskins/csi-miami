@@ -351,3 +351,55 @@ func TestUnblockReleasesTheCall(t *testing.T) {
 	}
 	<-started
 }
+
+// A bind from a dead transport hangs while its source is resolved, which holds
+// the source busy and not the target; Unblock of the transport frees it.
+func TestUnblockFreesABindFromADeadSource(t *testing.T) {
+	t.Parallel()
+	f := Mounter{DefaultTimeout: 20 * time.Millisecond}
+	ctx := context.Background()
+	f.Block("/nfs")
+
+	if err := f.Bind(ctx, "/nfs/vol", "/pub/x", false); !errors.Is(err, mount.ErrTimeout) {
+		t.Fatalf("first bind: got %v, want ErrTimeout", err)
+	}
+	err := f.Bind(ctx, "/nfs/vol", "/pub/y", false)
+	if !errors.Is(err, mount.ErrBusy) || !strings.Contains(err.Error(), "/nfs/vol") {
+		t.Errorf("a second bind of the dead source: got %v, want ErrBusy naming the source", err)
+	}
+	if err := f.Unmount(ctx, "/pub/x", 0); err != nil {
+		t.Errorf("unmount of the target while the source hangs: %v", err)
+	}
+
+	f.Unblock("/nfs")
+	if err := f.Bind(ctx, "/nfs/vol", "/pub/x", false); err != nil {
+		t.Errorf("bind after Unblock: %v", err)
+	}
+	if err := f.Bind(ctx, "/nfs/vol", "/pub/y", false); err != nil {
+		t.Errorf("second bind after Unblock: %v", err)
+	}
+}
+
+// The cause of a busy key is the block that produced it, not only the paths
+// below the one unblocked.
+func TestUnblockClearsWhatItCaused(t *testing.T) {
+	t.Parallel()
+	f := Mounter{DefaultTimeout: 20 * time.Millisecond}
+	ctx := context.Background()
+	f.Block("/nfs")
+	f.Block("/other")
+
+	if err := f.Unmount(ctx, "/nfs/a", 0); !errors.Is(err, mount.ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	if err := f.Unmount(ctx, "/other/b", 0); !errors.Is(err, mount.ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	f.Unblock("/nfs")
+	if err := f.Unmount(ctx, "/nfs/a", 0); err != nil {
+		t.Errorf("/nfs/a after Unblock(/nfs): %v", err)
+	}
+	if err := f.Unmount(ctx, "/other/b", 0); !errors.Is(err, mount.ErrBusy) {
+		t.Errorf("/other/b is still held by its own block: got %v, want ErrBusy", err)
+	}
+}

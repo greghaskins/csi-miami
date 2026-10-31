@@ -65,7 +65,7 @@ type Mounter struct {
 	errs     map[key]error
 	statfs   map[string]unix.Statfs_t
 	blocked  map[string]chan struct{}
-	busy     map[busyKey]struct{}
+	busy     map[busyKey]string // the blocked path that caused each busy key
 	table    observe.Table
 	tableErr error
 }
@@ -75,11 +75,20 @@ var _ mount.Mounter = (*Mounter)(nil)
 type key struct{ op, target string }
 
 // busyKey is what the real Mounter tracks: one call at a time per path, with
-// statfs apart from the calls that change mounts.
+// statfs and the resolving of a bind source apart from the calls that change
+// mounts.
 type busyKey struct {
-	statfs bool
-	path   string
+	kind keyKind
+	path string
 }
+
+type keyKind int
+
+const (
+	kindMount   keyKind = iota // calls that change mounts, by target
+	kindStatfs                 // statfs, by path
+	kindResolve                // resolving a bind source, by source
+)
 
 // anyOp matches every operation in the error table.
 const anyOp = ""
@@ -136,7 +145,9 @@ func (f *Mounter) SetMountsError(err error) {
 // error wrapping mount.ErrTimeout (a deadline, including the default one) or
 // the context's own error (a cancellation), or after Unblock. As with the real
 // Mounter, a call that timed out leaves its path busy: later calls on that
-// path fail at once with mount.ErrBusy until Unblock. Mounts is never blocked.
+// path fail at once with mount.ErrBusy until Unblock. For a bind from a
+// blocked source, the path held busy is the source (it is resolved first, on
+// a key of its own), not the target. Mounts is never blocked.
 func (f *Mounter) Block(path string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -148,8 +159,9 @@ func (f *Mounter) Block(path string) {
 	}
 }
 
-// Unblock releases the calls blocked by path, stops blocking it, and clears the
-// busy state of every path at or below it.
+// Unblock releases the calls blocked by path, stops blocking it, and clears
+// the busy state it caused: every key that was left busy because of this
+// block, and every path at or below it.
 func (f *Mounter) Unblock(path string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -157,8 +169,8 @@ func (f *Mounter) Unblock(path string) {
 		close(ch)
 		delete(f.blocked, path)
 	}
-	for k := range f.busy {
-		if within(path, k.path) {
+	for k, cause := range f.busy {
+		if cause == path || within(path, k.path) {
 			delete(f.busy, k)
 		}
 	}
@@ -196,19 +208,25 @@ func (f *Mounter) enter(ctx context.Context, c Call) error {
 		return ctxErr(c, err, "before the call started")
 	}
 
-	bk := busyKey{statfs: c.Op == OpStatfs, path: c.Target}
+	keys := keysOf(c)
 	f.mu.Lock()
-	if _, busy := f.busy[bk]; busy {
-		f.mu.Unlock()
-		return fmt.Errorf("%s %s: %w; re-observe and retry later", c.Op, c.Target, mount.ErrBusy)
+	for _, k := range keys {
+		if _, busy := f.busy[k]; busy {
+			f.mu.Unlock()
+			return fmt.Errorf("%s %s: %w; re-observe and retry later", c.Op, k.path, mount.ErrBusy)
+		}
 	}
 	f.calls = append(f.calls, c)
-	release := f.blockerLocked(c)
-	if release != nil {
-		if f.busy == nil {
-			f.busy = map[busyKey]struct{}{}
+	var release chan struct{}
+	for _, k := range keys {
+		if cause, ch := f.blockerLocked(k.path); ch != nil {
+			if f.busy == nil {
+				f.busy = map[busyKey]string{}
+			}
+			f.busy[k] = cause
+			release = ch
+			break
 		}
-		f.busy[bk] = struct{}{}
 	}
 	err, ok := f.errs[key{c.Op, c.Target}]
 	if !ok {
@@ -229,18 +247,31 @@ func (f *Mounter) enter(ctx context.Context, c Call) error {
 	return err
 }
 
-// blockerLocked returns the release channel of a blocked path that covers the
-// call's target or source, if any.
-func (f *Mounter) blockerLocked(c Call) chan struct{} {
-	if c.Op == OpMounts {
+// keysOf is the in-flight keys the real Mounter takes for a call: a bind
+// resolves its source under a key of its own, then takes the target's; statfs
+// has its own; reading the table takes none.
+func keysOf(c Call) []busyKey {
+	switch c.Op {
+	case OpMounts:
 		return nil
+	case OpStatfs:
+		return []busyKey{{kindStatfs, c.Target}}
+	case OpBind:
+		return []busyKey{{kindResolve, c.Source}, {kindMount, c.Target}}
+	default:
+		return []busyKey{{kindMount, c.Target}}
 	}
+}
+
+// blockerLocked returns the blocked path that covers path, and its release
+// channel.
+func (f *Mounter) blockerLocked(path string) (string, chan struct{}) {
 	for p, ch := range f.blocked {
-		if within(p, c.Target) || (c.Source != "" && within(p, c.Source)) {
-			return ch
+		if within(p, path) {
+			return p, ch
 		}
 	}
-	return nil
+	return "", nil
 }
 
 func ctxErr(c Call, cause error, what string) error {
