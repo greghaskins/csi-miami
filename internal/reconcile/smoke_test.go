@@ -4,6 +4,7 @@ package reconcile_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -423,5 +424,83 @@ func saveMountinfo(t *testing.T, base string) {
 	name := "mountinfo-" + strings.ReplaceAll(t.Name(), "/", "_") + ".txt"
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Join(keep, "\n")+"\n"), 0o644); err != nil {
 		t.Logf("saving mountinfo: %v", err)
+	}
+}
+
+// (4) On the kernel: an unreadable record is unknown, not absent. A repeated
+// Stage and an Unpublish fail without touching a mount, no pass unmounts
+// anything while the record is broken, and an Unstage over a mount the driver
+// did not make leaves it.
+func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+	in := n.intent("pvc-1")
+	if err := r.Stage(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	target := n.target("pod1")
+	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: target}); err != nil {
+		t.Fatal(err)
+	}
+
+	record := filepath.Join(n.store.Dir(), intent.Escape(in.VolumeID)+".json")
+	good, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(record, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stage(ctx, in); !errors.Is(err, reconcile.ErrIntentsUnknown) {
+		t.Fatalf("Stage = %v, want ErrIntentsUnknown", err)
+	}
+	if err := r.Unpublish(ctx, in.VolumeID, target); !errors.Is(err, reconcile.ErrIntentsUnknown) {
+		t.Fatalf("Unpublish = %v, want ErrIntentsUnknown", err)
+	}
+	// A stray is not collected while a record is unreadable, and the pod's
+	// publish and the stage stay.
+	stray := filepath.Join(n.sRoot, "stray")
+	mkdir(t, stray)
+	if err := unix.Mount(filepath.Join(n.host, "pvc-2"), stray, "", unix.MS_BIND, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Unstage(ctx, "directory:pvc-2"); err != nil { // nudges a pass
+		t.Fatal(err)
+	}
+	n.waitPass()
+	tbl := currentTable(t)
+	for _, p := range []string{target, in.StagePath, stray} {
+		if _, ok := tbl.At(p); !ok {
+			t.Errorf("%s was unmounted while a record was unreadable", p)
+		}
+	}
+	if err := os.WriteFile(record, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A foreign mount at the publish target keeps the Unstage from removing
+	// anything it cannot show it made.
+	if err := r.Unpublish(ctx, in.VolumeID, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount("tmpfs", target, "tmpfs", 0, "size=1m"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: target}); !errors.Is(err, reconcile.ErrPublishConflict) {
+		t.Fatalf("Publish over a foreign mount = %v, want ErrPublishConflict", err)
+	}
+	if err := r.Unstage(ctx, in.VolumeID); !errors.Is(err, reconcile.ErrPublishConflict) {
+		t.Fatalf("Unstage = %v, want ErrPublishConflict", err)
+	}
+	tbl = currentTable(t)
+	if m, ok := tbl.At(target); !ok || m.FSType != "tmpfs" {
+		t.Error("the foreign mount at the target was removed")
+	}
+	if _, ok := tbl.At(in.StagePath); !ok {
+		t.Error("the stage was unmounted while a publish was in the way")
+	}
+	if _, ok, err := n.store.Get(in.VolumeID); err != nil || !ok {
+		t.Errorf("the record was deleted: %v, %v", ok, err)
 	}
 }

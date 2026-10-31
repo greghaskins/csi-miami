@@ -150,3 +150,44 @@ func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
 		t.Error("the volume was not restored from the newer record")
 	}
 }
+
+// A request made while a pass is running is not part of that pass: its record
+// may have been written after the pass read the store. It waits for the next
+// one, and is served by it.
+func TestARequestMadeDuringAPassIsServedByTheNextOne(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	v1 := e.vol("a", "pvc-1")
+	v2 := e.vol("b", "pvc-2")
+
+	entered := make(chan struct{})
+	gate := make(chan struct{})
+	e.setHook(func(c fake.Call) {
+		if c.Op == fake.OpBind && c.Target == v1.StagePath {
+			close(entered)
+			<-gate
+		}
+	})
+	res1 := make(chan error, 1)
+	go func() { res1 <- e.r.Stage(bg, v1) }()
+	<-entered // the pass is inside v1's bind
+	done := e.passes()
+
+	res2 := make(chan error, 1)
+	go func() { res2 <- e.r.Stage(bg, v2) }()
+	waitUntil(t, "the second Stage to queue", func() bool { return e.r.queued() == 1 })
+	if _, ok := e.visible(v2.StagePath); ok {
+		t.Fatal("the running pass served a request made after it began")
+	}
+	close(gate)
+
+	mustNil(t, "first Stage", <-res1)
+	mustNil(t, "second Stage", <-res2)
+	if got := e.passes(); got < done+2 {
+		t.Errorf("%d passes completed since the second request, want it served by one of its own", got-done)
+	}
+	if !e.isBind(v2.StagePath, e.itemDir("b", "pvc-2")) {
+		t.Error("the second volume is not staged")
+	}
+}
