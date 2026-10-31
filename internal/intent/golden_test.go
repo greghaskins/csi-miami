@@ -73,7 +73,7 @@ func TestRecordWrittenBeforeTheGenerationFieldStillLoads(t *testing.T) {
 	if strings.Contains(string(old), "generation") {
 		t.Fatal("the pre-generation record has a generation")
 	}
-	if err := os.WriteFile(filepath.Join(dir, Escape(want.VolumeID)+".json"), old, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, Escape(want.VolumeID)+".json"), old, 0o600); err != nil { // #nosec G703 -- a test file in a temp dir
 		t.Fatal(err)
 	}
 	got := mustLoad(t, s)
