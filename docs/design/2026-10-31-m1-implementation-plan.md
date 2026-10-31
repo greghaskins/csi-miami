@@ -138,7 +138,7 @@ and unstage of the same ID across calls.
 | `miami/transport.server` | nfs3 server |
 | `miami/transport.export` | nfs3 export path |
 | `miami/transport.path` | local host path |
-| `miami/subdir` | resolved subdirectory under the transport (tokens expanded) |
+| `miami/subdir` | optional prefix under the transport, tokens expanded; omitted when empty. The item directory is `<subdir>/<name>` (decision 20) |
 
 - Delete and expand get only the ID, so the controller fetches the PV by
   name (`pvc-<uuid>` is the PV name) and rebuilds the `Spec` from its
@@ -156,11 +156,19 @@ and unstage of the same ID across calls.
 | `transport.server` | nfs3 | address |
 | `transport.export` | nfs3 | export path |
 | `transport.path` | local | absolute host path |
-| `subdir` | no | path under the transport with `${pvc.namespace}`, `${pvc.name}`, `${pv.name}` tokens; default `${pv.name}` |
+| `subdir` | no | optional prefix under the transport with `${pvc.namespace}` and `${pvc.name}` tokens; default none. The volume's own name is always appended (decision 20) |
 
-Validation: `subdir` must be relative, must not contain `..` or NUL, and
-must not clean to `.`; an unresolved token is `InvalidArgument`. Unknown
-parameters are `InvalidArgument` so a typo cannot silently mean the default.
+Validation: `subdir` must be relative, must not contain `..` as a path
+element, a NUL or any control character, and no element may be longer than
+255 bytes or shaped like a PV name (`pvc-<uuid>`), so a directory can never
+nest inside another volume's. A template that cleans to `.` after resolution
+means no prefix, as does an empty or omitted `subdir`. Each token value must
+be a single non-empty path element. An unresolved or unknown token is
+`InvalidArgument`. Unknown parameters are `InvalidArgument` so a typo cannot
+silently mean the default.
+
+The item directory is always `<transport mount>/<subdir>/<volume name>`,
+with the name taken from the volume ID and never from a parameter.
 
 ## 6. CSI surface (M1)
 
@@ -190,7 +198,7 @@ other than this volume's transport directory. Never `panic` in a handler.
   into its own mount namespace under `--transports-root` (an `emptyDir`;
   statelessness is the point, nothing must survive a restart).
 - `CreateVolume`: validate, resolve `subdir`, mount the transport, `mkdir
-  -p <dir>` (idempotent: an existing directory is adopted), return ID and
+  -p <transport>/<subdir>/<name>` (idempotent: an existing directory is adopted), return ID and
   context, and for `local` the node topology. Capacity is echoed back; a
   directory has no size.
 - `DeleteVolume`: PV lookup (section 4), mount, `rm -r` the directory.
@@ -263,7 +271,7 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 **Converge, for a directory item.**
 
 1. Transport mounted (adopt or mount).
-2. `<transport>/<subdir>` exists and is a directory (adopt; create only in
+2. `<transport>/<subdir>/<name>` exists and is a directory (adopt; create only in
    the controller; a missing directory at stage is `NotFound`).
 3. Stage path is a bind mount of that directory (adopt if mountinfo shows
    exactly that source; `FailedPrecondition` if it shows something else;
