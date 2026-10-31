@@ -460,7 +460,7 @@ consumer, not an item kind.
 
 ## 7. Image, supply chain and CI
 
-### 7.1 A static binary on a self-built tools base, assembled by `ko`
+### 7.1 A static binary plus two tools, one multi-stage build
 
 Two external tools stay in the image, because reimplementing either is a
 data-loss risk not worth taking: `e2fsprogs` (`mkfs.ext4`, `e2fsck -p` on
@@ -481,18 +481,27 @@ mount:
 - **Device nodes**: dm-crypt mappings are created by `cryptsetup`, which
   makes its own `/dev/mapper` node when no udev is present.
 
-**The image (decision 13).** A tools base is built in this repository: a
-digest-pinned musl builder stage installs `e2fsprogs` and `cryptsetup`, a
-script computes the shared-library closure of exactly the binaries the
-driver calls, and only that closure is copied into a `scratch` final stage.
-No shell, no package manager, no `busybox`; roughly 10 to 15 MB per
-architecture. `ko` then uses that image as its base, pinned by digest in
-`.ko.yaml`, and layers the static Go binary on top with
-`--platform=linux/amd64,linux/arm64` (`ko` resolves a multi-arch base
-index per platform). The tools base is rebuilt by a scheduled workflow
-against the pinned distribution release and scanned, so security
-advisories reach it without a code change; the driver image is rebuilt by
-every PR. The controller is the same image with a different subcommand.
+**The image (decision 13).** One multi-stage Dockerfile, built with
+`buildx`, and nothing published but the driver image. Stage one is a
+digest-pinned musl distribution that installs `e2fsprogs` and `cryptsetup`;
+a script computes the shared-library closure of exactly the binaries the
+driver calls. Stage two is `scratch` with that closure and the Go binary,
+cross-compiled from `TARGETARCH` with `CGO_ENABLED=0`. No shell, no package
+manager, no `busybox`; roughly 10 to 15 MB per architecture. Multi-arch is
+one `buildx --platform=linux/amd64,linux/arm64` invocation: emulation is
+used only to run the package install for arm64, which is file extraction
+and takes seconds; the Go compile is never emulated. `buildx` emits the
+SBOM and provenance attestations. The controller is the same image with a
+different subcommand.
+
+Updates are ordinary dependency bumps: the dependency bot moves the pinned
+base digest, CI rebuilds and scans, the PR merges. There is no separately
+maintained base image, no schedule and no second pipeline.
+
+**Why not `ko`.** `ko` cannot install packages, so keeping the real tools
+under `ko` means publishing and maintaining a tools base of our own. A
+single Dockerfile gives the same shell-free image with one artifact and
+one update path.
 
 **Rejected: borrowing the tools from the host.** Running the host's
 `e2fsck` and `cryptsetup` in a child process chrooted into a read-only
@@ -525,15 +534,15 @@ Runtime posture:
 ### 7.2 Supply chain
 
 - Images are signed with keyless cosign from the release workflow's OIDC
-  identity, carry `ko`'s SBOM and build provenance attestations, and the
+  identity, carry `buildx`'s SBOM and provenance attestations, and the
   kustomize base references them by tag with the digest recorded alongside.
 - `govulncheck` on every PR; container scanning on every built image;
   dependency updates for Go modules, GitHub Actions and sidecar images by
   automated PRs. Actions are pinned by commit SHA, and every workflow
   declares the least `permissions:` it needs.
-- Multi-arch (`linux/amd64`, `linux/arm64`) is one `ko` invocation; no
-  job compiles under QEMU. Native arm64 runners, when available, run the
-  arm64 smoke test rather than the build.
+- Multi-arch (`linux/amd64`, `linux/arm64`) is one `buildx` invocation;
+  no job compiles under emulation. Native arm64 runners, when available,
+  run the arm64 smoke test rather than the build.
 
 ### 7.3 CI: fast by parallelism, robust by running the real thing
 
@@ -545,7 +554,7 @@ Every PR runs the full set below as parallel jobs; nothing waits for
 | `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | cache |
 | `unit` | `go test -race -shuffle=on ./...` with coverage | cache |
 | `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | setup-envtest cache |
-| `build` | `ko build` for both platforms on the digest-pinned tools base, image tarball uploaded as an artifact | Go cache |
+| `build` | `buildx` for both platforms from the one Dockerfile, image tarball uploaded as an artifact | buildx and Go caches |
 | `smoke` | root on the runner: loop devices, ext4, LUKS2, `unshare --mount` plugin replacement, simulated reboot | the image artifact |
 | `sanity` | csi-sanity against the binary | the image artifact |
 | `e2e` matrix `local`, `nfs3`, `nfs4` | kind cluster, real NFS server container (kernel server for `nfs3` and `nfs4`), fault injection: server restart, partition, plugin restart, force detach, surge rollout, holder kill with remote writers | the image artifact |
@@ -617,9 +626,10 @@ Recorded:
     **Node-local persistent** is an image item on the `local` transport
     with topology and a move operation (5.2), scheduled after RWX images.
 
-13. **Image**: one static Go binary layered by `ko` onto a self-built,
-    digest-pinned tools base holding only `e2fsprogs`, `cryptsetup` and
-    their library closure; no shell, no mount helpers (7.1).
+13. **Image**: one multi-stage Dockerfile built with `buildx`: `scratch`
+    plus the static Go binary, `e2fsprogs`, `cryptsetup` and their library
+    closure from a digest-pinned builder; no shell, no mount helpers, no
+    separately maintained base image (7.1).
 14. **Syscalls and ioctls over shell-outs** for NFS mounts, loop devices,
     fencing and probes (7.1), each proven on real NFSv3 in CI.
 15. **CI shape**: parallel jobs on every PR including smoke, sanity and
@@ -638,7 +648,7 @@ Pending: none that block M1.
 1. **M1, directory items on NFSv3 and local**: the binary, controller and
    DaemonSet; transports on the host mount table with driver-owned
    profiles via `mount(2)`; intent store and reconciler; opaque IDs with PV
-   lookup; metrics; the `miami lock` helper; the `ko` image and the full CI shape
+   lookup; metrics; the `miami lock` helper; the image build and the full CI shape
    of 7.3 with the `local` and `nfs3` e2e variants.
    Proves the plumbing with nothing but `mkdir` and bind mounts.
 2. **M2, image items**: loop, ext4, LUKS2, offline expand, holder plus
