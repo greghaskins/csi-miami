@@ -55,6 +55,11 @@ type simKernel struct {
 	lstatErr error
 	// evalErrAt fails evalSymlinks for that one path only.
 	evalErrAt string
+	// evalBlockAt makes evalSymlinks of that path hang until evalRelease is
+	// closed, signalling evalEntered first.
+	evalBlockAt string
+	evalRelease chan struct{}
+	evalEntered chan struct{}
 
 	// block, when set to "mount", "unmount" or "statfs", makes that call wait
 	// until release is closed. entered is signalled when it starts waiting;
@@ -195,6 +200,10 @@ func (s *simKernel) mounts() (observe.Table, error) {
 }
 
 func (s *simKernel) evalSymlinks(p string) (string, error) {
+	if s.evalBlockAt != "" && p == s.evalBlockAt {
+		s.evalEntered <- struct{}{}
+		<-s.evalRelease
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.evalErr != nil {
@@ -210,6 +219,9 @@ func (s *simKernel) evalSymlinks(p string) (string, error) {
 		if p == l || strings.HasPrefix(p, l+"/") {
 			p = d + strings.TrimPrefix(p, l)
 		}
+	}
+	if s.missing[p] {
+		return "", fmt.Errorf("lstat %s: %w", p, fs.ErrNotExist) // a dangling link
 	}
 	return p, nil
 }
@@ -893,6 +905,87 @@ func TestSymlinksAreRefused(t *testing.T) {
 	})
 }
 
+// A dangling symlink resolves to "does not exist"; a caller that answers that
+// with MkdirAll would then hit EEXIST, so it is reported as unresolved.
+func TestDanglingSymlinksAreNotResolved(t *testing.T) {
+	t.Parallel()
+	setup := func() *simKernel {
+		k := newSim()
+		k.links = map[string]string{"/dang": "/gone"}
+		k.missing = map[string]bool{"/gone": true, "/absent": true}
+		return k
+	}
+	run := map[string]func(m Mounter, p string) error{
+		"Mount":           func(m Mounter, p string) error { return m.Mount(bg(), "tmpfs", p, "tmpfs", 0, "") },
+		"Bind target":     func(m Mounter, p string) error { return m.Bind(bg(), "/data/src", p, false) },
+		"Bind source":     func(m Mounter, p string) error { return m.Bind(bg(), p, "/mnt/dst", false) },
+		"RemountReadOnly": func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) },
+		"Unmount":         func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) },
+	}
+	for name, op := range run {
+		for _, p := range []string{"/dang", "/dang/t"} {
+			t.Run(name+" "+p, func(t *testing.T) {
+				t.Parallel()
+				k := setup()
+				err := op(newMounter(k, time.Second), p)
+				if !errors.Is(err, ErrNotResolved) || errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("got %v, want ErrNotResolved and not a not-exist error", err)
+				}
+				if n := len(k.callsCopy()); n != 0 {
+					t.Errorf("%d kernel calls, want 0", n)
+				}
+			})
+		}
+	}
+
+	t.Run("a path that is only missing stays a not-exist error", func(t *testing.T) {
+		t.Parallel()
+		k := setup()
+		err := newMounter(k, time.Second).Mount(bg(), "tmpfs", "/absent/t", "tmpfs", 0, "")
+		if !errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNotResolved) {
+			t.Errorf("got %v, want a plain not-exist error", err)
+		}
+		err = newMounter(k, time.Second).Bind(bg(), "/absent", "/mnt/dst", false)
+		if !errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNotResolved) {
+			t.Errorf("source: got %v, want a plain not-exist error", err)
+		}
+	})
+}
+
+// A bind source on a dead transport hangs while it is resolved. That must hold
+// only the source busy: unmounting the target, where nothing is mounted, must
+// still work, or pod teardown would wedge behind a dead stage.
+func TestHungSourcePinsOnlyItself(t *testing.T) {
+	t.Parallel()
+	k := newSim()
+	k.evalBlockAt = "/stage/dead"
+	k.evalRelease = make(chan struct{})
+	k.evalEntered = make(chan struct{}, 1)
+	m := newMounter(k, time.Hour)
+
+	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
+	defer cancel()
+	err := m.Bind(ctx, "/stage/dead", "/mnt/pub", false)
+	if !errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "/stage/dead") {
+		t.Fatalf("got %v, want ErrTimeout naming the source", err)
+	}
+	<-k.evalEntered
+
+	if err := m.Unmount(bg(), "/mnt/pub", 0); err != nil {
+		t.Errorf("unmount of the target while the source hangs: %v", err)
+	}
+	if err := m.Mount(bg(), "tmpfs", "/mnt/pub", "tmpfs", 0, ""); err != nil {
+		t.Errorf("mount on the target while the source hangs: %v", err)
+	}
+	if err := m.Bind(bg(), "/stage/dead", "/mnt/pub2", false); !errors.Is(err, ErrBusy) || !strings.Contains(err.Error(), "/stage/dead") {
+		t.Errorf("a second bind of the hung source: got %v, want ErrBusy naming the source", err)
+	}
+	if n := k.countOps("mount"); n != 1 {
+		t.Errorf("%d mount calls reached the kernel, want only the test's own", n)
+	}
+	close(k.evalRelease)
+}
+
 func TestStatfs(t *testing.T) {
 	t.Parallel()
 	k := newSim()
@@ -1190,32 +1283,47 @@ func TestAwaitPrefersARealResult(t *testing.T) {
 	}
 }
 
-// The real implementation, exercised with calls that cannot change the host:
-// a statfs, an unmount of something that is not mounted, reading the table,
-// and mounts onto paths that are missing or are symlinks.
+// trapKernel is the real kernel for reading (statfs, mountinfo, symlinks) with
+// mount(2) and umount2(2) trapped: a unit test must never change the host's
+// mounts, whatever a guard under test does, so reaching either is a failure.
+type trapKernel struct {
+	sysKernel
+	t *testing.T
+}
+
+func (k trapKernel) mount(_, target, _ string, _ uintptr, _ string) error {
+	k.t.Errorf("unit test reached mount(2) for %s", target)
+	return unix.EPERM
+}
+
+func (k trapKernel) unmount(target string, _ int) error {
+	k.t.Errorf("unit test reached umount2(2) for %s", target)
+	return unix.EPERM
+}
+
+// The real kernel for everything that only reads: statfs, mountinfo, symlink
+// resolution. The calls that would change mounts are trapped.
 func TestReal(t *testing.T) {
 	t.Parallel()
-	// Each subtest has its own missing path: they share one Mounter, which
-	// admits one call per path at a time.
-	missing := func(name string) string { return "/nonexistent-miami-test-dir/" + name }
-	m := New(5 * time.Second)
+	const missing = "/nonexistent-miami-test-dir/sub"
+	newReal := func(t *testing.T) Mounter { return newMounter(trapKernel{t: t}, 5*time.Second) }
 
-	t.Run("statfs of the root filesystem", func(t *testing.T) {
+	t.Run("New is a working Mounter", func(t *testing.T) {
 		t.Parallel()
-		st, err := m.Statfs(bg(), "/")
+		st, err := New(5*time.Second).Statfs(bg(), "/")
 		if err != nil || st.Bsize == 0 {
 			t.Errorf("Statfs(/) = %+v, %v", st, err)
 		}
 	})
 	t.Run("statfs of a missing path", func(t *testing.T) {
 		t.Parallel()
-		if _, err := m.Statfs(bg(), missing("statfs")); !errors.Is(err, unix.ENOENT) {
+		if _, err := newReal(t).Statfs(bg(), missing); !errors.Is(err, unix.ENOENT) {
 			t.Errorf("got %v, want ENOENT", err)
 		}
 	})
 	t.Run("mounts", func(t *testing.T) {
 		t.Parallel()
-		tbl, err := m.Mounts(bg())
+		tbl, err := newReal(t).Mounts(bg())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1225,52 +1333,45 @@ func TestReal(t *testing.T) {
 	})
 	t.Run("unmount of what is not mounted", func(t *testing.T) {
 		t.Parallel()
-		if err := m.Unmount(bg(), missing("unmount"), 0); err != nil {
+		if err := newReal(t).Unmount(bg(), missing, 0); err != nil {
 			t.Errorf("got %v, want nil", err)
 		}
 	})
 	t.Run("unmount of / is refused", func(t *testing.T) {
 		t.Parallel()
-		if err := m.Unmount(bg(), "/", 0); err == nil {
+		if err := newReal(t).Unmount(bg(), "/", 0); err == nil {
 			t.Error("want an error")
 		}
 	})
 	t.Run("mount onto a missing directory fails", func(t *testing.T) {
 		t.Parallel()
-		if err := m.Mount(bg(), "tmpfs", missing("mount"), "tmpfs", 0, ""); err == nil {
-			t.Error("want an error")
+		if err := newReal(t).Mount(bg(), "tmpfs", missing, "tmpfs", 0, ""); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("got %v, want not-exist", err)
 		}
 	})
 	t.Run("bind onto a missing directory fails", func(t *testing.T) {
 		t.Parallel()
-		if err := m.Bind(bg(), "/", missing("bind"), false); err == nil {
-			t.Error("want an error")
-		}
-	})
-	t.Run("raw mount onto a missing path fails", func(t *testing.T) {
-		t.Parallel()
-		if err := (sysKernel{}).mount("tmpfs", missing("rawmount"), "tmpfs", 0, ""); err == nil {
-			t.Error("want an error")
-		}
-	})
-	t.Run("raw unmount of a missing path fails", func(t *testing.T) {
-		t.Parallel()
-		if err := (sysKernel{}).unmount(missing("raw"), 0); err == nil {
-			t.Error("want an error")
+		if err := newReal(t).Bind(bg(), "/", missing, false); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("got %v, want not-exist", err)
 		}
 	})
 	t.Run("symlinks are refused before any system call", func(t *testing.T) {
 		t.Parallel()
+		m := newReal(t)
 		dir, err := filepath.EvalSymlinks(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
 		realDir := filepath.Join(dir, "real")
 		link := filepath.Join(dir, "link")
+		dangling := filepath.Join(dir, "dangling")
 		if err := os.Mkdir(realDir, 0o750); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(realDir, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(dir, "nowhere"), dangling); err != nil {
 			t.Fatal(err)
 		}
 		for name, err := range map[string]error{
@@ -1280,6 +1381,10 @@ func TestReal(t *testing.T) {
 			"unmount of a symlink":        m.Unmount(bg(), link, 0),
 			"remount of a symlink":        m.RemountReadOnly(bg(), link, true),
 			"bind onto a symlinked above": m.Bind(bg(), realDir, filepath.Join(link, "t"), false),
+			"mount onto a dangling link":  m.Mount(bg(), "tmpfs", dangling, "tmpfs", 0, ""),
+			"mount under a dangling link": m.Mount(bg(), "tmpfs", filepath.Join(dangling, "sub"), "tmpfs", 0, ""),
+			"bind from a dangling link":   m.Bind(bg(), dangling, filepath.Join(realDir, "t"), false),
+			"unmount of a dangling link":  m.Unmount(bg(), dangling, 0),
 		} {
 			if !errors.Is(err, ErrNotResolved) {
 				t.Errorf("%s: got %v, want ErrNotResolved", name, err)

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,12 +82,22 @@ type Mounter interface {
 	// made by this call is removed again. A target that is already a bind of
 	// source is left alone except that its read-only state is made to match;
 	// a different mount there is ErrConflict.
+	//
+	// The request governs the per-mount flag only. A source on a filesystem
+	// that is read-only itself stays read-only whatever readOnly says: Bind
+	// returns nil, mountinfo shows the mount as rw, and writes still fail with
+	// EROFS. observe.Mount.SuperReadOnly reports that case.
+	//
+	// The source is resolved in a call of its own, so a source that hangs
+	// (a dead stage) holds only itself busy, never the target.
 	Bind(ctx context.Context, source, target string, readOnly bool) error
 
 	// RemountReadOnly sets or clears read-only on the existing mount at
 	// target, keeping its other per-mount options. It is a no-op when the
 	// mount already has the requested state, and ErrNotMounted when there is
-	// no mount.
+	// no mount. Only the per-mount flag changes: clearing read-only on a mount
+	// of a filesystem that is read-only itself succeeds but the mount stays
+	// read-only (see observe.Mount.SuperReadOnly).
 	RemountReadOnly(ctx context.Context, target string, readOnly bool) error
 
 	// Unmount unmounts target with flags 0 or unix.MNT_DETACH; any other
@@ -213,8 +224,9 @@ func newMounter(k kernel, defaultTimeout time.Duration) *mounter {
 // Keys of the in-flight set: calls that change mounts share one namespace per
 // path, statfs has its own. Paths cannot contain NUL, so the prefixes cannot
 // collide with a path.
-func mutKey(path string) string  { return "m\x00" + path }
-func statKey(path string) string { return "s\x00" + path }
+func mutKey(path string) string     { return "m\x00" + path }
+func statKey(path string) string    { return "s\x00" + path }
+func resolveKey(path string) string { return "r\x00" + path }
 
 // flagsOfExisting are the mount(2) flags that act on an existing mount or its
 // propagation rather than creating a new one; they bypass the idempotency
@@ -256,18 +268,28 @@ func (m *mounter) Bind(ctx context.Context, source, target string, readOnly bool
 	if err := CheckPath(op, "target", target); err != nil {
 		return err
 	}
-	_, err := call(ctx, m.timeout, &m.busy, mutKey(target), op, target, func() (struct{}, error) {
+	// One deadline covers both calls below.
+	ctx, cancel := withDeadline(ctx, m.timeout)
+	defer cancel()
+
+	// The source may live on a dead transport, where resolving it hangs. Do it
+	// on a key of its own so that only the source is held busy, not the target:
+	// otherwise unmounting a target with nothing mounted on it would be refused
+	// for as long as the source hangs.
+	_, err := call(ctx, m.timeout, &m.busy, resolveKey(source), "resolve", source, func() (struct{}, error) {
+		return struct{}{}, m.checkSource(source)
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = call(ctx, m.timeout, &m.busy, mutKey(target), op, target, func() (struct{}, error) {
 		t, err := m.k.mounts()
 		if err != nil {
 			return struct{}{}, err
 		}
 		if err := m.checkResolved(target, t); err != nil {
 			return struct{}{}, err
-		}
-		if resolved, err := m.k.evalSymlinks(source); err != nil {
-			return struct{}{}, err
-		} else if resolved != source {
-			return struct{}{}, notResolved(source, resolved)
 		}
 		if _, ok := t.At(target); ok {
 			same, err := t.IsBindOf(target, source)
@@ -294,6 +316,19 @@ func (m *mounter) Bind(ctx context.Context, source, target string, readOnly bool
 		return struct{}{}, nil
 	})
 	return err
+}
+
+// checkSource fails with ErrNotResolved when the bind source is, or lies
+// under, a symlink.
+func (m *mounter) checkSource(source string) error {
+	resolved, err := m.k.evalSymlinks(source)
+	if err != nil {
+		return m.resolveFailure(source, err)
+	}
+	if resolved != source {
+		return notResolved(source, resolved)
+	}
+	return nil
 }
 
 func (m *mounter) RemountReadOnly(ctx context.Context, target string, readOnly bool) error {
@@ -386,7 +421,7 @@ func (m *mounter) checkResolved(path string, t observe.Table) error {
 	dir := filepath.Dir(path)
 	resolved, err := m.k.evalSymlinks(dir)
 	if err != nil {
-		return err
+		return m.resolveFailure(path, err)
 	}
 	if resolved != dir {
 		return notResolved(path, filepath.Join(resolved, filepath.Base(path)))
@@ -404,11 +439,33 @@ func (m *mounter) checkResolved(path string, t observe.Table) error {
 	if link {
 		resolved, err := m.k.evalSymlinks(path)
 		if err != nil {
-			return err
+			return m.resolveFailure(path, err)
 		}
 		return notResolved(path, resolved)
 	}
 	return nil
+}
+
+// resolveFailure explains an error from resolving path. A path that goes
+// through a dangling symlink fails to resolve with "does not exist", which a
+// caller would answer by creating the directory and then hit EEXIST, so that
+// case is reported as ErrNotResolved. Anything else is returned as it is.
+func (m *mounter) resolveFailure(path string, err error) error {
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	prefix := ""
+	for _, c := range strings.Split(strings.Trim(path, "/"), "/") {
+		prefix += "/" + c
+		link, lerr := m.k.isSymlink(prefix)
+		if lerr != nil {
+			return err // a component that is missing, not a dangling link
+		}
+		if link {
+			return fmt.Errorf("%w: %q goes through the symlink %q, which cannot be resolved; pass the resolved path", ErrNotResolved, path, prefix)
+		}
+	}
+	return err
 }
 
 func notResolved(path, resolved string) error {
@@ -456,11 +513,8 @@ func perMountFlags(opts []string) uintptr {
 // operation and the target only.
 func call[T any](ctx context.Context, def time.Duration, g *inflight, key, op, target string, fn func() (T, error)) (T, error) {
 	var zero T
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, def)
-		defer cancel()
-	}
+	ctx, cancel := withDeadline(ctx, def)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return zero, contextDone(op, target, err, "before the call started")
 	}
@@ -470,11 +524,17 @@ func call[T any](ctx context.Context, def time.Duration, g *inflight, key, op, t
 
 	ch := make(chan result[T], 1)
 	go func() {
-		v, err := fn()
-		if key != "" {
-			g.release(key)
-		}
-		ch <- result[T]{v, err}
+		var r result[T]
+		func() {
+			// Deferred so that even a panic in fn frees the path.
+			defer func() {
+				if key != "" {
+					g.release(key)
+				}
+			}()
+			r.v, r.err = fn()
+		}()
+		ch <- r
 	}()
 
 	r, done := await(ctx.Done(), ch)
@@ -485,6 +545,15 @@ func call[T any](ctx context.Context, def time.Duration, g *inflight, key, op, t
 		return zero, fmt.Errorf("%s %s: %w", op, target, r.err)
 	}
 	return r.v, nil
+}
+
+// withDeadline returns ctx, or a child of it with the default timeout when it
+// has no deadline. The cancel func is always safe to call.
+func withDeadline(ctx context.Context, def time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, def)
 }
 
 type result[T any] struct {
