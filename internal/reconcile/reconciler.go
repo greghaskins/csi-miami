@@ -206,9 +206,10 @@ func realTicker(d time.Duration) (<-chan time.Time, func()) {
 	return t.C, t.Stop
 }
 
-// within reports whether path is dir or lies below it. Both are clean.
+// within reports whether path is dir or lies below it. Both are clean, and dir
+// may be "/".
 func within(dir, path string) bool {
-	return path == dir || strings.HasPrefix(path, dir+"/")
+	return dir == "/" || path == dir || strings.HasPrefix(path, dir+"/")
 }
 
 // strictlyBelow reports whether path lies below dir and is not dir.
@@ -423,26 +424,32 @@ func (r *Reconciler) Unpublish(ctx context.Context, volumeID, targetPath string)
 }
 
 // checkTargetPath refuses a target that is not an absolute, cleaned path, and
-// one that is, or is inside, a directory the driver keeps for itself: the
-// transports root (a publish there would sit among the transports, and an
-// unpublish would unmount one) or the staging root (a publish there is
+// one that is, is inside, or is an ancestor of a directory the driver keeps for
+// itself: the transports root (a publish there would sit among the transports,
+// and an unpublish would unmount one) or the staging root (a publish there is
 // garbage by rule (a) and would be mounted and unmounted on every pass, and an
-// unpublish would unmount a volume's stage). Both are ErrTargetOutsideScope.
+// unpublish would unmount a volume's stage). An ancestor is as bad as the
+// directory: a bind mounted on the directory above the staging root hides
+// every stage under it. All are ErrTargetOutsideScope.
 func (r *Reconciler) checkTargetPath(what, target string) error {
 	if err := mount.CheckPath(what, "target path", target); err != nil {
 		return fmt.Errorf("%w: %w", ErrTargetOutsideScope, err)
 	}
 	for _, root := range []struct{ name, dir string }{{"transports root", r.opts.TransportsRoot}, {"stage root", r.opts.StageRoot}} {
-		if within(root.dir, target) {
+		switch {
+		case within(root.dir, target):
 			return fmt.Errorf("%w: %s is the %s or inside it", ErrTargetOutsideScope, target, root.name)
+		case within(target, root.dir):
+			return fmt.Errorf("%w: %s is the %s or contains it", ErrTargetOutsideScope, target, root.name)
 		}
 	}
 	return nil
 }
 
-// checkTargetScope reads the intents and refuses a target that is, or is
-// inside, some intent's stage path (ErrTargetOutsideScope: another volume's
-// stage would otherwise be an unpublish away from unmounted), and one that
+// checkTargetScope reads the intents and refuses a target that is, is inside,
+// or contains some intent's stage path (ErrTargetOutsideScope: another
+// volume's stage would otherwise be an unpublish away from unmounted, or
+// hidden by a publish above it), and one that
 // another volume's record claims as its publish target (ErrPublishConflict,
 // naming the claimant): two volumes cannot be bound at one path, and an
 // unpublish for one must not unmount the other's. A store that cannot be read
@@ -454,8 +461,8 @@ func (r *Reconciler) checkTargetScope(volumeID, target string) error {
 		return fmt.Errorf("%w: %w", ErrIntentsUnknown, err)
 	}
 	for id, in := range loaded.Intents {
-		if within(in.StagePath, target) {
-			return fmt.Errorf("%w: %s is the stage path of %s or inside it", ErrTargetOutsideScope, target, id)
+		if within(in.StagePath, target) || within(target, in.StagePath) {
+			return fmt.Errorf("%w: %s is the stage path of %s, or inside it, or contains it", ErrTargetOutsideScope, target, id)
 		}
 		if id == volumeID {
 			continue
