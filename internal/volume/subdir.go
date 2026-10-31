@@ -16,10 +16,15 @@ const (
 	maxSubdirLen = maxPathLen - 1 - maxNameLen
 )
 
-// pvNameShape is what the external-provisioner names a PV. No element of a
-// subdir may look like one, so a claim named like another volume cannot
-// place a directory inside that volume's.
+// pvNameShape is what the external-provisioner names a PV, and the only shape
+// a volume name may have (IsPVName).
 var pvNameShape = regexp.MustCompile(`^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// pvNameShapeFold is pvNameShape without regard to case. No element of a subdir
+// may look like a PV name in any case, so a claim named like another volume
+// cannot place a directory inside that volume's, even on a case-insensitive
+// export where PVC-... and pvc-... are the same directory.
+var pvNameShapeFold = regexp.MustCompile(`(?i)^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // Tokens are the values a subdir template may use. They come from the
 // provisioner's extra create metadata. The volume's own name is not a token:
@@ -163,7 +168,7 @@ func validateSubdir(s string) error {
 			return invalid("subdir must be a cleaned path (no trailing, doubled or '.' elements)")
 		case len(elem) > maxElementLen:
 			return invalid("subdir must not have a path element longer than 255 bytes")
-		case pvNameShape.MatchString(elem):
+		case pvNameShapeFold.MatchString(elem):
 			return invalid("subdir must not have an element shaped like a PV name (pvc-<uuid>), so that no directory can nest inside another volume's")
 		}
 	}

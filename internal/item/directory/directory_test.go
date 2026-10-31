@@ -20,10 +20,17 @@ import (
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
+// Volume names of the one shape a volume may have (decision 22:
+// pvc-<lower-case uuid>), one per volume a test stages.
+const (
+	pvc1 = "pvc-00000000-0000-4000-8000-000000000001"
+	pvc2 = "pvc-00000000-0000-4000-8000-000000000002"
+)
+
 const (
 	root  = "/var/lib/miami"
 	host  = "/export/data"
-	stage = "/stage/pvc-1/globalmount"
+	stage = "/stage/" + pvc1 + "/globalmount"
 )
 
 var spec = transport.Spec{Kind: transport.KindLocal, Path: host}
@@ -36,11 +43,11 @@ func tdir() string {
 	return d
 }
 
-func itemDir() string { return filepath.Join(tdir(), "pvc-1") }
+func itemDir() string { return filepath.Join(tdir(), pvc1) }
 
 func theIntent() intent.Intent {
 	return intent.Intent{
-		Version: intent.Version, VolumeID: "directory:pvc-1", Kind: volume.KindDirectory,
+		Version: intent.Version, VolumeID: "directory:" + pvc1, Kind: volume.KindDirectory,
 		Transport: spec, StagePath: stage, AccessMode: "MULTI_NODE_MULTI_WRITER",
 	}
 }
@@ -57,7 +64,7 @@ func stageBind(opts ...string) observe.Mount {
 	if len(opts) == 0 {
 		opts = []string{"rw"}
 	}
-	return observe.Mount{ID: 3, ParentID: 1, Major: 8, Minor: 1, Root: host + "/pvc-1", MountPoint: stage, Options: opts, FSType: "ext4", Source: "/dev/sda1", SuperOptions: []string{"rw"}}
+	return observe.Mount{ID: 3, ParentID: 1, Major: 8, Minor: 1, Root: host + "/" + pvc1, MountPoint: stage, Options: opts, FSType: "ext4", Source: "/dev/sda1", SuperOptions: []string{"rw"}}
 }
 
 type dirInfo struct{ dir bool }
@@ -216,7 +223,7 @@ func TestConvergeErrors(t *testing.T) {
 	foreign := stageBind()
 	foreign.Major, foreign.Minor, foreign.FSType = 0, 55, "tmpfs"
 	otherBind := stageBind()
-	otherBind.Root = host + "/pvc-2"
+	otherBind.Root = host + "/" + pvc2
 	hiddenStage := stageBind()
 	hiddenStage.MountPoint = stage
 	cover := observe.Mount{ID: 9, ParentID: 1, Major: 0, Minor: 9, Root: "/", MountPoint: filepath.Dir(stage), FSType: "tmpfs", Source: "t"}
@@ -262,7 +269,7 @@ func TestConvergeErrors(t *testing.T) {
 			func(fx *fixture, _ *intent.Intent) { fx.f.FailOp(fake.OpBind, stage, mount.ErrBusy) },
 			[]error{mount.ErrBusy}},
 		{"a malformed volume ID", []observe.Mount{rootMount(), transportMount()},
-			func(_ *fixture, in *intent.Intent) { in.VolumeID = "pvc-1" }, nil},
+			func(_ *fixture, in *intent.Intent) { in.VolumeID = pvc1 }, nil},
 		{"a name that is not valid", []observe.Mount{rootMount(), transportMount()},
 			func(_ *fixture, in *intent.Intent) { in.VolumeID = "directory:a b" }, nil},
 	}
@@ -357,7 +364,7 @@ func TestTeardownLeavesWhatIsNotOurs(t *testing.T) {
 	foreign := stageBind()
 	foreign.Major, foreign.Minor, foreign.FSType = 0, 55, "tmpfs"
 	other := stageBind()
-	other.Root = host + "/pvc-2"
+	other.Root = host + "/" + pvc2
 	stacked := foreign
 	stacked.ID = 4
 	tests := []struct {
@@ -434,7 +441,7 @@ func TestTeardownErrors(t *testing.T) {
 		t.Errorf("got %v", err)
 	}
 	bad := theIntent()
-	bad.VolumeID = "pvc-1"
+	bad.VolumeID = pvc1
 	if err := it.Teardown(context.Background(), bad, item.Observed{}); err == nil {
 		t.Error("a malformed volume ID was accepted")
 	}

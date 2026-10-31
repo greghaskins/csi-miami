@@ -32,7 +32,7 @@ func TestAVolumeWhoseDirectoryWasDeletedCanBeUnstaged(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.sim.markDeleted(in.StagePath, target)
 
@@ -52,7 +52,7 @@ func TestAPublishOfAVolumeWhoseDirectoryWasDeletedCanBeUnpublished(t *testing.T)
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.sim.markDeleted(in.StagePath, target)
 
@@ -68,7 +68,7 @@ func TestUnstageWithTheTransportGoneSaysSoAndRetriesOnceItIsBack(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	e.sim.remove(e.tdir("a"))
 

@@ -20,7 +20,7 @@ func TestUnstageWithABusyPublishKeepsTheStageAndTheIntent(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	busy := e.stageAndPublish(in, "pod1", false)
 	e.mkTargetParent("pod2")
 	other := e.target("pod2")
@@ -61,7 +61,7 @@ func TestDefaultSeamsAreNoOps(t *testing.T) {
 
 	// A Reconciler with none of the seams set works.
 	e := newEnv(t, func(o *Options) { o.Metrics, o.Events, o.Logger = nil, nil, nil })
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	mustNil(t, "converge", e.converge(in.VolumeID))
 }
@@ -77,7 +77,7 @@ func TestASecondVolumeOnAHungTransportIsSkippedInThePass(t *testing.T) {
 	d, err := e.dirItem(20*time.Millisecond, func() { stats.add(); <-release })
 	mustNil(t, "item", err)
 	e.r = e.newReconciler(func(o *Options) { o.Items = []item.Item{d} })
-	v1, v2 := e.vol("a", "pvc-1"), e.vol("a", "pvc-2")
+	v1, v2 := e.vol("a", pvc1), e.vol("a", pvc2)
 	mustNil(t, "save", e.store.Save(v1))
 	mustNil(t, "save", e.store.Save(v2))
 
@@ -99,7 +99,7 @@ func TestASecondVolumeOnAHungTransportIsSkippedInThePass(t *testing.T) {
 func TestATransportThatCannotBeObservedIsUnavailable(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.sim.SetMountsError(errors.New("boom"))
 	err := e.converge(in.VolumeID)
@@ -112,7 +112,7 @@ func TestATransportThatCannotBeObservedIsUnavailable(t *testing.T) {
 func TestAMountFailureOfTheTransportIsUnavailableAndAConflictIsAConflict(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 
 	e.sim.FailOp(fake.OpBind, e.tdir("a"), errors.New("no route"))
@@ -130,7 +130,7 @@ func TestAMountFailureOfTheTransportIsUnavailableAndAConflictIsAConflict(t *test
 func TestAnIntentOfAnUnhandledKindFailsOnlyThatVolume(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.r.items = map[volume.Kind]item.Item{}
 	if err := e.converge(in.VolumeID); err == nil {

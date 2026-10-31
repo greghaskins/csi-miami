@@ -33,7 +33,7 @@ func TestAHungTransportRaisesOneEventAcrossManyPasses(t *testing.T) {
 	lg, buf := logger()
 	e := newEnv(t, func(o *Options) { o.Logger = lg })
 	e.sim.DefaultTimeout = 20 * time.Millisecond
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.sim.Block(e.tdir("a"))
 
@@ -85,7 +85,7 @@ func TestAHungItemStatRaisesOneEventAcrossManyPasses(t *testing.T) {
 	d, err := e.dirItem(20*time.Millisecond, func() { <-release })
 	mustNil(t, "item", err)
 	e.r = e.newReconciler(func(o *Options) { o.Items = []item.Item{d} })
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 
 	for range 6 {
@@ -138,7 +138,7 @@ func TestABusyStrayWarnsOncePerKindOfFailure(t *testing.T) {
 func TestShutdownRaisesNoEvents(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 
 	ctx, cancel := context.WithCancel(bg)
@@ -161,7 +161,7 @@ func TestShutdownRaisesNoEvents(t *testing.T) {
 func TestAPersistentPublishFailureRaisesOneEventUntilItChanges(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	e.mkTargetParent("pod1")
 	target := e.target("pod1")
 	e.sim.addMount(target, "tmpfs", "t")

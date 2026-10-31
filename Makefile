@@ -14,7 +14,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check smoke e2e
+.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check smoke e2e envtest sanity
 
 build:
 	mkdir -p bin
@@ -82,6 +82,28 @@ image:
 # separate CI job and not part of `check`.
 smoke:
 	hack/smoke.sh
+
+# The PV paths of the controller against a real API server and etcd, started
+# by envtest (build tag envtest). setup-envtest, pinned in mise.toml, downloads
+# the binaries of the Kubernetes version below on first use and prints where
+# they are. Not part of `check`: it is the envtest CI job.
+ENVTEST_K8S_VERSION := 1.37.0
+
+envtest:
+	KUBEBUILDER_ASSETS="$$(setup-envtest use $(ENVTEST_K8S_VERSION) --print path)" \
+		go test -tags envtest -count=1 ./internal/csi
+
+# The csi-sanity suite (pinned in mise.toml) against the identity and
+# controller services, on a local transport, for which the controller touches
+# no file system; and the tests of the delete path that mount real file
+# systems (a tmpfs, bind mounts) and race a rename or a mount against the
+# removal. ROOT ONLY: run it as `sudo -E env "PATH=$PATH" make sanity`, with
+# the pinned Go and csi-sanity on PATH. The node service is not part of this run. A
+# separate CI job, not part of `check`. The suite serves on a unix socket under
+# TMPDIR, whose path is limited to about 100 bytes: if TMPDIR is long, point it
+# at a short directory (TMPDIR=/tmp) for the run.
+sanity:
+	hack/sanity.sh
 
 # End-to-end tests of one transport against a real server, chosen by
 # E2E_TRANSPORT (nfs3: a kernel NFSv3 server in a privileged container, see

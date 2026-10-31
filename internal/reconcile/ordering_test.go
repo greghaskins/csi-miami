@@ -29,7 +29,7 @@ func (e *env) abandonedUnstage(volumeID string) {
 func TestAStageSupersedesAnAbandonedUnstage(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t) // the loop starts after both requests are queued
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	e.abandonedUnstage(in.VolumeID)
@@ -45,7 +45,7 @@ func TestAStageSupersedesAnAbandonedUnstage(t *testing.T) {
 	if _, ok := e.intentOf(in.VolumeID); !ok {
 		t.Error("the Stage's record was deleted by the stale Unstage")
 	}
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("the volume is not staged")
 	}
 }
@@ -53,7 +53,7 @@ func TestAStageSupersedesAnAbandonedUnstage(t *testing.T) {
 func TestAPublishSupersedesAnAbandonedUnstage(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	e.abandonedUnstage(in.VolumeID)
@@ -77,7 +77,7 @@ func TestAPublishSupersedesAnAbandonedUnstage(t *testing.T) {
 func TestTheSupersededUnstageIsAnswered(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	unstage := &request{kind: reqUnstage, volume: in.VolumeID, done: make(chan error, 1)}
@@ -98,7 +98,7 @@ func TestTheSupersededUnstageIsAnswered(t *testing.T) {
 func TestAnUnstageAfterAStageWins(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	stage := &request{kind: reqStage, volume: in.VolumeID, done: make(chan error, 1)}
@@ -122,7 +122,7 @@ func TestUnstageDoesNotDeleteAnIdenticalStageWrittenDuringTheTeardown(t *testing
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	loaded, _ := e.intentOf(in.VolumeID)
 
@@ -145,7 +145,7 @@ func TestUnstageDoesNotDeleteAnIdenticalStageWrittenDuringTheTeardown(t *testing
 	}
 	e.hook.Store(nil)
 	e.freshPass(e.r.nudge)
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
 		t.Error("the volume was not restored")
 	}
 }
@@ -156,7 +156,7 @@ func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	e.mkTargetParent("pod9")
 	late := e.target("pod9")
@@ -180,7 +180,7 @@ func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
 	// The next pass brings the volume back, stage and the late publish.
 	e.hook.Store(nil)
 	e.freshPass(e.r.nudge)
-	if !e.isBind(in.StagePath, e.itemDir("a", "pvc-1")) || !e.isBind(late, in.StagePath) {
+	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) || !e.isBind(late, in.StagePath) {
 		t.Error("the volume was not restored from the newer record")
 	}
 }
@@ -192,8 +192,8 @@ func TestARequestMadeDuringAPassIsServedByTheNextOne(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	v1 := e.vol("a", "pvc-1")
-	v2 := e.vol("b", "pvc-2")
+	v1 := e.vol("a", pvc1)
+	v2 := e.vol("b", pvc2)
 
 	entered := make(chan struct{})
 	gate := make(chan struct{})
@@ -221,7 +221,7 @@ func TestARequestMadeDuringAPassIsServedByTheNextOne(t *testing.T) {
 	if got := e.passes(); got < done+2 {
 		t.Errorf("%d passes completed since the second request, want it served by one of its own", got-done)
 	}
-	if !e.isBind(v2.StagePath, e.itemDir("b", "pvc-2")) {
+	if !e.isBind(v2.StagePath, e.itemDir("b", pvc2)) {
 		t.Error("the second volume is not staged")
 	}
 }

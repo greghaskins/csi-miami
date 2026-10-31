@@ -55,7 +55,7 @@ func TestStageDoesNotRewriteAnUnreadableRecord(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	good := e.breakRecord(in.VolumeID)
 	junk, _ := os.ReadFile(e.recordPath(in.VolumeID))
@@ -96,7 +96,7 @@ func TestStageAfterAPassThatSawAnUnreadableRecord(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.breakRecord(in.VolumeID)
 
@@ -119,9 +119,9 @@ func TestNothingIsCollectedWhileAnyRecordIsUnreadable(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, func(o *Options) { o.TransportIdle = time.Minute })
 	e.start()
-	a := e.vol("a", "pvc-1")
+	a := e.vol("a", pvc1)
 	targetA := e.stageAndPublish(a, "pod1", false)
-	b := e.vol("b", "pvc-2")
+	b := e.vol("b", pvc2)
 	targetB := e.stageAndPublish(b, "pod2", false)
 	e.stop()
 
@@ -172,7 +172,7 @@ func TestUnpublishWithAnUnreadableRecordUnmountsNothing(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	good := e.breakRecord(in.VolumeID)
 
@@ -198,7 +198,7 @@ func TestUnstageWithAnUnreadableRecordTouchesNothing(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.breakRecord(in.VolumeID)
 	junk, _ := os.ReadFile(e.recordPath(in.VolumeID))
@@ -222,7 +222,7 @@ func TestARecordThatIsNotAFileIsUnknownNotAbsent(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	id := "directory:pvc-1"
+	id := "directory:" + pvc1
 	mustNil(t, "mkdir", os.MkdirAll(filepath.Join(e.recordPath(id), "x"), 0o700))
 	if err := e.r.Unstage(bg, id); !errors.Is(err, ErrIntentsUnknown) {
 		t.Errorf("Unstage = %v", err)
@@ -241,7 +241,7 @@ func TestTheLogLineForAnUnreadableRecordWarnsAboutRemovingIt(t *testing.T) {
 	t.Parallel()
 	lg, buf := logger()
 	e := newEnv(t, func(o *Options) { o.Logger = lg })
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.breakRecord(in.VolumeID)
 	e.pass()

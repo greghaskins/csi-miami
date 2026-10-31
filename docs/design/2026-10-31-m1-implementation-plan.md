@@ -20,8 +20,11 @@ real cluster by hand:
 1. A PVC with `storageClassName` naming an `nfs3` transport binds, its pod
    runs, and a second pod on another node sees the first pod's writes.
 2. The same with a `local` transport on one node.
-3. Deleting the PVC removes the directory on the transport; deleting after
-   a controller restart still removes it.
+3. With an `nfs3` transport, deleting the PVC removes the directory on the
+   transport, and deleting after a controller restart still removes it. With
+   a `local` transport, deleting the PVC deletes the PV and the directory
+   remains on its node (decision 23); the e2e for `local` asserts exactly
+   that, and does not expect the directory to be gone.
 4. Restarting the node plugin pod while pods are running changes nothing:
    the transport stays mounted on the host, bind mounts survive, and the
    next stage and unstage on that node succeed.
@@ -129,7 +132,10 @@ and unstage of the same ID across calls.
 - `volume_id` = `<kind>:<name>`, where `name` is `pvc-<uuid>` as the
   provisioner names it (`--extra-create-metadata` is on so the PVC name and
   namespace are available for subdir tokens). Opaque; never parsed for a
-  locator.
+  locator. The name is always of that shape, lower-case hex, and any other is
+  refused at every boundary (decision 22), so no subdir element can be a
+  volume and no volume can nest in another; a static PV keeps or receives
+  such a name.
 - `volume_context` (set by `CreateVolume`, stored on the PV, sent on every
   node call):
 
@@ -200,17 +206,52 @@ PV that cannot be read; `DeadlineExceeded` from any observation that hits
 its deadline; `FailedPrecondition` for a stage path mounted from something
 other than this volume's transport directory. Never `panic` in a handler.
 
+Choices made in T8 where the plan was silent:
+
+- A volume ID that does not parse is one this driver could not have issued.
+  `ValidateVolumeCapabilities` and `ControllerPublishVolume` answer
+  `NotFound`; `ControllerUnpublishVolume` and `DeleteVolume` answer success
+  (the CSI specification's idempotent reading), and delete deletes nothing.
+- `ListVolumes` lists directories two levels below each transport the
+  controller has mounted whose names are PV names (pvc-<uuid>), enters the
+  other directories as subdir elements, ignores `max_entries`, and answers
+  `Aborted` to any starting token. It has a deadline of its own and leaves out
+  a transport that does not answer. It is for operators and the sanity suite,
+  not for completeness.
+- The controller remembers, in memory and bounded, what each `CreateVolume`
+  name answered, so a repeat with other parameters or capacity is
+  `AlreadyExists`. A restart forgets it; nothing else depends on it.
+- `DeleteVolume` treats a 404 for the PV as "no PV" only when the API server
+  itself answered it (a `Status`); a 404 from a proxy or load balancer in
+  front of a wrong endpoint is an unknown answer, `Unavailable`. It also
+  refuses a PV whose reclaim policy is not `Delete`.
+- Removal of a directory is relative to descriptors (`openat2` with
+  `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_XDEV`), so it needs
+  Linux 5.6; there is no fallback to removing by path.
+- File system operations against one transport are bounded (one per
+  directory, eight per transport); beyond that a call is `Unavailable` at
+  once, so a hung transport costs a bounded number of threads.
+- A second request for a volume whose first is still running is `Aborted`.
+- `mount_flags` in a capability are ignored: the driver owns the mount options.
+
 ## 7. Controller
 
 - Stateless. Mounts transports with the same `internal/transport` code
   into its own mount namespace under `--transports-root` (an `emptyDir`;
   statelessness is the point, nothing must survive a restart).
-- `CreateVolume`: validate, resolve `subdir`, mount the transport, `mkdir
-  -p <transport>/<subdir>/<name>` (idempotent: an existing directory is adopted), return ID and
-  context, and for `local` the node topology. Capacity is echoed back; a
-  directory has no size.
-- `DeleteVolume`: PV lookup (section 4), mount, `rm -r` the directory.
-  Idempotent: a missing directory is success.
+- `CreateVolume`: validate, resolve `subdir`. For `nfs3`: mount the
+  transport, `mkdir -p <transport>/<subdir>/<name>` (idempotent: an existing
+  directory is adopted), return ID and context. For `local` (decision 23):
+  return ID, context and the node topology and touch no file system, because
+  the directory is on the disk of the node the volume is for, not of the node
+  the controller runs on; the node creates it at first stage if it is
+  missing. Capacity is echoed back; a directory has no size.
+- `DeleteVolume`: PV lookup (section 4). For `nfs3`: mount, then remove the
+  directory relative to descriptors (no symlink or mount crossed). Idempotent:
+  a missing directory is success. For `local` the controller cannot reach the
+  node's disk: success, logged at warning, nothing deleted; the directory
+  remains on the node until M4's node-local tier removes it (a documented
+  limitation, as on a cluster older than 1.31 without a PV).
 - `ControllerPublishVolume` and unpublish: accept and record nothing.
 - Needs `hostNetwork` on clusters whose NAS export ACLs admit node
   addresses only; `privileged: false` with `SYS_ADMIN` only, read-only root
@@ -313,8 +354,10 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 **Converge, for a directory item.**
 
 1. Transport mounted (adopt or mount).
-2. `<transport>/<subdir>/<name>` exists and is a directory (adopt; create only in
-   the controller; a missing directory at stage is `NotFound`).
+2. `<transport>/<subdir>/<name>` exists and is a directory (adopt). For
+   `nfs3` the controller created it, and a missing directory at stage is
+   `NotFound`; for `local` the controller creates nothing (decision 23), so
+   the node creates the directory here, with mode 0755, when it is missing.
 3. Stage path is a bind mount of that directory (adopt if mountinfo shows
    exactly that source; `FailedPrecondition` if it shows something else;
    bind if absent).
@@ -406,7 +449,7 @@ Workflows, all pinned by SHA with least permissions:
   content-addressed per-arch tags pushed from the PR, sha alias on `main`), `smoke` (matrix, root, under
   `unshare --mount`: transport survives a plugin restart, bind adoption,
   garbage unmount, simulated reboot via a fresh mount namespace),
-  `sanity` (matrix), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
+  `sanity` (matrix; amd64 only in T8, arm64 joins in T10), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
   on arm64), `manifest` (every PR: the multi-arch index from the digests
   the build legs ran), `publish` (`main` only: the sha alias), `ci-ok`.
 - `secret-scan.yml` and `secret-scan-text.yml`: already present.
@@ -433,7 +476,7 @@ acceptance check. Order matters only where stated.
 | T5 | `internal/intent`: record format, atomic write, load with failure accounting | unit tests including a corrupt record |
 | T6 | `internal/reconcile` with the `directory` item: converge, garbage, per-volume serialization, request queue | unit tests with fake observers; smoke: plugin restart with mounts live, reboot simulation |
 | T7 | `internal/csi` node server over the reconciler; `internal/metrics`; gRPC interceptor | `csi-sanity` node half; metrics scraped in smoke |
-| T8 | `internal/kube` (PV read) and the controller server; `CreateVolume`, `DeleteVolume` with PV lookup, publish/unpublish, list | envtest for the PV paths; `csi-sanity` full |
+| T8 | `internal/kube` (PV read) and the controller server; `CreateVolume`, `DeleteVolume` with PV lookup, publish/unpublish, list | envtest for the PV paths; `csi-sanity` for the identity and controller services (full run in T10) |
 | T9 | `deploy/kustomize/base` and `e2e` overlay; `deploy/policy_test.go`; Dockerfile from scratch | `kubectl apply -k` on kind; both pods Ready |
 | T10 | `test/e2e`: the exit criteria 1 to 6 as tests, `local` and `nfs3` variants; `smoke` and `sanity` and `e2e` jobs wired into `ci.yml` | `ci-ok` green with the full matrix |
 | T11 | `miami lock` and its test against the `nfs3` e2e transport | two pods on two nodes serialize through it; a stale lock is broken |

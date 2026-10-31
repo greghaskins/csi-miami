@@ -14,7 +14,7 @@ func TestAnUnreadableMountTableIsUnavailableOnEveryPath(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 	e.mkTargetParent("pod2")
 	other := e.target("pod2")
@@ -48,8 +48,8 @@ func TestAnUnreadableMountTableIsUnavailableOnEveryPath(t *testing.T) {
 func TestARecordUnreadableWhenItsPassRunsIsNotAnUnknownVolume(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
-	other := e.vol("a", "pvc-2")
+	in := e.vol("a", pvc1)
+	other := e.vol("a", pvc2)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	e.breakRecord(in.VolumeID) // after the request wrote it, before its pass

@@ -37,7 +37,9 @@ func TestResolveSubdir(t *testing.T) {
 		{name: "dots inside an element are fine", template: "a..b", tokens: tokens, want: "a..b"},
 		{name: "255 byte element", template: elem255, tokens: tokens, want: elem255},
 		{name: "near-PV-shaped element is fine", template: "pvc-0a1b2c3d-1111-2222-3333-44445555666", tokens: tokens, want: "pvc-0a1b2c3d-1111-2222-3333-44445555666"},
-		{name: "upper-case UUID is not the PV shape", template: "pvc-0A1B2C3D-1111-2222-3333-444455556666", tokens: tokens, want: "pvc-0A1B2C3D-1111-2222-3333-444455556666"},
+		{name: "upper-case UUID is refused too: an export may ignore case", template: "pvc-0A1B2C3D-1111-2222-3333-444455556666", tokens: tokens, wantErr: "PV name"},
+		{name: "mixed-case prefix is refused too", template: "PVC-0a1b2c3d-1111-2222-3333-444455556666", tokens: tokens, wantErr: "PV name"},
+		{name: "an upper-case PV name inside a longer path is refused", template: "a/Pvc-0a1b2c3d-1111-2222-3333-444455556666/b", tokens: tokens, wantErr: "PV name"},
 		// Two claims whose tokens flatten to the same prefix are fine: the
 		// volume's own name, appended later, tells the directories apart.
 		{name: "flattened A", template: "${pvc.namespace}-${pvc.name}", tokens: Tokens{PVCNamespace: "a-b", PVCName: "c"}, want: "a-b-c"},
@@ -133,7 +135,7 @@ func checkResolved(t *testing.T, got string) {
 			t.Errorf("result %q has element %q", got, elem)
 		case len(elem) > maxElementLen:
 			t.Errorf("result %q has an element of %d bytes", got, len(elem))
-		case pvNameShape.MatchString(elem):
+		case pvNameShapeFold.MatchString(elem):
 			t.Errorf("result %q has PV-shaped element %q", got, elem)
 		}
 	}

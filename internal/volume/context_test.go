@@ -273,15 +273,15 @@ func TestContextValidate(t *testing.T) {
 func TestMatchesID(t *testing.T) {
 	t.Parallel()
 	c := Context{Kind: KindDirectory, Transport: validSpec()}
-	if err := c.MatchesID(ID{Kind: KindDirectory, Name: "pvc-1"}); err != nil {
+	if err := c.MatchesID(ID{Kind: KindDirectory, Name: PV}); err != nil {
 		t.Fatalf("MatchesID() = %v", err)
 	}
 	wantInvalid(t, c.MatchesID(ID{Kind: KindDirectory, Name: ""}), "must not be empty")
-	wantInvalid(t, c.MatchesID(ID{Kind: "image", Name: "pvc-1"}), "kind")
+	wantInvalid(t, c.MatchesID(ID{Kind: "image", Name: PV}), "kind")
 
 	// A kind both sides know about but that differs.
 	other := Context{Kind: "image", Transport: validSpec()}
-	wantInvalid(t, other.MatchesID(ID{Kind: KindDirectory, Name: "pvc-1"}), "does not match")
+	wantInvalid(t, other.MatchesID(ID{Kind: KindDirectory, Name: PV}), "does not match")
 }
 
 func TestDir(t *testing.T) {
@@ -325,7 +325,7 @@ func TestDir(t *testing.T) {
 		wantErr string
 	}{
 		{"invalid context", Context{Kind: KindDirectory, Transport: validSpec(), Subdir: "../x"}, root, id1, "'..'"},
-		{"invalid ID", Context{Kind: KindDirectory, Transport: validSpec()}, root, ID{Kind: KindDirectory, Name: "a/b"}, "may contain only"},
+		{"invalid ID", Context{Kind: KindDirectory, Transport: validSpec()}, root, ID{Kind: KindDirectory, Name: "a/b"}, shapeMsg},
 		{"kind mismatch", Context{Kind: "image", Transport: validSpec()}, root, id1, "miami/kind"},
 		{"relative root", Context{Kind: KindDirectory, Transport: validSpec()}, "var/lib", id1, "transports root"},
 		{"uncleaned root", Context{Kind: KindDirectory, Transport: validSpec()}, root + "/", id1, "transports root"},

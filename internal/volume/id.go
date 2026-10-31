@@ -15,14 +15,21 @@ type Kind string
 const KindDirectory Kind = "directory"
 
 const (
-	// maxNameLen is the longest volume name, in bytes. With the longest
-	// kind, "directory:", the ID is then exactly maxIDLen. A longer kind
-	// needs a shorter limit; TestNameLimitFitsEveryKind catches it.
+	// maxNameLen is the room reserved for a volume name, in bytes, when
+	// sizing a subdir (see maxSubdirLen) and the ceiling checked against a
+	// kind by TestNameLimitFitsEveryKind: with the longest kind, "directory:",
+	// the ID is then exactly maxIDLen. The names actually accepted are the 40
+	// bytes of pvc-<uuid>.
 	maxNameLen = 118
 
 	// maxIDLen is the longest volume ID CSI allows, in bytes.
 	maxIDLen = 128
 )
+
+// IsPVName reports whether name has the shape the external-provisioner gives
+// a PV, pvc-<uuid> with the UUID in lower-case hex. It is the one shape a
+// volume name may have, and the one shape a subdir element may not.
+func IsPVName(name string) bool { return pvNameShape.MatchString(name) }
 
 // Valid reports whether k is a kind this driver knows.
 func (k Kind) Valid() bool {
@@ -58,27 +65,19 @@ func (id ID) Validate() error {
 	return validateName(id.Name)
 }
 
-// validateName allows [A-Za-z0-9._-], 1 to 118 bytes. "." and ".." are
-// refused as well so that a name is never a path traversal if it is ever
-// used as a file name.
+// validateName requires exactly the name the external-provisioner gives a
+// volume, pvc-<uuid> with the UUID in lower-case hex (see IsPVName). Every
+// boundary that makes or reads a volume ID goes through here, so a volume's
+// name is always of that shape and never one a subdir element can have: no
+// directory a subdir template can produce is a volume, and no volume's
+// directory can nest inside another's. A static PV (migration, adoption) must
+// keep or be given such a name.
 func validateName(name string) error {
 	if name == "" {
 		return invalid("volume ID name must not be empty")
 	}
-	if len(name) > maxNameLen {
-		return invalid("volume ID name must be at most 118 bytes")
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
-			c == '.', c == '_', c == '-':
-		default:
-			return invalid("volume ID name may contain only A-Z, a-z, 0-9, '.', '_' and '-'")
-		}
-	}
-	if name == "." || name == ".." {
-		return invalid("volume ID name must not be '.' or '..'")
+	if !IsPVName(name) {
+		return invalid("volume ID name must be a provisioner name: pvc- and a lower-case UUID")
 	}
 	return nil
 }

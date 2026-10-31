@@ -1,6 +1,6 @@
 // Command miami is the csi-miami driver: one binary with a subcommand per
 // role. In this scaffold each role only reports its name and the build
-// version.
+// version, except the controller, which serves CSI (controller.go).
 package main
 
 import (
@@ -43,7 +43,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runCommand("version", args[1:], stdout, stderr, func() {
 			_, _ = fmt.Fprintln(stdout, version)
 		})
-	case "node", "controller", "lock":
+	case "controller":
+		return runController(args[1:], stdout, stderr)
+	case "node", "lock":
 		name := args[0]
 		return runCommand(name, args[1:], stdout, stderr, func() {
 			_, _ = fmt.Fprintf(stdout, "miami %s %s\n", name, version)

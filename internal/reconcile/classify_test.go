@@ -117,11 +117,11 @@ func TestTheErrorsThePackageProducesClassifyAsDocumented(t *testing.T) {
 	e := newEnv(t)
 	e.sim.DefaultTimeout = 30 * time.Millisecond
 	e.start()
-	a := e.vol("a", "pvc-1")
+	a := e.vol("a", pvc1)
 
 	// Request errors.
 	bad := a
-	bad.VolumeID = "pvc-1"
+	bad.VolumeID = pvc1
 	outside := a
 	outside.StagePath = filepath.Join(e.base, "elsewhere")
 	for name, tc := range map[string]struct {
@@ -165,21 +165,21 @@ func TestTheErrorsThePackageProducesClassifyAsDocumented(t *testing.T) {
 	e.mkTargetParent("foreign")
 	e.sim.addMount(e.target("foreign"), "tmpfs", "t")
 	check("a publish over a foreign mount", e.r.Publish(bg, a.VolumeID, intent.Publish{TargetPath: e.target("foreign")}), ClassFailedPrecondition)
-	b := e.vol("a", "pvc-2")
+	b := e.vol("a", pvc2)
 	e.sim.addMount(b.StagePath, "tmpfs", "t")
 	check("a stage over a foreign mount", e.r.Stage(bg, b), ClassFailedPrecondition)
 
 	// An item that is not there, and one that is not a directory.
-	c := e.vol("a", "pvc-3")
-	mustNil(t, "rm", os.Remove(filepath.Join(e.host("a"), "pvc-3")))
+	c := e.vol("a", pvc3)
+	mustNil(t, "rm", os.Remove(filepath.Join(e.host("a"), pvc3)))
 	check("a missing item", e.r.Stage(bg, c), ClassNotFound)
-	d := e.vol("a", "pvc-4")
-	mustNil(t, "rm", os.Remove(filepath.Join(e.host("a"), "pvc-4")))
-	mustNil(t, "file", os.WriteFile(filepath.Join(e.host("a"), "pvc-4"), nil, 0o600))
+	d := e.vol("a", pvc4)
+	mustNil(t, "rm", os.Remove(filepath.Join(e.host("a"), pvc4)))
+	mustNil(t, "file", os.WriteFile(filepath.Join(e.host("a"), pvc4), nil, 0o600))
 	check("an item that is a file", e.r.Stage(bg, d), ClassFailedPrecondition)
 
 	// A hung transport: a timeout, and then busy while the call is stuck.
-	f := e.vol("hung", "pvc-5")
+	f := e.vol("hung", pvc5)
 	e.sim.Block(e.tdir("hung"))
 	check("a transport that hangs", e.r.Stage(bg, f), ClassDeadlineExceeded)
 	check("the same transport, still stuck", e.r.Stage(bg, f), ClassUnavailable)
@@ -196,7 +196,7 @@ func TestAnUnstageFailureIsOneError(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	t1 := e.stageAndPublish(in, "pod1", false)
 	e.mkTargetParent("pod2")
 	t2 := e.target("pod2")
@@ -220,7 +220,7 @@ func TestAnUnstageFailureIsOneError(t *testing.T) {
 func TestCallerContextsAndStopClassify(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t) // no loop: a request waits
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 
 	ctx, cancel := context.WithCancel(bg)
 	res := make(chan error, 1)
@@ -246,7 +246,7 @@ func TestCallerContextsAndStopClassify(t *testing.T) {
 func TestTheSupersededAndTheClassString(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	in := e.vol("a", "pvc-1")
+	in := e.vol("a", pvc1)
 	mustNil(t, "save", e.store.Save(in))
 	e.pass()
 	unstage := &request{kind: reqUnstage, volume: in.VolumeID, done: make(chan error, 1)}
