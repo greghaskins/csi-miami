@@ -451,6 +451,18 @@ func TestLoadCorruptRecords(t *testing.T) {
 			t.Errorf("failure for %s has no error", f.Path)
 		}
 		byPath[f.Path] = f.Err
+		wantID, _ := Unescape(strings.TrimSuffix(filepath.Base(f.Path), ".json"))
+		if f.VolumeID != wantID {
+			t.Errorf("failure for %s: VolumeID = %q, want %q", f.Path, f.VolumeID, wantID)
+		}
+	}
+	for _, f := range got.Failures {
+		if filepath.Base(f.Path) == "directory%3Atruncated.json" && f.VolumeID != "directory:truncated" {
+			t.Errorf("VolumeID for the truncated record = %q, want directory:truncated", f.VolumeID)
+		}
+		if filepath.Base(f.Path) == "unescaped:name.json" && f.VolumeID != "" {
+			t.Errorf("VolumeID for a name that does not unescape = %q, want empty", f.VolumeID)
+		}
 	}
 	for _, c := range cases {
 		p := filepath.Join(dir, c.file)
