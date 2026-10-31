@@ -460,12 +460,14 @@ consumer, not an item kind.
 
 ## 7. Image, supply chain and CI
 
-### 7.1 One static binary, built with `ko`
+### 7.1 A static binary on a self-built tools base, assembled by `ko`
 
-The image is the Go binary and nothing else. Every operation the driver
-performs reaches the kernel directly, so there is no package list to
-maintain, no shell, and no helper whose absence or misconfiguration can
-break a mount:
+Two external tools stay in the image, because reimplementing either is a
+data-loss risk not worth taking: `e2fsprogs` (`mkfs.ext4`, `e2fsck -p` on
+every stage, `resize2fs`) and `cryptsetup` (LUKS2 format, open, resize,
+key-slot add and kill). Everything else the driver does reaches the kernel
+directly, so there is no shell and no helper whose absence can break a
+mount:
 
 - **NFS**: `mount(2)` with a kernel-ready option string (`addr=` resolved
   by the driver, `vers=3`, the profile's options). The kernel performs the
@@ -474,49 +476,34 @@ break a mount:
   read from `/proc/self/mountinfo`.
 - **Loop devices**: `LOOP_CTL_GET_FREE`, `LOOP_CONFIGURE` (direct I/O,
   sector size), `LOOP_SET_CAPACITY`, `LOOP_CLR_FD`; observed through sysfs.
-- **ext4 creation**: a small ext4 image is produced at build time by
-  `mke2fs` with a fixed UUID, fixed hash seed and `E2FSPROGS_FAKE_TIME`, so
-  it is byte-reproducible and checked against a recorded digest, then
-  compressed and `go:embed`ded (a few hundred KB). A new volume is a copy
-  of the template, mounted, given a fresh UUID with `EXT4_IOC_SETFSUUID`
-  (kernel 6.0+) and grown to the requested size with `EXT4_IOC_RESIZE_FS`,
-  the same ioctl `resize2fs` uses on a mounted filesystem. Default reserved
-  GDT blocks allow 1024x growth and the kernel converts to `meta_bg`
-  beyond that, so a 64 MiB template reaches any size.
-- **Expansion**: the controller truncates the file while the volume is
-  unpublished; the next stage sets the loop capacity and resizes online.
-- **No fsck on the stage path (decision 16).** The kernel replays the
-  journal itself; `e2fsck` only repairs corruption beyond the journal.
-  Corruption is detected by `errors=remount-ro` and the probes (4.6) and
-  repaired offline, which works on any Linux machine because the volume is
-  a plain file. An optional, separate tools image can run an in-cluster
-  repair Job; the driver image never carries `e2fsprogs`.
-- **Encryption (decision 17)**: LUKS2 implemented in Go. Unlocking a key
-  slot uses an existing library; the dm-crypt table, resize and removal
-  are device-mapper ioctls, and the driver creates its own device node
-  since there is no udev in the container. Header creation, key-slot add
-  and kill are written here: the on-disk format, argon2id and the
-  anti-forensic split are all specified and small. CI uses real
-  `cryptsetup` as the oracle in both directions (it opens what the driver
-  formats; the driver opens what it formats). Plain dm-crypt without a
-  header was the simpler alternative and was rejected because cheap key
-  rotation and standard offline recovery were deliberate choices.
 - **Fencing**: `EXT4_IOC_SHUTDOWN` and a netlink `SOCK_DESTROY`; no `ss`.
-- **ext4 probes**: `O_DIRECT` reads and `statfs`, syscalls.
+- **Probes**: `O_DIRECT` reads and `statfs`, syscalls.
+- **Device nodes**: dm-crypt mappings are created by `cryptsetup`, which
+  makes its own `/dev/mapper` node when no udev is present.
 
-Build: `ko` with `--platform=linux/amd64,linux/arm64`, base image
-`distroless/static` pinned by digest (scratch plus CA certificates and
-timezone data, which the API client wants), `SOURCE_DATE_EPOCH` for
-reproducible layers, SPDX SBOM emitted by `ko` itself. No Dockerfile, no
-Docker daemon in CI, no emulation: Go cross-compiles. Size target: under
-25 MB per architecture. The controller is the same image with a different
-subcommand.
+**The image (decision 13).** A tools base is built in this repository: a
+digest-pinned musl builder stage installs `e2fsprogs` and `cryptsetup`, a
+script computes the shared-library closure of exactly the binaries the
+driver calls, and only that closure is copied into a `scratch` final stage.
+No shell, no package manager, no `busybox`; roughly 10 to 15 MB per
+architecture. `ko` then uses that image as its base, pinned by digest in
+`.ko.yaml`, and layers the static Go binary on top with
+`--platform=linux/amd64,linux/arm64` (`ko` resolves a multi-arch base
+index per platform). The tools base is rebuilt by a scheduled workflow
+against the pinned distribution release and scanned, so security
+advisories reach it without a code change; the driver image is rebuilt by
+every PR. The controller is the same image with a different subcommand.
 
-Build-time only dependencies: `e2fsprogs` (template) and `cryptsetup`
-(oracle), both on the CI runner, never in the image. Milestone 3's
-kernel NFS re-export needs the kernel's export table fed; that is either
-the host's `nfs-utils` or a small Go responder for the kernel's export
-upcall channel, decided then.
+**Rejected: borrowing the tools from the host.** Running the host's
+`e2fsck` and `cryptsetup` in a child process chrooted into a read-only
+host-root mount works and keeps the image to one binary, but it demands
+host packages, which almost no CSI driver does, ties correctness to a tool
+version that varies per node and per OS upgrade, and means CI cannot test
+the bytes that run. It remains an escape hatch, not the default.
+
+Milestone 3's kernel NFS re-export needs the kernel's export table fed;
+that is either the host's `nfs-utils` or a small Go responder for the
+kernel's export upcall channel, decided then.
 
 Runtime posture:
 
@@ -558,7 +545,7 @@ Every PR runs the full set below as parallel jobs; nothing waits for
 | `static` | `gofmt -s`, `go vet`, `golangci-lint`, `go mod tidy` drift, `govulncheck` | cache |
 | `unit` | `go test -race -shuffle=on ./...` with coverage | cache |
 | `envtest` | PV lookups, PV recreation, admission policy CEL against a real API server | setup-envtest cache |
-| `build` | `make template` (reproducible, digest-checked), then `ko build` for both platforms, image tarball uploaded as an artifact | Go cache |
+| `build` | `ko build` for both platforms on the digest-pinned tools base, image tarball uploaded as an artifact | Go cache |
 | `smoke` | root on the runner: loop devices, ext4, LUKS2, `unshare --mount` plugin replacement, simulated reboot | the image artifact |
 | `sanity` | csi-sanity against the binary | the image artifact |
 | `e2e` matrix `local`, `nfs3`, `nfs4` | kind cluster, real NFS server container (kernel server for `nfs3` and `nfs4`), fault injection: server restart, partition, plugin restart, force detach, surge rollout, holder kill with remote writers | the image artifact |
@@ -630,18 +617,19 @@ Recorded:
     **Node-local persistent** is an image item on the `local` transport
     with topology and a move operation (5.2), scheduled after RWX images.
 
-13. **Image**: one static Go binary on digest-pinned `distroless/static`,
-    built with `ko`; no shell, no tools, no mount helpers (7.1).
-14. **Syscalls and ioctls over shell-outs** for everything: NFS mounts,
-    loop devices, ext4 creation from an embedded template with online
-    resize, dm-crypt, fencing (7.1), each proven on real NFSv3 in CI.
+13. **Image**: one static Go binary layered by `ko` onto a self-built,
+    digest-pinned tools base holding only `e2fsprogs`, `cryptsetup` and
+    their library closure; no shell, no mount helpers (7.1).
+14. **Syscalls and ioctls over shell-outs** for NFS mounts, loop devices,
+    fencing and probes (7.1), each proven on real NFSv3 in CI.
 15. **CI shape**: parallel jobs on every PR including smoke, sanity and
     the kind e2e matrix, one required `ci-ok` check, no retries, build once
     (7.3).
 
-16. **No fsck on the stage path**; repair is offline or through a
-    separate tools image (7.1).
-17. **LUKS2 in Go**, with `cryptsetup` as a CI oracle only (7.1).
+16. **`e2fsck -p` stays on the stage path** and `mkfs.ext4` and
+    `resize2fs` are the real tools; no embedded template, no fsck-free
+    mounts (7.1).
+17. **LUKS2 through `cryptsetup`**, not a Go implementation (7.1).
 
 Pending: none that block M1.
 
