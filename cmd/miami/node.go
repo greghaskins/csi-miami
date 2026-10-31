@@ -162,7 +162,7 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		return err
 	}
 
-	reg := metrics.New()
+	reg := metrics.New(metrics.WithReconciler())
 	opts := reconcile.Options{
 		TransportsRoot: tRoot,
 		StageRoot:      sRoot,
@@ -205,11 +205,16 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	}
 
 	// Each part has a context of its own, cancelled in the order above.
-	var wg sync.WaitGroup
-	start := func(parent context.Context, f func(context.Context)) context.CancelFunc {
-		c, cancel := context.WithCancel(parent)
-		wg.Go(func() { f(c) })
-		return cancel
+	// start runs f and returns the function that stops it: cancel its context
+	// and wait for f to return, so the order below is the order that happens.
+	start := func(f func(context.Context)) (stop func()) {
+		c, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f(c)
+		}()
+		return func() { cancel(); <-done }
 	}
 	srvCtx, srvCancel := context.WithCancel(ctx)
 	defer srvCancel()
@@ -220,18 +225,18 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		srvCancel()
 	}
 
-	stopRec := start(context.Background(), func(c context.Context) {
+	stopRec := start(func(c context.Context) {
 		if err := rec.Run(c); err != nil {
 			fail(fmt.Errorf("reconciler: %w", err))
 		}
 	})
 	stopEvents := func() {}
 	if events != nil {
-		stopEvents = start(context.Background(), events.Run)
+		stopEvents = start(events.Run)
 	}
 	stopMetrics := func() {}
 	if metricsLis != nil {
-		stopMetrics = start(context.Background(), func(c context.Context) {
+		stopMetrics = start(func(c context.Context) {
 			if err := reg.Serve(c, metricsLis); err != nil {
 				fail(fmt.Errorf("metrics server: %w", err))
 			}
@@ -251,7 +256,6 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	stopRec()
 	stopEvents()
 	stopMetrics()
-	wg.Wait()
 	if serveErr != nil {
 		return serveErr
 	}

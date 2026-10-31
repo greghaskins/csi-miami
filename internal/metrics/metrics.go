@@ -52,10 +52,28 @@ type Registry struct {
 
 var _ reconcile.Metrics = (*Registry)(nil)
 
-// New returns a Registry with every metric of the package, the Go collector
-// and the process collector registered on its own prometheus.Registry (the
-// global default registry is not used).
-func New() *Registry {
+// Option configures New.
+type Option func(*options)
+
+type options struct{ reconciler bool }
+
+// WithReconciler registers the reconciler's family (the intents, transports,
+// reconcile duration and error, timeout, garbage and load-failure metrics).
+// Only the node runs a reconciler; without the option those metrics are not
+// exposed, so the controller's endpoint does not carry a family that is always
+// zero. The Registry still implements reconcile.Metrics, and its methods work
+// either way.
+func WithReconciler() Option { return func(o *options) { o.reconciler = true } }
+
+// New returns a Registry with the CSI request metrics, the Go collector and
+// the process collector registered on its own prometheus.Registry (the global
+// default registry is not used), and the reconciler's family if WithReconciler
+// is given.
+func New(opts ...Option) *Registry {
+	var o options
+	for _, f := range opts {
+		f(&o)
+	}
 	r := &Registry{reg: prometheus.NewRegistry()}
 	r.intents = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "miami_intents", Help: "Intents (volumes staged on this node) by volume kind.",
@@ -94,11 +112,16 @@ func New() *Registry {
 	}
 
 	r.reg.MustRegister(
-		r.intents, r.transports, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
-		r.garbage, r.loadFailures, r.requests, r.requestDuration,
+		r.requests, r.requestDuration,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
+	if o.reconciler {
+		r.reg.MustRegister(
+			r.intents, r.transports, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
+			r.garbage, r.loadFailures,
+		)
+	}
 	return r
 }
 

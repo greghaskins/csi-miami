@@ -61,7 +61,7 @@ func sample(t *testing.T, r *Registry, name string, want map[string]string) *dto
 
 func TestReconcileMetricsHaveThePlansNamesAndLabels(t *testing.T) {
 	t.Parallel()
-	r := New()
+	r := New(WithReconciler())
 	r.SetIntents("directory", 3)
 	r.SetTransport("local", "abc123", true)
 	r.SetTransport("nfs3", "def456", false)
@@ -162,7 +162,7 @@ func TestShortMethod(t *testing.T) {
 
 func TestHandlerServesMetricsAndHealth(t *testing.T) {
 	t.Parallel()
-	r := New()
+	r := New(WithReconciler())
 	r.SetIntents("directory", 1)
 	h := r.Handler()
 
@@ -231,7 +231,7 @@ func TestServeReportsAListenerThatFails(t *testing.T) {
 // first failure.
 func TestStepCountersExistAtZero(t *testing.T) {
 	t.Parallel()
-	r := New()
+	r := New(WithReconciler())
 	for _, step := range ReconcileSteps {
 		if v := sample(t, r, "miami_reconcile_errors_total", map[string]string{"step": step}).GetCounter().GetValue(); v != 0 {
 			t.Errorf("errors[%s] = %v", step, v)
@@ -239,5 +239,31 @@ func TestStepCountersExistAtZero(t *testing.T) {
 		if v := sample(t, r, "miami_observation_timeouts_total", map[string]string{"op": step}).GetCounter().GetValue(); v != 0 {
 			t.Errorf("timeouts[%s] = %v", step, v)
 		}
+	}
+}
+
+// Without WithReconciler the reconciler's family is not exposed (the
+// controller), though the methods still work; the request metrics are.
+func TestReconcilerFamilyOnlyOnRequest(t *testing.T) {
+	t.Parallel()
+	r := New()
+	r.SetIntents("directory", 1)
+	r.IncReconcileError("item")
+	r.ObserveReconcile(time.Millisecond)
+	for _, name := range []string{
+		"miami_intents", "miami_transports", "miami_reconcile_duration_seconds", "miami_reconcile_errors_total",
+		"miami_observation_timeouts_total", "miami_garbage_unmounts_total", "miami_intent_load_failures",
+	} {
+		if family(t, r, name) != nil {
+			t.Errorf("%s is exposed without WithReconciler", name)
+		}
+	}
+	_, _ = r.MetricsInterceptor()(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/csi.v1.Identity/Probe"},
+		func(context.Context, any) (any, error) { return nil, nil })
+	if family(t, r, "miami_csi_requests_total") == nil || family(t, r, "go_goroutines") == nil {
+		t.Error("the request metrics or the Go collector are missing")
+	}
+	if family(t, New(WithReconciler()), "miami_intent_load_failures") == nil {
+		t.Error("WithReconciler did not register the family")
 	}
 }
