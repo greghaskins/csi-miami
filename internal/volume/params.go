@@ -3,6 +3,7 @@ package volume
 import (
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/greghaskins/csi-miami/internal/transport"
 )
@@ -14,11 +15,12 @@ const (
 )
 
 // Parameters the external-provisioner injects when --extra-create-metadata
-// is on. ParseParameters reads them for token values.
+// is on. ParseParameters reads them for token values. The PV name it also
+// injects is deliberately not read: the volume's name comes from the volume
+// ID alone.
 const (
 	paramPVCName      = "csi.storage.k8s.io/pvc/name"
 	paramPVCNamespace = "csi.storage.k8s.io/pvc/namespace"
-	paramPVName       = "csi.storage.k8s.io/pv/name"
 
 	// providerPrefix marks every parameter the provisioner injects; ones we
 	// do not read are ignored rather than rejected.
@@ -30,14 +32,15 @@ const (
 type Params struct {
 	Kind           Kind
 	Transport      transport.Spec
-	SubdirTemplate string // DefaultSubdir when the StorageClass sets none
+	SubdirTemplate string // empty when the StorageClass sets none: no prefix
 	Tokens         Tokens // from the provisioner's extra create metadata
 }
 
 // ParseParameters parses and validates StorageClass parameters. Parameter
 // names are case-sensitive and an unknown one is InvalidArgument, so a typo
 // cannot silently mean the default. Keys under csi.storage.k8s.io/ other
-// than the three the provisioner uses for tokens are ignored.
+// than the two the provisioner uses for tokens are ignored. An empty or
+// absent subdir means no prefix.
 func ParseParameters(params map[string]string) (Params, error) {
 	// Sorted, so that which unknown key is named does not depend on map
 	// order.
@@ -59,17 +62,16 @@ func ParseParameters(params map[string]string) (Params, error) {
 		}
 	}
 
+	if _, set := params[ParamKind]; !set {
+		return Params{}, invalid("parameter " + ParamKind + " is required (directory)")
+	}
 	p := Params{
 		Kind:           Kind(params[ParamKind]),
-		SubdirTemplate: DefaultSubdir,
+		SubdirTemplate: params[ParamSubdir],
 		Tokens: Tokens{
 			PVCNamespace: params[paramPVCNamespace],
 			PVCName:      params[paramPVCName],
-			PVName:       params[paramPVName],
 		},
-	}
-	if _, set := params[ParamKind]; !set {
-		return Params{}, invalid("parameter " + ParamKind + " is required (directory)")
 	}
 	if !p.Kind.Valid() {
 		return Params{}, invalid("parameter " + ParamKind + " must be directory")
@@ -80,24 +82,18 @@ func ParseParameters(params map[string]string) (Params, error) {
 		return Params{}, err
 	}
 	p.Transport = spec
-
-	if tmpl, set := params[ParamSubdir]; set {
-		if tmpl == "" {
-			return Params{}, invalid("parameter " + ParamSubdir + " must not be empty; omit it for the default " + DefaultSubdir)
-		}
-		p.SubdirTemplate = tmpl
-	}
 	return p, nil
 }
 
-// quote renders an untrusted key for an error message.
+// quote renders untrusted text (a key or a token name) for an error
+// message: truncated, with anything that is not printable replaced.
 func quote(s string) string {
 	const limit = 64
 	if len(s) > limit {
 		s = s[:limit] + "..."
 	}
 	return "\"" + strings.Map(func(r rune) rune {
-		if r < ' ' || r == '"' || r == '\\' || r == 0x7f {
+		if !unicode.IsPrint(r) || r == '"' || r == '\\' {
 			return '?'
 		}
 		return r

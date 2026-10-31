@@ -14,8 +14,15 @@ type Kind string
 // KindDirectory is a directory on a transport.
 const KindDirectory Kind = "directory"
 
-// maxNameLen is the longest volume name, in bytes.
-const maxNameLen = 200
+const (
+	// maxNameLen is the longest volume name, in bytes. With the longest
+	// kind, "directory:", the ID is then exactly maxIDLen. A longer kind
+	// needs a shorter limit; TestNameLimitFitsEveryKind catches it.
+	maxNameLen = 118
+
+	// maxIDLen is the longest volume ID CSI allows, in bytes.
+	maxIDLen = 128
+)
 
 // Valid reports whether k is a kind this driver knows.
 func (k Kind) Valid() bool {
@@ -51,7 +58,7 @@ func (id ID) Validate() error {
 	return validateName(id.Name)
 }
 
-// validateName allows [A-Za-z0-9._-], 1 to 200 bytes. "." and ".." are
+// validateName allows [A-Za-z0-9._-], 1 to 118 bytes. "." and ".." are
 // refused as well so that a name is never a path traversal if it is ever
 // used as a file name.
 func validateName(name string) error {
@@ -59,7 +66,7 @@ func validateName(name string) error {
 		return invalid("volume ID name must not be empty")
 	}
 	if len(name) > maxNameLen {
-		return invalid("volume ID name must be at most 200 bytes")
+		return invalid("volume ID name must be at most 118 bytes")
 	}
 	for i := 0; i < len(name); i++ {
 		c := name[i]

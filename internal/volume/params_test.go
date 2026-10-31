@@ -8,9 +8,11 @@ import (
 	"github.com/greghaskins/csi-miami/internal/transport"
 )
 
+// del, as an override value, deletes the key.
+const del = "\x00delete"
+
 // nfsParams returns valid StorageClass parameters for an NFS transport with
-// the provisioner's metadata, with overrides applied; an override of "\x00"
-// deletes the key.
+// the provisioner's metadata, with overrides applied.
 func nfsParams(overrides map[string]string) map[string]string {
 	p := map[string]string{
 		"kind":                             "directory",
@@ -19,10 +21,10 @@ func nfsParams(overrides map[string]string) map[string]string {
 		"transport.export":                 "/export/data",
 		"csi.storage.k8s.io/pvc/name":      "data",
 		"csi.storage.k8s.io/pvc/namespace": "team-a",
-		"csi.storage.k8s.io/pv/name":       "pvc-0a1b",
+		"csi.storage.k8s.io/pv/name":       pvUUID1,
 	}
 	for k, v := range overrides {
-		if v == "\x00" {
+		if v == del {
 			delete(p, k)
 		} else {
 			p[k] = v
@@ -34,7 +36,7 @@ func nfsParams(overrides map[string]string) map[string]string {
 func TestParseParameters(t *testing.T) {
 	t.Parallel()
 	nfs := transport.Spec{Kind: "nfs3", Server: "nas.example.com", Export: "/export/data"}
-	tokens := Tokens{PVCNamespace: "team-a", PVCName: "data", PVName: "pvc-0a1b"}
+	tokens := Tokens{PVCNamespace: "team-a", PVCName: "data"}
 
 	tests := []struct {
 		name   string
@@ -44,9 +46,9 @@ func TestParseParameters(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:   "nfs3 with default subdir",
+			name:   "nfs3 with no subdir",
 			params: nfsParams(nil),
-			want:   Params{Kind: KindDirectory, Transport: nfs, SubdirTemplate: DefaultSubdir, Tokens: tokens},
+			want:   Params{Kind: KindDirectory, Transport: nfs, Tokens: tokens},
 		},
 		{
 			name:   "explicit subdir",
@@ -54,28 +56,38 @@ func TestParseParameters(t *testing.T) {
 			want:   Params{Kind: KindDirectory, Transport: nfs, SubdirTemplate: "${pvc.namespace}/${pvc.name}", Tokens: tokens},
 		},
 		{
+			name:   "explicit empty subdir means no prefix",
+			params: nfsParams(map[string]string{"subdir": ""}),
+			want:   Params{Kind: KindDirectory, Transport: nfs, Tokens: tokens},
+		},
+		{
 			name: "local without provisioner metadata",
 			params: map[string]string{
 				"kind": "directory", "transport.kind": "local", "transport.path": "/export/data",
 			},
-			want: Params{Kind: KindDirectory, Transport: transport.Spec{Kind: "local", Path: "/export/data"}, SubdirTemplate: DefaultSubdir},
+			want: Params{Kind: KindDirectory, Transport: transport.Spec{Kind: "local", Path: "/export/data"}},
 		},
 		{
-			name:   "other csi.storage.k8s.io keys are ignored",
+			name:   "transport is normalized",
+			params: nfsParams(map[string]string{"transport.server": "NAS.Example.com", "transport.export": "/export/data/"}),
+			want:   Params{Kind: KindDirectory, Transport: nfs, Tokens: tokens},
+		},
+		{
+			name:   "other csi.storage.k8s.io keys are ignored, pv/name is not a token",
 			params: nfsParams(map[string]string{"csi.storage.k8s.io/pv/annotations": "x", "csi.storage.k8s.io/future": "y"}),
-			want:   Params{Kind: KindDirectory, Transport: nfs, SubdirTemplate: DefaultSubdir, Tokens: tokens},
+			want:   Params{Kind: KindDirectory, Transport: nfs, Tokens: tokens},
 		},
 
 		{name: "no parameters", params: nil, wantErr: "parameter kind is required"},
-		{name: "missing kind", params: nfsParams(map[string]string{"kind": "\x00"}), wantErr: "parameter kind is required"},
+		{name: "missing kind", params: nfsParams(map[string]string{"kind": del}), wantErr: "parameter kind is required"},
 		{name: "empty kind", params: nfsParams(map[string]string{"kind": ""}), wantErr: "parameter kind must be directory"},
 		{name: "unknown kind", params: nfsParams(map[string]string{"kind": "image"}), wantErr: "parameter kind must be directory"},
-		{name: "missing transport.kind", params: nfsParams(map[string]string{"transport.kind": "\x00"}), wantErr: "transport.kind is required"},
+		{name: "missing transport.kind", params: nfsParams(map[string]string{"transport.kind": del}), wantErr: "transport.kind is required"},
 		{name: "unknown transport.kind", params: nfsParams(map[string]string{"transport.kind": "smb"}), wantErr: "transport.kind must be"},
-		{name: "nfs3 without server", params: nfsParams(map[string]string{"transport.server": "\x00"}), wantErr: "transport.server is required"},
-		{name: "nfs3 without export", params: nfsParams(map[string]string{"transport.export": "\x00"}), wantErr: "transport.export is required"},
+		{name: "nfs3 without server", params: nfsParams(map[string]string{"transport.server": del}), wantErr: "transport.server is required"},
+		{name: "nfs3 without export", params: nfsParams(map[string]string{"transport.export": del}), wantErr: "transport.export is required"},
+		{name: "nfs3 export is the root", params: nfsParams(map[string]string{"transport.export": "/"}), wantErr: "filesystem root"},
 		{name: "local without path", params: map[string]string{"kind": "directory", "transport.kind": "local"}, wantErr: "transport.path is required"},
-		{name: "empty subdir", params: nfsParams(map[string]string{"subdir": ""}), wantErr: "parameter subdir must not be empty"},
 
 		{name: "unknown parameter", params: nfsParams(map[string]string{"subDir": "x"}), wantErr: `unknown parameter "subDir"`},
 		{name: "parameter names are case sensitive", params: nfsParams(map[string]string{"Kind": "directory"}), wantErr: `unknown parameter "Kind"`},
@@ -112,14 +124,16 @@ func TestParseParametersErrorsNameOnlyTheKey(t *testing.T) {
 
 func TestParseParametersQuotesUntrustedKeys(t *testing.T) {
 	t.Parallel()
+	// U+0085 is a C1 control: not printable, but above the C0 range.
+	nel := string(rune(0x85))
 	long := strings.Repeat("k", 100)
-	_, err := ParseParameters(nfsParams(map[string]string{long: "x", "bad\"key\n": "y"}))
+	_, err := ParseParameters(nfsParams(map[string]string{long: "x", "bad\"key\n" + nel: "y"}))
 	wantInvalid(t, err, "unknown parameter")
 	if len(err.Error()) > 200 {
 		t.Errorf("error is %d bytes; keys must be truncated", len(err.Error()))
 	}
-	if strings.ContainsAny(err.Error(), "\n") {
-		t.Errorf("error %q contains a newline", err.Error())
+	if strings.ContainsAny(err.Error(), "\n"+nel) {
+		t.Errorf("error %q contains a non-printable character", err.Error())
 	}
 }
 
@@ -133,9 +147,14 @@ func TestNewContext(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:   "default subdir is the PV name",
+			name:   "no subdir is no prefix",
 			params: nfsParams(nil),
-			want:   Context{Kind: KindDirectory, Transport: nfs, Subdir: "pvc-0a1b"},
+			want:   Context{Kind: KindDirectory, Transport: nfs},
+		},
+		{
+			name:   "empty subdir is no prefix",
+			params: nfsParams(map[string]string{"subdir": ""}),
+			want:   Context{Kind: KindDirectory, Transport: nfs},
 		},
 		{
 			name:   "namespace and name tokens",
@@ -143,9 +162,24 @@ func TestNewContext(t *testing.T) {
 			want:   Context{Kind: KindDirectory, Transport: nfs, Subdir: "team-a/data"},
 		},
 		{
-			name:    "default subdir without metadata",
-			params:  nfsParams(map[string]string{"csi.storage.k8s.io/pv/name": "\x00"}),
-			wantErr: "${pv.name} is empty",
+			name:   "template that cleans to dot is no prefix",
+			params: nfsParams(map[string]string{"subdir": "./"}),
+			want:   Context{Kind: KindDirectory, Transport: nfs},
+		},
+		{
+			name:   "forged pv/name does not steer anything",
+			params: nfsParams(map[string]string{"subdir": "x", "csi.storage.k8s.io/pv/name": "../../etc"}),
+			want:   Context{Kind: KindDirectory, Transport: nfs, Subdir: "x"},
+		},
+		{
+			name:    "pv.name token is withdrawn",
+			params:  nfsParams(map[string]string{"subdir": "${pv.name}"}),
+			wantErr: `unknown token "pv.name"`,
+		},
+		{
+			name:    "token without metadata",
+			params:  nfsParams(map[string]string{"subdir": "${pvc.name}", "csi.storage.k8s.io/pvc/name": del}),
+			wantErr: "${pvc.name} is empty",
 		},
 		{
 			name:    "subdir escaping the transport",
@@ -156,6 +190,11 @@ func TestNewContext(t *testing.T) {
 			name:    "PVC name with a slash",
 			params:  nfsParams(map[string]string{"subdir": "${pvc.name}", "csi.storage.k8s.io/pvc/name": "a/b"}),
 			wantErr: "single path element",
+		},
+		{
+			name:    "PVC named like a PV",
+			params:  nfsParams(map[string]string{"subdir": "${pvc.name}", "csi.storage.k8s.io/pvc/name": pvUUID2}),
+			wantErr: "PV name",
 		},
 		{
 			name:    "unknown parameter",

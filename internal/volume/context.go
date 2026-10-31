@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -22,14 +23,17 @@ const (
 
 // Context is the volume context set by CreateVolume, stored on the PV and
 // sent on every node call.
+//
+// The directory of a volume is always <transport mount>/<Subdir>/<name>,
+// where name comes from the volume ID; Dir computes it.
 type Context struct {
 	Kind      Kind
 	Transport transport.Spec
-	Subdir    string // resolved, relative, cleaned
+	Subdir    string // optional prefix, relative and cleaned; empty means none
 }
 
-// Validate reports whether the Context is complete and well formed. The
-// error carries the gRPC code InvalidArgument.
+// Validate reports whether the Context is complete and exactly in the form
+// NewContext produces. The error carries the gRPC code InvalidArgument.
 func (c Context) Validate() error {
 	if !c.Kind.Valid() {
 		return invalid("volume context " + keyKind + " must be directory")
@@ -37,14 +41,43 @@ func (c Context) Validate() error {
 	if err := c.Transport.Validate(); err != nil {
 		return err
 	}
-	cleaned, err := cleanSubdir(c.Subdir)
-	if err != nil {
-		return err
-	}
-	if cleaned != c.Subdir {
-		return invalid("subdir must be a cleaned path")
+	if c.Subdir != "" {
+		return validateSubdir(c.Subdir)
 	}
 	return nil
+}
+
+// MatchesID returns InvalidArgument unless id is a valid volume ID of the
+// same kind as the Context.
+func (c Context) MatchesID(id ID) error {
+	if err := id.Validate(); err != nil {
+		return err
+	}
+	if id.Kind != c.Kind {
+		return invalid("volume ID kind does not match the volume context kind")
+	}
+	return nil
+}
+
+// Dir returns the directory of the volume: <transport mount>/<Subdir>/<name>
+// with the transport mounted under root (see transport.Spec.MountPoint). It
+// is the one place the directory is computed. Because the volume's own name is
+// always the last element, no two volumes share a directory.
+//
+// It returns InvalidArgument if the Context or the ID is invalid, if their
+// kinds differ, or if root is not an absolute, cleaned path.
+func (c Context) Dir(root string, id ID) (string, error) {
+	if err := c.Validate(); err != nil {
+		return "", err
+	}
+	if err := c.MatchesID(id); err != nil {
+		return "", err
+	}
+	mount, err := c.Transport.MountPoint(root)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(mount, c.Subdir, id.Name), nil
 }
 
 // Encode returns the volume context map. Empty values are omitted.
@@ -65,8 +98,10 @@ func (c Context) Encode() map[string]string {
 }
 
 // DecodeContext reads a volume context. It returns InvalidArgument for a
-// missing or malformed key and for any unknown key that starts with
-// "miami/"; keys without that prefix are ignored.
+// missing or malformed key, for any unknown key that starts with "miami/",
+// and for anything NewContext would not have produced (it never cleans or
+// repairs a value); keys without that prefix are ignored. The subdir key may
+// be absent.
 func DecodeContext(m map[string]string) (Context, error) {
 	var unknown []string
 	for k := range m {
@@ -84,7 +119,7 @@ func DecodeContext(m map[string]string) (Context, error) {
 		return Context{}, invalid("unknown volume context key " + quote(unknown[0]))
 	}
 
-	for _, k := range []string{keyKind, keyTransportKind, keySubdir} {
+	for _, k := range []string{keyKind, keyTransportKind} {
 		if m[k] == "" {
 			return Context{}, invalid("volume context key " + k + " is required")
 		}
@@ -100,14 +135,6 @@ func DecodeContext(m map[string]string) (Context, error) {
 		},
 		Subdir: m[keySubdir],
 	}
-	if !c.Kind.Valid() {
-		return Context{}, invalid("volume context key " + keyKind + " must be directory")
-	}
-	subdir, err := cleanSubdir(c.Subdir)
-	if err != nil {
-		return Context{}, err
-	}
-	c.Subdir = subdir
 	if err := c.Validate(); err != nil {
 		return Context{}, err
 	}

@@ -34,7 +34,7 @@ func TestParseID(t *testing.T) {
 	}{
 		{name: "pvc name", in: "directory:pvc-0a1b2c3d-1111-2222-3333-444455556666", want: ID{KindDirectory, "pvc-0a1b2c3d-1111-2222-3333-444455556666"}},
 		{name: "every allowed character", in: "directory:aZ09._-", want: ID{KindDirectory, "aZ09._-"}},
-		{name: "longest name", in: "directory:" + strings.Repeat("a", 200), want: ID{KindDirectory, strings.Repeat("a", 200)}},
+		{name: "longest name", in: "directory:" + strings.Repeat("a", 118), want: ID{KindDirectory, strings.Repeat("a", 118)}},
 		{name: "dots inside a name", in: "directory:a..b", want: ID{KindDirectory, "a..b"}},
 
 		{name: "empty", in: "", wantErr: "<kind>:<name>"},
@@ -43,7 +43,7 @@ func TestParseID(t *testing.T) {
 		{name: "unknown kind", in: "image:pvc-1", wantErr: "kind"},
 		{name: "kind is case sensitive", in: "Directory:pvc-1", wantErr: "kind"},
 		{name: "empty name", in: "directory:", wantErr: "must not be empty"},
-		{name: "name too long", in: "directory:" + strings.Repeat("a", 201), wantErr: "at most 200 bytes"},
+		{name: "name too long", in: "directory:" + strings.Repeat("a", 119), wantErr: "at most 118 bytes"},
 		{name: "second colon", in: "directory:pvc:1", wantErr: "may contain only"},
 		{name: "slash in name", in: "directory:pvc/1", wantErr: "may contain only"},
 		{name: "space in name", in: "directory:pvc 1", wantErr: "may contain only"},
@@ -82,6 +82,18 @@ func TestIDRoundTrip(t *testing.T) {
 	}
 	if back != id {
 		t.Errorf("round trip = %+v, want %+v", back, id)
+	}
+}
+
+// TestNameLimitFitsEveryKind keeps the longest ID within CSI's 128-byte
+// volume_id limit when a kind is added.
+func TestNameLimitFitsEveryKind(t *testing.T) {
+	t.Parallel()
+	for _, k := range []Kind{KindDirectory} {
+		id := ID{Kind: k, Name: strings.Repeat("a", maxNameLen)}
+		if got := len(id.String()); got > maxIDLen {
+			t.Errorf("longest %s ID is %d bytes, over %d", k, got, maxIDLen)
+		}
 	}
 }
 
