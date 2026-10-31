@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
+	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -145,9 +147,9 @@ func TestDeleteVolumeNeverDeletesOnDoubt(t *testing.T) {
 		{"transport cannot be mounted", func(e *env, _ *kube.PV) {
 			e.mounter.FailOp(fake.OpBind, e.mountDir(), errors.New("boom"))
 		}, codes.Unavailable, "cannot be mounted"},
-		{"mount table unreadable", func(e *env, _ *kube.PV) {
+		{"mount table unreadable while mounting", func(e *env, _ *kube.PV) {
 			e.mounter.SetMountsError(errors.New("no mountinfo"))
-		}, codes.Unavailable, ""},
+		}, codes.Unavailable, "cannot be mounted"},
 		{"a mount inside the directory", func(e *env, _ *kube.PV) {
 			e.mounter.SetTable(tableWithMountAt(filepath.Join(e.mountDir(), nameA, "deep")))
 		}, codes.Unavailable, "mount is at or below"},
@@ -393,4 +395,68 @@ func TestDeleteVolumeNeverTreatsASubdirAsAVolume(t *testing.T) {
 	if calls := e.pvs.Calls(); len(calls) != 0 {
 		t.Errorf("a PV was read for a name that is not a volume name: %v", calls)
 	}
+}
+
+// failingTable is a mount table reader that cannot be read.
+type failingTable struct{}
+
+func (failingTable) Mounts(context.Context) (observe.Table, error) {
+	return nil, errors.New("no mountinfo")
+}
+
+// The mount table is read after the transport is mounted, to prove that no
+// mount is inside the directory. When it cannot be read, nothing is deleted.
+func TestRemoveItemDirNeverDeletesWithoutTheMountTable(t *testing.T) {
+	t.Parallel()
+	mountDir := resolved(t, t.TempDir())
+	dir := filepath.Join(mountDir, nameA)
+	writeFile(t, filepath.Join(dir, "precious"), "x")
+
+	removed, err := removeItemDir(context.Background(), failingTable{}, mountDir, dir, nameA)
+	if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "mount table") || removed {
+		t.Fatalf("removed = %v, error = %v; want Unavailable naming the mount table", removed, err)
+	}
+	mustExist(t, filepath.Join(dir, "precious"))
+}
+
+// afterFirstMounts is a Mounter whose mount table can be read for the first n
+// reads only: enough for the transport to be mounted, not for the delete
+// path's own check afterwards.
+type afterFirstMounts struct {
+	*fake.Mounter
+	mu    sync.Mutex
+	reads int
+	n     int
+}
+
+func (m *afterFirstMounts) Mounts(ctx context.Context) (observe.Table, error) {
+	m.mu.Lock()
+	m.reads++
+	fail := m.reads > m.n
+	m.mu.Unlock()
+	if fail {
+		return nil, errors.New("no mountinfo")
+	}
+	return m.Mounter.Mounts(ctx)
+}
+
+func TestDeleteVolumeWhenTheMountTableFailsAfterTheMount(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	id, dir, sibling := volumeWithContent(t, e)
+	flaky := &afterFirstMounts{Mounter: e.mounter, n: 1}
+	ctrl, err := NewController(ControllerOptions{Root: e.root, Mounter: flaky, PVs: e.pvs})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ctrl.DeleteVolume(context.Background(), deleteReq(id))
+	if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "mount table") {
+		t.Fatalf("error = %v, want Unavailable naming the mount table", err)
+	}
+	if flaky.reads < 2 {
+		t.Fatalf("the mount table was read %d times; the test must reach the delete path's own read", flaky.reads)
+	}
+	mustExist(t, filepath.Join(dir, "a.txt"))
+	mustExist(t, filepath.Join(sibling, "keep.txt"))
 }
