@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 19 recorded (section 9)
+**Status:** Draft, decisions 1 to 20 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -677,6 +677,13 @@ Recorded:
     run re-runs the image before aliasing, and the alias is created from the
     index that `main`'s own run verified. Provenance describes the run that
     built the tag, which may be a pull request merge ref.
+20. **One directory per volume**: a directory item lives at
+    `<transport>/<subdir>/<name>`, where `subdir` is an optional per-class
+    prefix built from `${pvc.namespace}` and `${pvc.name}` and `name` is
+    always the volume's own name from the volume ID. No template can make
+    two volumes share a directory or nest one inside another: elements
+    shaped like a PV name are rejected. The plan's `<transport>/<subdir>`
+    with a `${pv.name}` token is withdrawn.
 
 Pending: none that block M1.
 
