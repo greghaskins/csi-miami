@@ -17,8 +17,8 @@ import (
 // Suggested mapping: ErrUnknownVolume to NotFound or FailedPrecondition (the
 // CSI call decides); ErrItemMissing to NotFound; ErrTransportConflict,
 // ErrStageConflict, ErrPublishConflict, ErrItemNotDirectory and
-// ErrStagePathOutsideRoot to FailedPrecondition or InvalidArgument as the
-// call warrants; mount.ErrTimeout to DeadlineExceeded; mount.ErrBusy,
+// ErrStagePathOutsideRoot and ErrTargetOutsideScope to InvalidArgument or
+// FailedPrecondition as the call warrants; mount.ErrTimeout to DeadlineExceeded; mount.ErrBusy,
 // ErrTransportUnavailable and ErrIntentsUnknown to Unavailable.
 var (
 	// ErrTransportConflict is returned when the transport's mount point holds
@@ -66,6 +66,12 @@ var (
 	// during a pass: what should be true on the node is unknown, so nothing
 	// is converged and nothing is collected. It is retryable.
 	ErrIntentsUnknown = errors.New("the intents on this node cannot be read")
+
+	// ErrTargetOutsideScope is returned by Publish and Unpublish for a target
+	// path the driver must not mount on or unmount: one that is not absolute
+	// and cleaned, or is, or is inside, the transports root, the staging root
+	// or a volume's stage path. It is the caller's mistake, InvalidArgument.
+	ErrTargetOutsideScope = errors.New("the target path is not one the driver may publish to")
 
 	// ErrSuperseded is returned to a request that a later request for the same
 	// volume overtook: an Unstage that was still waiting when a Stage or a

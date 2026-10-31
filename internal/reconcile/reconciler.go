@@ -287,7 +287,7 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 // tree again would leave kubelet's cleanup of the orphaned pod directory
 // failing on it for as long as the bind exists.
 func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publish) error {
-	if err := mount.CheckPath("publish", "target path", p.TargetPath); err != nil {
+	if err := r.checkTargetPath("publish", p.TargetPath); err != nil {
 		return err
 	}
 	unlock, err := r.locks.lock(ctx, volumeID)
@@ -295,6 +295,9 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 		return fmt.Errorf("waiting for volume %s: %w", volumeID, err)
 	}
 	defer unlock()
+	if err := r.checkTargetScope(volumeID, p.TargetPath); err != nil {
+		return err
+	}
 
 	_, ok, err := r.store.Get(volumeID)
 	if err != nil {
@@ -344,7 +347,7 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 // still has it open) stays mounted, the error says so, and the caller
 // retries; nothing is detached lazily.
 func (r *Reconciler) Unpublish(ctx context.Context, volumeID, targetPath string) error {
-	if err := mount.CheckPath("unpublish", "target path", targetPath); err != nil {
+	if err := r.checkTargetPath("unpublish", targetPath); err != nil {
 		return err
 	}
 	unlock, err := r.locks.lock(ctx, volumeID)
@@ -352,6 +355,9 @@ func (r *Reconciler) Unpublish(ctx context.Context, volumeID, targetPath string)
 		return fmt.Errorf("waiting for volume %s: %w", volumeID, err)
 	}
 	defer unlock()
+	if err := r.checkTargetScope(volumeID, targetPath); err != nil {
+		return err
+	}
 
 	in, ok, err := r.store.Get(volumeID)
 	if err != nil {
@@ -373,6 +379,51 @@ func (r *Reconciler) Unpublish(ctx context.Context, volumeID, targetPath string)
 		}
 	}
 	return r.await(ctx, &request{kind: reqUnpublish, volume: volumeID, target: targetPath})
+}
+
+// checkTargetPath refuses a target that is not an absolute, cleaned path, and
+// one that is, or is inside, a directory the driver keeps for itself: the
+// transports root (a publish there would sit among the transports, and an
+// unpublish would unmount one) or the staging root (a publish there is
+// garbage by rule (a) and would be mounted and unmounted on every pass, and an
+// unpublish would unmount a volume's stage). Both are ErrTargetOutsideScope.
+func (r *Reconciler) checkTargetPath(what, target string) error {
+	if err := mount.CheckPath(what, "target path", target); err != nil {
+		return fmt.Errorf("%w: %w", ErrTargetOutsideScope, err)
+	}
+	for _, root := range []struct{ name, dir string }{{"transports root", r.opts.TransportsRoot}, {"stage root", r.opts.StageRoot}} {
+		if within(root.dir, target) {
+			return fmt.Errorf("%w: %s is the %s or inside it", ErrTargetOutsideScope, target, root.name)
+		}
+	}
+	return nil
+}
+
+// checkTargetScope reads the intents and refuses a target that is, or is
+// inside, some intent's stage path (ErrTargetOutsideScope: another volume's
+// stage would otherwise be an unpublish away from unmounted), and one that
+// another volume's record claims as its publish target (ErrPublishConflict,
+// naming the claimant): two volumes cannot be bound at one path, and an
+// unpublish for one must not unmount the other's. A store that cannot be read
+// is ErrIntentsUnknown. Records that fail to load cannot be consulted; their
+// stage paths are below the staging root, which checkTargetPath refuses.
+func (r *Reconciler) checkTargetScope(volumeID, target string) error {
+	loaded, err := r.store.Load()
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrIntentsUnknown, err)
+	}
+	for id, in := range loaded.Intents {
+		if within(in.StagePath, target) {
+			return fmt.Errorf("%w: %s is the stage path of %s or inside it", ErrTargetOutsideScope, target, id)
+		}
+		if id == volumeID {
+			continue
+		}
+		if hasPublish(in, target) {
+			return fmt.Errorf("%w: %s is claimed by the publish of %s", ErrPublishConflict, target, id)
+		}
+	}
+	return nil
 }
 
 func hasPublish(in intent.Intent, target string) bool {
