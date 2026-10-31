@@ -1,0 +1,134 @@
+# Findings that secret scanning (hack/secret-scan/) must not report, one
+# fingerprint per line. gitleaks reads this file from the repository root. Lines
+# starting with '#' are comments; a comment cannot follow a fingerprint on the
+# same line.
+#
+# Each line exempts exactly one finding: one rule, on one line, of one file or
+# commit message, in one commit. It exempts nothing else; the same text in any
+# other commit, file or line is still reported.
+#
+# Fingerprint formats:
+#   content of a commit (gitleaks git):
+#     <full commit sha>:<path in that commit>:<rule id>:<line number>
+#   message of a commit (hack/secret-scan/range.sh scans each message as a file
+#   named by the commit's full sha, and reports it with no directory):
+#     <full commit sha>:<rule id>:<line number>
+#
+# Adding a line is the repository owner's decision, and the commit that adds it
+# must say why. No line may name a commit that is not yet on main.
+#
+# Messages of commits already on main that carry a Claude Code session
+# identifier in a trailer line, which the claude-session-id rule did not exist
+# to catch when they were written (in history order, with their subjects):
+# docs: architecture brief for discussion
+aed2b45be7c5c5e6b03f52a26b7b566fb663f883:claude-session-id:11
+# docs: record decisions 1 to 5; replace object volumes with directory items
+7a82be9ed9da0c9d56681ef4de90fcaa9a132b67:claude-session-id:9
+# docs: RWX images via holder-node re-export; record decisions 6 to 8
+fba4474bf7715da71812290646f0bd6a3e6a4e06:claude-session-id:10
+# docs: record decisions 9 to 12; directory items first, probe, tiers
+7b00ab53d2c9ab0c59e94a79bd31cd3eccfa3c2c:claude-session-id:10
+# docs: image, supply chain and CI section; decisions 13 to 15
+159af188c4bb0594d4dc95e7e7127262311fdc62:claude-session-id:10
+# docs: single static binary built with ko; decisions 16 and 17
+fcc4ba17d36870ffc540e0ebb29e2740e857c769:claude-session-id:9
+# docs: keep e2fsprogs and cryptsetup on a self-built tools base under ko
+1344f1065a9ff6afa3314bc471bdc56ec5b25399:claude-session-id:8
+# docs: one multi-stage buildx image instead of a maintained tools base
+b2aa0ee6371543fa1d6662e8fe0d94c804f94d06:claude-session-id:4
+# docs: native per-architecture builds and a manifest job, no emulation
+39fb7d783d07979d2739771b6109a145dedd9745:claude-session-id:4
+# hack: scrub check for forbidden tokens, keyed so the list reveals nothing
+c839e16d8593f86bb6b29cb5a75539b48ca57e38:claude-session-id:4
+# scrub: gitleaks hooks and workflows fed by a private rule set
+5d9dfeb72a8e25987346c78bf99f9163de3bd078:claude-session-id:13
+# scrub-text: overwrite matching titles and bodies, not only delete comments
+b32b986b5bdb7228e6ea947e1862253dc885d2b5:claude-session-id:9
+# secret-scan: present the checks as ordinary gitleaks secret scanning
+9910e5bf7e5ba8ee1d215f54e098d78381921bdd:claude-session-id:8
+# secret-scan: pre-push hook and a Claude Code pre-publish hook
+baa35d605ce01959a108b977f37740ee63192f1f:claude-session-id:8
+# secret-scan: pre-push reads the range pre-commit provides, never scans nothing
+cef4362f681beaa0918ae55f57646ea40b18e071:claude-session-id:7
+# secret-scan: accept the config base64-encoded on one line
+e3f922fe7dc0900e5b251807469fe44c52e496ea:claude-session-id:7
+# secret-scan: every script refuses on its own when no config is set
+1214f12db91495c0f8e8cd24542de406ca2c2bee:claude-session-id:4
+# docs: M1 implementation plan
+8dbe79372cd709b1c26d44fc6f6368967cfefc73:claude-session-id:10
+# docs: one NFSv3 option set, no hard variant; softerr and lookupcache=positive
+03d46be398defdaf6ead971627d3cfe974af1753:claude-session-id:4
+# docs: working mode for M1, the hand-off between sessions
+bcd2eb32fcbf590ac1f89f5467359f1fc4773643:claude-session-id:4
+# Add the miami command skeleton and pin Go and golangci-lint
+557bf97c2c94d304935e962a84f57befa5d14571:claude-session-id:13
+# Add Makefile and a scratch-based Dockerfile
+277e239e3a8546b8d0693ccbc82379af90176205:claude-session-id:13
+# Add the ci workflow and name the secret-scan check
+f579ebb00a9392f8b27017c19b6d780632a80f45:claude-session-id:13
+# Ignore per-agent worktrees
+6d9874bfd2933e1b0bc83073810d8f2ec1f75133:claude-session-id:9
+# docs: merge commits instead of squash on main
+2f6e6f452136245390500f47db10f728e0874fc9:claude-session-id:14
+# Pin Go 1.27.3 and the exact checkout release
+180cce2899461bdd49666e10c5206a343b49934e:claude-session-id:13
+# Harden ci.yml: concurrency, least privilege and pinned tooling
+c442eb83ae6f8c1520581628e6bd6c6228b78e1e:claude-session-id:23
+# Make the Makefile checks exact and match what CI runs
+50c71f1b49cb08bba2e046c75f5c5d4efa5036b6:claude-session-id:15
+# Check stdout and stderr exactly and send subcommand help to stdout
+3e1d468ca52215e8f8043c0bd923ebc69962eb6e:claude-session-id:13
+# Make .dockerignore an allowlist
+669b3a1f54c979e6cf9257cdc3e9af104f4c49fe:claude-session-id:8
+# Add a content hash of the image's build inputs
+34b28c452fe95ac050fe9f776bbf8f107ca8b5b4:claude-session-id:14
+# Build images by content hash instead of by commit
+b5205f11f75c704cfd56c934e64a4ceba1109c3d:claude-session-id:22
+# docs: record content-addressed images
+113d11af9f4415034896870db13c896217e33a41:claude-session-id:11
+# Hash the image build script and make registry checks strict
+55c0c7442123509fccc25e86e63b012932e8fede:claude-session-id:20
+# Prefix content tags with x- instead of c-
+bac4e3967f0cb8f60faf61f58e838f5957398455:claude-session-id:8
+# Create the index from the digests that were run, and tighten ci.yml
+dde425ac07bc194f01bcd1e271ec273aa7cf32d3:claude-session-id:22
+# docs: bring the design documents in line with the CI as built
+9061c01c3b5a35d7385e2f65a04555369e49578e:claude-session-id:17
+# Add transport.Spec with validation, canonical form and ID
+3d4823f2e1c1c70dd7d52931ed7537599a52f04d:claude-session-id:16
+# Add volume ID, context and StorageClass parameter parsing
+21147a492e4097f0ac6194583ff02cd5cf04f82a:claude-session-id:21
+# Add observe: a mountinfo parser and mount table queries
+7a89770e03fcb945e5f80e46b2b73fff198845b0:claude-session-id:14
+# Add mount: mount(2) wrappers under deadlines, and a test fake
+9f0dcde08ff8fe6cd75a8f6ca0e2dceab850d251:claude-session-id:25
+# Add a smoke test against the real kernel and run it in CI
+5aa6b1e699d778fac559c0a39bd262283e946cef:claude-session-id:18
+# Tighten transport.Spec: normal form, host grammar, limits
+02a943e145c13726f74b6736c652a654acdf5409:claude-session-id:22
+# Give every volume its own directory: subdir is a prefix
+851eb80dea60f5efd27c5e8d76d8a14da1895755:claude-session-id:33
+# Record decision 20: one directory per volume
+b7e27306979dc153c00c53d3fcc5d4b5cb55ba0e:claude-session-id:10
+# Parse mountinfo exactly: single-space fields, empty source, odd bytes
+e71e78337a7da8ab746f58e1d3dccbf3bd56a0a1:claude-session-id:18
+# Resolve mounts through the mount tree, not mount IDs
+f074a5f705eaa0e3ce6ab948e5a9f5f62a5bc605:claude-session-id:27
+# Make the Mounter refuse overlapping calls and resolve its paths
+8a1acbd4c99e1c7a2dfa11b824d99aff4b02b032:claude-session-id:31
+# Make the fake Mounter behave like the real one under failure
+094ca0f2d7bec48c7fb4be7b5b7b4913b6190b13:claude-session-id:18
+# Fix lint findings in the new tests
+d79baec24f6084f5069e1eecb68196351a23ed29:claude-session-id:7
+# Smoke-test the kernel behaviours the review reproduced
+1841e5b234a058a2a92b769a4df2722796011e0e:claude-session-id:22
+# Document ErrBusy, resolved paths and Mounts in the package comment
+ab33287234b0f666dcb1edc767c66ba344c7f637:claude-session-id:4
+# Cross the shortest mount point first, and read mountinfo consistently
+de3a7aaec6bdbb8279d4c2478529c5d82e3b39cd:claude-session-id:25
+# Keep a hung bind source off the target, and refuse dangling links
+0f2d7faad1f4d77178c73194c4c5c7c90ac63983:claude-session-id:25
+# Free what a block caused when the fake is unblocked
+84feb5f27aacf36f0d27719e7822e18c4037c145:claude-session-id:14
+# Smoke-test the sibling cover, superblock read-only and dangling links
+77a122dda744fbd3164983f639294d3f3509395d:claude-session-id:19
