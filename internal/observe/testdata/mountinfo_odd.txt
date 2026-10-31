@@ -1,0 +1,5 @@
+90 20 0:80 /rootx /mnt/ab ro,relatime - tmpfs tmpfs rw,size=64k
+91 20 0:81 /root x /mnt/a b ro,noatime - tmpfs tmpfs rw,size=64k
+92 20 0:82 / /mnt/abc rw,relatime - tmpfs tmpfs rw
+93 20 0:83 / /mnt/emptysrc rw,relatime - tmpfs  rw
+94 20 0:40 /vols/gone//deleted /mnt/gone rw,noatime - nfs 198.51.100.10:/export/data rw,vers=3

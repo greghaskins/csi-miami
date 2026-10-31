@@ -68,6 +68,42 @@ jobs:
           path: coverage.out
           if-no-files-found: error
 
+  # The mount and observe packages against the real kernel, natively on each
+  # architecture: hack/smoke.sh builds the smoke tests and runs them as root
+  # under `unshare --mount --propagation private`, so nothing they mount
+  # outlives or escapes them. sudo gets the pinned Go through PATH. A failing
+  # run uploads the mountinfo lines for the test's own temporary paths.
+  smoke:
+    name: smoke (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run the smoke tests as root
+        env:
+          SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/smoke
+        run: sudo -E env "PATH=$PATH" make smoke
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: smoke-mountinfo-${{ matrix.arch }}
+          path: ${{ runner.temp }}/smoke/mountinfo-*.txt
+          if-no-files-found: ignore
+
   # Builds and pushes x-<hash>-<arch> natively on each architecture (no
   # emulation) unless that tag already exists, then runs the image from the
   # registry, so every run proves the image that will be used starts, whether
@@ -256,7 +292,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [static, unit, build, manifest, publish]
+    needs: [static, unit, smoke, build, manifest, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -265,13 +301,14 @@ jobs:
         env:
           STATIC: ${{ needs.static.result }}
           UNIT: ${{ needs.unit.result }}
+          SMOKE: ${{ needs.smoke.result }}
           BUILD: ${{ needs.build.result }}
           MANIFEST: ${{ needs.manifest.result }}
           PUBLISH: ${{ needs.publish.result }}
           PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           fail=0
-          for pair in "static=$STATIC" "unit=$UNIT" "build=$BUILD" "manifest=$MANIFEST"; do
+          for pair in "static=$STATIC" "unit=$UNIT" "smoke=$SMOKE" "build=$BUILD" "manifest=$MANIFEST"; do
             if [ "${pair#*=}" != "success" ]; then
               echo "::error::${pair%%=*} was ${pair#*=}, expected success"
               fail=1
