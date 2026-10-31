@@ -2,9 +2,6 @@ package csi
 
 import (
 	"errors"
-	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -46,72 +43,22 @@ func relativeTo(base, path string) ([]string, bool) {
 
 // ensureItemDir makes dir, which lies below mountDir, and every directory
 // between them that is missing, like mkdir -p, and reports whether dir itself
-// was created.
-//
-// It never follows a symlink: each element is looked at with Lstat before it
-// is entered, and one that exists as anything but a plain directory is an
-// error, so a link planted on the share cannot send the new directory
+// was created. It works relative to descriptors and never follows a symlink or
+// crosses a mount point (see treeRemover.ensureBeneath), so a link planted on
+// the share, or swapped in while this runs, cannot send the new directory
 // somewhere else. A final element that exists and is a directory is adopted
-// (that is what makes CreateVolume idempotent); one that exists and is
-// anything else, including a symlink, is AlreadyExists. A directory the
-// controller makes is set to dirMode whatever the umask.
+// (that is what makes CreateVolume idempotent); one that exists and is anything
+// else is AlreadyExists. A directory the controller makes is set to dirMode
+// whatever the umask.
 func ensureItemDir(mountDir, dir string) (created bool, err error) {
-	elems, ok := relativeTo(mountDir, dir)
-	if !ok {
-		return false, status.Errorf(codes.Internal, "volume directory %q is not below the transport mount %q", dir, mountDir)
-	}
-	cur := mountDir
-	for i, elem := range elems {
-		cur = filepath.Join(cur, elem)
-		last := i == len(elems)-1
-
-		fi, err := os.Lstat(cur)
-		switch {
-		case err == nil:
-			// Exists: must be a plain directory.
-		case errors.Is(err, fs.ErrNotExist):
-			if err := makeDir(cur); err != nil {
-				return false, fsStatus("creating "+elem, err)
-			}
-			created = last
-			continue
-		default:
-			return false, fsStatus("looking at "+elem, err)
-		}
-		if fi.Mode().IsDir() {
-			continue
-		}
-		if last {
-			return false, status.Errorf(codes.AlreadyExists, "%s exists and is not a directory", elem)
-		}
-		return false, status.Errorf(codes.FailedPrecondition, "%s on the transport is not a directory", elem)
-	}
-	return created, nil
+	return ensureItemDirWith(&treeRemover{}, mountDir, dir)
 }
 
-// makeDir creates path with dirMode. A directory that appears between the
-// check and the call is accepted if it is a plain directory. The mode is set
-// on an open descriptor of the new directory, which cannot be swapped for a
-// link, because the umask would otherwise decide it.
-func makeDir(path string) error {
-	if err := os.Mkdir(path, dirMode); err != nil {
-		if !errors.Is(err, fs.ErrExist) {
-			return err
-		}
-		fi, lerr := os.Lstat(path)
-		if lerr != nil {
-			return lerr
-		}
-		if !fi.Mode().IsDir() {
-			return fmt.Errorf("%w: not a directory", syscall.ENOTDIR)
-		}
-		return nil
+// ensureItemDirWith is ensureItemDir with the remover given, for tests.
+func ensureItemDirWith(r *treeRemover, mountDir, dir string) (bool, error) {
+	elems, ok := relativeTo(mountDir, dir)
+	if !ok {
+		return false, status.Errorf(codes.Internal, "volume directory is not below the transport mount")
 	}
-	f, err := os.OpenFile(path, //nolint:gosec // path is the directory just made, built by the caller from a validated name
-		os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	return f.Chmod(dirMode)
+	return r.ensureBeneath(mountDir, elems)
 }

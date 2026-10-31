@@ -87,7 +87,7 @@ func TestEnvtestPVPaths(t *testing.T) {
 	root := resolved(t, t.TempDir())
 	logs := &syncBuffer{}
 	ctrl, err := NewController(ControllerOptions{
-		Root: root, Mounter: &fake.Mounter{}, PVs: c,
+		Root: root, Mounter: &simMounter{Mounter: &fake.Mounter{}}, PVs: c,
 		Log: slog.New(slog.NewTextHandler(logs, nil)),
 	})
 	if err != nil {
@@ -107,6 +107,22 @@ func TestEnvtestPVPaths(t *testing.T) {
 	delReq := func(name string) *csi.DeleteVolumeRequest {
 		return &csi.DeleteVolumeRequest{VolumeId: "directory:" + name}
 	}
+
+	t.Run("a 404 for another path is not a missing PV", func(t *testing.T) {
+		// A server address with a path prefix (here a real one, /api/v1, so the
+		// request goes to a path the API server answers with its own 404 and no
+		// details about a PV).
+		prefixed := rest.CopyConfig(cfg)
+		prefixed.Host += "/api/v1"
+		pc, err := kube.NewClient(prefixed, 30*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = pc.GetPV(ctx, "pvc-00000000-0000-4000-8000-0000000000ff")
+		if err == nil || errors.Is(err, kube.ErrNotFound) {
+			t.Fatalf("error = %v, want an error that is not kube.ErrNotFound", err)
+		}
+	})
 
 	t.Run("GetPV finds a PV and reports a missing one as not found", func(t *testing.T) {
 		createPV(t, cfg, apiPV("pvc-00000000-0000-4000-8000-000000000001", "directory:pvc-00000000-0000-4000-8000-000000000001", map[string]string{"miami/kind": "directory"}))

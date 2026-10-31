@@ -185,7 +185,11 @@ type treeReader interface {
 //  2. No mount is at or below dir in the mount table. A mount inside the
 //     directory (a bind mount of something else, even of the same file system)
 //     would make the recursive removal reach into a file system the volume does
-//     not own.
+//     not own. And the table shows the transport itself at mountDir; if it does
+//     not, the transport was unmounted and what is there is not it. (The
+//     removal then holds the directory it opens as the root to this entry: the
+//     same device and, where the kernel says (Linux 5.8), the same mount ID, so
+//     that something mounted over mountDir in the moment since is refused.)
 //  3. mountDir itself is a plain directory, and every element from mountDir
 //     down to the parent of dir is looked at with Lstat and must be a plain
 //     directory on the same device as mountDir. A symlink there (planted on the
@@ -252,6 +256,14 @@ func removeItemDirWith(ctx context.Context, m treeReader, r *treeRemover, mountD
 	if inside := table.Under(dir); len(inside) > 0 {
 		return false, unavailable("a mount is at or below the directory of volume %q, so nothing is deleted", name)
 	}
+	// The table must show the transport itself at mountDir: if it does not, it
+	// was unmounted in the moment since it was mounted, and what is at
+	// mountDir is not the transport. The removal checks the directory it opens
+	// as the root against this entry.
+	mnt, mounted := table.At(mountDir)
+	if !mounted {
+		return false, unavailable("the transport of volume %q is not mounted, so nothing is deleted", name)
+	}
 
 	// 3. A plain path of directories, on one device.
 	root, err := os.Lstat(mountDir)
@@ -290,7 +302,7 @@ func removeItemDirWith(ctx context.Context, m treeReader, r *treeRemover, mountD
 		}
 	}
 
-	return r.removeBeneath(ctx, mountDir, elems)
+	return r.removeBeneath(ctx, mountDir, elems, transportMount{id: mnt.ID, major: mnt.Major, minor: mnt.Minor})
 }
 
 // deviceOf returns the device number of the file system fi was read from.

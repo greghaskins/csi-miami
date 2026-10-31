@@ -24,7 +24,7 @@ import (
 
 	kubefake "github.com/greghaskins/csi-miami/internal/kube/fake"
 	"github.com/greghaskins/csi-miami/internal/mount"
-	"github.com/greghaskins/csi-miami/internal/mount/fake"
+	"github.com/greghaskins/csi-miami/internal/observe"
 )
 
 // This test runs the csi-sanity suite (the binary on PATH, pinned in mise.toml)
@@ -250,7 +250,7 @@ func TestSanityDeleteRefusesAnotherDevice(t *testing.T) {
 	dir := filepath.Join(teams, nameA)
 	writeFile(t, filepath.Join(dir, "precious"), "x")
 
-	_, err := removeItemDir(context.Background(), &fake.Mounter{}, mountDir, dir, nameA)
+	_, err := removeItemDir(context.Background(), mounterWithMount(t, mountDir), mountDir, dir, nameA)
 	if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "another device") {
 		t.Fatalf("error = %v, want Unavailable naming another device", err)
 	}
@@ -335,7 +335,7 @@ func TestSanityDeleteSurvivesAnAncestorSwappedForASymlink(t *testing.T) {
 		for swaps.Load() < 5 { // the racer is running before the removal starts
 			runtime.Gosched()
 		}
-		ok, err := removeItemDir(context.Background(), &fake.Mounter{}, tr.mount, tr.dir, nameA)
+		ok, err := removeItemDir(context.Background(), mounterWithMount(t, tr.mount), tr.mount, tr.dir, nameA)
 		close(stop)
 		if rerr := <-done; rerr != nil {
 			t.Fatalf("the racer: %v", rerr)
@@ -373,7 +373,7 @@ func TestSanityDeleteRefusesABindMountOnAnAncestor(t *testing.T) {
 	t.Cleanup(func() { _ = unix.Unmount(teams, 0) })
 
 	// An empty mount table, so that the table check cannot be what refuses.
-	_, err := removeItemDir(context.Background(), &fake.Mounter{}, tr.mount, tr.dir, nameA)
+	_, err := removeItemDir(context.Background(), mounterWithMount(t, tr.mount), tr.mount, tr.dir, nameA)
 	if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "changed under the removal") {
 		t.Fatalf("error = %v, want Unavailable saying the path changed", err)
 	}
@@ -404,7 +404,7 @@ func TestSanityDeleteRefusesAMountThatAppearsDuringTheRemoval(t *testing.T) {
 	t.Cleanup(func() { _ = unix.Unmount(sub, 0) })
 
 	// An empty mount table again: the table was read before the mount came.
-	_, err := removeItemDirWith(context.Background(), &fake.Mounter{}, r, tr.mount, tr.dir, nameA)
+	_, err := removeItemDirWith(context.Background(), mounterWithMount(t, tr.mount), r, tr.mount, tr.dir, nameA)
 	if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "changed under the removal") {
 		t.Fatalf("error = %v, want Unavailable saying the path changed", err)
 	}
@@ -412,4 +412,160 @@ func TestSanityDeleteRefusesAMountThatAppearsDuringTheRemoval(t *testing.T) {
 		t.Fatal("the hook never ran")
 	}
 	mustExist(t, filepath.Join(sub, "on-the-mount"))
+}
+
+// The transport's mount directory is opened by path. A mount placed over it
+// after the mount table was read must not be taken for the transport, whether
+// it is another file system (the device differs) or a bind mount of a
+// directory of the same one (only the mount ID differs). The directory placed
+// there holds a volume of the same name, which the removal must not touch.
+func TestSanityDeleteRefusesAMountPlacedOverTheTransportRoot(t *testing.T) {
+	overmounts := map[string]func(t *testing.T, base, over string){
+		"another file system": func(t *testing.T, _, over string) {
+			if err := unix.Mount("tmpfs", over, "tmpfs", 0, ""); err != nil {
+				t.Fatalf("mounting a tmpfs over the transport: %v", err)
+			}
+			writeFile(t, filepath.Join(over, "teams", nameA, "precious"), "x")
+		},
+		"a bind mount of the same file system": func(t *testing.T, base, over string) {
+			other := filepath.Join(base, "other")
+			writeFile(t, filepath.Join(other, "teams", nameA, "precious"), "x")
+			if err := unix.Mount(other, over, "", unix.MS_BIND, ""); err != nil {
+				t.Fatalf("bind mount over the transport: %v", err)
+			}
+		},
+	}
+	for name, overmount := range overmounts {
+		t.Run(name, func(t *testing.T) {
+			base := resolved(t, t.TempDir())
+			mountTmpfs(t, base)
+			tr := treeAt(t, base)
+			over := tr.mount
+			placed := false
+			r := &treeRemover{beforeRoot: func() {
+				overmount(t, base, over)
+				placed = true
+			}}
+			t.Cleanup(func() { _ = unix.Unmount(over, 0) })
+
+			// The table is the one read before the mount came.
+			removed, err := removeItemDirWith(context.Background(), mounterWithMount(t, tr.mount), r, tr.mount, tr.dir, nameA)
+			if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "not the mount the mount table showed") || removed {
+				t.Fatalf("removed = %v, error = %v; want Unavailable saying the root is not the mount in the table", removed, err)
+			}
+			if !placed {
+				t.Fatal("the hook never ran")
+			}
+			mustExist(t, filepath.Join(over, "teams", nameA, "precious"))
+		})
+	}
+}
+
+// The reviewer's racer, for the root: a goroutine mounts a bind of a directory
+// holding a volume of the same name over the transport's mount directory and
+// unmounts it, over and over, while the removal runs. Whatever the removal
+// answers, nothing outside the transport may be removed.
+func TestSanityDeleteSurvivesABindMountRacingOverTheTransportRoot(t *testing.T) {
+	base := resolved(t, t.TempDir())
+	mountTmpfs(t, base)
+	if err := os.MkdirAll(filepath.Join(base, "mnt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(base, "other")
+	writeFile(t, filepath.Join(other, "teams", nameA, "precious"), "x")
+
+	const iterations = 100
+	var removed, refused int
+	for i := 0; i < iterations; i++ {
+		tr := treeAt(t, base)                // <base>/mnt/teams/<nameA>, and its own outside
+		table := tableWithMount(t, tr.mount) // the transport as it is before any bind
+		stop := make(chan struct{})
+		done := make(chan error, 1)
+		var cycles atomic.Int64
+		// A bind is there from the start, and the racer keeps stacking another
+		// on it and lazily unmounting the top one, so that the transport's
+		// directory is overmounted at every instant and the mount that is on top
+		// keeps changing.
+		if err := unix.Mount(other, tr.mount, "", unix.MS_BIND, ""); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				select {
+				case <-stop:
+					done <- nil
+					return
+				default:
+				}
+				if err := unix.Mount(other, tr.mount, "", unix.MS_BIND, ""); err != nil {
+					done <- err
+					return
+				}
+				// Lazily: the removal may hold descriptors in the bind.
+				if err := unix.Unmount(tr.mount, unix.MNT_DETACH); err != nil {
+					done <- err
+					return
+				}
+				cycles.Add(1)
+			}
+		}()
+		for cycles.Load() < 3 {
+			runtime.Gosched()
+		}
+		ok, err := removeItemDir(context.Background(), &tableOnly{table}, tr.mount, tr.dir, nameA)
+		close(stop)
+		if rerr := <-done; rerr != nil {
+			t.Fatalf("the racer: %v", rerr)
+		}
+		for { // whatever is left on it
+			if err := unix.Unmount(tr.mount, unix.MNT_DETACH); err != nil {
+				break
+			}
+		}
+		mustExist(t, filepath.Join(other, "teams", nameA, "precious"))
+		switch {
+		case err == nil && ok:
+			removed++
+		case err == nil, codeOf(err) == codes.Unavailable:
+			refused++
+		default:
+			t.Fatalf("iteration %d: unexpected error %v", i, err)
+		}
+		if err := os.RemoveAll(filepath.Join(base, "mnt")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(base, "mnt"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("%d iterations: %d removed, %d refused or found nothing", iterations, removed, refused)
+}
+
+// tableOnly is a treeReader that returns one table.
+type tableOnly struct{ table observe.Table }
+
+func (m *tableOnly) Mounts(context.Context) (observe.Table, error) { return m.table, nil }
+
+// A mount point where the volume's parent directory should be is not entered
+// or written through when the directory is made: the open is refused under
+// RESOLVE_NO_XDEV.
+func TestSanityCreateRefusesAMountPointOnTheWay(t *testing.T) {
+	base := resolved(t, t.TempDir())
+	mountTmpfs(t, base)
+	tr := treeAt(t, base)
+	other := filepath.Join(base, "other")
+	if err := os.MkdirAll(other, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	teams := filepath.Join(tr.mount, "teams")
+	if err := unix.Mount(other, teams, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind mount: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(teams, 0) })
+
+	created, err := ensureItemDir(tr.mount, filepath.Join(teams, nameB))
+	if codeOf(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "mount point") || created {
+		t.Fatalf("created = %v, error = %v; want FailedPrecondition naming a mount point", created, err)
+	}
+	mustNotExist(t, filepath.Join(other, nameB))
 }

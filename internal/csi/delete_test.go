@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	"github.com/greghaskins/csi-miami/internal/kube"
+	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/volume"
@@ -144,6 +145,7 @@ func TestDeleteVolumeNeverDeletesOnDoubt(t *testing.T) {
 			pv.VolumeAttributes["miami/transport.path"] = "/x"
 		}, codes.Unavailable, "do not decode"},
 		{"transport cannot be mounted", func(e *env, _ *kube.PV) {
+			e.mounter.SetTable(nil) // it was mounted when the volume was made; now it is not
 			e.mounter.FailOp(fake.OpMount, e.mountDir(), errors.New("boom"))
 		}, codes.Unavailable, "cannot be mounted"},
 		{"mount table unreadable while mounting", func(e *env, _ *kube.PV) {
@@ -423,7 +425,7 @@ func TestRemoveItemDirNeverDeletesWithoutTheMountTable(t *testing.T) {
 // reads only: enough for the transport to be mounted, not for the delete
 // path's own check afterwards.
 type afterFirstMounts struct {
-	*fake.Mounter
+	mount.Mounter
 	mu    sync.Mutex
 	reads int
 	n     int
