@@ -106,11 +106,7 @@ func (r resolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, 
 func ips(addrs ...string) []net.IPAddr {
 	var out []net.IPAddr
 	for _, a := range addrs {
-		zone := ""
-		if i := strings.IndexByte(a, '%'); i >= 0 {
-			a, zone = a[:i], a[i+1:]
-		}
-		out = append(out, net.IPAddr{IP: net.ParseIP(a), Zone: zone})
+		out = append(out, net.IPAddr{IP: net.ParseIP(a)})
 	}
 	return out
 }
@@ -318,7 +314,6 @@ func TestNFS3MountAddr(t *testing.T) {
 		timedOut bool
 	}{
 		{name: "IPv4 literal is used as it is", server: "192.0.2.10", wantAddr: "192.0.2.10"},
-		{name: "IPv6 literal is unbracketed", server: "[2001:db8::1]", wantAddr: "2001:db8::1"},
 		{
 			name: "a name uses the first address", server: "nas.example.com",
 			resolver: resolver(func(_ context.Context, host string) ([]net.IPAddr, error) {
@@ -335,19 +330,21 @@ func TestNFS3MountAddr(t *testing.T) {
 			wantAddr: "198.51.100.7",
 		},
 		{
-			name: "an IPv6 answer", server: "nas.example.com",
-			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return ips("2001:db8::7"), nil }),
-			wantAddr: "2001:db8::7",
+			name: "a dual-stack answer with IPv6 first picks the IPv4 address", server: "nas.example.com",
+			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) {
+				return ips("2001:db8::7", "198.51.100.7"), nil
+			}),
+			wantAddr: "198.51.100.7",
 		},
 		{
-			name: "a scoped IPv6 answer keeps its zone", server: "nas.example.com",
-			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return ips("fe80::7%eth0"), nil }),
-			wantAddr: "fe80::7%eth0",
+			name: "an IPv6-only answer fails", server: "nas.example.com",
+			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return ips("2001:db8::7", "2001:db8::8"), nil }),
+			wantErr:  `"nas.example.com": the name has no IPv4 address`,
 		},
 		{
 			name: "a name with no address", server: "nas.example.com",
 			resolver: resolver(func(context.Context, string) ([]net.IPAddr, error) { return nil, nil }),
-			wantErr:  `"nas.example.com": the name has no address`,
+			wantErr:  `"nas.example.com": the name has no IPv4 address`,
 		},
 		{
 			name: "a failed lookup", server: "nas.example.com",

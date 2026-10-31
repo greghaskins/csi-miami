@@ -46,13 +46,12 @@ const (
 // from.
 //
 // A valid Spec is in normal form: paths are cleaned, a host name is lower
-// case ASCII and an IPv6 literal is in its shortest form. Validate rejects
-// anything else, so the strings a Spec carries (and a volume context stores)
+// case ASCII. Validate rejects anything else, so the strings a Spec carries (and a volume context stores)
 // can be compared byte for byte. Normalize and ParseSpec produce the normal
 // form from a looser spelling.
 type Spec struct {
 	Kind   string // "nfs3" | "local"
-	Server string // nfs3: ASCII host name, dotted IPv4 literal or bracketed IPv6 literal
+	Server string // nfs3: ASCII host name or dotted IPv4 literal; IPv6 is not supported
 	Export string // nfs3: absolute export path, not "/"
 	Path   string // local: absolute host path, not "/"
 }
@@ -107,18 +106,11 @@ func validateServer(server string) error {
 	}
 	switch {
 	case strings.HasPrefix(server, "["):
-		addr, ok := parseIPv6Literal(server)
-		if !ok {
-			return invalid(ParamServer + ": a bracketed address must be an IPv6 literal without a zone, such as [2001:db8::1]")
-		}
-		if server != "["+addr.String()+"]" {
-			return invalid(ParamServer + ": an IPv6 literal must be in its shortest lower-case form")
-		}
-		return nil
+		return invalid(ParamServer + ": IPv6 is not supported; use an IPv4 address or a host name")
 	case strings.Contains(server, ":"):
-		return invalid(ParamServer + " must not contain ':' unless it is a bracketed IPv6 literal")
+		return invalid(ParamServer + " must not contain ':' (a port is not allowed, and IPv6 is not supported; use an IPv4 address or a host name)")
 	case strings.ContainsAny(server, "[]"):
-		return invalid(ParamServer + " must not contain '[' or ']' except around an IPv6 literal")
+		return invalid(ParamServer + " must not contain '[' or ']'")
 	}
 	return validateHostname(server)
 }
@@ -156,19 +148,6 @@ func validateHostname(h string) error {
 		}
 	}
 	return nil
-}
-
-// parseIPv6Literal parses "[addr]" where addr is an IPv6 address without a
-// zone.
-func parseIPv6Literal(s string) (netip.Addr, bool) {
-	if len(s) < 3 || s[0] != '[' || s[len(s)-1] != ']' {
-		return netip.Addr{}, false
-	}
-	addr, err := netip.ParseAddr(s[1 : len(s)-1])
-	if err != nil || !addr.Is6() || addr.Zone() != "" {
-		return netip.Addr{}, false
-	}
-	return addr, true
 }
 
 func validatePath(field, p string) error {
@@ -215,13 +194,6 @@ func asciiLower(s string) string {
 	return string(b)
 }
 
-func normalizeServer(server string) string {
-	if addr, ok := parseIPv6Literal(server); ok {
-		return "[" + addr.String() + "]"
-	}
-	return asciiLower(server)
-}
-
 // normalizePath cleans p unless it has a ".." element: cleaning would
 // resolve the element away and hide it from Validate.
 func normalizePath(p string) string {
@@ -237,10 +209,10 @@ func normalizePath(p string) string {
 }
 
 // Normalize returns the Spec with its server lower-cased (ASCII only) and
-// its paths cleaned, and an IPv6 literal written in shortest form. It does
+// its paths cleaned. It does
 // not make an invalid Spec valid: a path with a ".." element is left alone.
 func (s Spec) Normalize() Spec {
-	s.Server = normalizeServer(s.Server)
+	s.Server = asciiLower(s.Server)
 	s.Export = normalizePath(s.Export)
 	s.Path = normalizePath(s.Path)
 	return s
@@ -285,7 +257,7 @@ func (s Spec) MountPoint(root string) (string, error) {
 
 // ParseSpec builds a validated Spec in normal form from StorageClass
 // parameters: paths are cleaned (a trailing slash is accepted), the server
-// is lower-cased and an IPv6 literal is shortened before validation. It
+// is lower-cased before validation. It
 // reads only the transport.* keys and ignores the rest; rejecting unknown
 // keys is the caller's job, since the other keys belong to the caller.
 func ParseSpec(params map[string]string) (Spec, error) {
