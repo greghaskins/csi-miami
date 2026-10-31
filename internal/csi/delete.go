@@ -162,7 +162,7 @@ type treeReader interface {
 //  1. dir is strictly below mountDir, its parent is mountDir or below it, and
 //     its last element is exactly the volume name. Volume.Context.Dir
 //     guarantees this by construction; it is checked again because the
-//     recursive removal below must never be pointed at a transport's root or
+//     removal below must never be pointed at a transport's root or
 //     at a path outside it by a mistake elsewhere.
 //  2. No mount is at or below dir in the mount table. A mount inside the
 //     directory (a bind mount of something else, even of the same file system)
@@ -181,17 +181,26 @@ type treeReader interface {
 //     never followed: it is not what CreateVolume made, so something else has
 //     put it there. A path that does not exist is success.
 //
-// Only then does it call os.RemoveAll on exactly dir. RemoveAll does not
-// follow a symlink it finds inside the tree; it unlinks the link. If the
-// removal fails part way, the error is Unavailable and a retry continues from
-// what is left.
+// Those checks look at paths, and a path can change between the look and the
+// removal: a writer on the shared storage can replace an ancestor by a symlink
+// with rename(2), an administrator can put a bind mount on it. So the removal
+// itself (rmtree.go) does not use those paths. It opens the transport mount,
+// then every element down to the parent, then the directory, each relative to
+// the descriptor of the one before with openat2(2) and RESOLVE_BENEATH,
+// RESOLVE_NO_SYMLINKS and RESOLVE_NO_XDEV, checks each against the transport's
+// device, and removes everything with unlinkat(2) relative to the descriptors
+// it holds (a symlink inside the tree is unlinked, never followed):
 //
-// What this cannot rule out: a writer on the shared storage who replaces a
-// checked element by a symlink in the moments between the checks and the
-// removal. The target would have to hold a directory named exactly like the
-// volume, which is unguessable for a provisioner-made name; the window is
-// narrowed, not closed, because Go's os package offers no removal relative to
-// a held directory descriptor for the first elements of the path.
+//  5. No symlink and no mount point is crossed from the transport mount down
+//     to every file and directory removed, and each directory is on the
+//     transport's device, at the moment it is opened and for as long as it is
+//     held. If a link or a mount appears where a directory was, the open fails
+//     and the removal stops with Unavailable; what was removed before was
+//     inside the volume. A kernel without openat2 (before Linux 5.6) is
+//     Unavailable too, with no fallback to removing by path.
+//
+// If the removal fails part way, the error is Unavailable and a retry
+// continues from what is left.
 //
 // removeItemDir runs file system calls that can hang on a dead transport; the
 // caller runs it with blocking. If the request's context ends first, the call
@@ -200,6 +209,11 @@ type treeReader interface {
 // removes what is left, and a name is never reused for a new volume (it is the
 // PV's name, a fresh UUID), so the late removal cannot hit a new volume.
 func removeItemDir(ctx context.Context, m treeReader, mountDir, dir, name string) (bool, error) {
+	return removeItemDirWith(ctx, m, &treeRemover{}, mountDir, dir, name)
+}
+
+// removeItemDirWith is removeItemDir with the remover given, for tests.
+func removeItemDirWith(ctx context.Context, m treeReader, r *treeRemover, mountDir, dir, name string) (bool, error) {
 	// 1. The shape of the path.
 	elems, ok := relativeTo(mountDir, dir)
 	if !ok {
@@ -258,10 +272,7 @@ func removeItemDir(ctx context.Context, m treeReader, mountDir, dir, name string
 		}
 	}
 
-	if err := os.RemoveAll(dir); err != nil {
-		return true, fsStatus("removing the directory", err)
-	}
-	return true, nil
+	return r.removeBeneath(ctx, mountDir, elems)
 }
 
 // deviceOf returns the device number of the file system fi was read from.
