@@ -375,7 +375,7 @@ func (n *testNS) waitPodReady(t *testing.T, name, after string) *corev1.Pod {
 		if err != nil {
 			return "", false, err
 		}
-		seen := describePod(p) + ", container " + containerID(p)
+		seen := describePod(p) + ", container " + containerID(p) + n.podEvents(ctx, name)
 		if after != "" && containerID(p) == after {
 			return seen, false, nil
 		}
@@ -386,6 +386,25 @@ func (n *testNS) waitPodReady(t *testing.T, name, after string) *corev1.Pod {
 		return seen, false, nil
 	})
 	return out
+}
+
+// podEvents is the latest events about a pod, for the observation of a wait
+// that may fail: why a pod is not Ready is almost always in them.
+func (n *testNS) podEvents(ctx context.Context, name string) string {
+	evs, err := n.e.Client.CoreV1().Events(n.Name).List(ctx, metav1.ListOptions{FieldSelector: "involvedObject.name=" + name})
+	if err != nil || len(evs.Items) == 0 {
+		return ""
+	}
+	sort.Slice(evs.Items, func(i, j int) bool { return evs.Items[i].LastTimestamp.Before(&evs.Items[j].LastTimestamp) })
+	items := evs.Items
+	if len(items) > 4 {
+		items = items[len(items)-4:]
+	}
+	var parts []string
+	for _, ev := range items {
+		parts = append(parts, fmt.Sprintf("%s %s: %s", ev.Type, ev.Reason, tail(ev.Message, 300)))
+	}
+	return "; events: " + strings.Join(parts, " | ")
 }
 
 // deletePod deletes a pod and waits for it to be gone, which the API server

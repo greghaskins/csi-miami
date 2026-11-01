@@ -64,6 +64,9 @@ func (e *env) dump(t *testing.T, ns string) {
 					}
 					note(name, err)
 					write(name, b)
+					if !previous && c == "miami" {
+						t.Logf("log of %s/%s (last lines):\n%s", p.Name, c, tailLines(string(b), 25))
+					}
 				}
 			}
 		}
@@ -108,6 +111,7 @@ func (e *env) dump(t *testing.T, ns string) {
 		}
 	}
 	write("events.txt", events.Bytes())
+	t.Logf("events of %s and %s:\n%s", ns, e.DriverNS, tailLines(events.String(), 60))
 
 	// Each node's mount table.
 	if nodesErr == nil {
@@ -121,4 +125,13 @@ func (e *env) dump(t *testing.T, ns string) {
 		write("errors.txt", []byte(strings.Join(problems, "\n")+"\n"))
 	}
 	t.Logf("artifacts for %s written to %s", t.Name(), dir)
+}
+
+// tailLines is the last n lines of s.
+func tailLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }

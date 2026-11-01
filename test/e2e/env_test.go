@@ -33,7 +33,7 @@ const (
 
 // defaultTimeout bounds each wait unless -e2e.timeout or MIAMI_E2E_TIMEOUT
 // says otherwise.
-const defaultTimeout = 5 * time.Minute
+const defaultTimeout = 3 * time.Minute
 
 // pollEvery is the interval of every poll.
 const pollEvery = 2 * time.Second
@@ -144,7 +144,7 @@ func readEnv() (*env, error) {
 func runVariant(t *testing.T, e *env, variant string, fn func(t *testing.T)) {
 	t.Helper()
 	if e.Transport != variant {
-		t.Logf("this criterion has no %s variant; the run is for %s", e.Transport, variant)
+		t.Logf("the %s variant is not for this run, which is for %s", variant, e.Transport)
 		return
 	}
 	t.Run(variant, fn)
@@ -159,20 +159,32 @@ func poll(timeout time.Duration, check func(ctx context.Context) (seen string, d
 	defer cancel()
 	tick := time.NewTicker(pollEvery)
 	defer tick.Stop()
+	var lastSeen, lastErr string
+	report := func() string {
+		switch {
+		case lastSeen == "" && lastErr == "":
+			return "nothing"
+		case lastErr == "":
+			return lastSeen
+		case lastSeen == "":
+			return "error: " + lastErr
+		}
+		return lastSeen + " (and a later error: " + lastErr + ")"
+	}
 	for {
 		seen, done, err := check(ctx)
-		switch {
-		case err != nil:
-			last = "error: " + err.Error()
-		default:
-			last = seen
-		}
-		if err == nil && done {
-			return last, true
+		if err == nil {
+			// An observation made while the deadline passed is not news.
+			lastSeen, lastErr = seen, ""
+			if done {
+				return report(), true
+			}
+		} else if ctx.Err() == nil {
+			lastErr = err.Error()
 		}
 		select {
 		case <-ctx.Done():
-			return last, false
+			return report(), false
 		case <-tick.C:
 		}
 	}
