@@ -44,7 +44,7 @@ spec:
         - operator: Exists
       containers:
         - name: miami
-          image: ghcr.io/greghaskins/csi-miami:latest
+          image: ghcr.io/greghaskins/csi-miami:unset
           args:
             - node
             - --endpoint=unix://$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock

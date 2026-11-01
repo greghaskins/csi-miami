@@ -531,15 +531,22 @@ must tolerate that.
 PV get/list/watch/create/patch/delete (the provisioner creates and deletes PVs
 and the attacher patches them; added in T9 from the pinned sidecars' own RBAC),
 PVC get/list/watch/update, StorageClass get/list/watch, VolumeAttachment
-get/list/watch/update/patch and its status patch, Node get/list/watch, CSINode
-get/list/watch, events list/watch/create/update/patch, leases get/create/update/delete;
-node: PV get, events get, create and patch: the recorder reads an event before it bumps its
-count); the controller Deployment
+get/list/watch/patch and its status patch (no update: neither pinned sidecar's
+own RBAC grants it; T19 compared every verb with the csi-attacher v4.13.0 and
+csi-provisioner v6.4.0 files), Node get/list/watch, CSINode get/list/watch,
+events list/watch/create/update/patch; leases get/create/update/delete in a
+namespaced Role in the driver's namespace, not a ClusterRole;
+node: PV get in the ClusterRole, and events get, create and patch in a Role
+and RoleBinding in the `default` namespace, the only place the recorder writes:
+it reads an event before it bumps its count); the controller Deployment
 (provisioner with `--extra-create-metadata --feature-gates=Topology=true`,
 attacher, resizer kept out until M2, livenessprobe); the node DaemonSet
 (registrar, livenessprobe, `Bidirectional` kubelet dir and transports
 root, host `/dev` not needed in M1); an example StorageClass per transport.
-Sidecars pinned by digest. Resource requests and limits on every container.
+Sidecars pinned by digest. The driver image in the base is the placeholder
+`ghcr.io/greghaskins/csi-miami:unset`, a tag CI never publishes, so a base
+applied without an overlay cannot pull a mutable image into the privileged
+DaemonSet. Resource requests and limits on every container.
 `deploy/policy_test.go` asserts the RBAC rule set is exactly the list above.
 The sidecars are csi-provisioner v6.4.0, csi-attacher v4.13.0,
 csi-node-driver-registrar v2.18.0 and livenessprobe v2.20.0. The kubelet

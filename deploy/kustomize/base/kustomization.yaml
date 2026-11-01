@@ -33,8 +33,10 @@
 # Known roots: k0s /var/lib/k0s/kubelet, k3s /var/lib/rancher/k3s/agent/kubelet,
 # microk8s /var/snap/microk8s/common/var/lib/kubelet.
 #
-# The driver image below is a placeholder; every overlay sets the real one with
-# `images:`. The sidecar images carry a tag for the reader and the digest of the
+# The driver image below is the placeholder ghcr.io/greghaskins/csi-miami:unset,
+# a tag CI never publishes, so applying this base without an overlay fails to
+# pull and never runs a mutable image in the privileged node DaemonSet. Every
+# overlay sets the real one with `images:`, by digest where it can. The sidecar images carry a tag for the reader and the digest of the
 # multi-arch index for the runtime.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -49,6 +51,8 @@ resources:
   - role-controller.yaml
   - rolebinding-controller.yaml
   - clusterrolebinding-node.yaml
+  - role-node.yaml
+  - rolebinding-node.yaml
   - deployment-controller.yaml
   - daemonset-node.yaml
 configMapGenerator:

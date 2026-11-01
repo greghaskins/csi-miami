@@ -270,17 +270,17 @@ func (m *recMetrics) errCount(step string) int {
 	return m.errors[step]
 }
 
-type recEvent struct{ Volume, Reason, Message string }
+type recEvent struct{ Volume, Reason string }
 
 type recEvents struct {
 	mu sync.Mutex
 	ev []recEvent
 }
 
-func (e *recEvents) Event(volumeID, reason, message string) {
+func (e *recEvents) Event(volumeID, reason string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.ev = append(e.ev, recEvent{volumeID, reason, message})
+	e.ev = append(e.ev, recEvent{volumeID, reason})
 }
 
 func (e *recEvents) all() []recEvent {

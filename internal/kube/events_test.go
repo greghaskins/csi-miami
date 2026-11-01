@@ -124,7 +124,7 @@ func TestRunSendsUntilItsContextEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.Run(ctx); close(done) }()
-	r.Event(volumeID, "MountFailed", "x")
+	r.Event(volumeID, "MountFailed")
 	select {
 	case <-a.created:
 	case <-time.After(10 * time.Second):
@@ -138,8 +138,8 @@ func TestEventIsCreatedOnThePV(t *testing.T) {
 	t.Parallel()
 	a := newEventsAPI()
 	r := newRecorder(t, a, 0)
-	r.Event(volumeID, "MountFailed", "the stage path is mounted from something else")
-	r.Event(volumeID, "GarbageUnmounted", "unmounted a stray mount")
+	r.Event(volumeID, "MountFailed")
+	r.Event(volumeID, "GarbageUnmounted")
 	drain(r)
 
 	a.mu.Lock()
@@ -174,12 +174,42 @@ func TestEventIsCreatedOnThePV(t *testing.T) {
 	}
 }
 
+// An event is readable by anyone who can view its namespace, so its text is
+// fixed per reason and never carries the error behind the condition.
+func TestEventMessagesAreFixedPerReason(t *testing.T) {
+	t.Parallel()
+	want := map[string]string{
+		"MountFailed":          "the volume could not be mounted on node node-a; see the node plugin's log",
+		"TransportUnavailable": "the volume's transport did not answer on node node-a; see the node plugin's log",
+		"GarbageUnmounted":     "a mount of this volume that no intent claimed was removed on node node-a",
+	}
+	for reason, msg := range want {
+		a := newEventsAPI()
+		r := newRecorder(t, a, 0)
+		r.Event(volumeID, reason)
+		drain(r)
+		a.mu.Lock()
+		if len(a.events) != 1 {
+			t.Fatalf("%s: %d events, want 1", reason, len(a.events))
+		}
+		for _, ev := range a.events {
+			if ev["message"] != msg {
+				t.Errorf("%s message = %q, want %q", reason, ev["message"], msg)
+			}
+		}
+		a.mu.Unlock()
+	}
+	if got := eventMessage("Surprise", "node-a"); !strings.Contains(got, "Surprise") || !strings.Contains(got, "node-a") {
+		t.Errorf("an unknown reason gives %q", got)
+	}
+}
+
 func TestARepeatedEventCountsInsteadOfDuplicating(t *testing.T) {
 	t.Parallel()
 	a := newEventsAPI()
 	r := newRecorder(t, a, 0)
 	for range 3 {
-		r.Event(volumeID, "TransportUnavailable", "the server did not answer")
+		r.Event(volumeID, "TransportUnavailable")
 	}
 	drain(r)
 	a.mu.Lock()
@@ -200,12 +230,12 @@ func TestARecreatedPVGetsItsOwnEvent(t *testing.T) {
 	t.Parallel()
 	a := newEventsAPI()
 	r := newRecorder(t, a, 0)
-	r.Event(volumeID, "MountFailed", "the same message")
+	r.Event(volumeID, "MountFailed")
 	drain(r)
 	a.mu.Lock()
 	a.pvs[pvName] = "uid-2"
 	a.mu.Unlock()
-	r.Event(volumeID, "MountFailed", "the same message")
+	r.Event(volumeID, "MountFailed")
 	drain(r)
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -228,8 +258,8 @@ func TestEventsThatCannotBeRecordedAreDropped(t *testing.T) {
 		t.Parallel()
 		a := newEventsAPI()
 		r := newRecorder(t, a, 0)
-		r.Event("", "MountFailed", "x")
-		r.Event("not-an-id", "MountFailed", "x")
+		r.Event("", "MountFailed")
+		r.Event("not-an-id", "MountFailed")
 		if len(r.queue) != 0 {
 			t.Errorf("%d events were queued", len(r.queue))
 		}
@@ -239,7 +269,7 @@ func TestEventsThatCannotBeRecordedAreDropped(t *testing.T) {
 		a := newEventsAPI()
 		delete(a.pvs, pvName)
 		r := newRecorder(t, a, 0)
-		r.Event(volumeID, "MountFailed", "x")
+		r.Event(volumeID, "MountFailed")
 		drain(r)
 		if a.posts != 0 {
 			t.Errorf("%d events were posted", a.posts)
@@ -250,7 +280,7 @@ func TestEventsThatCannotBeRecordedAreDropped(t *testing.T) {
 		a := newEventsAPI()
 		a.failOn = "create"
 		r := newRecorder(t, a, 0)
-		r.Event(volumeID, "MountFailed", "x")
+		r.Event(volumeID, "MountFailed")
 		drain(r) // must return, not retry forever
 		if a.posts != 1 {
 			t.Errorf("%d posts, want 1", a.posts)
@@ -260,24 +290,13 @@ func TestEventsThatCannotBeRecordedAreDropped(t *testing.T) {
 		t.Parallel()
 		a := newEventsAPI()
 		r := newRecorder(t, a, 2)
-		for i := range 5 {
-			r.Event(volumeID, "MountFailed", strings.Repeat("x", i+1))
+		for range 5 {
+			r.Event(volumeID, "MountFailed")
 		}
 		if len(r.queue) != 2 {
 			t.Errorf("%d events queued, want 2 (the rest dropped)", len(r.queue))
 		}
 	})
-}
-
-func TestTruncateKeepsValidUTF8(t *testing.T) {
-	t.Parallel()
-	if got := truncate("short", 10); got != "short" {
-		t.Errorf("got %q", got)
-	}
-	got := truncate(strings.Repeat("é", 10), 5) // 2 bytes each
-	if len(got) > 5 || got != "éé" {
-		t.Errorf("got %q", got)
-	}
 }
 
 func TestNewEventRecorderNeedsAConfig(t *testing.T) {
