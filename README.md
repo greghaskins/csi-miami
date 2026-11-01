@@ -4,6 +4,16 @@
 Kubernetes CSI driver for my own personal needs, on a bare-metal cluster with
 a NAS, attached storage, and self-hosted workloads.
 
+The goal: make bare-metal hardware behave like a proper Kubernetes storage
+layer. csi-miami is responsible for:
+
+1. **Flexibility** across directories and images, local disks and a remote NAS.
+2. **Strong RWO and RWX semantics**, available when a workload needs them.
+3. **Encryption at rest.**
+
+All of it should be mostly transparent to workloads, especially open source
+projects run off the shelf.
+
 > **TECH:** Pod's stuck. The events keep piling up.
 >
 > **LIEUTENANT:** *(sunglasses on)* The evidence is *mounting.*
@@ -52,7 +62,7 @@ Details: [architecture brief](docs/design/2026-10-30-architecture-brief.md).
 | **M2** (next) | Image on the NAS | an ext4 `.img` on the NAS | one node at a time |
 | **M3** | Shared image | an M2 image, re-exported over NFSv4 by its holder node | many nodes |
 | **M4** | Local image | an ext4 `.img` on the local disk, moved with `miami move` | one node |
-| Later | S3 service | an S3 endpoint backed by an image volume | over the network |
+| Later, maybe | Blob storage | content-addressed, encrypted blobs on an image volume (an S3 interface on top is out of scope) | — |
 
 ## Installation
 
