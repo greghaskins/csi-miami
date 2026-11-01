@@ -96,7 +96,9 @@ scrape() {
       sleep 1
     done
     echo "kind: $pod /metrics answered 200 with $(grep -c '^miami_' <<<"$body") miami_ series, for example:"
-    grep '^miami_' <<<"$body" | head -3 | sed 's/^/kind:   /'
+    # -m stops grep after three lines without a broken pipe, which under
+    # pipefail failed the check whenever the body was large enough.
+    grep -m3 '^miami_' <<<"$body" | sed 's/^/kind:   /'
   done
 }
 scrape controller 9811
