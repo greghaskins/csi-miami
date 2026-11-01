@@ -117,3 +117,5 @@ unmerged predecessor's branch when the wave needs it, and says so in the PR.
 3. Check which PRs are open and which tasks are merged (`git log main`),
    and pick up at the first incomplete wave.
 4. If the first design PR is not merged yet, nothing else starts.
+
+A documentation-only change, to see the change filter skip the heavy jobs.
