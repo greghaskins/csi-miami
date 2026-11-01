@@ -216,10 +216,12 @@ func (e *env) pvEvents(ctx context.Context, pv, reason string) ([]corev1.Event, 
 // The outage is as long as the plugin needs to notice it: a pod started during
 // it wakes the plugin's loop, whose probe of the dead server takes its 10 second
 // deadline. That is well under the soft mount's major timeout (timeo 10s times
-// retrans 3 plus 1, about 40 seconds), so the writer's blocked writes complete
+// retrans 17 plus 1, 180 seconds), so the writer's blocked writes complete
 // and do not fail. (A first version waited for the loop's 30 second timer, held
 // the server down for about 40 seconds, and a write in flight then failed with
-// ETIMEDOUT and its data was dropped, in both architectures.)
+// ETIMEDOUT and its data was dropped, in both architectures. That was when the
+// major timeout was 40 seconds, retrans 3; the outage here stays short anyway,
+// so the test does not depend on which value the profile has.)
 func TestNFSServerRestart(t *testing.T) {
 	e := loadEnv(t)
 	runVariant(t, e, transportNFS3, func(t *testing.T) { nfsServerRestart(t, e) })
@@ -316,11 +318,11 @@ func nfsServerRestart(t *testing.T, e *env) {
 
 	// The node plugin's pass runs every 30 seconds, and a pass that probes the
 	// dead server takes its 10 second deadline: waiting for the timer would hold
-	// the server down for about as long as the soft mount takes to give up (a
-	// major timeout of timeo 10s times retrans 3 plus 1, about 40 seconds), and
-	// a write in flight then may fail with ETIMEDOUT. A request wakes the loop at
-	// once, so a pod that starts during the outage is the cheap way to have the
-	// plugin look now: its NodePublishVolume cannot complete while the server is
+	// the server down for about as long as the soft mount once took to give up
+	// (40 seconds, retrans 3; the major timeout is now timeo 10s times retrans 17
+	// plus 1, 180 seconds), and a write in flight then could fail with
+	// ETIMEDOUT. A request wakes the loop at once, so a pod that starts during
+	// the outage is the cheap way to have the plugin look now: its NodePublishVolume cannot complete while the server is
 	// down, is recorded, and is bound by a pass after the server is back.
 	n.createPod(t, podSpec{Name: "late", Claim: "data", Node: node, Run: stay("echo late > /data/late")})
 
