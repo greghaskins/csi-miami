@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,7 +52,7 @@ func nodeExec(ctx context.Context, node string, argv ...string) (string, error) 
 }
 
 // nodeMounts reads the mount table of the node's init process, which is the
-// table the kubelet and the driver's Bidirectional mounts share.
+// table the kubelet sees: the driver's stage and publish binds are in it.
 func nodeMounts(ctx context.Context, node string) (mountTable, error) {
 	out, err := nodeExec(ctx, node, "cat", "/proc/1/mountinfo")
 	if err != nil {
@@ -60,6 +61,30 @@ func nodeMounts(ctx context.Context, node string) (mountTable, error) {
 	ms, err := observe.Parse(strings.NewReader(out))
 	if err != nil {
 		return nil, fmt.Errorf("parsing the mount table of %s: %w", node, err)
+	}
+	return mountTable(ms), nil
+}
+
+// pluginMounts reads the mount table of the node plugin's own process, which is
+// where the transports are mounted: the transports root is private to the
+// plugin (brief decision 26), so the node's table does not list them. The
+// process is found by its metrics address, which only the node plugin has.
+func pluginMounts(ctx context.Context, node string) (mountTable, error) {
+	out, err := nodeExec(ctx, node, "pgrep", "-o", "-f", "--", "--metrics-addr=:"+strconv.Itoa(nodePort))
+	if err != nil {
+		return nil, fmt.Errorf("finding the node plugin process on %s: %w", node, err)
+	}
+	pid := strings.TrimSpace(out)
+	if _, err := strconv.Atoi(pid); err != nil {
+		return nil, fmt.Errorf("pgrep on %s printed %q, want a process ID", node, out)
+	}
+	table, err := nodeExec(ctx, node, "cat", "/proc/"+pid+"/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	ms, err := observe.Parse(strings.NewReader(table))
+	if err != nil {
+		return nil, fmt.Errorf("parsing the mount table of the node plugin on %s: %w", node, err)
 	}
 	return mountTable(ms), nil
 }

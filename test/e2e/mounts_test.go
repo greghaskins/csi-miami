@@ -55,9 +55,9 @@ type mountIDs struct {
 	Publish   int
 }
 
-// volumeMounts finds a volume's transport mount, stage bind and the publish
-// bind for one pod, each exactly once. The stage path comes from the node's
-// intent record. It returns an error that says which mount is missing or
+// volumeMounts finds a volume's transport mount (in the node plugin's mount
+// namespace), stage bind and the publish bind for one pod (on the node), each
+// exactly once. The stage path comes from the node's intent record. It returns an error that says which mount is missing or
 // duplicated and lists what the table has near it.
 func volumeMounts(ctx context.Context, node string, vol volumeInfo, pod types.UID) (mountIDs, error) {
 	table, err := nodeMounts(ctx, node)
@@ -82,17 +82,22 @@ func volumeMounts(ctx context.Context, node string, vol volumeInfo, pod types.UI
 	if !published {
 		return mountIDs{}, fmt.Errorf("the intent of %s on %s lists no publish at %s (publishes: %v)", vol.PV, node, want, in.Publishes)
 	}
+	plugin, err := pluginMounts(ctx, node)
+	if err != nil {
+		return mountIDs{}, err
+	}
 	var ids mountIDs
 	for _, c := range []struct {
-		what string
-		path string
-		id   *int
+		what  string
+		table mountTable
+		path  string
+		id    *int
 	}{
-		{"transport mount", transportDir, &ids.Transport},
-		{"stage bind", in.StagePath, &ids.Stage},
-		{"publish bind", want, &ids.Publish},
+		{"transport mount (in the plugin's mount namespace)", plugin, transportDir, &ids.Transport},
+		{"stage bind", table, in.StagePath, &ids.Stage},
+		{"publish bind", table, want, &ids.Publish},
 	} {
-		got := table.at(c.path)
+		got := c.table.at(c.path)
 		if len(got) != 1 {
 			return mountIDs{}, fmt.Errorf("%s of %s on %s: %d mounts at %s, want exactly 1 (stage mounts on the node: %v)", c.what, vol.PV, node, len(got), c.path, table.stages())
 		}
@@ -126,9 +131,10 @@ type liveVolume struct {
 // noLeakedMounts checks the node's mount table against the volumes pods on it
 // use: under the kubelet's CSI staging directory and the pods' CSI volume
 // directories there is exactly the stage and publish mounts of those volumes,
-// each once, and under the transports root exactly one mount at each
-// transport directory, with the live volumes' transports among them. (An idle
-// transport stays mounted by design: the idle TTL is off by default.)
+// each once; and in the node plugin's mount namespace, under the transports
+// root, exactly one mount at each transport directory, with the live volumes'
+// transports among them. (An idle transport stays mounted by design: the idle
+// TTL is off by default.)
 func noLeakedMounts(ctx context.Context, node string, live []liveVolume) error {
 	table, err := nodeMounts(ctx, node)
 	if err != nil {
@@ -147,14 +153,24 @@ func noLeakedMounts(ctx context.Context, node string, live []liveVolume) error {
 	seen := map[string]int{}
 	for _, m := range table {
 		mp := m.MountPoint
-		switch {
-		case strings.HasPrefix(mp, stageRoot+"/"),
-			strings.HasPrefix(mp, filepath.Join(kubeletDir, "pods")+"/") && strings.Contains(mp, "/volumes/kubernetes.io~csi/"):
+		if strings.HasPrefix(mp, stageRoot+"/") ||
+			strings.HasPrefix(mp, filepath.Join(kubeletDir, "pods")+"/") && strings.Contains(mp, "/volumes/kubernetes.io~csi/") {
 			seen[mp]++
 			if !allowed[mp] {
 				problems = append(problems, fmt.Sprintf("%s (mount %d) belongs to no volume a pod on %s uses", mp, m.ID, node))
 			}
-		case strings.HasPrefix(mp, transportsRoot+"/"):
+		}
+		if strings.HasPrefix(mp, transportsRoot+"/") {
+			problems = append(problems, fmt.Sprintf("%s (mount %d) is on the node's table, where a transport (private to the plugin) must not be", mp, m.ID))
+		}
+	}
+	plugin, err := pluginMounts(ctx, node)
+	if err != nil {
+		return err
+	}
+	for _, m := range plugin {
+		mp := m.MountPoint
+		if strings.HasPrefix(mp, transportsRoot+"/") {
 			seen[mp]++
 			if filepath.Dir(mp) != filepath.Join(transportsRoot, "transports") {
 				problems = append(problems, fmt.Sprintf("%s (mount %d) is not a transport directory", mp, m.ID))

@@ -26,7 +26,7 @@ func TestLocalVolumeOnOneNode(t *testing.T) {
 	e := loadEnv(t)
 	runVariant(t, e, transportLocal, func(t *testing.T) {
 		node := e.workers(t)[0]
-		const content = "written on the node's own disk"
+		const content = "written on the disk of the node"
 
 		sc := e.storageClass(t)
 		if sc.VolumeBindingMode == nil || *sc.VolumeBindingMode != storagev1.VolumeBindingWaitForFirstConsumer {

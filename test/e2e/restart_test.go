@@ -79,10 +79,12 @@ func (e *env) waitPluginBack(t *testing.T, node string, oldUID types.UID, oldCon
 }
 
 // Exit criterion 4: restarting the node plugin pod while a pod writes to a
-// volume changes nothing. The writes keep landing, the transport mount, the
-// stage bind and the publish bind are the same mounts (same mount IDs) before
-// and after, the plugin comes back Ready, and a new claim and pod on that node
-// stage and publish, and unstage cleanly when the pod goes.
+// volume changes nothing. The writes keep landing, the stage bind and the
+// publish bind are the same mounts (same mount IDs) before and after, the new
+// plugin has the transport mounted again (the transport is private to the
+// plugin's mount namespace, brief decision 26, so it is not the same mount),
+// the plugin comes back Ready, and a new claim and pod on that node stage and
+// publish, and unstage cleanly when the pod goes.
 func TestNodePluginRestartChangesNothing(t *testing.T) {
 	e := loadEnv(t)
 	for _, variant := range []string{transportLocal, transportNFS3} {
@@ -121,10 +123,10 @@ func nodePluginRestart(t *testing.T, e *env) {
 	// The writer kept writing through it.
 	n.waitLog(t, "writer", "writes after the plugin came back", func(l string) bool { return lastWrote(l) >= wroteBefore+5 })
 	after := e.mustVolumeMounts(t, node, vol, writer.UID)
-	if after != before {
-		t.Errorf("mounts changed across the plugin restart: before %+v, after %+v", before, after)
+	if after.Stage != before.Stage || after.Publish != before.Publish {
+		t.Errorf("the stage or publish bind changed across the plugin restart: before %+v, after %+v", before, after)
 	}
-	t.Logf("after: mounts %+v (the same mount IDs)", after)
+	t.Logf("after: mounts %+v (stage and publish are the same mounts; the transport, private to the plugin, was mounted again by the new one)", after)
 
 	out := n.runOnce(t, "live", node, "cat /data/loop.log")
 	if err := checkSequence(out, wroteBefore+5); err != nil {
@@ -148,8 +150,8 @@ func nodePluginRestart(t *testing.T, e *env) {
 	t.Logf("the new volume %s staged, published and unstaged through the new plugin", freshVol.PV)
 
 	// The first volume is untouched by all of it.
-	if again := e.mustVolumeMounts(t, node, vol, writer.UID); again != before {
-		t.Errorf("mounts of the running volume changed: before %+v, now %+v", before, again)
+	if again := e.mustVolumeMounts(t, node, vol, writer.UID); again != after {
+		t.Errorf("mounts of the running volume changed: before %+v, now %+v", after, again)
 	}
 	e.waitNoLeakedMounts(t, node, []liveVolume{{Vol: vol, Pod: writer.UID}})
 
