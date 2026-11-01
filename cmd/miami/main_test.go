@@ -16,7 +16,7 @@ func TestRun(t *testing.T) {
 		wantStderr string
 	}{
 		{name: "version", args: []string{"version"}, wantStdout: version + "\n"},
-		{name: "lock", args: []string{"lock"}, wantStdout: "miami lock " + version + "\n"},
+		{name: "lock without a verb", args: []string{"lock"}, wantCode: 2, wantStderr: lockUsage},
 
 		{name: "no command prints usage", args: nil, wantCode: 2, wantStderr: usage},
 		{name: "-h", args: []string{"-h"}, wantStdout: usage},
@@ -24,7 +24,7 @@ func TestRun(t *testing.T) {
 		{name: "--help", args: []string{"--help"}, wantStdout: usage},
 		{name: "help", args: []string{"help"}, wantStdout: usage},
 
-		{name: "lock --help", args: []string{"lock", "--help"}, wantStdout: "Usage of miami lock:\n"},
+		{name: "lock --help", args: []string{"lock", "--help"}, wantStdout: lockUsage},
 		{name: "version -h", args: []string{"version", "-h"}, wantStdout: "Usage of miami version:\n"},
 
 		{
@@ -35,15 +35,15 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:       "extra argument",
-			args:       []string{"lock", "x"},
+			args:       []string{"version", "x"},
 			wantCode:   2,
-			wantStderr: "miami lock: unexpected argument \"x\"\n",
+			wantStderr: "miami version: unexpected argument \"x\"\n",
 		},
 		{
 			name:       "unknown flag",
-			args:       []string{"lock", "-nope"},
+			args:       []string{"version", "-nope"},
 			wantCode:   2,
-			wantStderr: "flag provided but not defined: -nope\nUsage of miami lock:\n",
+			wantStderr: "flag provided but not defined: -nope\nUsage of miami version:\n",
 		},
 	}
 

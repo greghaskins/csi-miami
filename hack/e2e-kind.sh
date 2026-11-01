@@ -113,6 +113,7 @@ if [ "$transport" = nfs3 ]; then
     TestNodeReboot
     TestMetrics
     TestNFSServerRestart
+    TestLockSerializesPodsAndBreaksAStaleLock
   )
 else
   expected=(
@@ -121,6 +122,7 @@ else
     TestNodePluginRestartChangesNothing
     TestNodeReboot
     TestMetrics
+    TestLockSerializesPodsAndBreaksAStaleLock
   )
 fi
 listed="$("$kind_work/e2e.test" -test.list '^Test')"
