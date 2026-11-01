@@ -987,6 +987,32 @@ Recorded:
     is held by another (the command was not started), 2 on an error or a lost
     lock (the command was terminated, nothing was released).
 
+32. **Breaking a `miami lock` safely (M1, T17; amends 29)**: the security
+    review of T11 found three ways to break a lock wrongly, and this closes
+    them. (a) *Only a lock-shaped directory is broken*: a real directory
+    holding regular files named `holder`, `since` or their temporary names, and
+    nothing else, checked before the rename and again on what was moved.
+    Anything else at the lock's path (a directory with other contents, a
+    regular file, a symbolic link, dangling or not) is reported with the error
+    `ErrNotALock` and exit code 3 and is never moved or removed, because it
+    may be someone's data. (b) *No stamp makes a lock unbreakable*: a stamp
+    more than 30 seconds ahead of the probe, the server's now, is stale, and
+    the reason is recorded and printed on stderr. A tenant setting a stamp
+    into the future, or a server clock stepped backwards, then costs a live
+    holder at most one renewal interval of exposure, since its next renewal
+    restamps with the server's clock. (c) *Breakers take turns*: a breaker
+    takes the directory `.NAME.breaking` (mkdir), judges the lock again under
+    it, then renames the lock to a private name, checks it and removes it; one
+    left by a dead breaker is reclaimed after `--stale`. A breaker stalled
+    between judging and renaming therefore finds the lock another breaker took
+    and leaves it. (d) *Accepted overlap*: NFSv3 has no conditional rename, so
+    a holder whose live lock is moved in the instant between a breaker's second
+    judgement and its rename, and whose path another acquirer takes before the
+    breaker puts it back, learns that at its next renewal. Two holders may
+    overlap for up to `--renew` (30s by default) plus the stop grace
+    `--timeout` (10s by default). The lock is a lease without fencing, and the
+    work it protects must tolerate that. Decisions numbered after 31.
+
 Pending: none that block M1.
 
 ## 10. Milestones
