@@ -122,6 +122,9 @@ type dropped struct {
 	// knew it (from the intent that claimed the target, or the volume's current
 	// one for an Unpublish). The target must be a bind of it. "" means unknown.
 	itemDir string
+	// tdir is the mount point of the volume's transport ("" when unknown or
+	// wide). A drop is not judged while nothing is mounted there.
+	tdir string
 	// wide is set only for an explicit Unpublish of a volume with no intent:
 	// nothing then says which directory the target should be a bind of, so the
 	// target may be a bind of any directory in one of the driver's transports.
@@ -132,7 +135,7 @@ type dropped struct {
 // targetInfo is what the reconciler remembers of a publish target between
 // passes: whose it was, and the item directory it was a bind of.
 type targetInfo struct {
-	volume, itemDir string
+	volume, itemDir, tdir string
 }
 
 // New returns a Reconciler over an intent store and a Mounter. It fails if

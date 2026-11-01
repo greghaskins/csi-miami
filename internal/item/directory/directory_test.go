@@ -81,6 +81,41 @@ func (d dirInfo) ModTime() time.Time { return time.Time{} }
 func (d dirInfo) IsDir() bool        { return d.dir }
 func (d dirInfo) Sys() any           { return nil }
 
+// popper removes the top mount at a path when it is unmounted, like the kernel.
+type popper struct {
+	*fake.Mounter
+	table observe.Table
+}
+
+func (p *popper) Unmount(ctx context.Context, target string, flags int) error {
+	if err := p.Mounter.Unmount(ctx, target, flags); err != nil {
+		return err
+	}
+	var keep observe.Table
+	dropped := false
+	for i := len(p.table) - 1; i >= 0; i-- {
+		if !dropped && p.table[i].MountPoint == target {
+			dropped = true
+			continue
+		}
+		keep = append(observe.Table{p.table[i]}, keep...)
+	}
+	p.table = keep
+	p.SetTable(keep)
+	return nil
+}
+
+func newPopperItem(t *testing.T, ms ...observe.Mount) (*Item, *popper) {
+	t.Helper()
+	p := &popper{Mounter: &fake.Mounter{}, table: observe.Table(ms)}
+	p.SetTable(p.table)
+	it, err := New(Config{Root: root, Mounter: p, Stat: func(string) (fs.FileInfo, error) { return dirInfo{dir: true}, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return it, p
+}
+
 type fixture struct {
 	mu     sync.Mutex
 	f      *fake.Mounter
@@ -209,9 +244,6 @@ func TestConvergeErrors(t *testing.T) {
 	foreign.Major, foreign.Minor, foreign.FSType = 0, 55, "tmpfs"
 	otherBind := stageBind()
 	otherBind.Root = host + "/" + pvc2
-	hiddenStage := stageBind()
-	hiddenStage.MountPoint = stage
-	cover := observe.Mount{ID: 9, ParentID: 1, Major: 0, Minor: 9, Root: "/", MountPoint: filepath.Dir(stage), FSType: "tmpfs", Source: "t"}
 
 	tests := []struct {
 		name  string
@@ -246,10 +278,6 @@ func TestConvergeErrors(t *testing.T) {
 			[]error{item.ErrStageConflict, mount.ErrConflict}},
 		{"a bind of another directory", []observe.Mount{rootMount(), transportMount(), otherBind}, nil,
 			[]error{item.ErrStageConflict}},
-		{"a stage hidden under another mount", []observe.Mount{rootMount(), transportMount(), hiddenStage, cover}, nil,
-			[]error{item.ErrStageConflict}},
-		{"even a bind of the item directory is a conflict", []observe.Mount{rootMount(), transportMount(), stageBind()}, nil,
-			[]error{item.ErrStageConflict, mount.ErrConflict}},
 		{"a conflict at the stage path creates nothing", []observe.Mount{rootMount(), transportMount(), foreign},
 			func(fx *fixture, in *intent.Intent) {
 				in.EnsureItem = true
@@ -357,22 +385,22 @@ func TestTeardownWithNothingAtTheStagePathIsANoOp(t *testing.T) {
 	}
 }
 
-// Whatever is mounted at the stage path is not the driver's, and is left.
+// What is mounted at the stage path and is not a bind of the volume's own
+// directory is not the driver's, and is left.
 func TestTeardownLeavesAnythingMountedAtTheStagePath(t *testing.T) {
 	t.Parallel()
 	foreign := stageBind()
 	foreign.Major, foreign.Minor, foreign.FSType = 0, 55, "tmpfs"
 	stacked := foreign
 	stacked.ID = 4
-	gone := stageBind()
-	gone.Deleted = true
+	other := stageBind()
+	other.Root = host + "/" + pvc2
 	tests := []struct {
 		name  string
 		table []observe.Mount
 	}{
 		{"a foreign file system", []observe.Mount{rootMount(), transportMount(), foreign}},
-		{"a bind of the volume's directory", []observe.Mount{rootMount(), transportMount(), stageBind()}},
-		{"a bind of a removed directory", []observe.Mount{rootMount(), transportMount(), gone}},
+		{"a bind of another volume's directory", []observe.Mount{rootMount(), transportMount(), other}},
 		{"a stack of mounts", []observe.Mount{rootMount(), transportMount(), stageBind(), stacked}},
 	}
 	for _, tt := range tests {
@@ -390,16 +418,81 @@ func TestTeardownLeavesAnythingMountedAtTheStagePath(t *testing.T) {
 	}
 }
 
-// A mount hidden under a parent's is not reported by Teardown, so a stale one
-// cannot make a volume impossible to unstage.
-func TestTeardownIgnoresAHiddenMount(t *testing.T) {
+// A mount hidden under a parent's is not looked at by Converge or Teardown:
+// kubelet never sees it, and the driver mounts nothing there, so a stale one
+// blocks nothing.
+func TestAHiddenMountAtTheStagePathIsIgnored(t *testing.T) {
 	t.Parallel()
 	cover := observe.Mount{ID: 9, ParentID: 1, Major: 0, Minor: 9, Root: "/", MountPoint: filepath.Dir(stage), FSType: "tmpfs", Source: "t"}
-	it, f, tab := teardownFixture(t, rootMount(), transportMount(), stageBind(), cover)
-	if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: tab}); err != nil {
+	it, p := newPopperItem(t, rootMount(), transportMount(), stageBind(), cover)
+	obs := item.Observed{Mounts: p.table}
+	if err := it.Teardown(context.Background(), theIntent(), obs); err != nil {
 		t.Fatal(err)
 	}
-	if got := unmounts(f); len(got) != 0 {
+	if err := it.Converge(context.Background(), theIntent(), obs); err != nil {
+		t.Fatal(err)
+	}
+	if got := unmounts(p.Mounter); len(got) != 0 {
+		t.Errorf("unmounted %v", got)
+	}
+}
+
+// A bind of the volume's own directory at the stage path was made by an
+// earlier build. Converge and Teardown unmount it once, whether or not the
+// directory has since been removed, and then there is nothing to do.
+func TestAStageBindFromAnEarlierBuildIsUnmounted(t *testing.T) {
+	t.Parallel()
+	gone := stageBind()
+	gone.Deleted = true
+	for name, bind := range map[string]observe.Mount{"present": stageBind(), "removed": gone} {
+		for op, run := range map[string]func(*Item, item.Observed) error{
+			"Converge": func(it *Item, o item.Observed) error { return it.Converge(context.Background(), theIntent(), o) },
+			"Teardown": func(it *Item, o item.Observed) error { return it.Teardown(context.Background(), theIntent(), o) },
+		} {
+			t.Run(op+" "+name, func(t *testing.T) {
+				t.Parallel()
+				it, p := newPopperItem(t, rootMount(), transportMount(), bind)
+				if err := run(it, item.Observed{Mounts: p.table}); err != nil {
+					t.Fatal(err)
+				}
+				if got := unmounts(p.Mounter); !slices.Equal(got, []string{stage}) {
+					t.Errorf("unmounts = %v, want the stage once", got)
+				}
+				if _, ok := p.table.At(stage); ok {
+					t.Error("the stage bind is still mounted")
+				}
+				// Nothing more to do the second time.
+				if err := run(it, item.Observed{Mounts: p.table}); err != nil {
+					t.Fatal(err)
+				}
+				if got := unmounts(p.Mounter); len(got) != 1 {
+					t.Errorf("unmounts after the second call = %v", got)
+				}
+			})
+		}
+	}
+}
+
+// An unmount of the old bind that fails is the caller's to retry, and one with
+// something stacked on it is a conflict that leaves both.
+func TestAStageBindFromAnEarlierBuildThatCannotBeUnmounted(t *testing.T) {
+	t.Parallel()
+	it, p := newPopperItem(t, rootMount(), transportMount(), stageBind())
+	p.FailOp(fake.OpUnmount, stage, mount.ErrBusy)
+	if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: p.table}); !errors.Is(err, mount.ErrBusy) {
+		t.Errorf("got %v, want ErrBusy", err)
+	}
+	if _, ok := p.table.At(stage); !ok {
+		t.Error("a busy bind was removed")
+	}
+
+	foreign := stageBind()
+	foreign.ID, foreign.Major, foreign.Minor, foreign.FSType = 4, 0, 55, "tmpfs"
+	it, p = newPopperItem(t, rootMount(), transportMount(), stageBind(), foreign)
+	if err := it.Converge(context.Background(), theIntent(), item.Observed{Mounts: p.table}); !errors.Is(err, item.ErrStageConflict) {
+		t.Errorf("got %v, want ErrStageConflict", err)
+	}
+	if got := unmounts(p.Mounter); len(got) != 0 {
 		t.Errorf("unmounted %v", got)
 	}
 }

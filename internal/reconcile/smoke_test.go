@@ -757,7 +757,7 @@ func TestSmokeAMountAtTheStagePathIsAConflictAndIsLeft(t *testing.T) {
 	r, _, _ := n.run(nil)
 	in := n.intent(pvc1)
 	mkdir(t, in.StagePath)
-	if err := unix.Mount(filepath.Join(n.host, pvc1), in.StagePath, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount("tmpfs", in.StagePath, "tmpfs", 0, "size=1m"); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Stage(ctx, in); !errors.Is(err, reconcile.ErrStageConflict) {
@@ -770,4 +770,48 @@ func TestSmokeAMountAtTheStagePathIsAConflictAndIsLeft(t *testing.T) {
 	if c := n.mountsAt(in.StagePath); c != 1 {
 		t.Errorf("%d mounts at the stage path, want the one left alone", c)
 	}
+}
+
+// (9) A node upgraded in place still has the stage bind, and the publish bound
+// from it, that the previous build made. On the kernel the first pass
+// recognises the stage bind as the driver's own and unmounts it, the publish
+// is adopted (it is a bind of the item directory), and Unstage succeeds.
+func TestSmokeAStageBindFromAnEarlierBuildIsRemoved(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+	in := n.intent(pvc1)
+	target := n.target("pod1")
+	if err := r.Stage(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: target}); err != nil {
+		t.Fatal(err)
+	}
+
+	item := filepath.Join(n.tdir(), pvc1)
+	mkdir(t, in.StagePath)
+	if err := unix.Mount(item, in.StagePath, "", unix.MS_BIND, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Unmount(target, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount(in.StagePath, target, "", unix.MS_BIND, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	n.runPass(r)
+	n.requireNoStage(pvc1)
+	n.requireBind(target, item, true)
+	if c := n.mountsAt(target); c != 1 {
+		t.Errorf("%d mounts at the target, want the adopted one", c)
+	}
+	if err := r.Unstage(ctx, in.VolumeID); err != nil {
+		t.Fatalf("Unstage: %v", err)
+	}
+	if _, ok := currentTable(t).At(target); ok {
+		t.Error("the publish is still mounted")
+	}
+	n.requireNoStage(pvc1)
 }

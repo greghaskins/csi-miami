@@ -399,8 +399,9 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
    has converged; a directory missing without it is `NotFound`, as for `nfs3`,
    so a disk that is not mounted, or a reboot, never gives a pod an empty
    volume.
-3. The item directory exists; nothing is mounted at the stage path
-   (decision 25). Anything mounted there is `FailedPrecondition`, reported and
+3. Nothing is mounted at the stage path (decision 25). A bind of the item
+   directory there is the stage bind of a build before the decision, and is
+   unmounted; anything else mounted there is `FailedPrecondition`, reported and
    left, since the driver makes no mount there and cannot show it made that
    one.
 4. Each publish target is a bind of the item directory with the requested
@@ -413,8 +414,9 @@ path, so a mount at exactly a live stage path, or inside it, is the volume's
 conflict and is left), and so is a mount at a publish target
 that no intent claims but that an `Unpublish` named or that the previous pass
 saw claimed; a publish target is unmounted only if it is a bind of the
-volume's directory in its transport (the same device and root path, also for a
-directory that has since been removed), once, never a stack. The one wider
+volume's directory in its transport (a bind of it as the kernel reports binds, the same device and root path or on
+NFS the directory in the mount source, also for a directory that has since been
+removed), once, never a stack. The one wider
 case is an explicit `NodeUnpublishVolume` for a volume with no intent: kubelet
 named the path and nothing identifies the volume, so a bind of any directory
 in one of the driver's transports is accepted. A transport with no referencing intent is unmounted only
