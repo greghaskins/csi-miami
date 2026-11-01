@@ -10,28 +10,49 @@ a NAS, attached storage, and self-hosted workloads.
 >
 > **YEEEAAAH**
 
-## Mounting modes
+## How it works
 
 ```
-shared directory · RWX · M1
-  pod ─▶ <export>/<ns>/<pvc>/ ─▶ NAS (NFSv3)
-
-local directory · one node · M1
-  pod ─▶ /export/data/<pvc>/ ─▶ node disk
-
-image on the NAS · RWO · M2
-  pod ─▶ ext4 ─▶ loop ─▶ pvc.img ─▶ NAS (NFSv3)
-
-shared image · RWX · M3
-  pod ─▶ NFSv4 ─▶ holder node's ext4 ─▶ loop ─▶ NAS
-
-local image · one node · M4
-  pod ─▶ ext4 ─▶ loop ─▶ pvc.img ─▶ node disk
+┌─ node ─────────────────────────────────────┐
+│                                            │
+│  ┌─ workload pod ───────────────────────┐  │
+│  │  /data                               │  │
+│  └──────────────────▲───────────────────┘  │
+│                     │ bind mount           │
+│  ┌─ miami node (DaemonSet) ─────────────┐  │
+│  │  mounts the NAS export on the host   │  │
+│  │  directory: bind the subdirectory    │  │
+│  │  image: loop ▶ (LUKS2) ▶ ext4        │  │
+│  └──────┬─────────────────────┬─────────┘  │
+│         │                     │            │
+│  ┌──────▼──────────┐          │            │
+│  │ local disk      │          │            │
+│  │ /export/data/   │          │            │
+│  └─────────────────┘          │            │
+└───────────────────────────────┼────────────┘
+                                │ NFSv3, soft
+                     ┌──────────▼──────────┐
+                     │ NAS                 │
+                     │ <ns>/<pvc>/         │
+                     │ pvc.img, pvc.holder │
+                     └─────────────────────┘
 ```
 
-Images can add LUKS2 and are held by one node at a time (attach plus a
-heartbeat file on the NAS). Details:
-[architecture brief](docs/design/2026-10-30-architecture-brief.md).
+The `miami node` DaemonSet runs on every node and does all the mounting. A
+small `miami controller` Deployment creates and deletes volumes on the NAS.
+Images are held by one node at a time (attach plus the `.holder` heartbeat).
+Details: [architecture brief](docs/design/2026-10-30-architecture-brief.md).
+
+## Milestones
+
+| | Mode | Where the data lives | Access |
+|---|---|---|---|
+| **M1** (building) | Shared directory | a subdirectory on the NAS | many nodes |
+| **M1** (building) | Local directory | a subdirectory on the local disk | one node |
+| **M2** (next) | Image on the NAS | an ext4 `.img` on the NAS | one node at a time |
+| **M3** | Shared image | an M2 image, re-exported over NFSv4 by its holder node | many nodes |
+| **M4** | Local image | an ext4 `.img` on the local disk, moved with `miami move` | one node |
+| Later | S3 service | an S3 endpoint backed by an image volume | over the network |
 
 ## Installation
 
