@@ -127,6 +127,19 @@ func (p *pass) deleteRecord(in intent.Intent) error {
 // down when every publish is gone. The transport stays mounted.
 func (p *pass) teardownVolume(in intent.Intent) error {
 	r := p.r
+	if tdir := r.transportDirOf(in); tdir != "" {
+		// Judging a bind of the volume, a publish or an old stage, needs the
+		// transport in the table (see unmountCandidate).
+		t, err := r.observe(p.ctx)
+		if err != nil {
+			return err
+		}
+		if _, staged := t.At(in.StagePath); staged || len(in.Publishes) > 0 {
+			if err := transportMounted(t, tdir); err != nil {
+				return err
+			}
+		}
+	}
 	for _, pub := range in.Publishes {
 		owned, what := r.publishOwnership(r.itemDirOf(in), false)
 		err := item.UnmountIf(p.ctx, r.m, pub.TargetPath, owned, what, ErrPublishConflict)

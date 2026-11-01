@@ -266,7 +266,8 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-// NodeUnstageVolume unmounts the volume's publishes and stage path and
+// NodeUnstageVolume unmounts the volume's publishes (nothing is mounted at the
+// stage path, except a bind left by an earlier build, which goes too) and
 // forgets it. A volume that is not staged is already unstaged.
 func (n *Node) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 	id, err := requireID(req.GetVolumeId())

@@ -10,7 +10,7 @@ import (
 )
 
 // A directory volume has no mount at its stage path. Whatever is mounted
-// there, even a bind of the volume's own directory, is the volume's
+// there that is not a bind of the volume's own directory is the volume's
 // ErrStageConflict from Stage and from Unstage, and is never unmounted.
 func TestAnythingAtTheStagePathIsAConflictAndIsNeverUnmounted(t *testing.T) {
 	t.Parallel()
@@ -21,8 +21,10 @@ func TestAnythingAtTheStagePathIsAConflictAndIsNeverUnmounted(t *testing.T) {
 		{"a foreign file system", func(e *env, in intent.Intent) {
 			e.sim.addMount(in.StagePath, "tmpfs", "tmpfs")
 		}},
-		{"a bind of the volume's directory", func(e *env, in intent.Intent) {
-			mustNil(t, "bind", e.sim.Bind(bg, e.srcOf(in), in.StagePath, false))
+		{"a bind of another volume's directory", func(e *env, in intent.Intent) {
+			other := e.vol("a", pvc2)
+			mustNil(t, "Stage other", e.r.Stage(bg, other)) // brings the transport up
+			mustNil(t, "bind", e.sim.Bind(bg, e.srcOf(other), in.StagePath, false))
 		}},
 	}
 	for _, tt := range tests {
@@ -130,5 +132,129 @@ func TestUnstageWithNoPublishesUnmountsNothing(t *testing.T) {
 	}
 	if _, ok := e.intentOf(in.VolumeID); ok {
 		t.Error("the record is still there")
+	}
+}
+
+// A node upgraded in place still has the stage bind (and publish binds of it)
+// that the previous build made. The first pass recognises the stage bind as
+// the driver's own and unmounts it, the publish is adopted because it is a bind
+// of the item directory, and the Unstage then succeeds.
+func TestAStageBindFromAnEarlierBuildIsRemovedAndThePublishAdopted(t *testing.T) {
+	t.Parallel()
+	for _, deleted := range []bool{false, true} {
+		name := "the directory present"
+		if deleted {
+			name = "the directory removed"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := newEnv(t)
+			e.start()
+			in := e.vol("a", pvc1)
+			target := e.stageAndPublish(in, "pod1", false)
+			e.sim.Reset()
+
+			// What the previous build left: the item directory bound at the
+			// stage path, and the publish a bind of that.
+			mustNil(t, "old stage", e.sim.Bind(bg, e.srcOf(in), in.StagePath, false))
+			mustNil(t, "drop publish", e.sim.Unmount(bg, target, 0))
+			mustNil(t, "old publish", e.sim.Bind(bg, in.StagePath, target, false))
+			if deleted {
+				e.sim.markDeleted(in.StagePath, target)
+			}
+			e.sim.Reset()
+
+			e.freshPass(e.r.nudge)
+			e.noStageMount(in)
+			if _, ok := e.visible(target); !ok {
+				t.Fatal("the publish was lost")
+			}
+			if !deleted && !e.isBind(target, e.srcOf(in)) {
+				t.Error("the old publish is not a bind of the item directory")
+			}
+			var unmounts []string
+			for _, c := range e.sim.mutating() {
+				if c.Op == fake.OpUnmount {
+					unmounts = append(unmounts, c.Target)
+				}
+			}
+			if len(unmounts) != 1 || unmounts[0] != in.StagePath {
+				t.Errorf("unmounts = %v, want only the old stage bind", unmounts)
+			}
+			for _, c := range e.sim.mutating() {
+				if c.Op == fake.OpBind && c.Target == target {
+					t.Errorf("the adopted publish was bound again: %+v", c)
+				}
+			}
+
+			mustNil(t, "Unstage", e.r.Unstage(bg, in.VolumeID))
+			if _, ok := e.visible(target); ok {
+				t.Error("the publish is still mounted")
+			}
+			e.noStageMount(in)
+		})
+	}
+}
+
+// With the transport unmounted, a publish that is still mounted cannot be
+// recognised as the driver's own. An Unstage is Unavailable, not a conflict
+// for a person to fix, and unmounts nothing; once the transport is back the
+// retry succeeds.
+func TestUnstageWithThePublishStillMountedAndTheTransportGoneIsUnavailable(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", pvc1)
+	target := e.stageAndPublish(in, "pod1", false)
+	e.sim.remove(e.tdir("a"))
+	e.sim.Reset()
+
+	err := e.r.Unstage(bg, in.VolumeID)
+	if !errors.Is(err, ErrTransportUnavailable) || errors.Is(err, ErrPublishConflict) || Classify(err) != ClassUnavailable {
+		t.Fatalf("Unstage = %v (class %v), want Unavailable and not a conflict", err, Classify(err))
+	}
+	for _, c := range e.sim.mutating() {
+		if c.Op == fake.OpUnmount {
+			t.Errorf("unexpected unmount %+v", c)
+		}
+	}
+	if _, ok := e.visible(target); !ok {
+		t.Error("the publish was unmounted")
+	}
+	if _, ok := e.intentOf(in.VolumeID); !ok {
+		t.Error("the record was deleted")
+	}
+
+	// The next pass mounts the transport again; the retry then succeeds.
+	e.freshPass(e.r.nudge)
+	mustNil(t, "Unstage again", e.r.Unstage(bg, in.VolumeID))
+	if _, ok := e.visible(target); ok {
+		t.Error("the publish is still mounted")
+	}
+}
+
+// The same for an Unpublish: the drop is kept for the next pass, which
+// unmounts the target once the transport is back, instead of being discarded
+// as a foreign mount.
+func TestUnpublishWithTheTransportGoneIsUnavailableAndIsRetried(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", pvc1)
+	target := e.stageAndPublish(in, "pod1", false)
+	e.sim.remove(e.tdir("a"))
+	e.sim.FailOp(fake.OpBind, e.tdir("a"), mount.ErrBusy) // the pass cannot mount it again
+
+	err := e.r.Unpublish(bg, in.VolumeID, target)
+	if !errors.Is(err, ErrTransportUnavailable) || errors.Is(err, ErrPublishConflict) {
+		t.Fatalf("Unpublish = %v, want ErrTransportUnavailable and not a conflict", err)
+	}
+	if _, ok := e.visible(target); !ok {
+		t.Error("the publish was unmounted")
+	}
+	e.sim.FailOp(fake.OpBind, e.tdir("a"), nil)
+	mustNil(t, "Unpublish again", e.r.Unpublish(bg, in.VolumeID, target))
+	if _, ok := e.visible(target); ok {
+		t.Error("the publish is still mounted after the transport came back")
 	}
 }

@@ -24,10 +24,12 @@
 // item.ErrItemMissing like nfs3), with mode 0755, relative to descriptors and
 // without following a symlink or crossing a mount.
 //
-// Anything mounted at the stage path is not this volume's and is
+// A bind of the volume's own item directory at the stage path is the one thing
+// the driver recognises there: an earlier build made it. Converge and Teardown
+// unmount it once, without MNT_DETACH, so a node upgraded in place does not
+// keep it. Anything else mounted there is not this volume's and is
 // item.ErrStageConflict, from Converge and from Teardown alike: it is left
-// exactly as it is, never stacked over and never removed. Teardown has nothing
-// to unmount and removes nothing.
+// exactly as it is, never stacked over and never removed.
 //
 // Nothing is cached. Whether the stage path is clear is decided from the mount
 // table the reconciler hands in.
@@ -124,14 +126,17 @@ func (d *Item) PublishSource(in intent.Intent) (string, error) {
 	return dir, nil
 }
 
-// Converge checks the item directory and that the stage path is clear, and
-// makes nothing:
+// Converge clears the stage path, checks the item directory, and mounts
+// nothing:
 //
-//  1. Nothing is mounted at the stage path. A visible mount there, or a mount
-//     hidden under a parent's mount, is item.ErrStageConflict and is left
-//     exactly as it is: the driver makes no mount at a directory volume's
-//     stage path, so whatever is there is not its own, and kubelet's reference
-//     check would see it too.
+//  1. Nothing is mounted at the stage path. A visible mount there that is a
+//     bind of the volume's item directory was made by an earlier build and is
+//     unmounted (clearStage). Any other visible mount is item.ErrStageConflict
+//     and is left exactly as it is: the driver makes no mount at a directory
+//     volume's stage path now, so whatever else is there is not its own, and
+//     kubelet's reference check would see it. A mount hidden under a
+//     parent's mount is not looked at: kubelet resolves through the covering
+//     mount and never sees it, and the driver mounts nothing there.
 //
 //  2. The item directory exists and is a directory; for a local transport a
 //     missing one is created first if in.EnsureItem is set (see ensure). The
@@ -145,7 +150,7 @@ func (d *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed
 	if err != nil {
 		return err
 	}
-	if err := stageClear(in, obs.Mounts, true); err != nil {
+	if err := d.clearStage(ctx, in, dir, obs.Mounts); err != nil {
 		return err
 	}
 
@@ -163,16 +168,28 @@ func (d *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed
 	return err
 }
 
-// stageClear is item.ErrStageConflict if anything is mounted at the stage
-// path: a visible mount, or, when hiddenToo, one that a parent's mount covers.
-func stageClear(in intent.Intent, t observe.Table, hiddenToo bool) error {
+// clearStage is step 1 of Converge and all of Teardown. A visible mount at the
+// stage path that is a bind of the volume's item directory, deleted or not
+// (observe.Table.IsBindOfIncludingDeleted), is the driver's own from before
+// directory items stopped mounting there, and is unmounted by item.UnmountBind:
+// once, without MNT_DETACH, and never a stack. Any other visible mount is
+// item.ErrStageConflict.
+func (d *Item) clearStage(ctx context.Context, in intent.Intent, dir string, t observe.Table) error {
 	stage := in.StagePath
-	if top, ok := t.At(stage); ok {
+	top, ok := t.At(stage)
+	if !ok {
+		return nil
+	}
+	ours, err := t.IsBindOfIncludingDeleted(stage, dir)
+	if err != nil {
+		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+	}
+	if !ours {
 		return fmt.Errorf("directory item %s: %w: %s is mounted as %s from %q; the driver mounts nothing at a directory volume's stage path",
 			in.VolumeID, item.ErrStageConflict, stage, top.FSType, top.Source)
 	}
-	if hiddenToo && hidden(t, stage) {
-		return fmt.Errorf("directory item %s: %w: %s has a mount that is hidden under another mount; clear it before staging", in.VolumeID, item.ErrStageConflict, stage)
+	if err := item.UnmountBind(ctx, d.cfg.Mounter, stage, dir, item.ErrStageConflict); err != nil {
+		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
 	}
 	return nil
 }
@@ -214,31 +231,23 @@ func (d *Item) ensure(ctx context.Context, in intent.Intent, dir string) error {
 	return nil
 }
 
-// hidden reports whether the table has a mount at path that no visible mount
-// leads to, because a mount of a parent directory covers it.
-func hidden(t observe.Table, path string) bool {
-	for _, m := range t {
-		if m.MountPoint == path {
-			return true
-		}
-	}
-	return false
-}
-
-// Teardown has nothing to unmount and removes nothing: Converge made nothing
-// at the stage path. It returns item.ErrStageConflict if a mount is visible
-// there, and leaves it, as Converge does: the driver never puts one there, so
-// it is someone else's, and removing what the driver cannot show it made is not
-// the driver's call. The cost is that an Unstage over such a mount fails until
-// a person clears it, which is the loud outcome; the alternative is unmounting
-// something that holds data. A mount hidden under a parent's is not reported
-// here, so a stale one cannot make a volume impossible to unstage.
+// Teardown takes down what an earlier build made at the stage path and nothing
+// else: a bind of the volume's item directory there is unmounted (clearStage),
+// once and without MNT_DETACH, so a busy one is an error for the caller to
+// retry, and it is recognised even if the directory has since been removed. In a
+// current build there is nothing to undo. Any other mount visible at the stage
+// path is item.ErrStageConflict and is left, as Converge leaves it: removing
+// what the driver cannot show it made is not the driver's call. The cost is
+// that an Unstage over such a mount fails until a person clears it, which is
+// the loud outcome; the alternative is unmounting something that holds data. A
+// mount hidden under a parent's is not looked at.
 //
-// It does not stat the item directory and does not depend on the transport
-// being mounted or reachable.
-func (d *Item) Teardown(_ context.Context, in intent.Intent, obs item.Observed) error {
-	if _, err := d.PublishSource(in); err != nil {
+// It does not stat the item directory. Recognising an old bind needs the
+// transport in the mount table; the reconciler checks for it first.
+func (d *Item) Teardown(ctx context.Context, in intent.Intent, obs item.Observed) error {
+	dir, err := d.PublishSource(in)
+	if err != nil {
 		return err
 	}
-	return stageClear(in, obs.Mounts, false)
+	return d.clearStage(ctx, in, dir, obs.Mounts)
 }

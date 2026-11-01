@@ -97,10 +97,13 @@ var ErrObserve = errors.New("the mount table cannot be read")
 type Owned func(t observe.Table, top observe.Mount) (bool, error)
 
 // BindOf is the Owned test for a mount that must be a bind of the directory
-// source: same device and same root path, including when the directory has
-// since been removed (observe.Table.IsBindOfIncludingDeleted). A volume whose
+// source: the mount is a bind of that directory as the kernel reports it
+// (the same device and the same root path, or, on NFS, which reports "/" as
+// the root of every mount of an export, the same device and the directory in
+// the mount source), including when the directory has since been removed
+// (observe.Table.IsBindOfIncludingDeleted). A volume whose
 // directory was deleted while it was staged must still be unstageable. For a
-// removed directory this is "same device and same last-known root path", not a
+// removed directory this is "the same last-known root path", not a
 // proof of identity: renaming another directory to the volume's name before
 // the removal would pass for it. The mount table has nothing better to offer,
 // and the cost of the mistake is unmounting a bind of a directory in the
