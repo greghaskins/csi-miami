@@ -119,9 +119,10 @@ func (c lockConfig) validate(verb string, command []string) error {
 		return errors.New("--holder is required")
 	case c.stale < lock.MinStale:
 		return fmt.Errorf("--stale %s is below the minimum %s (the attribute cache of the nfs3 transport is 30s)", c.stale, lock.MinStale)
-	case c.renew <= 0:
+	// --renew means nothing to a single attempt.
+	case verb == "run" && c.renew <= 0:
 		return errors.New("--renew must be positive")
-	case c.renew > c.stale/3:
+	case verb == "run" && c.renew > c.stale/3:
 		return fmt.Errorf("--renew %s must be at most a third of --stale %s", c.renew, c.stale)
 	case c.timeout <= 0:
 		return errors.New("--timeout must be positive")

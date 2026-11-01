@@ -171,6 +171,13 @@ func TestLockAcquireAndReleaseExitCodes(t *testing.T) {
 		{"acquire in a directory that does not exist", []string{"acquire", "--dir", filepath.Join(dir, "missing"), "--name", "web", "--holder", "a"}, 2, "mkdir: no such file or directory"},
 		{"release in a directory that does not exist", []string{"release", "--dir", filepath.Join(dir, "missing"), "--name", "web", "--holder", "a"}, 1, "not held"},
 	}
+	// --renew is for run only: a short --stale with the default --renew is fine.
+	steps = append(steps, struct {
+		name string
+		args []string
+		code int
+		err  string
+	}{"acquire with the minimum stale and the default renew", lockArgs("acquire", t.TempDir(), "--holder", "a", "--stale", "60s"), 0, ""})
 	for _, s := range steps {
 		code, stdout, stderr := lockCmd(s.args...)
 		if code != s.code || stdout != "" {
