@@ -2,6 +2,7 @@ package observe
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -158,6 +159,15 @@ func (t Table) collect(prefix string, includeAt bool) Table {
 // kernel rewrites it), and two exports of one server can share a superblock,
 // so a caller adopting a transport must verify the source string and super
 // options itself as well; that is the transport's job, not this table's.
+//
+// NFS is the exception to "a Root equal to sourceDir's path": its client
+// reports "/" as the root of every mount, and puts the directory a bind
+// mount is of into the source ("server:/export/sub"). So for two NFS mounts
+// of one device whose sources differ, the comparison is of the sources: the
+// target's source must be the container's with sourceDir's path below it
+// appended. When the sources are equal the Root decides, as for any other
+// file system (a bind of the export root itself, or a client that reports the
+// directory in the Root).
 func (t Table) IsBindOf(mountPoint, sourceDir string) (bool, error) {
 	return t.isBindOf(mountPoint, sourceDir, false)
 }
@@ -203,8 +213,30 @@ func (t Table) isBindOf(mountPoint, sourceDir string, deletedOK bool) (bool, err
 	if err != nil {
 		return false, fmt.Errorf("observe: %w", err)
 	}
-	want := filepath.Join(container.Root, rel)
-	return target.Major == container.Major && target.Minor == container.Minor && target.Root == want, nil
+	if target.Major != container.Major || target.Minor != container.Minor {
+		return false, nil
+	}
+	if isNFS(container.FSType) && isNFS(target.FSType) && target.Source != container.Source {
+		want, ok := nfsSourceFor(container.Source, rel)
+		return ok && target.Source == want, nil
+	}
+	return target.Root == filepath.Join(container.Root, rel), nil
+}
+
+// isNFS reports whether a file system type is an NFS client's.
+func isNFS(fstype string) bool { return fstype == "nfs" || fstype == "nfs4" }
+
+// nfsSourceFor is the source an NFS mount reports for the directory rel below
+// a mount whose source is src. The NFS client reports "/" as the root of every
+// mount of an export, bind mounts of its subdirectories included, and carries
+// the directory in the source instead: a bind of rel below "server:/export" is
+// "server:/export/rel". It is false when src has no "server:/path" form.
+func nfsSourceFor(src, rel string) (string, bool) {
+	i := strings.Index(src, ":/")
+	if i < 0 {
+		return "", false
+	}
+	return src[:i+1] + path.Join(src[i+1:], rel), true
 }
 
 // within reports whether path is dir or lies below it. Both are clean.
