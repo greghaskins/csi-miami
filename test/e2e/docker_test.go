@@ -23,7 +23,7 @@ import (
 // it (deploy/kustomize/base/daemonset-node.yaml).
 const (
 	kubeletDir     = "/var/lib/kubelet"
-	transportsRoot = "/var/lib/miami"
+	transportsRoot = kubeletDir + "/plugins/miami.csi.greghaskins.com/transports"
 )
 
 // stageRoot is the directory the kubelet stages the driver's volumes under.

@@ -55,6 +55,10 @@ spec:
           securityContext:
             privileged: false
             runAsUser: 0
+            # containerd's default AppArmor profile on Ubuntu denies mount(2)
+            # even with CAP_SYS_ADMIN (decision 27).
+            appArmorProfile:
+              type: Unconfined
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -75,6 +79,9 @@ spec:
             - --feature-gates=Topology=true
             - --leader-election
             - --leader-election-namespace=$(POD_NAMESPACE)
+            # A first CreateVolume on a transport pays for the NFS mount, which
+            # the default 15s does not cover.
+            - --timeout=60s
             - --v=2
           env:
             - name: POD_NAMESPACE

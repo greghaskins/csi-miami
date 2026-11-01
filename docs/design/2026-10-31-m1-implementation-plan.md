@@ -364,9 +364,11 @@ reported and never stacked over.
 that every transport looks the same to the item and observer code. It
 must exist and be a directory; the driver never creates it.
 
-**Mount point on the host table.** The DaemonSet mounts a `hostPath`
-directory (`--transports-root`, default `/var/lib/miami`) with
-`mountPropagation: Bidirectional`. A transport mounted under it is visible
+**Mount point on the host table.** The DaemonSet mounts the kubelet
+directory with `mountPropagation: Bidirectional`; the node's transports root
+(`--transports-root`) defaults to
+`<kubelet-dir>/plugins/miami.csi.greghaskins.com/transports` (decision 27)
+and the controller's to `/var/lib/miami`, an emptyDir. A transport mounted under it is visible
 to the host and to the next plugin pod. On start the reconciler reads
 mountinfo and adopts what is there; it never assumes.
 
@@ -607,12 +609,13 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
   kernels: retired by the `nfs3` e2e variant in T4, before any node-agent
   code depends on it, and by the first real-cluster mount.
 - **`Bidirectional` propagation and adoption across a plugin restart**: the
-  reason the transports root is a hostPath; adoption across a process
+  reason the transports root is under the kubelet directory's hostPath; adoption across a process
   restart is retired by the T4 smoke (one private mount namespace, so it
   does not exercise propagation); propagation is proven by the e2e on a real
   cluster in T10 and by exit criterion 4.
-- **Kubelet path differences across distributions**: one replacement in
-  the kustomize base, checked by a render test in T9.
+- **Kubelet path differences across distributions**: one ConfigMap
+  literal and one replacement in the kustomize base, checked by a render test
+  in T9 and by a throwaway overlay in T13.
 - **A hung NFS mount blocking the reconciler**: every observation has a
   deadline and its own goroutine; retired by a T6 unit test with a blocking
   fake and by an e2e that stops the NFS server mid-stage.

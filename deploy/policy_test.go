@@ -245,8 +245,8 @@ func TestCSIDriver(t *testing.T) {
 	if d.Spec.PodInfoOnMount == nil || *d.Spec.PodInfoOnMount {
 		t.Error("podInfoOnMount must be false")
 	}
-	if d.Spec.FSGroupPolicy == nil || *d.Spec.FSGroupPolicy != storagev1.FileFSGroupPolicy {
-		t.Errorf("fsGroupPolicy = %v, want File", d.Spec.FSGroupPolicy)
+	if d.Spec.FSGroupPolicy == nil || *d.Spec.FSGroupPolicy != storagev1.ReadWriteOnceWithFSTypeFSGroupPolicy {
+		t.Errorf("fsGroupPolicy = %v, want ReadWriteOnceWithFSType", d.Spec.FSGroupPolicy)
 	}
 	if !reflect.DeepEqual(d.Spec.VolumeLifecycleModes, []storagev1.VolumeLifecycleMode{storagev1.VolumeLifecyclePersistent}) {
 		t.Errorf("volumeLifecycleModes = %v, want [Persistent]", d.Spec.VolumeLifecycleModes)
@@ -256,6 +256,21 @@ func TestCSIDriver(t *testing.T) {
 	}
 	if d.Spec.StorageCapacity == nil || *d.Spec.StorageCapacity {
 		t.Error("storageCapacity must be false")
+	}
+}
+
+// TestNamespaceLabels: the namespace sets the enforce level and its version
+// and nothing else; warn and audit are the cluster's choice.
+func TestNamespaceLabels(t *testing.T) {
+	t.Parallel()
+	var ns corev1.Namespace
+	base(t).get(t, "Namespace", "miami-system", &ns)
+	want := map[string]string{
+		"pod-security.kubernetes.io/enforce":         "privileged",
+		"pod-security.kubernetes.io/enforce-version": "latest",
+	}
+	if !reflect.DeepEqual(ns.Labels, want) {
+		t.Errorf("namespace labels = %v, want %v", ns.Labels, want)
 	}
 }
 
@@ -343,7 +358,11 @@ func TestNodeDaemonSet(t *testing.T) {
 		t.Errorf("NODE_NAME must come from the downward API field spec.nodeName, got %+v", env)
 	}
 
-	// The mounts of the miami container, by host path.
+	// The node has exactly one hostPath: the kubelet directory, mounted whole
+	// and Bidirectional into the miami container.
+	if len(spec.Volumes) != 1 {
+		t.Errorf("the node has %d volumes, want only the kubelet directory", len(spec.Volumes))
+	}
 	hostPaths := map[string]corev1.Volume{}
 	for _, v := range spec.Volumes {
 		if v.HostPath == nil {
@@ -370,9 +389,7 @@ func TestNodeDaemonSet(t *testing.T) {
 		got[v.HostPath.Path] = mount{v.HostPath.Path, typ, vm.MountPath, prop}
 	}
 	want := map[string]mount{
-		kubeletDir:                            {kubeletDir, corev1.HostPathDirectory, kubeletDir, corev1.MountPropagationBidirectional},
-		"/var/lib/miami":                      {"/var/lib/miami", corev1.HostPathDirectoryOrCreate, "/var/lib/miami", corev1.MountPropagationBidirectional},
-		kubeletDir + "/plugins/" + driverName: {kubeletDir + "/plugins/" + driverName, corev1.HostPathDirectoryOrCreate, "/csi", corev1.MountPropagationNone},
+		kubeletDir: {kubeletDir, corev1.HostPathDirectory, kubeletDir, corev1.MountPropagationBidirectional},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("miami host mounts:\n got %+v\nwant %+v", got, want)
@@ -395,70 +412,207 @@ func TestNodeDaemonSet(t *testing.T) {
 	}
 }
 
-// TestKubeletDirAgreement checks the one literal the node manifest repeats:
-// the --kubelet-dir argument, the registrar's registration path and the
-// hostPaths and mount paths all derive from it.
+// expand applies Kubernetes' $(VAR) expansion for one variable.
+func expand(s, name, value string) string {
+	return strings.ReplaceAll(s, "$("+name+")", value)
+}
+
+// checkKubeletDir asserts that the one kubelet directory dir is what every
+// field of the node DaemonSet that names it says: the fields Kubernetes cannot
+// expand (the env values, the hostPath and the miami container's mount path) and every
+// argument, which derives from $(KUBELET_DIR).
+func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
+	t.Helper()
+	driverDir := dir + "/plugins/" + driverName
+	sock := "unix://" + driverDir + "/csi.sock"
+	wantArgs := map[string]map[string]string{
+		"miami": {
+			"endpoint":    sock,
+			"kubelet-dir": dir,
+		},
+		"csi-node-driver-registrar": {
+			"csi-address":               "/csi/csi.sock",
+			"kubelet-registration-path": driverDir + "/csi.sock",
+			"plugin-registration-path":  "/registration",
+		},
+		"livenessprobe": {
+			"csi-address": "/csi/csi.sock",
+		},
+	}
+	// Only the miami container mounts the whole kubelet directory; each
+	// sidecar mounts just the subPaths it uses.
+	type vm struct{ mountPath, subPath string }
+	wantMounts := map[string][]vm{
+		"miami":                     {{dir, ""}},
+		"csi-node-driver-registrar": {{"/csi", "plugins/" + driverName}, {"/registration", "plugins_registry"}},
+		"livenessprobe":             {{"/csi", "plugins/" + driverName}},
+	}
+	// Only the miami and registrar containers use $(KUBELET_DIR).
+	wantEnv := map[string]bool{"miami": true, "csi-node-driver-registrar": true}
+	for _, c := range spec.Containers {
+		var vals []string
+		for _, e := range c.Env {
+			if e.Name == "KUBELET_DIR" {
+				vals = append(vals, e.Value)
+			}
+		}
+		switch {
+		case wantEnv[c.Name] && (len(vals) != 1 || vals[0] != dir):
+			t.Errorf("%s: KUBELET_DIR env = %v, want exactly [%s]", c.Name, vals, dir)
+		case !wantEnv[c.Name] && len(vals) != 0:
+			t.Errorf("%s: KUBELET_DIR env = %v, want none", c.Name, vals)
+		}
+		for _, a := range c.Args {
+			if strings.Contains(a, "kubelet") && !strings.Contains(a, "$(KUBELET_DIR)") && !strings.HasPrefix(a, "--kubelet-") {
+				t.Errorf("%s: argument %q names a kubelet path without deriving it from $(KUBELET_DIR)", c.Name, a)
+			}
+		}
+		for name, want := range wantArgs[c.Name] {
+			if got := expand(flagValue(t, c.Args, name), "KUBELET_DIR", dir); got != want {
+				t.Errorf("%s: --%s expands to %q, want %q", c.Name, name, got, want)
+			}
+		}
+		var mounts []vm
+		for _, m := range c.VolumeMounts {
+			if m.Name != "kubelet-dir" {
+				t.Errorf("%s: mounts unknown volume %s", c.Name, m.Name)
+				continue
+			}
+			mounts = append(mounts, vm{m.MountPath, m.SubPath})
+		}
+		if !reflect.DeepEqual(mounts, wantMounts[c.Name]) {
+			t.Errorf("%s: kubelet-dir mounts = %v, want %v", c.Name, mounts, wantMounts[c.Name])
+		}
+		if c.Name != "miami" {
+			for _, m := range c.VolumeMounts {
+				if m.MountPath == dir || m.SubPath == "" {
+					t.Errorf("%s: mounts the kubelet root (%+v); a sidecar mounts only subPaths", c.Name, m)
+				}
+			}
+		}
+	}
+	if len(spec.Volumes) != 1 || spec.Volumes[0].Name != "kubelet-dir" || spec.Volumes[0].HostPath == nil ||
+		spec.Volumes[0].HostPath.Path != dir {
+		t.Errorf("volumes = %+v, want the one hostPath %s", spec.Volumes, dir)
+	}
+	// The node's defaults for the state, stage and transports roots live under
+	// --kubelet-dir; none may be overridden.
+	m := container(t, spec, "miami")
+	for _, f := range []string{"state-dir", "stage-root", "transports-root"} {
+		for _, a := range m.Args {
+			if strings.HasPrefix(a, "--"+f+"=") {
+				t.Errorf("--%s is set (%s); the default under the kubelet directory is the contract", f, a)
+			}
+		}
+	}
+	// No literal copy of the directory in any argument.
+	for _, c := range spec.Containers {
+		for _, a := range c.Args {
+			if strings.Contains(a, dir) {
+				t.Errorf("%s: argument %q holds the kubelet directory literally", c.Name, a)
+			}
+		}
+	}
+}
+
+// TestKubeletDirAgreement checks that the base's one kubelet directory is what
+// the env values, the hostPath, the mount paths and every argument say.
 func TestKubeletDirAgreement(t *testing.T) {
 	t.Parallel()
-	spec := node(t, base(t)).Spec.Template.Spec
-	m := container(t, spec, "miami")
-	dir := flagValue(t, m.Args, "kubelet-dir")
-	if dir != kubeletDir {
-		t.Errorf("--kubelet-dir = %q, want %q (change the constant here when the manifest changes)", dir, kubeletDir)
-	}
+	checkKubeletDir(t, node(t, base(t)).Spec.Template.Spec, kubeletDir)
+}
 
-	reg := container(t, spec, "csi-node-driver-registrar")
-	wantReg := dir + "/plugins/" + driverName + "/csi.sock"
-	if got := flagValue(t, reg.Args, "kubelet-registration-path"); got != wantReg {
-		t.Errorf("--kubelet-registration-path = %q, want %q", got, wantReg)
-	}
-
-	wantPaths := map[string]string{
-		"kubelet-dir":      dir,
-		"plugin-dir":       dir + "/plugins/" + driverName,
-		"registration-dir": dir + "/plugins_registry",
-	}
-	seen := map[string]bool{}
-	for _, v := range spec.Volumes {
-		if want, ok := wantPaths[v.Name]; ok {
-			seen[v.Name] = true
-			if v.HostPath == nil || v.HostPath.Path != want {
-				t.Errorf("volume %s hostPath = %+v, want %s", v.Name, v.HostPath, want)
-			}
-		}
-	}
-	for name := range wantPaths {
-		if !seen[name] {
-			t.Errorf("no volume %s", name)
-		}
-	}
-	// The kubelet directory is mounted at the same path inside, because the
-	// binary's --kubelet-dir names a path in its own mount namespace.
-	for _, vm := range m.VolumeMounts {
-		if vm.Name == "kubelet-dir" && vm.MountPath != dir {
-			t.Errorf("kubelet-dir mounted at %s, want %s", vm.MountPath, dir)
-		}
-	}
-	// The node's state and stage defaults live under --kubelet-dir; they must
-	// not be overridden to somewhere that is not a host mount.
-	for _, f := range []string{"state-dir", "stage-root"} {
-		for _, a := range m.Args {
-			if strings.HasPrefix(a, "--"+f+"=") && !strings.HasPrefix(strings.TrimPrefix(a, "--"+f+"="), dir+"/") {
-				t.Errorf("%s is outside the kubelet directory: %s", f, a)
-			}
-		}
-	}
-	// Every occurrence of a kubelet path in the rendered DaemonSet starts with
-	// the one directory.
-	js, err := json.Marshal(spec)
+// replacementBlock returns the base's replacements entry as YAML for an
+// overlay to repeat, read from the base so the test cannot drift from it. The
+// documented snippet in the base kustomization is checked against it.
+func replacementBlock(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("kustomize", "base", "kustomization.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range strings.Split(string(js), `"`) {
-		if i := strings.Index(s, "/kubelet"); i >= 0 && strings.HasPrefix(s, "/") && !strings.HasPrefix(s, dir) {
-			t.Errorf("a path mentions kubelet but is not under %s: %s", dir, s)
+	var k struct {
+		Replacements []any `json:"replacements"`
+	}
+	if err := yaml.Unmarshal(raw, &k); err != nil {
+		t.Fatal(err)
+	}
+	out, err := yaml.Marshal(k.Replacements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// TestKubeletDirSnippetMatches asserts the overlay snippet documented in the
+// base kustomization is the base's own replacement, so a reader who pastes it
+// gets the one that is tested.
+func TestKubeletDirSnippetMatches(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile(filepath.Join("kustomize", "base", "kustomization.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snippet []string
+	in := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line == "#   replacements:" {
+			in = true
+		}
+		if in {
+			if !strings.HasPrefix(line, "#") || line == "#" {
+				break
+			}
+			snippet = append(snippet, strings.TrimPrefix(strings.TrimPrefix(line, "#"), " "))
 		}
 	}
+	if len(snippet) == 0 {
+		t.Fatal("no documented replacements snippet in the base kustomization")
+	}
+	var doc, live struct {
+		Replacements []any `json:"replacements"`
+	}
+	if err := yaml.Unmarshal([]byte(strings.Join(snippet, "\n")), &doc); err != nil {
+		t.Fatalf("the documented snippet does not parse: %v", err)
+	}
+	if err := yaml.Unmarshal(raw, &live); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(doc.Replacements, live.Replacements) {
+		t.Errorf("the documented replacements differ from the base's:\n doc  %v\n base %v", doc.Replacements, live.Replacements)
+	}
+}
+
+// TestKubeletDirOverlay renders a throwaway overlay that sets the ConfigMap
+// literal and nothing else, and asserts every field follows.
+func TestKubeletDirOverlay(t *testing.T) {
+	t.Parallel()
+	const custom = "/var/lib/k0s/kubelet"
+	dir := t.TempDir()
+	baseAbs, err := filepath.Abs("kustomize/base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(dir, baseAbs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kz := `apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ` + rel + `
+configMapGenerator:
+  - name: miami-deploy
+    namespace: miami-system
+    behavior: merge
+    literals:
+      - kubeletDir=` + custom + `
+replacements:
+` + replacementBlock(t)
+	if err := os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kz), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkKubeletDir(t, node(t, render(t, dir)).Spec.Template.Spec, custom)
 }
 
 func TestControllerDeployment(t *testing.T) {
@@ -508,6 +662,12 @@ func TestControllerDeployment(t *testing.T) {
 		if sc.RunAsUser == nil || *sc.RunAsUser != 0 {
 			t.Errorf("%s: runAsUser must be 0", c.Name)
 		}
+		// containerd's default AppArmor profile denies mount(2); only the
+		// container that mounts is unconfined.
+		unconfined := sc.AppArmorProfile != nil && sc.AppArmorProfile.Type == corev1.AppArmorProfileTypeUnconfined
+		if unconfined != (c.Name == "miami") {
+			t.Errorf("%s: appArmorProfile = %+v, want Unconfined on miami only", c.Name, sc.AppArmorProfile)
+		}
 		if sc.Capabilities == nil || !reflect.DeepEqual(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) {
 			t.Errorf("%s: capabilities must drop ALL", c.Name)
 			continue
@@ -536,7 +696,7 @@ func TestControllerDeployment(t *testing.T) {
 		t.Errorf("--transports-root = %q", got)
 	}
 	p := container(t, spec, "csi-provisioner")
-	for _, a := range []string{"--extra-create-metadata", "--feature-gates=Topology=true", "--leader-election", "--csi-address=/csi/csi.sock"} {
+	for _, a := range []string{"--timeout=60s", "--extra-create-metadata", "--feature-gates=Topology=true", "--leader-election", "--csi-address=/csi/csi.sock"} {
 		if !hasArg(p.Args, a) {
 			t.Errorf("csi-provisioner lacks %s", a)
 		}
