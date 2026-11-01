@@ -284,8 +284,8 @@ The simplification is in **who decides fenceability**. **Decision 8:
 the driver owns mount options.** The driver mounts NFSv3 with one fixed option set
 (`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,
 actimeo=30,noatime`; the reasons are in the M1 plan, section 8), so the NFS
-major timeout `S` (180 seconds; decision 30) is a constant, the takeover timeout `T` is one driver
-flag validated against it at startup, and `FenceAfter = T - S - margin` and
+major timeout `S` (180 seconds; decision 30) is a constant, the takeover
+timeout `T` is one driver flag validated against it at startup, and `FenceAfter = T - S - margin` and
 `ResetAfter = T - margin` are derived once. No per-StorageClass option
 strings, no `hard` variant, no "not fenceable because of option X"
 branches. `local` transports are non-fenceable by kind and get taint-only

@@ -358,7 +358,9 @@ its meaning, not a byte-exact comparison (`rsize` and `wsize` are
 negotiated, newer kernels add tokens, the MOUNT request adds `mount*`): a
 mount that also has `nocto`, `nosharecache`, `noresvport`, `soft`, `hard`,
 `ro`, an `acdirmin`, `sec`, `lookupcache` or `local_lock` with another
-value, or any per-mount option beyond `rw` and `noatime`, is not adopted. That includes a mount made with an earlier profile (`retrans=3`): it is reported as a transport conflict and left alone (decision 30).
+value, or any per-mount option beyond `rw` and `noatime`, is not adopted.
+That includes a mount made with an earlier profile (`retrans=3`): it is
+reported as a transport conflict and left alone (decision 30).
 The source must match exactly, which is why a server is named one way across
 StorageClasses (section 5). Anything else at the mount point is a conflict,
 reported and never stacked over.

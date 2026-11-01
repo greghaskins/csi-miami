@@ -322,8 +322,9 @@ func nfsServerRestart(t *testing.T, e *env) {
 	// (40 seconds, retrans 3; the major timeout is now timeo 10s times retrans 17
 	// plus 1, 180 seconds), and a write in flight then could fail with
 	// ETIMEDOUT. A request wakes the loop at once, so a pod that starts during
-	// the outage is the cheap way to have the plugin look now: its NodePublishVolume cannot complete while the server is
-	// down, is recorded, and is bound by a pass after the server is back.
+	// the outage is the cheap way to have the plugin look now: its
+	// NodePublishVolume cannot complete while the server is down, is recorded,
+	// and is bound by a pass after the server is back.
 	n.createPod(t, podSpec{Name: "late", Claim: "data", Node: node, Run: stay("echo late > /data/late")})
 
 	// The node plugin notices: the transport is down and the volume says why.
