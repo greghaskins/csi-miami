@@ -150,6 +150,7 @@ func TestSmoke(t *testing.T) {
 	// Read-only follows RemountReadOnly, in both directions, and the source
 	// directory is unaffected.
 	requireWritable(t, publish)
+	requireNoSuidNoDev(t, publish)
 	requireReadOnly(t, publishRO)
 	if err := m.RemountReadOnly(dctx, publish, true); err != nil {
 		t.Fatalf("remount read-only: %v", err)
@@ -161,6 +162,7 @@ func TestSmoke(t *testing.T) {
 		t.Fatalf("remount read-write: %v", err)
 	}
 	requireWritable(t, publish)
+	requireNoSuidNoDev(t, publish)
 	if err := m.RemountReadOnly(dctx, filepath.Join(vol, "a"), true); !errors.Is(err, mount.ErrNotMounted) {
 		t.Errorf("remount of a directory that is not a mount point: got %v, want ErrNotMounted", err)
 	}
@@ -470,6 +472,7 @@ func TestSmokeReadOnlyIsWhatWasAskedFor(t *testing.T) {
 				requireReadOnly(t, pub)
 			} else {
 				requireWritable(t, pub)
+				requireNoSuidNoDev(t, pub)
 			}
 		}
 	}
@@ -583,7 +586,6 @@ func requireReadOnly(t *testing.T, mountPoint string) {
 
 func requireWritable(t *testing.T, mountPoint string) {
 	t.Helper()
-	requireNoSuidNoDev(t, mountPoint)
 	if cur, ok := currentTable(t).At(mountPoint); ok && cur.ReadOnly() {
 		t.Errorf("mountinfo shows %s read-only", mountPoint)
 	}
