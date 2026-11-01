@@ -31,6 +31,12 @@ type fsys interface {
 	// name, returns its modification time (the server's clock) and removes
 	// it. The file is removed whether or not reading the time succeeds.
 	Probe(dir, name string) (time.Time, error)
+	// Lstat returns the mode of the entry at path without following a
+	// symbolic link.
+	Lstat(path string) (fs.FileMode, error)
+	// ReadDir lists up to n entries of a directory, opening it first so that
+	// the client revalidates its cache.
+	ReadDir(path string, n int) ([]fs.DirEntry, error)
 	// RemoveAll removes a directory and what is in it.
 	RemoveAll(path string) error
 	// OpenDir opens the directory at path and pins it: the handle keeps
@@ -64,6 +70,27 @@ func (osFS) Mkdir(path string) error { return os.Mkdir(path, 0o755) } //nolint:g
 func (osFS) Rename(oldpath, newpath string) error { return os.Rename(oldpath, newpath) }
 
 func (osFS) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) } //nolint:gosec // the path is built from a validated lock name
+
+func (osFS) Lstat(path string) (fs.FileMode, error) {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	return st.Mode(), nil
+}
+
+func (osFS) ReadDir(path string, n int) ([]fs.DirEntry, error) {
+	d, err := os.Open(path) //nolint:gosec // the path is built from a validated lock name
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = d.Close() }()
+	ents, err := d.ReadDir(n)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	return ents, err
+}
 
 func (osFS) RemoveAll(path string) error { return os.RemoveAll(path) }
 

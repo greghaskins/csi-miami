@@ -154,7 +154,7 @@ func TestReleaseRemovesLateFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "web"+Suffix, ".since.tmp-late"), nil, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "web"+Suffix, ".since.tmp-0123456789abcdef"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Release(context.Background()); err != nil {

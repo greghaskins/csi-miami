@@ -15,7 +15,9 @@
 //     writes two files inside, each created under a temporary name and
 //     renamed into place so that a reader never sees a partial file: holder,
 //     whose content is the holder string the caller gave (by default
-//     "<hostname>:<pid>"), and since, an empty file whose modification time
+//     "<hostname>:<pid>"; two containers of one pod that are both PID 1 get
+//     the same one, so containers that share a pod should pass a holder that
+//     tells them apart), and since, an empty file whose modification time
 //     is the renewal stamp.
 //   - Renew rewrites since. The stamp is the modification time the server
 //     gives the new file; the holder's clock is never used.
@@ -42,14 +44,73 @@
 // probe by more than Options.Stale. No local time enters the decision, so
 // clock skew between nodes cannot break a live lock or keep a dead one.
 //
-// To break a stale lock the acquirer renames the lock directory to a unique
-// hidden name in D (rename is atomic, so two breakers cannot both win), removes
-// it, and makes the directory as usual. A breaker that loses the rename tries
-// to make the directory once more and, if that finds it taken, reports
-// ErrContended. A breaker checks, after winning the rename, that the directory
-// it moved still has the holder and stamp it judged stale, and puts it back
-// if not (a holder renewed, or the lock changed hands, between the judgement
-// and the rename).
+// A stamp more than 30 seconds ahead of a probe taken after the stamp was read
+// is stale too, with the
+// reason recorded (Lock.Broke): a tenant can set a stamp into the future, and
+// a server clock stepped backwards leaves every earlier stamp ahead of it, and
+// either would keep the lock unbreakable for as long as the lie. A live holder
+// restamps with the server's clock at its next renewal, so a backwards step
+// exposes a live lock to a break for at most one renewal interval.
+//
+// # What is broken
+//
+// Only a lock-shaped directory is ever broken: a directory (not a symbolic
+// link) holding nothing but regular files named holder, since, or the
+// temporary names .holder.tmp-* and .since.tmp-* (16 hex digits), or the
+// silly-renamed files .nfs<hex> that NFSv3 leaves for a moment when a file is
+// renamed over while another client has it open; at most 9 entries. An empty
+// one counts. Anything else at the lock's path, a regular file, a symbolic link,
+// or a directory with other contents, may be somebody's data: Acquire returns
+// ErrNotALock naming what it found, and moves and removes nothing. That error
+// is not ErrContended, and the miami command gives it exit code 3.
+//
+// # Breaking
+//
+// To break a stale lock the acquirer first takes a directory of its own,
+// .NAME.breaking in D (mkdir is atomic), so that breakers of one lock take
+// turns, and judges the lock again under it. A breaker stalled between
+// judging and acting, for as long as another took to break the lock and take
+// it, then sees a live lock and leaves it. A directory left by a breaker that
+// died is reclaimed once it is older than Stale, on the server's clock. The
+// breaker then renames the lock directory to a unique hidden name in D (rename
+// is atomic), checks that what it moved is lock-shaped and still has the
+// holder and stamp it judged stale, removes it, and makes the directory as
+// usual. A breaker that loses the rename tries to make the directory once more
+// and, if that finds it taken, reports ErrContended. If the check fails (a
+// holder renewed, or the lock changed, in the instant between the second
+// judgement and the rename) the directory is put back.
+//
+// A breaker that runs as another user than the holder can rename the lock
+// directory but may be refused when it empties it (EACCES, EPERM). The lock is
+// broken all the same: the attempt goes on and takes the lock, and the hidden
+// .NAME.broken-* directory is left behind. It is harmless; delete it by hand.
+//
+// NFSv3 has no conditional rename, so this does not close every window. It
+// opens in two ways. A holder renews, or a breaker stalls, between the second
+// judgement and the rename: if the holder renews there, the check of the moved
+// directory finds it alive and puts it back, and if any acquirer's mkdir
+// landed in that gap the restore fails (a rename does not replace a
+// directory), the error is returned, and the live lock is stranded under a
+// hidden .NAME.broken-* name. That takes one round trip of bad luck. Or a
+// breaker stalls there for longer than Stale: another breaker then reclaims
+// the breakers' directory, judges the lock stale, breaks it and takes it, and
+// the first breaker wakes and renames the new lock away, with the same
+// restore and the same failure. The holder of a stranded lock learns at its
+// next renewal. Two holders may overlap for up to one renewal interval plus
+// the grace the command is given to stop. The lock is a lease without
+// fencing, and the work it protects must tolerate that overlap. A call
+// abandoned at its deadline that completes late can also still move a lock
+// without these checks.
+//
+// That a restore does not replace an empty directory is Go's os.Rename, which
+// looks at the target with an Lstat before it calls rename(2); the raw system
+// call replaces an empty directory. It has a tiny window of its own between
+// the Lstat and the rename, and lookupcache=positive keeps the Lstat from
+// answering from a cached negative entry. Leaving the breakers' directory
+// moves it away and checks it is the one this breaker made; one that was
+// replaced is put back, and for the two round trips in between a mkdir lands
+// on the free name and strands it the same way (harmless: the next breaker
+// reclaims it after Stale).
 //
 // # The floor on Stale
 //
@@ -82,9 +143,13 @@
 //
 // A process killed in the middle of a call can leave entries in the directory
 // that holds the lock, hidden and named .NAME.probe-*, .NAME.tmp-*,
-// .NAME.broken-* or .NAME.removed-*, and temporary files inside a lock
+// .NAME.broken-*, .NAME.removed-*, .NAME.breaking or
+// .NAME.breaking-dead-*, and temporary files inside a lock
 // directory. They are harmless to the lock (nothing reads them, and a lock
-// directory holding one is removed with it) and can be deleted by hand.
+// directory holding one is removed with it) and can be deleted by hand. The
+// steps that put things right after a call (restore, leaving the breakers'
+// directory) run under a deadline key of their own, so a hung look at a moved
+// lock does not refuse the restore.
 //
 // Errors other than ErrContended and ErrLost are *Error values carrying the
 // operation and the lock name, never a path.

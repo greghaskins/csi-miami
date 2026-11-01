@@ -501,8 +501,27 @@ PersistentVolume named by the volume ID, where `kubectl describe pv` looks.
 inside it, renew `since` every `--renew` (default 30s) while `run` holds
 it, and let an acquirer break a lock whose `since` is older than `--stale`
 on the server's clock (compared against a probe file's mtime, never the
-local clock). Exit codes: 0 held, 1 contended, 2 error. This is the
-documented way to coordinate writers on a directory item; `flock` is not.
+local clock). Exit codes: 0 held, 1 contended, 2 error, 3 the lock path holds
+something that is not a lock. This is the documented way to coordinate
+writers on a directory item; `flock` is not.
+
+Breaking is bounded in what it touches and in who may do it (T17, decision
+32). Only a lock-shaped directory is broken: no symbolic link, and nothing in
+it but `holder`, `since` and their temporary names. A regular file, a symbolic
+link or a directory with other contents at the lock's path is reported with
+exit code 3 and left alone. A stamp more than 30 seconds ahead of the server's
+now is stale, with the reason printed on stderr, so a stamp set into the
+future or a server clock stepped back cannot keep a lock unbreakable. Breakers
+take turns through a `.NAME.breaking` directory and judge the lock again once
+they hold it, so a stalled breaker finds the lock another one took and leaves
+it. The overlap that remains is accepted: NFSv3 has no conditional rename, so
+a holder renewing at the wrong moment, or a breaker stalled for longer than
+`--stale` inside the breakers' directory, can have its live lock moved; if an
+acquirer took the name before it is put back, the lock's holder learns it at
+its next renewal. Two holders may then overlap for up to one
+renewal interval (`--renew`, 30s by default) plus the stop grace
+(`--timeout`, 10s). The lock is a lease without fencing; the work it protects
+must tolerate that.
 
 ## 12. Deploy
 
