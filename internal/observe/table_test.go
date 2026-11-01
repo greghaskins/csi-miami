@@ -3,6 +3,7 @@ package observe
 import (
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -382,5 +383,52 @@ func TestIsBindOfErrors(t *testing.T) {
 	empty := Table{{ID: 1, MountPoint: "/elsewhere"}}
 	if _, err := empty.IsBindOf("/elsewhere", "/mnt/nfs/x"); err == nil {
 		t.Error("source contained by no mount: want an error")
+	}
+}
+
+// The NFS client reports "/" as the root of every mount of an export, a bind
+// of a subdirectory included, and carries the directory in the source. The
+// lines are from a real node (the address and names are documentation ones).
+const nfsTable = `
+2052 549 0:375 / /var/lib/miami/transports/561bcb41ce13 rw,noatime shared:593 - nfs 192.0.2.10:/export rw,vers=3
+2054 549 0:375 / /stage/pvc-1/globalmount rw,noatime shared:593 - nfs 192.0.2.10:/export/ns/claim/pvc-1 rw,vers=3
+2060 549 0:375 / /pods/a/mount rw,noatime shared:593 - nfs 192.0.2.10:/export/ns/claim/pvc-1 rw,vers=3
+2061 549 0:375 / /pods/b/mount rw,noatime shared:593 - nfs 192.0.2.10:/export/ns/claim/pvc-2 rw,vers=3
+2062 549 0:376 / /other/mount rw,noatime shared:594 - nfs 192.0.2.10:/export/ns/claim/pvc-1 rw,vers=3
+`
+
+func TestIsBindOfOnNFS(t *testing.T) {
+	t.Parallel()
+	ms, err := Parse(strings.NewReader(strings.TrimSpace(nfsTable) + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := Table(ms)
+	const transport = "/var/lib/miami/transports/561bcb41ce13"
+	tests := []struct {
+		name       string
+		mountPoint string
+		source     string
+		want       bool
+	}{
+		{"the stage is a bind of the volume's directory in the transport", "/stage/pvc-1/globalmount", transport + "/ns/claim/pvc-1", true},
+		{"the stage is not a bind of a sibling directory", "/stage/pvc-1/globalmount", transport + "/ns/claim/pvc-2", false},
+		{"the stage is not a bind of the parent", "/stage/pvc-1/globalmount", transport + "/ns/claim", false},
+		{"the stage is not a bind of the whole export", "/stage/pvc-1/globalmount", transport, false},
+		{"a publish is a bind of the stage", "/pods/a/mount", "/stage/pvc-1/globalmount", true},
+		{"a publish of another directory is not a bind of the stage", "/pods/b/mount", "/stage/pvc-1/globalmount", false},
+		{"another device is not a bind of it", "/other/mount", transport + "/ns/claim/pvc-1", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := tbl.IsBindOf(tt.mountPoint, tt.source)
+			if err != nil {
+				t.Fatalf("IsBindOf(%q, %q): %v", tt.mountPoint, tt.source, err)
+			}
+			if got != tt.want {
+				t.Errorf("IsBindOf(%q, %q) = %v, want %v", tt.mountPoint, tt.source, got, tt.want)
+			}
+		})
 	}
 }

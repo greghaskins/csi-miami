@@ -24,9 +24,16 @@ import (
 //  (a) It is strictly below Options.StageRoot, it is visible, and it is
 //      neither a volume's stage path nor inside one. StageRoot is the
 //      driver's own staging directory, so nothing else has business mounting
-//      there; the mount at StageRoot itself is never touched. A mount inside
-//      a live stage path is something a pod or an operator put there and is
-//      left alone.
+//      there; the mount at StageRoot itself is never touched. The driver makes
+//      no mount at a directory volume's stage path, so every mount below the
+//      staging root is a stray; one at exactly a live stage path, or inside
+//      one, is nevertheless left and reported (ErrStageConflict for the
+//      volume), because the driver cannot show that it made it or that it
+//      holds nothing a pod needs, and what it did not make is not its to
+//      remove.
+//      The one exception is a bind of the volume's own directory, which an
+//      earlier build made: the item recognises it and unmounts it (see
+//      internal/item/directory).
 //
 //  (b) It is at exactly a publish target that no intent claims now and that
 //      the reconciler has reason to believe it made: the target was named by
@@ -91,7 +98,7 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 	for _, in := range p.intents {
 		stages = append(stages, in.StagePath)
 		for _, pub := range in.Publishes {
-			current[pub.TargetPath] = targetInfo{volume: in.VolumeID, itemDir: r.itemDirOf(in)}
+			current[pub.TargetPath] = targetInfo{volume: in.VolumeID, itemDir: r.itemDirOf(in), tdir: r.transportDirOf(in)}
 		}
 		dir, err := in.Transport.MountPoint(r.opts.TransportsRoot)
 		if err != nil {
@@ -109,7 +116,7 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 				continue
 			}
 			if _, have := r.drops[t]; !have {
-				r.drops[t] = dropped{volume: info.volume, itemDir: info.itemDir}
+				r.drops[t] = dropped{volume: info.volume, itemDir: info.itemDir, tdir: info.tdir}
 			}
 		}
 	}
@@ -127,6 +134,7 @@ func (p *pass) collectGarbage(batch []*request, failuresClean bool) {
 		d := dropped{volume: req.volume, explicit: true}
 		if in, known := p.intents[req.volume]; known {
 			d.itemDir = r.itemDirOf(in)
+			d.tdir = r.transportDirOf(in)
 		} else {
 			d.wide = true // no intent: nothing says which directory it should be a bind of
 		}
@@ -251,6 +259,19 @@ func (p *pass) unmountCandidate(c candidate) error {
 	if c.drop == nil {
 		return r.m.Unmount(p.ctx, c.path, 0)
 	}
+	if c.drop.tdir != "" {
+		// Judged only with the transport mounted: without it the directory
+		// resolves to whatever holds the transports root, and a bind of the
+		// volume would be taken for a foreign mount. That is a transient the
+		// next pass repairs, not a conflict, and the drop is kept.
+		t, err := r.observe(p.ctx)
+		if err != nil {
+			return fmt.Errorf("%w: %w", item.ErrObserve, err)
+		}
+		if err := transportMounted(t, c.drop.tdir); err != nil {
+			return err
+		}
+	}
 	owned, what := r.publishOwnership(c.drop.itemDir, c.drop.wide)
 	return item.UnmountIf(p.ctx, r.m, c.path, owned, what, ErrPublishConflict)
 }
@@ -268,18 +289,38 @@ func (p *pass) refuse(c candidate, err error) {
 	r.metrics.IncReconcileError("garbage")
 }
 
-// itemDirOf is the directory of the volume of in inside its transport, or ""
-// if the record cannot name one.
+// itemDirOf is the directory every publish of the volume of in is a bind of
+// (its item's PublishSource), or "" if the record cannot name one.
 func (r *Reconciler) itemDirOf(in intent.Intent) string {
-	id, err := in.ID()
-	if err != nil {
+	it, ok := r.items[in.Kind]
+	if !ok {
 		return ""
 	}
-	dir, err := in.Context().Dir(r.opts.TransportsRoot, id)
+	dir, err := it.PublishSource(in)
 	if err != nil {
 		return ""
 	}
 	return dir
+}
+
+// transportDirOf is the mount point of the transport of in, or "".
+func (r *Reconciler) transportDirOf(in intent.Intent) string {
+	dir, err := in.Transport.MountPoint(r.opts.TransportsRoot)
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// transportMounted is ErrTransportUnavailable if nothing is mounted at the
+// transport's mount point tdir, which makes a judgement about the volume's
+// mounts (is this a bind of the volume's directory?) impossible until the next
+// pass has mounted the transport again.
+func transportMounted(t observe.Table, tdir string) error {
+	if _, ok := t.At(tdir); ok {
+		return nil
+	}
+	return fmt.Errorf("%w: the transport is not mounted, so the volume's mounts cannot be recognised as the driver's own and are left in place; the next pass mounts it again", ErrTransportUnavailable)
 }
 
 // publishOwnership is the ownership test for a publish target, and the words
@@ -288,8 +329,10 @@ func (r *Reconciler) itemDirOf(in intent.Intent) string {
 //
 // The usual form, for teardown, derived drops and an Unpublish of a volume
 // with an intent: the target must be a bind of the volume's directory in its
-// transport (itemDir), by the same device and the same root path, including a
-// directory that has since been removed (observe.Table.IsBindOfIncludingDeleted).
+// transport (itemDir) as the kernel reports binds (observe.Table.IsBindOf: the
+// same device and root path, or on NFS the directory carried in the mount
+// source), including a directory that has since been removed
+// (observe.Table.IsBindOfIncludingDeleted).
 // It is tested against the item directory and not the stage path so that it
 // holds with the stage gone, and so that a bind of a different volume's
 // directory, stacked on ours or put there by someone else, is not taken for
@@ -488,8 +531,8 @@ func (p *pass) collectIdleTransports(t observe.Table, refs map[string]struct{}, 
 
 // dependents counts the other mounts that are made from the transport mount
 // tm: same file system, rooted at or inside tm's root, not stacked at tm's
-// own mount point. They are binds of the transport (a stage nobody claims, a
-// publish) that unmounting the transport would orphan from their path, and
+// own mount point. They are binds of the transport (a publish, or a stray
+// below the staging root) that unmounting the transport would orphan from their path, and
 // the idle timeout waits for them to go. For a transport that is the whole
 // export every mount of that file system counts; for one that is a host
 // directory, mounts of the host file system outside that directory do not.

@@ -139,6 +139,9 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 	volID := "directory:" + smokeVolume
 	stage := filepath.Join(cfg.stageRoot, "x", "globalmount")
 	target := filepath.Join(base, "kubelet", "pods", "p1", "volumes", "mount")
+	if err := os.MkdirAll(stage, 0o750); err != nil { // kubelet makes the staging directory
+		t.Fatal(err)
+	}
 	capability := &csi.VolumeCapability{
 		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
 		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER},
@@ -153,6 +156,23 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 		VolumeId: volID, StagingTargetPath: stage, TargetPath: target, VolumeCapability: capability,
 	}); err != nil {
 		t.Fatalf("NodePublishVolume: %v\n%s", err, logs.String())
+	}
+
+	// Nothing is mounted at the stage path, and the publish is a bind of the
+	// volume's directory in the transport.
+	tmp, err := spec.MountPoint(cfg.transportsRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounted, err := observe.ReadMountinfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, ok := observe.Table(mounted).At(stage); ok {
+		t.Errorf("something is mounted at the stage path: %+v", m)
+	}
+	if ok, err := observe.Table(mounted).IsBindOf(target, filepath.Join(tmp, "team", smokeVolume)); err != nil || !ok {
+		t.Errorf("the publish is not a bind of the volume's directory: %v, %v", ok, err)
 	}
 
 	// The node made the volume's directory, and a write through the publish

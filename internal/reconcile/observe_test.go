@@ -78,7 +78,7 @@ func TestARecordUnreadableWhenItsPassRunsIsNotAnUnknownVolume(t *testing.T) {
 		t.Errorf("a volume with no record = %v, want ErrUnknownVolume", err)
 	}
 	// And nothing was torn down on the strength of a record nobody could read.
-	if _, ok := e.visible(in.StagePath); !ok {
-		t.Error("the stage was unmounted")
+	if _, ok := e.visible(e.tdir("a")); !ok {
+		t.Error("the transport was unmounted")
 	}
 }

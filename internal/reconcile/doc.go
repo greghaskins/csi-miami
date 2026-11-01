@@ -5,8 +5,10 @@
 // wait for the loop to make it so. One goroutine, Run, reads the intents and
 // the kernel's mount table and drives the second toward the first, one
 // idempotent step per layer: the transport mounted on the host, the item
-// (for a directory, the volume's directory bound at the stage path), and a
-// bind of the stage path at each publish target. It does this once at start,
+// (for a directory, that the volume's directory exists and nothing is mounted
+// at the stage path), and a bind of the item's publish source (for a
+// directory, the volume's directory in the transport) at each publish
+// target. It does this once at start,
 // on every request and on a timer, so a plugin restart changes nothing the
 // kernel reports, a reboot is repaired on the first pass, and a mount that
 // someone removed is restored.

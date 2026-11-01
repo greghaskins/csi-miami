@@ -28,7 +28,7 @@ const publishDirMode = 0o700
 type reqKind int
 
 const (
-	// reqStage waits for the volume's transport and stage bind (Stage).
+	// reqStage waits for the volume's transport and item (Stage).
 	reqStage reqKind = iota
 	// reqPublish waits for one publish target to be bound (Publish).
 	reqPublish
@@ -122,6 +122,9 @@ type dropped struct {
 	// knew it (from the intent that claimed the target, or the volume's current
 	// one for an Unpublish). The target must be a bind of it. "" means unknown.
 	itemDir string
+	// tdir is the mount point of the volume's transport ("" when unknown or
+	// wide). A drop is not judged while nothing is mounted there.
+	tdir string
 	// wide is set only for an explicit Unpublish of a volume with no intent:
 	// nothing then says which directory the target should be a bind of, so the
 	// target may be a bind of any directory in one of the driver's transports.
@@ -132,7 +135,7 @@ type dropped struct {
 // targetInfo is what the reconciler remembers of a publish target between
 // passes: whose it was, and the item directory it was a bind of.
 type targetInfo struct {
-	volume, itemDir string
+	volume, itemDir, tdir string
 }
 
 // New returns a Reconciler over an intent store and a Mounter. It fails if
@@ -227,9 +230,9 @@ func within(dir, path string) bool {
 // strictlyBelow reports whether path lies below dir and is not dir.
 func strictlyBelow(dir, path string) bool { return path != dir && within(dir, path) }
 
-// Stage records that a volume should be staged and waits until the stage path
-// is a mount of it (the transport mounted, the item directory present, the
-// bind made), or until ctx ends. The result is the outcome of those steps
+// Stage records that a volume should be staged and waits until it is (the
+// transport mounted, the item directory present, nothing mounted at the stage
+// path, which a directory volume leaves empty), or until ctx ends. The result is the outcome of those steps
 // only, nil when they hold, otherwise one of the package's errors wrapping
 // the cause. It is not the outcome of the volume's publishes: one whose pod
 // is gone must not fail the Stage of a volume other pods are using.
@@ -305,9 +308,10 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 }
 
 // Publish adds a publish (a target path and its read-only flag) to the
-// volume's intent and waits until the target is a bind of the stage path with
-// that flag, and the result is the outcome for that target only: a failing
-// publish of another pod is not reported here (it is logged and counted).
+// volume's intent and waits until the target is a bind of the volume's publish
+// source with that flag, and the result is the outcome for that target only: a
+// failing publish of another pod is not reported here (it is logged and
+// counted).
 // Publishing a target that is already published changes its flag and nothing
 // else. A volume with no intent is ErrUnknownVolume: it must be
 // staged first.
@@ -516,18 +520,19 @@ func hasPublish(in intent.Intent, target string) bool {
 	return false
 }
 
-// Unstage waits until the volume's publishes and its stage path are unmounted
-// and then removes its intent. The transport is left mounted: the idle timeout
+// Unstage waits until the volume's publishes are unmounted and its item is
+// torn down (a directory has nothing mounted at the stage path) and then
+// removes its intent. The transport is left mounted: the idle timeout
 // decides about it.
 //
 // The order is the reverse of the usual one, on purpose. The record is
 // deleted after the mounts are gone, not before: Unstage carries only the
-// volume ID, and once the record is deleted nothing says where the stage path
-// was, so a stage unmount that failed (the volume is busy) could not be
+// volume ID, and once the record is deleted nothing says where the volume's
+// mounts were, so an unmount that failed (the volume is busy) could not be
 // retried or even reported to the caller. With the record kept until the
 // teardown succeeds, a failed Unstage is simply retried by kubelet, and a
 // crash between the unmount and the delete leaves a record whose next pass
-// binds the stage again and whose next Unstage removes it. During the
+// binds the publishes again and whose next Unstage removes them. During the
 // teardown the volume is not converged, so the publishes it just unmounted
 // are not made again in the same pass.
 //

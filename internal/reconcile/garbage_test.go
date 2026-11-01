@@ -12,7 +12,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
-	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 )
 
@@ -71,6 +70,9 @@ func TestMountsThatNoIntentEverNamedAreLeftAlone(t *testing.T) {
 	lookalike := filepath.Join(e.base, "kubelet", "pods", "uid", "volumes", "mount")
 	e.sim.addMount(kubelet, "tmpfs", "t")
 	e.sim.addMount(lookalike, "tmpfs", "t")
+	// A mount at a live stage path is something the driver cannot show it
+	// made: it is the volume's ErrStageConflict, reported and left.
+	e.sim.addMount(in.StagePath, "tmpfs", "t")
 	e.sim.addMount(inside, "tmpfs", "t") // inside a live stage
 	e.sim.Reset()
 
@@ -209,9 +211,19 @@ func TestARestartForgetsPreviousTargetsAndLeavesThemMounted(t *testing.T) {
 	if _, ok := e.visible(target); !ok {
 		t.Error("a mount no one in this process ever heard of was unmounted")
 	}
-	// The stage is below the staging root with no intent, so it is garbage.
+	e.noStageMount(in)
+}
+
+// Once no intent claims a stage path, a mount at it is below the staging root
+// and is a stray like any other.
+func TestAMountAtTheStagePathOfAVolumeWithNoIntentIsCollected(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	in := e.vol("a", pvc1)
+	e.sim.addMount(in.StagePath, "tmpfs", "t")
+	e.pass()
 	if _, ok := e.visible(in.StagePath); ok {
-		t.Error("the unclaimed stage was kept")
+		t.Error("the unclaimed mount was kept")
 	}
 }
 
@@ -420,7 +432,6 @@ func TestTheItemDirectoryOfALocalVolumeIsCreatedAtStage(t *testing.T) {
 	if rec, _, _ := e.store.Get(in.VolumeID); rec.EnsureItem {
 		t.Error("the permission to create the item directory was not cleared")
 	}
-	e.sim.remove(in.StagePath)
 	mustNil(t, "remove again", os.Remove(item))
 	if err := e.converge(in.VolumeID); !errors.Is(err, ErrItemMissing) {
 		t.Fatalf("a missing directory after the first converge: %v, want ErrItemMissing", err)
@@ -430,15 +441,14 @@ func TestTheItemDirectoryOfALocalVolumeIsCreatedAtStage(t *testing.T) {
 	}
 	mustNil(t, "restore", os.Mkdir(item, 0o750))
 	mustNil(t, "converge", e.converge(in.VolumeID))
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
-		t.Error("not bound")
-	}
-	// A conflict the Mounter reports itself (someone mounted there between
-	// the table read and the bind) is a stage conflict too.
-	e.sim.remove(in.StagePath)
-	e.sim.FailOp(fake.OpBind, in.StagePath, mount.ErrConflict)
+	e.noStageMount(in)
+	// Anything mounted at the stage path is a stage conflict, and is left.
+	e.sim.addMount(in.StagePath, "tmpfs", "t")
 	if err := e.converge(in.VolumeID); !errors.Is(err, ErrStageConflict) {
 		t.Errorf("got %v, want ErrStageConflict", err)
+	}
+	if m, ok := e.visible(in.StagePath); !ok || m.FSType != "tmpfs" {
+		t.Errorf("the mount at the stage path was not left alone: %+v, %v", m, ok)
 	}
 }
 

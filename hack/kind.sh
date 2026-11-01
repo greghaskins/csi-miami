@@ -156,7 +156,9 @@ scrape() {
       sleep 1
     done
     echo "kind: $pod /metrics answered 200 with $(grep -c '^miami_' <<<"$body") miami_ series, for example:"
-    grep '^miami_' <<<"$body" | head -3 | sed 's/^/kind:   /'
+    # awk reads all of its input: `grep | head -3` can die of SIGPIPE when head
+    # leaves early, which pipefail turns into a failed check.
+    awk '/^miami_/ && n++ < 3 { print "kind:   " $0 }' <<<"$body"
   done
 }
 scrape controller 9811

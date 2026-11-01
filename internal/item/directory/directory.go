@@ -2,20 +2,37 @@
 // bound into pods.
 //
 // A directory volume lives at <transport mount>/<subdir>/<name>
-// (volume.Context.Dir). Converge checks that it exists and is a directory,
-// then makes the stage path a bind mount of it. The node never creates the
-// directory for an nfs3 transport: the controller does, and a missing one is
-// item.ErrItemMissing, which the CSI layer reports as NotFound. For a local
-// transport the controller runs on another node and cannot reach the disk, so
-// the node creates the directory at first stage when it is missing (decision
-// 23; the intent's EnsureItem says it is the first stage, and a later pass that
-// finds the directory missing reports item.ErrItemMissing like nfs3), with mode 0755, relative to descriptors and without following a
-// symlink or crossing a mount. Teardown unmounts the stage path and removes
-// nothing.
+// (volume.Context.Dir). Converge checks that it exists and is a directory and
+// that nothing is mounted at the stage path, and mounts nothing: the stage
+// path is a directory kubelet owns and stays an empty one. The publish
+// targets are binds of the item directory (PublishSource).
 //
-// Nothing is cached. Whether the stage path is already right is decided from
-// the mount table the reconciler hands in, so a restarted process adopts what
-// its predecessor made without making a single mount call.
+// The reason is the NFS client, which reports "/" as the root of every mount
+// of an export, a bind of a subdirectory included. Before kubelet unstages a
+// volume it lists every other mount with the same device and root as the stage
+// path and refuses while one exists. A bind of the item directory at the stage
+// path would share its device and root with the transport and every other
+// volume's bind, so the stage could never be unstaged. With no mount at the
+// stage path kubelet finds no reference and unstages.
+//
+// The node never creates the directory for an nfs3 transport: the controller
+// does, and a missing one is item.ErrItemMissing, which the CSI layer reports
+// as NotFound. For a local transport the controller runs on another node and
+// cannot reach the disk, so the node creates the directory at first stage when
+// it is missing (decision 23; the intent's EnsureItem says it is the first
+// stage, and a later pass that finds the directory missing reports
+// item.ErrItemMissing like nfs3), with mode 0755, relative to descriptors and
+// without following a symlink or crossing a mount.
+//
+// A bind of the volume's own item directory at the stage path is the one thing
+// the driver recognises there: an earlier build made it. Converge and Teardown
+// unmount it once, without MNT_DETACH, so a node upgraded in place does not
+// keep it. Anything else mounted there is not this volume's and is
+// item.ErrStageConflict, from Converge and from Teardown alike: it is left
+// exactly as it is, never stacked over and never removed.
+//
+// Nothing is cached. Whether the stage path is clear is decided from the mount
+// table the reconciler hands in.
 package directory
 
 import (
@@ -36,31 +53,26 @@ import (
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
-// DefaultTimeout bounds the stat of the item directory and the creation of
-// the stage path when Config.Timeout is not positive.
+// DefaultTimeout bounds the stat of the item directory when Config.Timeout is
+// not positive.
 const DefaultTimeout = 10 * time.Second
 
-// stageMode is the mode of a stage directory this package creates. The
-// staging tree is the driver's own, and only the driver, as root, uses it.
-const stageMode = 0o700
-
-// Config is what an Item needs from its environment. Stat and MkdirAll exist
-// for tests; nil means the os package.
+// Config is what an Item needs from its environment. Stat and Ensure exist for
+// tests; nil means the os package.
 type Config struct {
 	// Root is the transports root: the directory under which transports are
 	// mounted at <Root>/transports/<id>. It must be absolute and cleaned.
 	Root string
 
-	// Mounter binds and unmounts.
+	// Mounter is required, as for every item kind; the directory kind makes
+	// no mount call.
 	Mounter mount.Mounter
 
-	// Timeout bounds the stat of the item directory and the creation of the
-	// stage directory, each of which can hang on a dead mount. Zero or
-	// negative means DefaultTimeout.
+	// Timeout bounds the stat and the creation of the item directory, each of
+	// which can hang on a dead mount. Zero or negative means DefaultTimeout.
 	Timeout time.Duration
 
-	Stat     func(path string) (fs.FileInfo, error)
-	MkdirAll func(path string, perm fs.FileMode) error
+	Stat func(path string) (fs.FileInfo, error)
 
 	// Ensure makes the item directory dir below the transport mount mountDir,
 	// with its parents, for a local transport. Nil means a safe creation with
@@ -71,7 +83,7 @@ type Config struct {
 // Item is the directory item kind. It is safe for concurrent use.
 type Item struct {
 	cfg  Config
-	busy deadline.Set // stat and mkdir calls that have not returned, by path
+	busy deadline.Set // stat and ensure calls that have not returned, by path
 }
 
 var _ item.Item = (*Item)(nil)
@@ -91,9 +103,6 @@ func New(cfg Config) (*Item, error) {
 	if cfg.Stat == nil {
 		cfg.Stat = os.Stat
 	}
-	if cfg.MkdirAll == nil {
-		cfg.MkdirAll = os.MkdirAll
-	}
 	if cfg.Ensure == nil {
 		cfg.Ensure = ensureBeneath
 	}
@@ -103,37 +112,46 @@ func New(cfg Config) (*Item, error) {
 // Kind is volume.KindDirectory.
 func (d *Item) Kind() volume.Kind { return volume.KindDirectory }
 
-// Converge checks the item directory and makes the stage path a bind of it,
-// each step a no-op when it is already true:
-//
-//  1. The item directory exists and is a directory; for a local transport a
-//     missing one is created first if in.EnsureItem is set and the stage path
-//     is not yet mounted (see ensure). The stat runs under the
-//     Config.Timeout deadline in its own goroutine, because a stat on a dead
-//     NFS mount never returns; a timeout wraps mount.ErrTimeout, and while
-//     the abandoned stat has not returned the next call fails at once with
-//     mount.ErrBusy instead of starting a second one. Missing is
-//     item.ErrItemMissing, a file is item.ErrItemNotDirectory.
-//
-//  2. The stage path is a bind of the item directory. The decision is made
-//     from obs: a visible mount that is a bind of the item directory is
-//     adopted without a mount call (so a restart changes nothing, and a stage
-//     whose transport is slow costs nothing), except that a read-only flag on
-//     it is cleared, because stages are read-write and read-only is a
-//     property of a publish. A visible mount that is anything else, or a
-//     mount at the path hidden under a parent's mount, is item.ErrStageConflict
-//     and is left exactly as it is: stacking over it would hide it and leak
-//     it, and removing it is not ours to decide. When nothing is mounted
-//     there, the stage directory is created (kubelet owns the staging tree
-//     above it) and the item directory is bound on it.
-func (d *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed) error {
+// PublishSource is the item directory in the transport (volume.Context.Dir):
+// publish targets are binds of it.
+func (d *Item) PublishSource(in intent.Intent) (string, error) {
 	id, err := in.ID()
 	if err != nil {
-		return fmt.Errorf("directory item: %w", err)
+		return "", fmt.Errorf("directory item: %w", err)
 	}
 	dir, err := in.Context().Dir(d.cfg.Root, id)
 	if err != nil {
-		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+		return "", fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+	}
+	return dir, nil
+}
+
+// Converge clears the stage path, checks the item directory, and mounts
+// nothing:
+//
+//  1. Nothing is mounted at the stage path. A visible mount there that is a
+//     bind of the volume's item directory was made by an earlier build and is
+//     unmounted (clearStage). Any other visible mount is item.ErrStageConflict
+//     and is left exactly as it is: the driver makes no mount at a directory
+//     volume's stage path now, so whatever else is there is not its own, and
+//     kubelet's reference check would see it. A mount hidden under a
+//     parent's mount is not looked at: kubelet resolves through the covering
+//     mount and never sees it, and the driver mounts nothing there.
+//
+//  2. The item directory exists and is a directory; for a local transport a
+//     missing one is created first if in.EnsureItem is set (see ensure). The
+//     stat runs under the Config.Timeout deadline in its own goroutine, because
+//     a stat on a dead NFS mount never returns; a timeout wraps
+//     mount.ErrTimeout, and while the abandoned stat has not returned the next
+//     call fails at once with mount.ErrBusy instead of starting a second one.
+//     Missing is item.ErrItemMissing, a file is item.ErrItemNotDirectory.
+func (d *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed) error {
+	dir, err := d.PublishSource(in)
+	if err != nil {
+		return err
+	}
+	if err := d.clearStage(ctx, in, dir, obs.Mounts); err != nil {
+		return err
 	}
 
 	err = d.checkDir(ctx, in.VolumeID, dir)
@@ -141,44 +159,39 @@ func (d *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed
 	// stages a local volume and the reconciler clears once the item has
 	// converged): a directory that is missing later is a disk that is not
 	// mounted, a reboot or a removal, and a new empty directory would put a pod
-	// on an empty volume. A directory that vanishes under a mounted stage is
-	// not made again either: the stage is a bind of the old one.
-	_, staged := obs.Mounts.At(in.StagePath)
-	if errors.Is(err, item.ErrItemMissing) && in.EnsureItem && in.Transport.Kind == transport.KindLocal && !staged {
+	// on an empty volume.
+	if errors.Is(err, item.ErrItemMissing) && in.EnsureItem && in.Transport.Kind == transport.KindLocal {
 		if err = d.ensure(ctx, in, dir); err == nil {
 			err = d.checkDir(ctx, in.VolumeID, dir)
 		}
 	}
-	if err != nil {
-		return err
-	}
+	return err
+}
 
+// clearStage is step 1 of Converge and all of Teardown. A visible mount at the
+// stage path that is a bind of the volume's item directory, deleted or not
+// (observe.Table.IsBindOfIncludingDeleted), is the driver's own from before
+// directory items stopped mounting there, and is unmounted by item.UnmountBind:
+// once, without MNT_DETACH, and never a stack. Any other visible mount is
+// item.ErrStageConflict.
+func (d *Item) clearStage(ctx context.Context, in intent.Intent, dir string, t observe.Table) error {
 	stage := in.StagePath
-	if top, ok := obs.Mounts.At(stage); ok {
-		same, err := obs.Mounts.IsBindOf(stage, dir)
-		if err != nil {
-			return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
-		}
-		if !same {
-			return fmt.Errorf("directory item %s: %w: %s is mounted as %s from %q, which is not a bind of the volume's directory",
-				in.VolumeID, item.ErrStageConflict, stage, top.FSType, top.Source)
-		}
-		if top.ReadOnly() {
-			return d.bind(ctx, in.VolumeID, dir, stage)
-		}
+	top, ok := t.At(stage)
+	if !ok {
 		return nil
 	}
-	if hidden(obs.Mounts, stage) {
-		return fmt.Errorf("directory item %s: %w: %s has a mount that is hidden under another mount; clear it before staging", in.VolumeID, item.ErrStageConflict, stage)
-	}
-
-	what := fmt.Sprintf("creating the stage directory %q", stage)
-	if _, err := deadline.Run(ctx, d.cfg.Timeout, what, &d.busy, "mkdir\x00"+stage, func(context.Context) (struct{}, error) {
-		return struct{}{}, d.cfg.MkdirAll(stage, stageMode)
-	}); err != nil {
+	ours, err := t.IsBindOfIncludingDeleted(stage, dir)
+	if err != nil {
 		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
 	}
-	return d.bind(ctx, in.VolumeID, dir, stage)
+	if !ours {
+		return fmt.Errorf("directory item %s: %w: %s is mounted as %s from %q; the driver mounts nothing at a directory volume's stage path",
+			in.VolumeID, item.ErrStageConflict, stage, top.FSType, top.Source)
+	}
+	if err := item.UnmountBind(ctx, d.cfg.Mounter, stage, dir, item.ErrStageConflict); err != nil {
+		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+	}
+	return nil
 }
 
 // checkDir is step 1 of Converge.
@@ -218,70 +231,23 @@ func (d *Item) ensure(ctx context.Context, in intent.Intent, dir string) error {
 	return nil
 }
 
-// bind binds dir on stage, read-write, turning the Mounter's conflict into
-// item.ErrStageConflict.
-func (d *Item) bind(ctx context.Context, volumeID, dir, stage string) error {
-	err := d.cfg.Mounter.Bind(ctx, dir, stage, false)
-	if errors.Is(err, mount.ErrConflict) && !errors.Is(err, item.ErrStageConflict) {
-		err = fmt.Errorf("%w: %w", item.ErrStageConflict, err)
-	}
-	if err != nil {
-		return fmt.Errorf("directory item %s: %w", volumeID, err)
-	}
-	return nil
-}
-
-// hidden reports whether the table has a mount at path that no visible mount
-// leads to, because a mount of a parent directory covers it.
-func hidden(t observe.Table, path string) bool {
-	for _, m := range t {
-		if m.MountPoint == path {
-			return true
-		}
-	}
-	return false
-}
-
-// Teardown unmounts the stage path, once and without MNT_DETACH, but only if
-// the mount there is a bind of the volume's directory (item.UnmountBind).
-// Anything else at the stage path is item.ErrStageConflict and is left where it
-// is, as Converge leaves it: Converge never puts anything but that bind there,
-// so a different mount is someone else's, or a stack on top of ours, and
-// removing what the driver cannot show it made is not the driver's call. The
-// cost is that an Unstage over such a mount fails until a person clears it,
-// which is the loud outcome; the alternative is unmounting something that
-// holds a pod's data.
+// Teardown takes down what an earlier build made at the stage path and nothing
+// else: a bind of the volume's item directory there is unmounted (clearStage),
+// once and without MNT_DETACH, so a busy one is an error for the caller to
+// retry, and it is recognised even if the directory has since been removed. In a
+// current build there is nothing to undo. Any other mount visible at the stage
+// path is item.ErrStageConflict and is left, as Converge leaves it: removing
+// what the driver cannot show it made is not the driver's call. The cost is
+// that an Unstage over such a mount fails until a person clears it, which is
+// the loud outcome; the alternative is unmounting something that holds data. A
+// mount hidden under a parent's is not looked at.
 //
-// It does not stat the item directory, and it recognises the bind of a
-// directory that has since been removed, so a volume whose directory was
-// deleted while it was staged can still be unstaged. It does need the
-// transport in the mount table to recognise the bind; without it Teardown
-// returns item.ErrTransportNotMounted, and the reconciler's converge restores
-// the transport before the unstage is retried.
+// It does not stat the item directory. Recognising an old bind needs the
+// transport in the mount table; the reconciler checks for it first.
 func (d *Item) Teardown(ctx context.Context, in intent.Intent, obs item.Observed) error {
-	id, err := in.ID()
+	dir, err := d.PublishSource(in)
 	if err != nil {
-		return fmt.Errorf("directory item: %w", err)
+		return err
 	}
-	dir, err := in.Context().Dir(d.cfg.Root, id)
-	if err != nil {
-		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
-	}
-	// The bind is recognised by the transport it was made from. If the stage
-	// is mounted and the transport is not, say that, rather than calling the
-	// stage a foreign mount: it is the driver's, and the next pass remounts the
-	// transport.
-	if _, staged := obs.Mounts.At(in.StagePath); staged {
-		tdir, err := in.Transport.MountPoint(d.cfg.Root)
-		if err != nil {
-			return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
-		}
-		if _, mounted := obs.Mounts.At(tdir); !mounted {
-			return fmt.Errorf("directory item %s: %w", in.VolumeID, item.ErrTransportNotMounted)
-		}
-	}
-	if err := item.UnmountBind(ctx, d.cfg.Mounter, in.StagePath, dir, item.ErrStageConflict); err != nil {
-		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
-	}
-	return nil
+	return d.clearStage(ctx, in, dir, obs.Mounts)
 }
