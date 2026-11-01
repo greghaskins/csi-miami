@@ -61,19 +61,17 @@ Each StorageClass picks one option per dimension, in any combination.
 | Dimension | Options |
 |---|---|
 | Location | local disk, NAS (NFSv3) |
-| Item type | flat files in a directory, filesystem image (ext4 on a loop device), opaque blobs |
+| Item type | flat files in a directory, filesystem image (ext4 on a loop device), opaque blobs (content-addressed, no S3 interface) |
 | Sharing | single node (RWO), shared (RWX) |
 | Encryption | off, on |
 
-## Milestones
+## Supported today
 
-| | Adds |
-|---|---|
-| **M1** (building) | directories, on local disk and on the NAS, shared |
-| **M2** (next) | images on the NAS, single node with exclusivity and fencing, encryption at rest |
-| **M3** | shared images, re-exported over NFSv4 by the node holding them |
-| **M4** | images on local disk, moved between nodes with `miami move` |
-| Later, maybe | blobs: opaque, content-addressed (an S3 interface on top is out of scope) |
+| | Location | Sharing | Encryption |
+|---|---|---|---|
+| **Directories** | local disk, NAS (in progress) | single node, shared (in progress) | not yet |
+| **Images** | not yet | not yet | not yet |
+| **Blobs** | not yet | not yet | not yet |
 
 ## Installation
 
