@@ -80,6 +80,10 @@ kubectl apply -k deploy/kustomize/base
 kubectl apply -k deploy/kustomize/examples   # edit server and paths first
 ```
 
+The base names the driver image `ghcr.io/greghaskins/csi-miami:unset`, a
+placeholder that cannot be pulled; every overlay sets the real image with
+`images:`, preferably by digest.
+
 ## Development
 
 `mise install` installs the pinned tools and git hooks. Commits, pushes, CI

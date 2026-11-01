@@ -229,7 +229,7 @@ spec:
         - --endpoint=unix:///csi/csi.sock
         - --transports-root=/var/lib/miami
         - --metrics-addr=:9811
-        image: ghcr.io/greghaskins/csi-miami:latest
+        image: ghcr.io/greghaskins/csi-miami:unset
         livenessProbe:
           failureThreshold: 3
           httpGet:
@@ -401,7 +401,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-        image: ghcr.io/greghaskins/csi-miami:latest
+        image: ghcr.io/greghaskins/csi-miami:unset
         livenessProbe:
           failureThreshold: 3
           httpGet:

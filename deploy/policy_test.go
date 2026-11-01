@@ -884,8 +884,8 @@ func TestResourcesAndImages(t *testing.T) {
 			}
 			switch {
 			case c.Name == "miami":
-				if c.Image != driverImage+":latest" {
-					t.Errorf("%s: image = %q, want the placeholder %s:latest", id, c.Image, driverImage)
+				if c.Image != driverImage+":unset" {
+					t.Errorf("%s: image = %q, want the placeholder %s:unset", id, c.Image, driverImage)
 				}
 			case !strings.HasPrefix(c.Image, "registry.k8s.io/sig-storage/"):
 				t.Errorf("%s: image %q is not a sig-storage sidecar", id, c.Image)
