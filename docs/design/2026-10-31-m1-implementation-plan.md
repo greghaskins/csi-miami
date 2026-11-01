@@ -158,10 +158,10 @@ and unstage of the same ID across calls.
 
 ## 5. StorageClass parameters (M1)
 
-Class names follow `miami-<type>-<location>-<sharing>[-<crypt>]`: type `dir`
+Class names follow `miami-<location>-<type>-<sharing>[-<crypt>]`: type `dir`
 (`img` later), location `local` or `remote`, sharing `rwo` or `rwx`, and a
 crypt suffix defined with M2's encryption (decision 35). The example classes
-are `miami-dir-remote-rwx` and `miami-dir-local-rwo`.
+are `miami-remote-dir-rwx` and `miami-local-dir-rwo`.
 
 | parameter | required | meaning |
 |---|---|---|
@@ -547,7 +547,7 @@ it reads an event before it bumps its count); the controller Deployment
 (provisioner with `--extra-create-metadata --feature-gates=Topology=true`,
 attacher, resizer kept out until M2, livenessprobe); the node DaemonSet
 (registrar, livenessprobe, `Bidirectional` kubelet dir and transports
-root, host `/dev` not needed in M1); an example StorageClass per transport (`miami-dir-remote-rwx`, `miami-dir-local-rwo`).
+root, host `/dev` not needed in M1); an example StorageClass per transport (`miami-remote-dir-rwx`, `miami-local-dir-rwo`).
 Sidecars pinned by digest. The driver image in the base is the placeholder
 `ghcr.io/greghaskins/csi-miami:unset`, a tag CI never publishes, so a base
 applied without an overlay cannot pull a mutable image into the privileged

@@ -987,7 +987,7 @@ func TestPortsDistinct(t *testing.T) {
 func TestExampleStorageClasses(t *testing.T) {
 	t.Parallel()
 	r := render(t, "kustomize/examples")
-	if got, want := r.names("StorageClass"), []string{"miami-dir-local-rwo", "miami-dir-remote-rwx"}; !reflect.DeepEqual(got, want) {
+	if got, want := r.names("StorageClass"), []string{"miami-local-dir-rwo", "miami-remote-dir-rwx"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("storage classes = %v, want %v", got, want)
 	}
 	tests := []struct {
@@ -995,9 +995,9 @@ func TestExampleStorageClasses(t *testing.T) {
 		binding storagev1.VolumeBindingMode
 		params  map[string]string
 	}{
-		{"miami-dir-local-rwo", storagev1.VolumeBindingWaitForFirstConsumer, map[string]string{
+		{"miami-local-dir-rwo", storagev1.VolumeBindingWaitForFirstConsumer, map[string]string{
 			"kind": "directory", "transport.kind": "local", "transport.path": "/export/data"}},
-		{"miami-dir-remote-rwx", storagev1.VolumeBindingImmediate, map[string]string{
+		{"miami-remote-dir-rwx", storagev1.VolumeBindingImmediate, map[string]string{
 			"kind": "directory", "transport.kind": "nfs3", "transport.server": "192.0.2.10",
 			"transport.export": "/export", "subdir": "${pvc.namespace}/${pvc.name}"}},
 	}
@@ -1034,7 +1034,7 @@ func TestE2EOverlay(t *testing.T) {
 	t.Parallel()
 	b, o := base(t), overlay(t)
 
-	if got, want := o.names("StorageClass"), []string{"miami-dir-local-rwo", "miami-dir-remote-rwx"}; !reflect.DeepEqual(got, want) {
+	if got, want := o.names("StorageClass"), []string{"miami-local-dir-rwo", "miami-remote-dir-rwx"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("overlay storage classes = %v, want %v", got, want)
 	}
 	norm := func(r rendered) map[string]any {
