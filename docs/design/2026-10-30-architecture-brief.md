@@ -276,6 +276,36 @@ loops always on NFS transports.
   joined, because a hung NFS call does not return. Probe results are
   exported as metrics so a wedge is visible before a pod notices.
 - Report: `VolumeCondition` abnormal; one event per consuming pod.
+- **What M1 does about a transport that does not answer (decision 28).** It
+  reports and does not remediate. Each pass asks every transport the intents
+  reference whether it answers (`statfs` of its mount directory under the stat
+  deadline), exported as `miami_transport_up{kind,id}`; a stat of a volume's
+  item directory that returns ESTALE, times out or is busy is the same
+  condition, counted in `miami_volume_condition{condition="transport-unavailable"}`
+  and raised once as a `TransportUnavailable` event on the PersistentVolume.
+  Nothing is unmounted, remounted or killed on account of it, and the next pass
+  looks again; remediation is the work of this section's later steps, which M1
+  does not build.
+
+  What the NFS server restart end-to-end test observed (the server container
+  stopped and started, its export on a docker volume, the `softerr` profile, on
+  both architectures): the gauge went to 0 and the condition to
+  `transport-unavailable` within 12 seconds of the stop, and both recovered
+  within 26 seconds of it, 12 seconds after the server was back; the transport
+  and publish mounts kept their mount IDs throughout; the writing pod's numbered
+  sequence had no gap. **A file a pod held open across the restart** (fsynced
+  every second) kept working: the export keeps its file system and `fsid=0`, so
+  the client's file handles stay valid, nothing returned ESTALE, and with the
+  server back after 14 seconds no write on the held descriptor failed. The wait
+  of a soft mount is bounded by its major timeout, which the first run of the
+  test showed to be near 40 seconds (the profile's `timeo` of 10 seconds times
+  `retrans` 3 plus 1; the comment on the profile that says about 100 seconds is
+  not what was seen): in that run the server was held down for about 40 seconds,
+  and the write in flight on the held descriptor failed with ETIMEDOUT
+  ("Connection timed out", returned by the fsync), its data was not in the file,
+  and later writes through the same descriptor succeeded. So an application that
+  holds a file open across a server restart must check the errors of `fsync` and
+  `close` and write again; the driver cannot and does not mask it.
 - Remediation: a shared package for all item kinds deletes controller-owned
   pods on this node that mount the failed volume, with a UID precondition,
   a rate limit, and a ValidatingAdmissionPolicy narrowing the grant to own
@@ -773,6 +803,57 @@ Recorded:
     `deploy` are skipped (`static` and `unit` still run) and `ci-ok` accepts
     exactly those as skipped; on code, a skipped, cancelled or failed job
     fails `ci-ok`.
+
+28. **Transport health and directory modes (M1, T14)**: the worst storage
+    outages of clusters on shared NFS are an NFS server restart (minutes of stale
+    handles), mounts detached by an external watchdog, and pods that cannot write
+    to directories created as root on a squashing export. M1 reports the first
+    and does not repair it, and fixes the third.
+    (1) **`mode` StorageClass parameter**: the mode of a directory item
+    (up to four octal digits, `0755` by default, for example `0777` or `2775`;
+    the setuid, setgid and sticky bits are allowed and nothing above them),
+    read by `volume.NewContext`, carried in the volume context as `miami/mode`
+    only when set (so existing contexts and the golden intent record are
+    unchanged) and in the intent. The controller applies it to the directory it
+    creates on nfs3, and the directory item to the one the node creates at the
+    first stage of a local volume, with `fchmod` on the new directory's own
+    descriptor so that the umask does not decide it. Only the volume's own
+    directory takes it, never the subdir elements above it (0755), and an
+    existing directory is adopted without a chmod. An invalid value is
+    `InvalidArgument` at `CreateVolume`.
+    (2) **A stale, timed-out or busy stat of the item directory is the
+    transport's condition**: ESTALE (the server restarted and its file handles
+    are gone), `mount.ErrTimeout` and `mount.ErrBusy` from the stat are
+    `ErrTransportUnavailable` (also `item.ErrTransportUnavailable`), event reason
+    `TransportUnavailable`, never `Internal` and never a reason to unmount;
+    ESTALE and busy are `Unavailable` to CSI (a timeout stays
+    `DeadlineExceeded` by the precedence table), and a stale handle on a volume
+    stats call is `Unavailable` too. The next pass retries.
+    (3) **`miami_transport_up{kind,id}`**: each pass, for every transport the
+    intents reference, a deadline-bounded `statfs` of its mount directory
+    (statfs always asks the server, where a stat can be answered from the
+    attribute cache): 1 when it answers, 0 when it times out, is busy or fails,
+    and 0 for a transport that is not mounted. It runs once per transport per
+    pass in the transport step under the hung-transport rule, and its change is
+    logged once at info level.
+    (4) **`miami_volume_condition{condition}`**: the number of volumes in each
+    condition after the pass, `ok` or the key events already use
+    (`unresponsive`, `transport-unavailable`, `transport-conflict`,
+    `stage-conflict`, `publish-conflict`, `item-missing`, `item-not-directory`,
+    `failed`), every value present at zero and no volume ID in a label. A
+    transport that does not answer is `transport-unavailable` however it is
+    first reported, ahead of the timeout it wraps; `unresponsive` is a timeout
+    or busy that is not traced to the transport.
+    **The NFS server restart e2e** (`test/e2e`, nfs3) stops and starts the
+    server container, whose export is now a docker volume instead of a tmpfs, so
+    the files and the file handles survive, and checks that its address is the
+    same. It is the observation that must be short: the node plugin's pass runs
+    every 30 seconds and a pass that probes the dead server takes its 10 second
+    deadline, and waiting for the timer holds the server down for about as long
+    as a soft mount takes to give up (about 40 seconds), when a write in flight
+    fails with ETIMEDOUT. So the test starts a pod during the outage, whose
+    publish request wakes the loop at once, and the outage is about 15 seconds.
+    What it observed about a file held open is in 4.6.
 
 Pending: none that block M1.
 

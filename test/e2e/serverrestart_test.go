@@ -457,7 +457,7 @@ func nfsServerRestart(t *testing.T, e *env) {
 	s := summarizeHeld(writes, recoveredAt)
 	t.Logf("open file across the restart (kernel %s, softerr mount): %d attempts ok and %d failed up to attempt %d (when the node plugin reported the server back), then %d ok and %d failed; first failure %s",
 		kernel, s.OKBefore, s.FailedBefore, recoveredAt, s.OKAfter, s.FailedAfter, describeHeldFailure(s.FirstFailure))
-	t.Logf("open file: the held file has %d lines and %d attempts were told ok, so the %d that failed are not in it", len(strings.Fields(file)), s.OKBefore+s.OKAfter, s.FailedBefore+s.FailedAfter)
+	t.Logf("open file: %d attempts were told ok (every one of them is in the held file, which has %d lines when it was read), %d failed", s.OKBefore+s.OKAfter, len(strings.Fields(file)), s.FailedBefore+s.FailedAfter)
 }
 
 func describeHeldFailure(w *heldWrite) string {
