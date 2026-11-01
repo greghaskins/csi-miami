@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Runs the end-to-end tests of one transport against a real server. Root only:
-# it loads kernel modules and mounts. The transport is chosen by E2E_TRANSPORT:
+# Runs the end-to-end tests of one transport. The transport is chosen by
+# E2E_TRANSPORT, the kind of test by E2E_MODE:
+#
+#   E2E_MODE=transport (the default)  the transport package's own test against
+#          a real server. Root only: it loads kernel modules and mounts.
+#   E2E_MODE=kind  the driver on a kind cluster, with the criteria tests of
+#          test/e2e; see hack/e2e-kind.sh, which this hands over to. It also
+#          needs E2E_IMAGE, a driver image in the local Docker daemon.
+#
+# In transport mode:
 #
 #   nfs3   starts the kernel NFSv3 server of hack/nfs-server in a privileged
 #          container, runs internal/transport's e2e test as root under
@@ -18,6 +26,15 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 export GOTOOLCHAIN=local
 export CGO_ENABLED=0
+
+case "${E2E_MODE:-transport}" in
+  transport) ;;
+  kind) exec hack/e2e-kind.sh ;;
+  *)
+    echo "e2e: unknown E2E_MODE '${E2E_MODE}' (transport or kind)" >&2
+    exit 2
+    ;;
+esac
 
 transport="${E2E_TRANSPORT:-}"
 case "$transport" in
