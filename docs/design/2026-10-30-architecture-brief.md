@@ -846,7 +846,7 @@ Recorded:
     that pays for an NFS mount. (h) *`ENODEV` from `mount(2)`* is reported as
     "the kernel has no NFS client; load the nfs module".
 
-29. **The `miami lock` contract (M1, T11)**: five choices that the helper's
+29. **The `miami lock` contract (M1, T11)**: seven choices that the helper's
     users see on the export. (a) *The lock is the directory
     `<dir>/<name>.lock`*, holding `holder` (the caller's string, default
     `<hostname>:<pid>`) and `since` (empty; its modification time is the
@@ -865,16 +865,33 @@ Recorded:
     writing it, the lock directory) is older than the probe by more than
     `--stale`. The probe is read before the stamp, so a renewal that lands
     in between makes the stamp newer than the probe, which is never stale.
-    (d) *`--stale` is at least 60s* (default 5m): the nfs3 profile caches
-    attributes for 30s (`actimeo=30`), so another client's stamp can look up
-    to 30s old. The helper reads every time from an open file, which
-    revalidates, but the floor is what makes a live lock safe. (e) *`--renew`
-    is at most a third of `--stale`* (default 30s), so two renewals can fail
-    in a row without the lock going stale; `run` stops its command when a
-    renewal finds the lock lost, or when renewals have failed for `--stale`
-    minus one renewal interval, because by then another acquirer may have
-    broken the lock. The limit is a duration measured on the local monotonic
-    clock, not a staleness decision about anyone's lock.
+    (d) *`--stale` is at least 60s* (default 5m). A holder that cannot renew
+    must stop its work before another acquirer may break the lock, which
+    takes a renewal period, a call that hangs until its deadline
+    (`--timeout`), the grace the work needs to stop (another `--timeout`) and
+    the stamp's own latency; 60s leaves room for that with the default
+    timeout. The nfs3 profile's 30s attribute cache (`actimeo=30`) is the
+    secondary reason: another client's stamp can look up to 30s old, though
+    the helper reads every time from an open file, which revalidates.
+    (e) *`--renew` is at most a third of `--stale`* (default 30s), so two
+    renewals can fail in a row without the lock going stale, and `--renew`
+    plus twice `--timeout` is less than `--stale`. `run` stops its command
+    when a renewal finds the lock lost, or when no renewal has succeeded for
+    `--stale` minus twice `--timeout`: a timer armed at the last success, so
+    it fires at that instant whatever the phase of the renewal ticks, and
+    SIGTERM (up to `--timeout`) and then SIGKILL fit before the lock can be
+    stale. That is a duration on the local monotonic clock, not a staleness
+    decision about anyone's lock. The command runs in a process group of its
+    own and the group is signalled. (f) *The holder pins its lock directory.*
+    It keeps the directory it made open and works relative to that handle,
+    so a lock broken and taken under the same path is never written to or
+    removed by the holder that lost it (a stamp lands in the moved directory;
+    release renames the directory away and checks device and inode before
+    removing it). (g) *Exit codes*: `acquire` 0 held, 1 held by another, 2
+    error; `release` 0 released, 1 not held by `--holder`, 2 error; `run`
+    the command's own status (128+n if a signal n killed it), 1 if the lock
+    is held by another (the command was not started), 2 on an error or a lost
+    lock (the command was terminated, nothing was released).
 
 Pending: none that block M1.
 

@@ -200,31 +200,39 @@ func lockStale(t *testing.T, n *testNS, image, nodeA, nodeB string) {
 	}
 	t.Logf("the taker's log:\n%s", log)
 
-	re := regexp.MustCompile(`(?m)^result refused age=(\S+)$`)
-	refusals, maxAge := 0, int64(-1)
-	for _, m := range re.FindAllStringSubmatch(log, -1) {
+	// Every refusal is at an age within the period (a second of slack for the
+	// two clocks being read in whole seconds), and the success is at an age
+	// past it: the age the stamp had just before the attempt that took the
+	// lock, less what the poll interval and the helper's own run can account
+	// for. A break at 48s would fail here.
+	const slack = 5 // seconds: the 2s poll, the helper's run, whole-second clocks
+	refused := regexp.MustCompile(`(?m)^result refused age=(\S+)$`)
+	refusals := 0
+	for _, m := range refused.FindAllStringSubmatch(log, -1) {
 		refusals++
 		age, err := strconv.ParseInt(m[1], 10, 64)
 		if err != nil {
 			continue // none: the lock was not there to measure
 		}
 		if age > int64(staleAfter/time.Second)+1 {
-			t.Errorf("a refusal at age %ds: the lock was %ds past its stamp on the volume's clock, over the period %s, and was not broken", age, age, staleAfter)
-		}
-		if age > maxAge {
-			maxAge = age
+			t.Errorf("a refusal at age %ds: the lock was past its stamp by more than the period %s on the volume's clock and was not broken", age, staleAfter)
 		}
 	}
-	if refusals == 0 {
-		t.Error("the taker was never refused: the dead holder's lock was taken at once, not after the stale period")
+	m := regexp.MustCompile(`(?m)^result acquired age_before=(\S+)$`).FindStringSubmatch(log)
+	if m == nil {
+		t.Fatalf("the taker never reported acquiring the lock")
 	}
-	if maxAge < int64(staleAfter/time.Second)-15 {
-		t.Errorf("the oldest refused stamp was %ds old, want one within a few polls of the %s period", maxAge, staleAfter)
+	age, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		t.Fatalf("the taker acquired the lock but could not measure the stamp's age (%q)", m[1])
 	}
-	if !strings.Contains(log, "result acquired") || !strings.Contains(log, "\nacquired\n") {
-		t.Errorf("the taker never reported acquiring the lock")
+	if floor := int64(staleAfter/time.Second) - slack; age < floor {
+		t.Errorf("the lock was taken when the stamp was %ds old, want at least %ds (period %s less %ds of slack): it was broken early", age, floor, staleAfter, slack)
 	}
-	t.Logf("stale lock broken after %d refusals; the oldest refused stamp was %ds old (period %s)", refusals, maxAge, staleAfter)
+	if !strings.Contains(log, "\nacquired\n") {
+		t.Errorf("the command under the lock never ran")
+	}
+	t.Logf("stale lock broken after %d refusals; the stamp was %ds old before the attempt that took it (period %s)", refusals, age, staleAfter)
 
 	out := n.runOnce(t, "locks", nodeA, `ls -a /data | tr '\n' ' '`)
 	for _, bad := range []string{"db.lock", ".broken", ".probe", ".tmp", ".clock"} {
