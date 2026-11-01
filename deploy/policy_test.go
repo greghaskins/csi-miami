@@ -384,6 +384,38 @@ func TestNodeDaemonSet(t *testing.T) {
 		if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 			t.Errorf("%s: seccompProfile must be RuntimeDefault", c.Name)
 		}
+		if sc.RunAsUser == nil || *sc.RunAsUser != 0 {
+			t.Errorf("%s: runAsUser must be 0", c.Name)
+		}
+		if c.Name == "miami" {
+			// Privileged already implies every capability and no AppArmor
+			// confinement (the container runtime runs it unconfined), and the
+			// API rejects allowPrivilegeEscalation: false beside it. So the
+			// manifest sets none of the three, and none may appear.
+			if sc.Capabilities != nil {
+				t.Errorf("miami: capabilities = %+v, want none (it is privileged)", sc.Capabilities)
+			}
+			if sc.AllowPrivilegeEscalation != nil && !*sc.AllowPrivilegeEscalation {
+				t.Error("miami: allowPrivilegeEscalation false is invalid beside privileged")
+			}
+			if sc.AppArmorProfile != nil && sc.AppArmorProfile.Type != corev1.AppArmorProfileTypeUnconfined {
+				t.Errorf("miami: appArmorProfile = %+v, want unset or Unconfined", sc.AppArmorProfile)
+			}
+			continue
+		}
+		// The sidecars share the pod with a privileged container and a
+		// root-owned kubelet subPath; they get nothing.
+		if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Errorf("%s: allowPrivilegeEscalation must be false", c.Name)
+		}
+		if sc.AppArmorProfile != nil {
+			t.Errorf("%s: appArmorProfile = %+v, want the runtime default", c.Name, sc.AppArmorProfile)
+		}
+		if sc.Capabilities == nil || !reflect.DeepEqual(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+			t.Errorf("%s: capabilities must drop ALL", c.Name)
+		} else if len(sc.Capabilities.Add) != 0 {
+			t.Errorf("%s: capabilities add = %v, want none", c.Name, sc.Capabilities.Add)
+		}
 	}
 	names := []string{}
 	for _, c := range spec.Containers {
