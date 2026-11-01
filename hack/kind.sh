@@ -20,16 +20,16 @@
 # (if set) receives `kind export logs`, both pods' logs, `kubectl describe` of
 # the pods and each node's /proc/1/mountinfo. KEEP_CLUSTER=1 keeps the cluster.
 #
-# Needs docker, kind and kubectl (pinned in mise.toml), curl-free.
+# Needs docker, kind and kubectl (pinned in mise.toml), curl-free. The cluster
+# steps are in hack/lib/kind.sh, which hack/e2e-kind.sh shares.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# shellcheck source=hack/lib/kind.sh
+source hack/lib/kind.sh
 
-# kindest/node for Kubernetes 1.37.0, the default of the pinned kind (0.33.0),
-# by the digest of its multi-arch index.
-node_image="kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5"
-driver="miami.csi.greghaskins.com"
-ns="miami-system"
+driver="$kind_driver"
+ns="$kind_ns"
 cluster="${KIND_CLUSTER_NAME:-miami-deploy-check}"
 timeout="${DEPLOY_TIMEOUT:-300s}"
 metrics_deadline="${DEPLOY_METRICS_DEADLINE:-120}"
@@ -45,84 +45,24 @@ if [ -z "$image" ]; then
   echo "usage: hack/kind.sh --image <ref>" >&2
   exit 2
 fi
-for tool in docker kind kubectl; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "kind: $tool not found" >&2
-    exit 1
-  fi
-done
-
-work="$(mktemp -d)"
-export KUBECONFIG="$work/kubeconfig"
-
-collect() {
-  local art="$1" node pod
-  mkdir -p "$art"
-  kind export logs --name "$cluster" "$art/kind-logs" >/dev/null 2>&1 || true
-  kubectl -n "$ns" describe pods >"$art/describe-pods.txt" 2>&1 || true
-  for pod in $(kubectl -n "$ns" get pods -o name 2>/dev/null); do
-    kubectl -n "$ns" logs "$pod" --all-containers --prefix --tail=-1 \
-      >"$art/logs-${pod#pod/}.txt" 2>&1 || true
-  done
-  for node in $(kind get nodes --name "$cluster" 2>/dev/null); do
-    docker exec "$node" cat /proc/1/mountinfo >"$art/mountinfo-${node}.txt" 2>&1 || true
-  done
-}
+kind_require_tools || exit 1
+kind_init "$cluster" "$timeout"
 
 cleanup() {
   status=$?
   trap - EXIT
   if [ "$status" -ne 0 ] && [ -n "${DEPLOY_ARTIFACT_DIR:-}" ]; then
     echo "kind: failed; collecting logs into $DEPLOY_ARTIFACT_DIR" >&2
-    collect "$DEPLOY_ARTIFACT_DIR" || true
+    kind_collect "$DEPLOY_ARTIFACT_DIR" || true
   fi
-  if [ "${KEEP_CLUSTER:-}" != "1" ]; then
-    kind delete cluster --name "$cluster" >/dev/null 2>&1 || true
-  fi
-  rm -rf "$work"
+  kind_delete
   exit "$status"
 }
 trap cleanup EXIT
 
-# Start from nothing: a cluster left over from an earlier run is not evidence.
-kind delete cluster --name "$cluster" >/dev/null 2>&1 || true
-
-cat >"$work/kind.yaml" <<YAML
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-  - role: control-plane
-    image: ${node_image}
-  - role: worker
-    image: ${node_image}
-  - role: worker
-    image: ${node_image}
-YAML
-
-echo "kind: creating cluster $cluster"
-kind create cluster --name "$cluster" --config "$work/kind.yaml" --wait "$timeout"
-nodes="$(kubectl get nodes -o name | wc -l)"
-echo "kind: $nodes nodes"
-
-echo "kind: loading $image"
-kind load docker-image --name "$cluster" "$image"
-
-mkdir "$work/overlay"
-hack/e2e-overlay.sh --image "$image" --out "$work/overlay"
-kubectl apply -k "$work/overlay"
-
-kubectl -n "$ns" wait --for=condition=Available --timeout="$timeout" deployment/miami-controller
-kubectl -n "$ns" wait --for=jsonpath='{.status.desiredNumberScheduled}'="$nodes" --timeout="$timeout" daemonset/miami-node
-kubectl -n "$ns" wait --for=jsonpath='{.status.numberReady}'="$nodes" --timeout="$timeout" daemonset/miami-node
-desired="$(kubectl -n "$ns" get daemonset miami-node -o jsonpath='{.status.desiredNumberScheduled}')"
-ready="$(kubectl -n "$ns" get daemonset miami-node -o jsonpath='{.status.numberReady}')"
-echo "kind: DaemonSet miami-node desired=$desired ready=$ready; Deployment miami-controller available"
-test "$desired" = "$ready"
-
-for node in $(kubectl get nodes -o name); do
-  kubectl wait --for=jsonpath='{.spec.drivers[*].name}'="$driver" --timeout="$timeout" "csinode/${node#node/}"
-  echo "kind: CSINode ${node#node/} lists $driver"
-done
+kind_create
+kind_apply "$image"
+kind_wait
 
 # The sidecars' leader election takes a Lease each, which shows that the
 # controller's RBAC covers them: the provisioner's is named for the driver, the
@@ -156,7 +96,9 @@ scrape() {
       sleep 1
     done
     echo "kind: $pod /metrics answered 200 with $(grep -c '^miami_' <<<"$body") miami_ series, for example:"
-    grep '^miami_' <<<"$body" | head -3 | sed 's/^/kind:   /'
+    # awk reads all of its input: `grep | head -3` can die of SIGPIPE when head
+    # leaves early, which pipefail turns into a failed check.
+    awk '/^miami_/ && n++ < 3 { print "kind:   " $0 }' <<<"$body"
   done
 }
 scrape controller 9811

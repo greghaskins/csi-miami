@@ -40,7 +40,7 @@ func (e *env) stageAndPublish(in intent.Intent, uid string, readOnly bool) strin
 
 // ---- converge ----
 
-func TestStageConvergesTransportThenStage(t *testing.T) {
+func TestStageMountsTheTransportAndNothingAtTheStagePath(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
@@ -51,18 +51,12 @@ func TestStageConvergesTransportThenStage(t *testing.T) {
 	if !e.isBind(e.tdir("a"), e.host("a")) {
 		t.Error("the transport is not a bind of the host directory")
 	}
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
-		t.Error("the stage path is not a bind of the volume's directory")
-	}
+	e.noStageMount(in)
 	want := []fake.Call{
 		{Op: fake.OpBind, Source: e.host("a"), Target: e.tdir("a")},
-		{Op: fake.OpBind, Source: e.itemDir("a", pvc1), Target: in.StagePath},
 	}
 	if got := e.sim.mutating(); !slices.Equal(got, want) {
 		t.Errorf("calls:\n got %+v\nwant %+v", got, want)
-	}
-	if fi, err := os.Stat(in.StagePath); err != nil || !fi.IsDir() {
-		t.Errorf("the stage directory was not made: %v", err)
 	}
 	id := in.Transport.ID()
 	if !e.metrics.transports["local/"+id] || e.metrics.intents["directory"] != 1 {
@@ -76,8 +70,7 @@ func TestStageConvergesTransportThenStage(t *testing.T) {
 	}
 }
 
-// After a restart the new Reconciler finds the transport, the stage bind and
-// the publish bind in the table and makes no call that changes a mount.
+// After a restart the new Reconciler finds the transport and the publish bind in the table and makes no call that changes a mount.
 func TestAdoptionAfterRestartMakesNoCalls(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -103,7 +96,7 @@ func TestAdoptionAfterRestartMakesNoCalls(t *testing.T) {
 }
 
 // A reboot loses every mount and keeps the store: the first pass brings the
-// transport, the stage and the publish back.
+// transport and the publish back, and still nothing at the stage path.
 func TestRebootRestoresEverything(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -115,9 +108,10 @@ func TestRebootRestoresEverything(t *testing.T) {
 	e.sim.clear()
 	e.passOn(e.newReconciler())
 
-	if !e.isBind(e.tdir("a"), e.host("a")) || !e.isBind(in.StagePath, e.itemDir("a", pvc1)) || !e.isBind(target, in.StagePath) {
+	if !e.isBind(e.tdir("a"), e.host("a")) || !e.isBind(target, e.srcOf(in)) {
 		t.Errorf("not restored; table: %+v", e.sim.table())
 	}
+	e.noStageMount(in)
 }
 
 func TestConvergeStopsAtTheFirstFailingStepForThatVolume(t *testing.T) {
@@ -131,7 +125,7 @@ func TestConvergeStopsAtTheFirstFailingStepForThatVolume(t *testing.T) {
 		name     string
 		prepare  func(e *env, in intent.Intent)
 		want     []error
-		noBinds  bool // no bind of the stage path may have been made
+		noBinds  bool // no mount call at the stage path may have been made
 		reason   string
 		wantStep string
 	}{
@@ -257,7 +251,7 @@ func TestPublishAddChangeRemove(t *testing.T) {
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 	t1 := e.stageAndPublish(in, "pod1", true)
 
-	if m, ok := e.visible(t1); !ok || !m.ReadOnly() || !e.isBind(t1, in.StagePath) {
+	if m, ok := e.visible(t1); !ok || !m.ReadOnly() || !e.isBind(t1, e.srcOf(in)) {
 		t.Fatalf("publish: %+v, %v", m, ok)
 	}
 
@@ -281,9 +275,7 @@ func TestPublishAddChangeRemove(t *testing.T) {
 	if _, ok := e.visible(t2); !ok {
 		t.Error("the second target went with it")
 	}
-	if _, ok := e.visible(in.StagePath); !ok {
-		t.Error("the stage went with it")
-	}
+	e.noStageMount(in)
 	got, _ = e.intentOf(in.VolumeID)
 	if len(got.Publishes) != 1 || got.Publishes[0].TargetPath != t2 {
 		t.Errorf("publishes = %+v", got.Publishes)
@@ -315,7 +307,7 @@ func TestPublishCreatesTheTargetTreeButConvergeCreatesOnlyTheLeaf(t *testing.T) 
 	e.stop()
 
 	// A reboot, and the pod's directory is gone: the converge pass must not
-	// make the pod's tree again, but must still restore the stage.
+	// make the pod's tree again, but must still restore the transport and the publishes that remain.
 	e.sim.clear()
 	mustNil(t, "remove pod dir", os.RemoveAll(filepath.Join(e.base, "kubelet", "pods")))
 	mustNil(t, "converge", e.converge(in.VolumeID))
@@ -325,9 +317,10 @@ func TestPublishCreatesTheTargetTreeButConvergeCreatesOnlyTheLeaf(t *testing.T) 
 	if _, err := os.Stat(filepath.Join(e.base, "kubelet", "pods")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("the pod tree was made again: %v", err)
 	}
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
-		t.Error("the stage was not restored")
+	if !e.isBind(e.tdir("a"), e.host("a")) {
+		t.Error("the transport was not restored")
 	}
+	e.noStageMount(in)
 }
 
 // A NodePublish that failed is never followed by a NodeUnpublish, so a record
@@ -362,7 +355,7 @@ func TestAStalePublishIsPrunedAndFailsNothingElse(t *testing.T) {
 	if len(got.Publishes) != 2 {
 		t.Errorf("publishes = %+v, want the two live ones", got.Publishes)
 	}
-	if !e.isBind(e.target("live"), in.StagePath) || !e.isBind(e.target("pod2"), in.StagePath) {
+	if !e.isBind(e.target("live"), e.srcOf(in)) || !e.isBind(e.target("pod2"), e.srcOf(in)) {
 		t.Error("a live publish was not bound")
 	}
 	if n := e.metrics.errCount("publish"); n != 0 {
@@ -391,7 +384,7 @@ func TestAPublishIsAnsweredWithItsOwnTargetsOutcome(t *testing.T) {
 	// pod's Publish and the volume's Stage do not hear of it.
 	mustNil(t, "Publish good", e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: e.target("good")}))
 	mustNil(t, "Stage again", e.r.Stage(bg, in))
-	if !e.isBind(e.target("good"), in.StagePath) {
+	if !e.isBind(e.target("good"), e.srcOf(in)) {
 		t.Error("the good publish was not bound")
 	}
 	if e.metrics.errCount("publish") == 0 {
@@ -521,9 +514,7 @@ func TestUnstageRemovesTheBindsAndTheIntentAndLeavesTheTransport(t *testing.T) {
 
 	mustNil(t, "Unstage", e.r.Unstage(bg, in.VolumeID))
 
-	if _, ok := e.visible(in.StagePath); ok {
-		t.Error("the stage is still mounted")
-	}
+	e.noStageMount(in)
 	if _, ok := e.visible(target); ok {
 		t.Error("the publish is still mounted")
 	}
@@ -533,15 +524,15 @@ func TestUnstageRemovesTheBindsAndTheIntentAndLeavesTheTransport(t *testing.T) {
 	if _, ok := e.intentOf(in.VolumeID); ok {
 		t.Error("the intent is still recorded")
 	}
-	// The publish went first: the stage is a source of the bind.
+	// Only the publish is unmounted: there is no mount at the stage path.
 	var order []string
 	for _, c := range e.sim.mutating() {
 		if c.Op == fake.OpUnmount {
 			order = append(order, c.Target)
 		}
 	}
-	if !slices.Equal(order, []string{target, in.StagePath}) {
-		t.Errorf("unmount order = %v, want the publish then the stage", order)
+	if !slices.Equal(order, []string{target}) {
+		t.Errorf("unmounts = %v, want only the publish", order)
 	}
 	// And it is idempotent, without calls.
 	e.sim.Reset()
@@ -558,33 +549,30 @@ func TestUnstageThatFailsKeepsTheIntentAndIsRetried(t *testing.T) {
 	in := e.vol("a", pvc1)
 	target := e.stageAndPublish(in, "pod1", false)
 
-	e.sim.FailOp(fake.OpUnmount, in.StagePath, unix.EBUSY)
+	e.sim.FailOp(fake.OpUnmount, target, unix.EBUSY)
 	err := e.r.Unstage(bg, in.VolumeID)
 	if !errors.Is(err, unix.EBUSY) {
 		t.Fatalf("got %v, want EBUSY", err)
 	}
 	if _, ok := e.intentOf(in.VolumeID); !ok {
-		t.Fatal("the intent was deleted although the stage is still mounted")
+		t.Fatal("the intent was deleted although the publish is still mounted")
 	}
-	if _, ok := e.visible(in.StagePath); !ok {
-		t.Error("the stage is gone")
-	}
-	// The publish that was unmounted is not made again in the same pass.
-	if _, ok := e.visible(target); ok {
-		t.Error("the publish was bound again in the pass that tore it down")
+	if _, ok := e.visible(target); !ok {
+		t.Error("the busy publish is gone")
 	}
 	if e.metrics.errCount("teardown") != 1 {
 		t.Errorf("errors = %v", e.metrics.errors)
 	}
 
-	e.sim.FailOp(fake.OpUnmount, in.StagePath, nil)
+	e.sim.FailOp(fake.OpUnmount, target, nil)
 	mustNil(t, "Unstage retry", e.r.Unstage(bg, in.VolumeID))
 	if _, ok := e.intentOf(in.VolumeID); ok {
 		t.Error("the intent survived the successful retry")
 	}
-	if _, ok := e.visible(in.StagePath); ok {
-		t.Error("the stage survived the successful retry")
+	if _, ok := e.visible(target); ok {
+		t.Error("the publish survived the successful retry")
 	}
+	e.noStageMount(in)
 }
 
 // Unstage takes down binds the driver made and nothing else: a foreign mount
@@ -636,9 +624,7 @@ func TestUnstageLeavesMountsThatAreNotOurs(t *testing.T) {
 		if m, ok := e.visible(target); !ok || m.FSType != "tmpfs" {
 			t.Error("the foreign mount at the target was removed")
 		}
-		if _, ok := e.visible(in.StagePath); !ok {
-			t.Error("the stage went while a publish was still in the way")
-		}
+		e.noStageMount(in)
 		if _, ok := e.intentOf(in.VolumeID); !ok {
 			t.Error("the record was deleted")
 		}
@@ -662,12 +648,12 @@ func TestUnstageWhoseRecordSurvivesTheTeardownIsAnError(t *testing.T) {
 	e := newEnv(t)
 	e.start()
 	in := e.vol("a", pvc1)
-	mustNil(t, "Stage", e.r.Stage(bg, in))
+	target := e.stageAndPublish(in, "pod1", false)
 	p := filepath.Join(e.store.Dir(), intent.Escape(in.VolumeID)+".json")
-	// While the stage is being unmounted, swap the record for something
+	// While the publish is being unmounted, swap the record for something
 	// Delete cannot remove.
 	e.setHook(func(c fake.Call) {
-		if c.Op == fake.OpUnmount && c.Target == in.StagePath {
+		if c.Op == fake.OpUnmount && c.Target == target {
 			_ = os.Remove(p)
 			_ = os.MkdirAll(filepath.Join(p, "x"), 0o700)
 		}
@@ -846,7 +832,7 @@ func TestBlockedTransportTimesOutAndOtherTransportsStillConverge(t *testing.T) {
 	if d := time.Since(started); d > 20*time.Second {
 		t.Errorf("the pass took %v", d)
 	}
-	if !e.isBind(v2.StagePath, e.itemDir("b", pvc2)) {
+	if !e.isBind(e.tdir("b"), e.host("b")) {
 		t.Error("v2 did not converge in the same pass")
 	}
 	// The hung transport was tried once, not once per volume.
@@ -913,7 +899,7 @@ func TestMounterBusyIsSurfacedWithoutStackingCalls(t *testing.T) {
 	e := newEnv(t)
 	e.start()
 	in := e.vol("a", pvc1)
-	e.sim.FailOp(fake.OpBind, in.StagePath, mount.ErrBusy)
+	e.sim.FailOp(fake.OpBind, e.tdir("a"), mount.ErrBusy)
 
 	for i := 1; i <= 3; i++ {
 		err := e.r.Stage(bg, in)
@@ -922,15 +908,15 @@ func TestMounterBusyIsSurfacedWithoutStackingCalls(t *testing.T) {
 		}
 		n := 0
 		for _, c := range e.sim.Calls() {
-			if c.Op == fake.OpBind && c.Target == in.StagePath {
+			if c.Op == fake.OpBind && c.Target == e.tdir("a") {
 				n++
 			}
 		}
 		if n != i {
-			t.Fatalf("after %d attempts, %d binds of the stage were started", i, n)
+			t.Fatalf("after %d attempts, %d binds of the transport were started", i, n)
 		}
 	}
-	e.sim.FailOp(fake.OpBind, in.StagePath, nil)
+	e.sim.FailOp(fake.OpBind, e.tdir("a"), nil)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 }
 
@@ -956,8 +942,8 @@ func TestAnUnreadableStoreCollectsNothingAndConvergesNothing(t *testing.T) {
 	if _, ok := e.visible(stray); !ok {
 		t.Error("garbage was collected on an unreadable store")
 	}
-	if _, ok := e.visible(in.StagePath); !ok {
-		t.Error("a live volume's stage was unmounted on an unreadable store")
+	if _, ok := e.visible(e.tdir("a")); !ok {
+		t.Error("a live volume's transport was unmounted on an unreadable store")
 	}
 	if c := e.sim.mutating(); len(c) != 0 {
 		t.Errorf("calls = %+v", c)
@@ -1011,7 +997,7 @@ func TestConcurrentPublishesOfOneVolumeSerialise(t *testing.T) {
 	if len(got.Publishes) != 2 {
 		t.Errorf("publishes = %+v, want both", got.Publishes)
 	}
-	if !e.isBind(t1, in.StagePath) || !e.isBind(t2, in.StagePath) {
+	if !e.isBind(t1, e.srcOf(in)) || !e.isBind(t2, e.srcOf(in)) {
 		t.Error("both targets must be mounted")
 	}
 	var order []string
@@ -1065,10 +1051,10 @@ func TestTimerPassRepairsAVolume(t *testing.T) {
 	in := e.vol("a", pvc1)
 	mustNil(t, "Stage", e.r.Stage(bg, in))
 
-	e.sim.remove(in.StagePath) // something unmounted it behind our back
+	e.sim.remove(e.tdir("a")) // something unmounted it behind our back
 	e.freshPass(func() { ticks <- time.Time{} })
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
-		t.Error("the timer pass did not restore the stage")
+	if !e.isBind(e.tdir("a"), e.host("a")) {
+		t.Error("the timer pass did not restore the transport")
 	}
 }
 
@@ -1079,7 +1065,7 @@ func TestRunConvergesOnceAtStart(t *testing.T) {
 	mustNil(t, "save", e.store.Save(in))
 	e.start()
 	e.waitPasses(1)
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
+	if !e.isBind(e.tdir("a"), e.host("a")) {
 		t.Error("the start pass did not converge")
 	}
 }

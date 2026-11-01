@@ -21,32 +21,46 @@ type Observed struct {
 	Mounts observe.Table
 }
 
-// Item makes one kind of volume real between its transport and its stage
-// path.
+// Item makes one kind of volume real between its transport and its publish
+// targets.
 //
-// The reconciler owns the layers on either side: it has the transport
-// mounted before it calls Converge, and it makes the publish binds from the
-// stage path after Converge succeeds. An Item owns what lies between: that
-// the volume's thing exists inside the transport directory, and that the
-// stage path is a mount of it. For a directory that is a stat and one bind;
-// an image item would attach a loop device and mount a file system.
+// The reconciler owns the layers on either side: it has the transport mounted
+// before it calls Converge, and it makes the publish binds after Converge
+// succeeds, each a bind of the directory PublishSource returns. An Item owns
+// what lies between: that the volume's thing exists inside the transport and,
+// if the kind needs one, a mount at the stage path. A directory needs none: the
+// NFS client reports "/" as the root of every mount of an export, so a bind of
+// a subdirectory at the stage path would look to kubelet's reference check
+// like a mount of the transport itself, and the stage could never be
+// unstaged. A directory item therefore makes nothing at the stage path, and
+// its publishes are binds of the directory in the transport. An image item
+// (M2) attaches a loop device and mounts a file system at the stage path, and
+// its publishes are binds of that.
 type Item interface {
 	// Kind is the volume kind the Item handles.
 	Kind() volume.Kind
 
-	// Converge takes one idempotent step toward the stage path being a mount
-	// of the volume, and returns nil when it is. It changes nothing that is
-	// already right, and it never stacks a mount over another or removes a
-	// mount it did not make: something else at the stage path is
-	// ErrStageConflict. Every call that can hang runs under a deadline, and a
-	// timeout wraps mount.ErrTimeout.
+	// Converge takes one idempotent step toward the volume's thing existing
+	// in its transport and, if the kind needs one, being mounted at the stage
+	// path, and returns nil when it is. It changes nothing that is already
+	// right, and it never stacks a mount over another or removes a mount it
+	// did not make: a mount at the stage path of a kind that makes none, or a
+	// foreign one at the stage path of a kind that does, is ErrStageConflict.
+	// Every call that can hang runs under a deadline, and a timeout wraps
+	// mount.ErrTimeout.
 	Converge(ctx context.Context, in intent.Intent, obs Observed) error
 
-	// Teardown undoes Converge: afterwards nothing is mounted at the stage
-	// path, and what the Item made below it is gone. It is a no-op when there
-	// is nothing to undo, and it never detaches lazily, so a busy stage is an
-	// error for the caller to retry. It does not touch the transport and does
-	// not depend on it being reachable.
+	// PublishSource is the directory each publish target is a bind of: for a
+	// directory item the volume's directory in the transport, for an image
+	// item its stage path. It decides from the intent alone and touches
+	// nothing.
+	PublishSource(in intent.Intent) (string, error)
+
+	// Teardown undoes Converge: afterwards nothing the Item made is mounted at
+	// the stage path, and what the Item made below it is gone. It is a no-op
+	// when there is nothing to undo, and it never detaches lazily, so a busy
+	// stage is an error for the caller to retry. It does not touch the
+	// transport and does not depend on it being reachable.
 	Teardown(ctx context.Context, in intent.Intent, obs Observed) error
 }
 
@@ -61,8 +75,18 @@ var (
 	// is something else.
 	ErrItemNotDirectory = errors.New("the volume's item path in its transport is not a directory")
 
+	// ErrTransportUnavailable is returned when the item cannot be looked at
+	// because the transport is not answering or has restarted: a stat of the
+	// item directory returned ESTALE, timed out (mount.ErrTimeout) or is held
+	// busy by an earlier call that has not returned (mount.ErrBusy). It is
+	// retryable and nothing is unmounted or mounted on account of it; the next
+	// pass looks again. The error it wraps says which.
+	ErrTransportUnavailable = errors.New("the transport is unavailable")
+
 	// ErrStageConflict is returned when the stage path holds a mount that is
-	// not this volume's. It wraps mount.ErrConflict. Nothing is changed.
+	// not this volume's: for a directory volume, any mount at all, since the
+	// driver makes none there, and kubelet's reference check would see it.
+	// It wraps mount.ErrConflict. Nothing is changed.
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
 )
 
@@ -76,22 +100,18 @@ var ErrNoOpenat2 = errors.New("the node needs openat2(2), which this kernel does
 // request that met it came by it. Retrying is the remedy.
 var ErrObserve = errors.New("the mount table cannot be read")
 
-// ErrTransportNotMounted is returned by an Item's Teardown when the stage path
-// is mounted but the transport it was made from is not, so the stage mount
-// cannot be told from a foreign one. Nothing is unmounted. The reconciler
-// remounts the transport on its next pass, after which the unstage can be
-// retried.
-var ErrTransportNotMounted = errors.New("the transport is not mounted, so the stage mount cannot be recognised as the driver's own")
-
 // Owned says whether the visible mount top at a mount point is one the driver
 // made. It decides from the table alone.
 type Owned func(t observe.Table, top observe.Mount) (bool, error)
 
 // BindOf is the Owned test for a mount that must be a bind of the directory
-// source: same device and same root path, including when the directory has
-// since been removed (observe.Table.IsBindOfIncludingDeleted). A volume whose
+// source: the mount is a bind of that directory as the kernel reports it
+// (the same device and the same root path, or, on NFS, which reports "/" as
+// the root of every mount of an export, the same device and the directory in
+// the mount source), including when the directory has since been removed
+// (observe.Table.IsBindOfIncludingDeleted). A volume whose
 // directory was deleted while it was staged must still be unstageable. For a
-// removed directory this is "same device and same last-known root path", not a
+// removed directory this is "the same last-known root path", not a
 // proof of identity: renaming another directory to the volume's name before
 // the removal would pass for it. The mount table has nothing better to offer,
 // and the cost of the mistake is unmounting a bind of a directory in the

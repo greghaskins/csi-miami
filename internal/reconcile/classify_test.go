@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
+	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 )
@@ -49,6 +50,9 @@ func TestClassifyEverySentinel(t *testing.T) {
 		{mount.ErrBusy, ClassUnavailable},
 		{ErrStopped, ClassUnavailable},
 		{unix.EBUSY, ClassUnavailable},
+		{unix.ESTALE, ClassUnavailable}, // the NFS server restarted: never Internal
+		{&fs.PathError{Op: "stat", Path: "/x", Err: unix.ESTALE}, ClassUnavailable},
+		{fmt.Errorf("%w: %w", ErrTransportUnavailable, unix.ESTALE), ClassUnavailable},
 		{errors.New("something else"), ClassInternal},
 		{fs.ErrNotExist, ClassInternal}, // only ErrItemMissing means NotFound
 	}
@@ -86,6 +90,22 @@ func TestClassifyMixedErrors(t *testing.T) {
 	busy := fmt.Errorf("%w: mounting x: %w", ErrTransportUnavailable, mount.ErrBusy)
 	if got := Classify(busy); got != ClassUnavailable {
 		t.Errorf("an unavailable transport that is busy = %v, want Unavailable", got)
+	}
+	// The stat of an item directory that fails because the transport restarted
+	// or does not answer: ESTALE and busy are Unavailable, a timeout stays a
+	// DeadlineExceeded by the order, and none is Internal.
+	for _, c := range []struct {
+		name  string
+		cause error
+		want  Class
+	}{
+		{"stale handle", unix.ESTALE, ClassUnavailable},
+		{"busy", mount.ErrBusy, ClassUnavailable},
+		{"timeout", timeout, ClassDeadlineExceeded},
+	} {
+		if got := Classify(fmt.Errorf("directory item x: %w: %w", item.ErrTransportUnavailable, c.cause)); got != c.want {
+			t.Errorf("an item stat that failed with %s = %v, want %v", c.name, got, c.want)
+		}
 	}
 	// A conflict joined with a timeout is the conflict: a person has to act.
 	both := errors.Join(fmt.Errorf("%w: at x", ErrStageConflict), timeout)

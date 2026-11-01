@@ -47,6 +47,9 @@ func (c nodeConfig) withDefaults() nodeConfig {
 	if c.stateDir == "" {
 		c.stateDir = filepath.Join(c.kubeletDir, "plugins", csi.DriverName, "intents")
 	}
+	if c.transportsRoot == "" {
+		c.transportsRoot = filepath.Join(c.kubeletDir, "plugins", csi.DriverName, "transports")
+	}
 	if c.stageRoot == "" {
 		c.stageRoot = filepath.Join(c.kubeletDir, "plugins", "kubernetes.io", "csi", csi.DriverName)
 	}
@@ -71,7 +74,7 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.endpoint, "endpoint", "unix:///csi/csi.sock", "CSI endpoint to listen on, unix:///<absolute path>")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "this node's name, as Kubernetes knows it (required)")
 	fs.StringVar(&cfg.kubeletDir, "kubelet-dir", "/var/lib/kubelet", "the kubelet's root directory on the host")
-	fs.StringVar(&cfg.transportsRoot, "transports-root", "/var/lib/miami", "directory to mount transports under")
+	fs.StringVar(&cfg.transportsRoot, "transports-root", "", "directory to mount transports under (default <kubelet-dir>/plugins/"+csi.DriverName+"/transports, where the kubelet guarantees mount propagation)")
 	fs.StringVar(&cfg.stateDir, "state-dir", "", "directory of the intent records (default <kubelet-dir>/plugins/"+csi.DriverName+"/intents)")
 	fs.StringVar(&cfg.stageRoot, "stage-root", "", "the driver's staging directory (default <kubelet-dir>/plugins/kubernetes.io/csi/"+csi.DriverName+")")
 	fs.StringVar(&cfg.metricsAddr, "metrics-addr", ":9810", "address to serve /metrics and /healthz on; empty turns it off")

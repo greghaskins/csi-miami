@@ -126,7 +126,7 @@ func (e *env) newReconciler(mods ...func(*Options)) *Reconciler {
 func (e *env) dirItem(timeout time.Duration, before func()) (item.Item, error) {
 	return directory.New(directory.Config{
 		Root: e.tRoot, Mounter: e.sim, Timeout: timeout,
-		Ensure: func(_, dir string) error { return os.MkdirAll(e.hostPath(dir), 0o755) }, //nolint:gosec // the mode the directory item makes
+		Ensure: func(_, dir string, _ uint32) error { return os.MkdirAll(e.hostPath(dir), 0o755) }, //nolint:gosec // the mode the directory item makes
 		Stat: func(p string) (fs.FileInfo, error) {
 			if before != nil {
 				before()
@@ -280,6 +280,26 @@ func (e *env) isBind(mountPoint, src string) bool {
 		e.t.Fatalf("IsBindOf(%s, %s): %v", mountPoint, src, err)
 	}
 	return ok
+}
+
+// srcOf is what each publish of the volume is a bind of: its directory in the
+// transport.
+func (e *env) srcOf(in intent.Intent) string {
+	e.t.Helper()
+	src, err := e.r.items[in.Kind].PublishSource(in)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return src
+}
+
+// noStageMount fails the test if anything is mounted at the volume's stage
+// path: a directory volume leaves it empty.
+func (e *env) noStageMount(in intent.Intent) {
+	e.t.Helper()
+	if m, ok := e.visible(in.StagePath); ok {
+		e.t.Errorf("something is mounted at the stage path %s: %+v", in.StagePath, m)
+	}
 }
 
 func (e *env) visible(path string) (observe.Mount, bool) {

@@ -5,8 +5,10 @@
 // wait for the loop to make it so. One goroutine, Run, reads the intents and
 // the kernel's mount table and drives the second toward the first, one
 // idempotent step per layer: the transport mounted on the host, the item
-// (for a directory, the volume's directory bound at the stage path), and a
-// bind of the stage path at each publish target. It does this once at start,
+// (for a directory, that the volume's directory exists and nothing is mounted
+// at the stage path), and a bind of the item's publish source (for a
+// directory, the volume's directory in the transport) at each publish
+// target. It does this once at start,
 // on every request and on a timer, so a plugin restart changes nothing the
 // kernel reports, a reboot is repaired on the first pass, and a mount that
 // someone removed is restored.
@@ -41,6 +43,19 @@
 // volume. A step that times out wraps mount.ErrTimeout; a path whose last
 // call has not returned fails at once wrapping mount.ErrBusy; neither stacks
 // calls, and both are retried by the next pass.
+//
+// # A transport's health is reported, not remediated
+//
+// Each pass asks every transport the intents reference whether it answers: a
+// statfs of its mount directory under the stat deadline (statfs always asks
+// the server, where a stat can come from the attribute cache), reported as the
+// up metric and logged once per change. A stat of a volume's item directory
+// that returns ESTALE (the server restarted and its file handles are gone),
+// times out or is busy is the same condition, ErrTransportUnavailable: the
+// volume's condition metric and its event say so, and nothing is unmounted,
+// remounted or rebound on account of it. The next pass looks again, and the
+// volume is ok when the server answers. What to do about a transport that
+// stays down is a person's call (or a later milestone's remediation).
 //
 // # Requests
 //

@@ -2,6 +2,12 @@
 # two example StorageClasses, and the driver image loaded into the kind nodes
 # and never pulled.
 #
+# The node plugin also gets the host's /export, so that the example local
+# StorageClass (transport.path /export/data) has a host directory the plugin
+# can see: the plugin binds the transport's path from inside its own container,
+# so a local transport's path must be mounted into it. A real deployment adds
+# the mounts its own paths need. The harness makes /export/data on each node.
+#
 # Two values vary per run, and the harness sets both with
 # hack/e2e-overlay.sh, which writes a throwaway kustomization that uses this
 # directory as its base:
@@ -48,3 +54,23 @@ patches:
             containers:
               - name: miami
                 imagePullPolicy: IfNotPresent
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: miami-node
+        namespace: miami-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: miami
+                volumeMounts:
+                  - name: local-export
+                    mountPath: /export
+                    mountPropagation: HostToContainer
+            volumes:
+              - name: local-export
+                hostPath:
+                  path: /export
+                  type: DirectoryOrCreate

@@ -147,6 +147,7 @@ and unstage of the same ID across calls.
 | `miami/transport.export` | nfs3 export path |
 | `miami/transport.path` | local host path |
 | `miami/subdir` | optional prefix under the transport, tokens expanded; omitted when empty. The item directory is `<subdir>/<name>` (decision 20) |
+| `miami/mode` | optional mode of the item directory when the driver creates it, four octal digits (`0755`); omitted when the StorageClass sets none (decision 28) |
 
 - Delete and expand get only the ID, so the controller fetches the PV by
   name (`pvc-<uuid>` is the PV name) and rebuilds the `Spec` from its
@@ -165,6 +166,7 @@ and unstage of the same ID across calls.
 | `transport.export` | nfs3 | export path |
 | `transport.path` | local | absolute host path |
 | `subdir` | no | optional prefix under the transport with `${pvc.namespace}` and `${pvc.name}` tokens; default none. The volume's own name is always appended (decision 20) |
+| `mode` | no | the mode of the volume's directory when the driver creates it: an octal number of up to four digits, `0755` by default; `0777` (any user may write, for an export that squashes root) and `2775` (setgid) are the documented examples (decision 28) |
 
 Validation: `subdir` must be relative, must not contain `..` as a path
 element, a NUL or any control character, and no element may be longer than
@@ -174,6 +176,18 @@ means no prefix, as does an empty or omitted `subdir`. Each token value must
 be a single non-empty path element. An unresolved or unknown token is
 `InvalidArgument`. Unknown parameters are `InvalidArgument` so a typo cannot
 silently mean the default.
+
+`mode` is `InvalidArgument` unless it is one to four octal digits (a sign, a
+prefix such as `0o`, a digit above 7 or more than four digits is refused); the
+setgid and sticky bits are the leading digit (0 to 3); setuid (a leading 4 to
+7) is refused because it has no meaning on a directory, and nothing above four
+digits is allowed. Upgrade every node plugin before setting `mode` on a class:
+an older node refuses a volume context with `miami/mode`, and one that rewrites
+a record drops the field. It is the mode of the volume's own directory only: the `subdir`
+elements above it are made 0755, and a directory that already exists is adopted
+as it is and never chmod'ed. The controller applies it for `nfs3` and the node at
+the first stage of a `local` volume, with `fchmod` so that the umask does not
+decide it.
 
 A given server is named one way across all StorageClasses on a cluster (the
 normal form already collapses case). The kernel reports a shared NFS
@@ -192,8 +206,8 @@ with the name taken from the volume ID and never from a parameter.
   (accept-all for directory items; exists so M2 needs no capability
   change), `LIST_VOLUMES` (walk the transports the controller currently has
   mounted; `Aborted` on a starting token, as before).
-- **Node**: `STAGE_UNSTAGE_VOLUME`, `GET_VOLUME_STATS` (`statfs` on the
-  stage path, in a goroutine with a deadline).
+- **Node**: `STAGE_UNSTAGE_VOLUME`, `GET_VOLUME_STATS` (`statfs` on a
+  publish target, in a goroutine with a deadline).
 - **Access modes**: `SINGLE_NODE_WRITER`, `SINGLE_NODE_MULTI_WRITER`,
   `MULTI_NODE_MULTI_WRITER`, `MULTI_NODE_READER_ONLY` for directory items.
 - **fsType**: none accepted for directory items (`InvalidArgument` if set).
@@ -203,8 +217,8 @@ with the name taken from the volume ID and never from a parameter.
 Error mapping: `InvalidArgument` for bad parameters; `NotFound` for an
 unknown volume; `Unavailable` for a transport that cannot be mounted or a
 PV that cannot be read; `DeadlineExceeded` from any observation that hits
-its deadline; `FailedPrecondition` for a stage path mounted from something
-other than this volume's transport directory. Never `panic` in a handler.
+its deadline; `FailedPrecondition` for anything mounted at a directory volume's stage
+path, or at a publish target from something other than the volume's directory. Never `panic` in a handler.
 
 Choices made in T8 where the plan was silent:
 
@@ -248,8 +262,9 @@ Choices made in T7 where the plan was silent:
   Stage never gives it back once the loop has cleared it). The flag is
   informational in the record format (omitted when false), so it needs no
   version bump.
-- `NodeGetVolumeStats` answers for the stage path and the publish targets of a
-  staged volume (`NotFound` otherwise). A statfs that fails or times out fails
+- `NodeGetVolumeStats` answers for the publish targets of a staged volume
+  (`NotFound` otherwise, the stage path included: nothing is mounted there,
+  and kubelet asks with the pod's path; decision 25). A statfs that fails or times out fails
   the call with the code of its class (`DeadlineExceeded` for a timeout,
   `Unavailable` for a busy path, `Internal` for an unexpected errno) and a
   warning in the log, so a wedged transport is not counted as a success. The
@@ -276,7 +291,8 @@ Choices made in T7 where the plan was silent:
   statelessness is the point, nothing must survive a restart).
 - `CreateVolume`: validate, resolve `subdir`. For `nfs3`: mount the
   transport, `mkdir -p <transport>/<subdir>/<name>` (idempotent: an existing
-  directory is adopted), return ID and context. For `local` (decision 23):
+  directory is adopted; the new directory gets the `mode` parameter, 0755 by
+  default), return ID and context. For `local` (decision 23):
   return ID, context and the node topology and touch no file system, because
   the directory is on the disk of the node the volume is for, not of the node
   the controller runs on; the node creates it at first stage if it is
@@ -310,7 +326,7 @@ and `noatime` is the generic mount flag `MS_NOATIME`, not a data option.
 | option | reason |
 |---|---|
 | `vers=3,proto=tcp` | the protocol the target NAS speaks; TCP so a socket reset is a real fence (M2) |
-| `softerr,timeo=100,retrans=3` | bounded failure: retries at 10, 20, 30 and 40 seconds, about 100s in all, so the major timeout is a constant the fence math (M2) can use. `softerr` returns `ETIMEDOUT` instead of `EIO`, so a NAS stall is distinguishable from a disk error. Needs kernel 5.3+; on `EINVAL` the mount fails with an explicit message, never a silent fallback to `soft` or `hard` |
+| `softerr,timeo=100,retrans=3` | bounded failure: a 40 second major timeout, `timeo` x (`retrans`+1) (over TCP the retry interval grows linearly and the major timeout is capped there), so it is a constant the fence math (M2) can use. `softerr` returns `ETIMEDOUT` instead of `EIO`, so a NAS stall is distinguishable from a disk error. Needs kernel 5.3+; on `EINVAL` the mount fails with an explicit message, never a silent fallback to `soft` or `hard` |
 | `nolock` | locks are node-local; cross-node coordination uses `mkdir` and `O_EXCL`, which are server round-trips regardless; no NLM, no lockd state to hang |
 | `lookupcache=positive` | never cache a negative lookup, so a file or lock directory created on another node is seen on the next lookup |
 | `actimeo=30` | attribute cache; file contents are unaffected because close-to-open revalidates on every `open` (also how M2 reads another node's holder mtime fresh); directory listings lag by at most 30s |
@@ -351,9 +367,11 @@ reported and never stacked over.
 that every transport looks the same to the item and observer code. It
 must exist and be a directory; the driver never creates it.
 
-**Mount point on the host table.** The DaemonSet mounts a `hostPath`
-directory (`--transports-root`, default `/var/lib/miami`) with
-`mountPropagation: Bidirectional`. A transport mounted under it is visible
+**Mount point on the host table.** The DaemonSet mounts the kubelet
+directory with `mountPropagation: Bidirectional`; the node's transports root
+(`--transports-root`) defaults to
+`<kubelet-dir>/plugins/miami.csi.greghaskins.com/transports` (decision 27)
+and the controller's to `/var/lib/miami`, an emptyDir. A transport mounted under it is visible
 to the host and to the next plugin pod. On start the reconciler reads
 mountinfo and adopts what is there; it never assumes.
 
@@ -388,7 +406,13 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 
 **Converge, for a directory item.**
 
-1. Transport mounted (adopt or mount).
+1. Transport mounted (adopt or mount), then asked whether it answers: a
+   `statfs` of its mount directory under the stat deadline, once per transport
+   per pass, reported as `miami_transport_up` and logged once per change. A
+   timeout or busy is noted as a hung transport (one deadline per transport per
+   pass, the other volumes on it wait for the next pass). The transport is
+   reported and never repaired: nothing is unmounted or remounted because it
+   does not answer.
 2. `<transport>/<subdir>/<name>` exists and is a directory (adopt). For
    `nfs3` the controller created it, and a missing directory at stage is
    `NotFound`; for `local` the controller creates nothing (decision 23), so
@@ -397,19 +421,29 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
    first record of a local volume and cleared by the reconciler once the item
    has converged; a directory missing without it is `NotFound`, as for `nfs3`,
    so a disk that is not mounted, or a reboot, never gives a pod an empty
-   volume.
-3. Stage path is a bind mount of that directory (adopt if mountinfo shows
-   exactly that source; `FailedPrecondition` if it shows something else;
-   bind if absent).
-4. Each publish target is a bind of the stage path with the requested
-   read-only flag (remount read-only if needed).
+   volume. A directory the node creates takes the volume's `mode` (0755 by
+   default). The stat of the directory that returns ESTALE, times out or is
+   busy is `ErrTransportUnavailable`, not a failure of the item: the NFS server
+   has restarted or is not answering, the volume's event is `TransportUnavailable`
+   and the next pass looks again (decision 28).
+3. Nothing is mounted at the stage path (decision 25). A bind of the item
+   directory there is the stage bind of a build before the decision, and is
+   unmounted; anything else mounted there is `FailedPrecondition`, reported and
+   left, since the driver makes no mount there and cannot show it made that
+   one.
+4. Each publish target is a bind of the item directory with the requested
+   read-only flag (adopt if mountinfo shows that directory, compared the NFS
+   way; remount read-only if needed).
 
 **Garbage.** Any mount strictly under the stage root that no volume's stage
-path covers is unmounted, deepest first, and so is a mount at a publish target
+path covers is unmounted, deepest first (the driver makes none at a stage
+path, so a mount at exactly a live stage path, or inside it, is the volume's
+conflict and is left), and so is a mount at a publish target
 that no intent claims but that an `Unpublish` named or that the previous pass
 saw claimed; a publish target is unmounted only if it is a bind of the
-volume's directory in its transport (the same device and root path, also for a
-directory that has since been removed), once, never a stack. The one wider
+volume's directory in its transport (a bind of it as the kernel reports binds, the same device and root path or on
+NFS the directory in the mount source, also for a directory that has since been
+removed), once, never a stack. The one wider
 case is an explicit `NodeUnpublishVolume` for a volume with no intent: kubelet
 named the path and nothing identifies the volume, so a bind of any directory
 in one of the driver's transports is accepted. A transport with no referencing intent is unmounted only
@@ -418,8 +452,8 @@ past the idle TTL, which is off by default (never).
 **CSI mapping.** `NodeStageVolume` writes the intent (without publishes)
 and waits for converge; `NodePublishVolume` adds a publish and waits;
 `NodeUnpublishVolume` removes it and waits; `NodeUnstageVolume` unmounts the
-publishes and the stage path, and only then removes the intent, so a failed
-unmount keeps the intent and is retried. All four are idempotent by
+publishes (a directory volume has nothing mounted at the stage path to take
+down), and only then removes the intent, so a failed unmount keeps the intent and is retried. All four are idempotent by
 construction.
 
 **Kubelet directory.** `--kubelet-dir` (default `/var/lib/kubelet`) because
@@ -434,7 +468,20 @@ On the node (`--metrics-addr`, default `:9810`, served on the host network):
 - `miami_intents{kind}` gauge; `miami_transports{kind,id}` gauge whose value
   is 1 when the transport was found mounted and 0 when not (a `mounted` label
   would leave a stale series at every change).
-- `miami_reconcile_duration_seconds` histogram; `miami_reconcile_errors_total{step}`.
+- `miami_transport_up{kind,id}` gauge: 1 when a deadline-bounded `statfs` of the
+  transport's mount directory answered in the pass, 0 when it timed out, was
+  busy or failed, or the transport is not mounted (statfs always asks the
+  server, where a stat can come from the attribute cache). One series per
+  transport the intents reference.
+- `miami_volume_condition{condition}` gauge: the number of volumes in each
+  condition after the pass; `condition` is `ok` or one of `unresponsive`,
+  `transport-unavailable`, `transport-conflict`, `stage-conflict`,
+  `publish-conflict`, `item-missing`, `item-not-directory`, `failed`, every
+  value present at zero. No volume ID in a label. A volume is in one condition:
+  its stage's if that failed, else its first failing publish's.
+- `miami_reconcile_duration_seconds` histogram; `miami_reconcile_errors_total{step}`
+  (steps: `load`, `transport`, `probe`, `item`, `publish`, `teardown`, `garbage`,
+  `observe`).
 - `miami_observation_timeouts_total{op}`; `miami_garbage_unmounts_total`.
 - `miami_intent_load_failures`: a gauge, the number of records unreadable in
   the latest pass (it falls when a person repairs one), not the counter the
@@ -497,22 +544,42 @@ CI job) is the deploy check on a control plane and two workers.
 
 Workflows, all pinned by SHA with least permissions:
 
-- `ci.yml` on every PR and push to `main`: `static`, `unit`, `envtest`,
-  `build` (matrix amd64 on `ubuntu-latest`, arm64 on the arm runner;
-  content-addressed per-arch tags pushed from the PR, sha alias on `main`), `smoke` (matrix, root, under
-  `unshare --mount`: transport survives a plugin restart, bind adoption,
-  garbage unmount, simulated reboot via a fresh mount namespace),
-  `sanity` (matrix; amd64 only in T8, arm64 joins in T10), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
-  on arm64), `manifest` (every PR: the multi-arch index from the digests
-  the build legs ran), `publish` (`main` only: the sha alias), `ci-ok`.
+- `ci.yml` on every PR and push to `main`:
+  - `changes`: whether the change is more than documentation (`docs/`,
+    Markdown files, `LICENSE`); on a push to `main` always "code".
+  - `static`, `unit`: every change.
+  - `envtest`, `build` (matrix amd64 on `ubuntu-latest`, arm64 on the arm
+    runner; content-addressed per-arch tags pushed from the PR, sha alias on
+    `main`), `manifest` (every PR: the multi-arch index from the digests the
+    build legs ran), `deploy` (the deploy check on kind): skipped when the
+    change is documentation only.
+  - `smoke` (matrix amd64, arm64; root, under `unshare --mount`: transport
+    survives a plugin restart, bind adoption, garbage unmount, simulated
+    reboot via a fresh mount namespace) and `sanity` (matrix amd64, arm64):
+    skipped when documentation only.
+  - `e2e` (`make e2e`, transport mode): the transport package's test against
+    the kernel NFSv3 server, nfs3 on amd64; skipped when documentation only.
+  - `e2e-kind` (`make e2e E2E_MODE=kind`): `local` and `nfs3` on amd64 and
+    `nfs3` on arm64, each from that architecture's `x-<hash>-<arch>` image on
+    a kind cluster of one control plane and two workers; exit criteria 1 to 6
+    as the Go tests of `test/e2e`; skipped when documentation only.
+  - `publish` (`main` only: the sha alias).
+  - `ci-ok`: needs every job; passes when `changes` succeeded and said "true"
+    or "false", `static` and `unit` succeeded, each filterable job succeeded
+    (or, only when `changes` said "false", was skipped) and `publish` ran on
+    `main` and was skipped elsewhere.
 - `secret-scan.yml` and `secret-scan-text.yml`: already present.
-- Path filters skip heavy jobs for docs-only changes; `ci-ok` still runs.
-- No retries. Failure uploads mountinfo, plugin logs and kind logs.
+- Path filters skip the heavy jobs for docs-only changes (the `changes` job);
+  `ci-ok` still runs and still passes, and never accepts a skipped job on a code
+  change.
+- No retries. Failure uploads mountinfo, plugin logs and kind logs; the kind
+  end-to-end tests also dump the failed test's YAML and events.
 
 **e2e NFS server.** `hack/nfs-server/` runs the kernel NFS server in a
-privileged container on the runner's docker network, exporting a tmpfs with
-`fsid=0,rw,no_root_squash,insecure` for NFSv3, and the kind nodes mount it
-by container IP. The `nfs3` variant is what proves `mount(2)` without a
+privileged container on the runner's docker network, exporting a docker volume
+(so that its files and the clients' file handles survive a restart of the
+container) with `fsid=0,rw,no_root_squash,insecure` for NFSv3, and the kind
+nodes mount it by container IP. The `nfs3` variant is what proves `mount(2)` without a
 helper; it must exist before the first node-agent PR merges.
 
 ## 15. Work breakdown
@@ -534,6 +601,7 @@ acceptance check. Order matters only where stated.
 | T10 | `test/e2e`: the exit criteria 1 to 6 as tests, `local` and `nfs3` variants; `smoke` and `sanity` and `e2e` jobs wired into `ci.yml` | `ci-ok` green with the full matrix |
 | T11 | `miami lock` and its test against the `nfs3` e2e transport | two pods on two nodes serialize through it; a stale lock is broken |
 | T12 | README: install, StorageClass examples, the lock contract, limitations | reviewed |
+| T14 | the `mode` parameter; ESTALE and deadlines on the item directory as the transport's condition; `miami_transport_up` and `miami_volume_condition`; the NFS server restart e2e on a docker-volume export | `ci-ok` green with the restart test in the nfs3 legs |
 
 T1 first, T2 to T5 in any order, T6 after T3 to T5, T7 after T6, T8 after
 T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
@@ -544,23 +612,34 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
   kernels: retired by the `nfs3` e2e variant in T4, before any node-agent
   code depends on it, and by the first real-cluster mount.
 - **`Bidirectional` propagation and adoption across a plugin restart**: the
-  reason the transports root is a hostPath; adoption across a process
+  reason the transports root is under the kubelet directory's hostPath; adoption across a process
   restart is retired by the T4 smoke (one private mount namespace, so it
   does not exercise propagation); propagation is proven by the e2e on a real
   cluster in T10 and by exit criterion 4.
-- **Kubelet path differences across distributions**: one replacement in
-  the kustomize base, checked by a render test in T9.
+- **Kubelet path differences across distributions**: one ConfigMap
+  literal and one replacement in the kustomize base, checked by a render test
+  in T9 and by a throwaway overlay in T13.
 - **A hung NFS mount blocking the reconciler**: every observation has a
   deadline and its own goroutine; retired by a T6 unit test with a blocking
   fake and by an e2e that stops the NFS server mid-stage.
 - **`attachRequired: true` with `ReadWriteMany` directory items**: the
   attacher creates one VolumeAttachment per node; retired by exit criterion
   1 (two nodes, one PVC).
+- **A directory bind at the stage path cannot be unstaged on NFS**: the T10
+  end-to-end test on kind found that the NFS client reports `/` as the root of
+  every mount of an export, so kubelet's reference check (same device and root
+  as the staging path) found the transport and every other volume's bind and
+  refused to unstage. Resolved by decision 25 (T10a): a directory item makes
+  no stage mount and publishes bind the item directory. The nfs3 e2e on the
+  T10 branch is rerun after T10a merges.
 - **client-go binary size on small nodes**: accepted; measured in T1 and
   recorded in the README.
 
 ## 17. Out of scope for M1
 
 Image items, loop devices, encryption, exclusivity, fencing, expansion,
-failed-volume detection, remediation, the migration tool, RWX images,
+failed-volume detection (M1 reports a transport that does not answer through
+`miami_transport_up`, `miami_volume_condition` and a `TransportUnavailable`
+event, and does not remediate it: no unmount, remount or pod deletion),
+remediation, the migration tool, RWX images,
 node-local tiers, the S3 service. Each has its milestone in the brief.

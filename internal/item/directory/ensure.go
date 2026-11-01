@@ -11,9 +11,10 @@ import (
 	"github.com/greghaskins/csi-miami/internal/item"
 )
 
-// createMode is the mode of an item directory the node creates, whatever the
-// umask.
-const createMode = 0o755
+// parentMode is the mode of a directory the node creates on the way to the
+// item directory (the subdir elements), whatever the umask. The item directory
+// itself takes the volume's mode.
+const parentMode = 0o755
 
 const (
 	openDirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC
@@ -29,9 +30,10 @@ const (
 // descriptors with openat2(2) and never follows a symlink or crosses a mount
 // point, so a link planted in the transport, or swapped in while this runs,
 // cannot send the new directory somewhere else. An element that exists must be
-// a directory. A directory it makes is set to createMode whatever the umask.
-// It needs Linux 5.6.
-func ensureBeneath(mountDir, dir string) error {
+// a directory. A directory it makes on the way is set to parentMode and dir
+// itself to mode (permission, setgid and sticky bits), whatever the
+// umask; a dir that exists is adopted and keeps its mode. It needs Linux 5.6.
+func ensureBeneath(mountDir, dir string, mode uint32) error {
 	rel, err := filepath.Rel(mountDir, dir)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
 		return fmt.Errorf("%s is not below the transport mount", dir)
@@ -47,8 +49,13 @@ func ensureBeneath(mountDir, dir string) error {
 		}
 		_ = unix.Close(root)
 	}()
-	for _, elem := range strings.Split(rel, "/") {
-		fd, err := openOrMake(cur, elem)
+	elems := strings.Split(rel, "/")
+	for i, elem := range elems {
+		m := uint32(parentMode)
+		if i == len(elems)-1 {
+			m = mode
+		}
+		fd, err := openOrMake(cur, elem, m)
 		if err != nil {
 			return err
 		}
@@ -71,7 +78,7 @@ func openBeneath(dirfd int, name string) (int, error) {
 	}
 }
 
-func openOrMake(dirfd int, name string) (int, error) {
+func openOrMake(dirfd int, name string, mode uint32) (int, error) {
 	fd, err := openBeneath(dirfd, name)
 	if err == nil {
 		return fd, nil
@@ -79,7 +86,7 @@ func openOrMake(dirfd int, name string) (int, error) {
 	if !errors.Is(err, unix.ENOENT) {
 		return -1, openError(name, err)
 	}
-	merr := unix.Mkdirat(dirfd, name, createMode)
+	merr := unix.Mkdirat(dirfd, name, mode&0o777)
 	if merr != nil && !errors.Is(merr, unix.EEXIST) {
 		return -1, fmt.Errorf("creating %s: %w", name, merr)
 	}
@@ -88,7 +95,7 @@ func openOrMake(dirfd int, name string) (int, error) {
 		return -1, openError(name, err)
 	}
 	if merr == nil {
-		if err := unix.Fchmod(fd, createMode); err != nil {
+		if err := unix.Fchmod(fd, mode); err != nil {
 			_ = unix.Close(fd)
 			return -1, fmt.Errorf("setting the mode of %s: %w", name, err)
 		}

@@ -321,9 +321,11 @@ func (m transportMount) devno() uint64 {
 // so a link or a mount that appears on the way is never followed and nothing is
 // created outside the transport.
 //
-// A last element that exists and is not a plain directory is AlreadyExists; an
-// element on the way that is not one is FailedPrecondition.
-func (r *treeRemover) ensureBeneath(mountDir string, elems []string) (bool, error) {
+// A directory made on the way gets dirMode and the last one gets mode, both
+// whatever the umask. A last element that exists and is not a plain directory
+// is AlreadyExists; an element on the way that is not one is
+// FailedPrecondition.
+func (r *treeRemover) ensureBeneath(mountDir string, elems []string, mode uint32) (bool, error) {
 	root, err := unix.Open(mountDir, openDirFlags|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return false, walkStatus("opening the transport mount", err)
@@ -339,7 +341,7 @@ func (r *treeRemover) ensureBeneath(mountDir string, elems []string) (bool, erro
 	created := false
 	for i, elem := range elems {
 		last := i == len(elems)-1
-		fd, made, err := r.openOrMake(cur, curPath, elem, last)
+		fd, made, err := r.openOrMake(cur, curPath, elem, last, mode)
 		if err != nil {
 			return false, err
 		}
@@ -354,7 +356,11 @@ func (r *treeRemover) ensureBeneath(mountDir string, elems []string) (bool, erro
 
 // openOrMake opens the directory name inside dirfd, making it first if it is
 // missing.
-func (r *treeRemover) openOrMake(dirfd int, parentPath, name string, last bool) (fd int, made bool, err error) {
+func (r *treeRemover) openOrMake(dirfd int, parentPath, name string, last bool, lastMode uint32) (fd int, made bool, err error) {
+	mode := uint32(dirMode)
+	if last {
+		mode = lastMode
+	}
 	fd, err = r.openBeneath(dirfd, parentPath, name)
 	if err == nil {
 		return fd, false, nil
@@ -362,7 +368,7 @@ func (r *treeRemover) openOrMake(dirfd int, parentPath, name string, last bool) 
 	if !errors.Is(err, unix.ENOENT) {
 		return -1, false, notDirectory(name, last, err)
 	}
-	merr := unix.Mkdirat(dirfd, name, dirMode)
+	merr := unix.Mkdirat(dirfd, name, mode&0o777)
 	if merr != nil && !errors.Is(merr, unix.EEXIST) {
 		return -1, false, fsStatus("creating "+name, merr)
 	}
@@ -374,7 +380,7 @@ func (r *treeRemover) openOrMake(dirfd int, parentPath, name string, last bool) 
 	if made {
 		// The mode is set on the new directory's own descriptor, because the
 		// umask would otherwise decide it.
-		if err := unix.Fchmod(fd, dirMode); err != nil {
+		if err := unix.Fchmod(fd, mode); err != nil {
 			_ = unix.Close(fd)
 			return -1, false, fsStatus("setting the mode of "+name, err)
 		}

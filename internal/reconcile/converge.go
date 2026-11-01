@@ -19,8 +19,9 @@ import (
 )
 
 // teardown is the unstage half of a pass: for each volume with an unstage
-// request, unmount its publishes, then its stage path (item.Teardown), then
-// delete its record, stopping at the first failure so the record stays and
+// request, unmount its publishes, then undo its item (item.Teardown; for a
+// directory it checks that nothing is mounted at the stage path), then delete
+// its record, stopping at the first failure so the record stays and
 // the next Unstage retries. The transport is not touched. A volume with no
 // record in this pass has nothing to undo.
 //
@@ -111,21 +112,34 @@ func (p *pass) deleteRecord(in intent.Intent) error {
 	return fmt.Errorf("%w: the record of %s changed while it was being unstaged, so it was kept", ErrSuperseded, in.VolumeID)
 }
 
-// teardownVolume unmounts the publishes and then the stage path. Each unmount
-// is without MNT_DETACH: a busy mount stays and is an error, because a lazy
-// detach would leave a pod writing into a mount nobody tracks. Each is also
-// once, and only if the table shows the mount to be a bind of what the
+// teardownVolume unmounts the publishes and then tears down the item. Each
+// unmount is without MNT_DETACH: a busy mount stays and is an error, because a
+// lazy detach would leave a pod writing into a mount nobody tracks. Each is
+// also once, and only if the table shows the mount to be a bind of what the
 // intent says it should be (item.UnmountIf): a publish target must be a bind
-// of the volume's directory in its transport (publishOwnership), the stage
-// path (in the item) a bind of the same directory. Anything else is
-// ErrPublishConflict or ErrStageConflict, left in
-// place and reported, so an Unstage can never unmount a mount the driver did
-// not make; the price is that it fails until a person clears the conflict.
-// The first publish that fails ends the teardown with that one error, so what
-// reaches the caller has one meaning; the stage path is only unmounted when
-// every publish is gone, since the binds are of it.
+// of the volume's directory in its transport (publishOwnership). Anything
+// else is ErrPublishConflict, left in place and reported, so an Unstage can
+// never unmount a mount the driver did not make; the price is that it fails
+// until a person clears the conflict. A directory item has no mount at the
+// stage path to take down, and a mount found there is ErrStageConflict, left
+// in place too. The first publish that fails ends the teardown with that one
+// error, so what reaches the caller has one meaning; the item is only torn
+// down when every publish is gone. The transport stays mounted.
 func (p *pass) teardownVolume(in intent.Intent) error {
 	r := p.r
+	if tdir := r.transportDirOf(in); tdir != "" {
+		// Judging a bind of the volume, a publish or an old stage, needs the
+		// transport in the table (see unmountCandidate).
+		t, err := r.observe(p.ctx)
+		if err != nil {
+			return err
+		}
+		if _, staged := t.At(in.StagePath); staged || len(in.Publishes) > 0 {
+			if err := transportMounted(t, tdir); err != nil {
+				return err
+			}
+		}
+	}
 	for _, pub := range in.Publishes {
 		owned, what := r.publishOwnership(r.itemDirOf(in), false)
 		err := item.UnmountIf(p.ctx, r.m, pub.TargetPath, owned, what, ErrPublishConflict)
@@ -145,9 +159,6 @@ func (p *pass) teardownVolume(in intent.Intent) error {
 		return err
 	}
 	err = it.Teardown(p.ctx, in, item.Observed{Mounts: obs})
-	if errors.Is(err, item.ErrTransportNotMounted) {
-		err = fmt.Errorf("%w: %w", ErrTransportUnavailable, err)
-	}
 	return err
 }
 
@@ -156,7 +167,7 @@ func (p *pass) teardownVolume(in intent.Intent) error {
 // and never with another's: one publish whose pod is gone must not fail the
 // Stage of the volume or the Publish of a different pod.
 type volumeResult struct {
-	// stage is the outcome of the transport and the item (the stage bind).
+	// stage is the outcome of the transport and the item.
 	// When it is not nil the publishes were not attempted.
 	stage error
 	// publish is the outcome of each publish, by target path. A pruned
@@ -182,8 +193,9 @@ func (p *pass) convergeAll() {
 	}
 }
 
-// convergeVolume brings one volume up: the transport, then the item (its
-// directory and the stage bind), then each publish, each step a no-op when it
+// convergeVolume brings one volume up: the transport, then the item (for a
+// directory, that its directory exists and the stage path is clear), then each
+// publish, each step a no-op when it
 // is already true. A failing step ends the volume's stage convergence, and the
 // publishes are then not attempted. The publishes are independent of each
 // other: one that fails does not keep another from being bound.
@@ -381,28 +393,92 @@ func (res *volumeResult) key() string {
 	return strings.Join(keys, ",")
 }
 
-// conditionOf classifies an error by the sentinel it wraps. A transport or a
-// path that does not answer, however it is first reported (a timeout, or busy
-// because an earlier call is still stuck), is one condition.
+// The conditions of a volume after a pass, as conditionOf names them: the keys
+// of the events and logs, and the values of the volume condition metric's
+// label. A volume is in one: the condition of its stage if that failed,
+// otherwise of its first failing publish, otherwise ConditionOK.
+const (
+	ConditionOK                   = "ok"
+	ConditionUnresponsive         = "unresponsive"
+	ConditionTransportUnavailable = "transport-unavailable"
+	ConditionTransportConflict    = "transport-conflict"
+	ConditionStageConflict        = "stage-conflict"
+	ConditionPublishConflict      = "publish-conflict"
+	ConditionItemMissing          = "item-missing"
+	ConditionItemNotDirectory     = "item-not-directory"
+	ConditionFailed               = "failed"
+)
+
+// Conditions lists every condition, so that a metric can create them all at
+// zero.
+var Conditions = []string{
+	ConditionOK, ConditionUnresponsive, ConditionTransportUnavailable, ConditionTransportConflict,
+	ConditionStageConflict, ConditionPublishConflict, ConditionItemMissing, ConditionItemNotDirectory,
+	ConditionFailed,
+}
+
+// conditionOf classifies an error by the sentinel it wraps. A transport that
+// does not answer or has restarted is one condition however it is first
+// reported (a timeout, busy because an earlier call is still stuck, a stale
+// handle): ErrTransportUnavailable decides it before the timeout it wraps
+// does. A timeout or busy on its own, from a call that is not the transport's
+// (a bind), is unresponsive.
 func conditionOf(err error) string {
 	switch {
-	case errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
-		return "unresponsive"
-	case errors.Is(err, ErrTransportConflict):
-		return "transport-conflict"
-	case errors.Is(err, ErrStageConflict):
-		return "stage-conflict"
-	case errors.Is(err, ErrPublishConflict):
-		return "publish-conflict"
-	case errors.Is(err, ErrItemMissing):
-		return "item-missing"
-	case errors.Is(err, ErrItemNotDirectory):
-		return "item-not-directory"
 	case errors.Is(err, ErrTransportUnavailable):
-		return "transport-unavailable"
+		return ConditionTransportUnavailable
+	case errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
+		return ConditionUnresponsive
+	case errors.Is(err, ErrTransportConflict):
+		return ConditionTransportConflict
+	case errors.Is(err, ErrStageConflict):
+		return ConditionStageConflict
+	case errors.Is(err, ErrPublishConflict):
+		return ConditionPublishConflict
+	case errors.Is(err, ErrItemMissing):
+		return ConditionItemMissing
+	case errors.Is(err, ErrItemNotDirectory):
+		return ConditionItemNotDirectory
 	default:
-		return "failed"
+		return ConditionFailed
 	}
+}
+
+// condition is the one condition a volume is in after a pass.
+func (res *volumeResult) condition() string {
+	if res.stage != nil {
+		return conditionOf(res.stage)
+	}
+	targets := make([]string, 0, len(res.publish))
+	for t := range res.publish {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+	for _, t := range targets {
+		if err := res.publish[t]; err != nil && !errors.Is(err, errTargetGone) {
+			return conditionOf(err)
+		}
+	}
+	return ConditionOK
+}
+
+// reportConditions sets the volume condition metric: how many of the volumes
+// converged in this pass are in each condition. Volumes that were not
+// converged (being unstaged, or with no readable record) are not counted. It
+// is skipped while shutting down, when the steps that failed were cancelled
+// and not broken.
+func (p *pass) reportConditions() {
+	if p.ctx.Err() != nil {
+		return
+	}
+	counts := make(map[string]int, len(Conditions))
+	for _, c := range Conditions {
+		counts[c] = 0
+	}
+	for _, res := range p.results {
+		counts[res.condition()]++
+	}
+	p.r.metrics.SetVolumeConditions(counts)
 }
 
 // problem names the event reason for what is wrong with the volume and joins
@@ -472,6 +548,7 @@ func (p *pass) ensureTransport(in intent.Intent, dir string) error {
 		res.err = fmt.Errorf("%w: %s is %s, not %s", ErrTransportConflict, dir, st, canonical)
 	}
 	r.metrics.SetTransport(spec.Kind, spec.ID(), res.mounted)
+	p.probe(spec, dir, res.mounted)
 	r.reported[dir] = spec.Kind
 	if res.err != nil {
 		p.noteHung(dir, res.err)
@@ -498,9 +575,11 @@ func (r *Reconciler) transportFor(spec transport.Spec) (transport.Transport, err
 	return tr, nil
 }
 
-// publish makes one publish target a bind of the stage path with the
-// requested read-only flag, from the table obs. A visible mount that is a
-// bind of the stage path is adopted without a mount call when its flag
+// publish makes one publish target a bind of the item's publish source (for a
+// directory, the volume's directory in its transport) with the requested
+// read-only flag, from the table obs. A visible mount that is a bind of the
+// source (observe.Table.IsBindOf, which compares the NFS way, so that it holds
+// on nfs3) is adopted without a mount call when its flag
 // already matches, and has the flag set with a remount (Mounter.Bind) when it
 // does not; anything else visible at the target, or hidden under a parent's
 // mount, is ErrPublishConflict and is left alone. When nothing is mounted
@@ -509,14 +588,22 @@ func (r *Reconciler) transportFor(spec transport.Spec) (transport.Transport, err
 func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) error {
 	r := p.r
 	target := pub.TargetPath
+	it, ok := r.items[in.Kind]
+	if !ok {
+		return fmt.Errorf("volume %s: no item handles kind %q", in.VolumeID, in.Kind)
+	}
+	source, err := it.PublishSource(in)
+	if err != nil {
+		return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
+	}
 	if top, ok := obs.At(target); ok {
-		same, err := obs.IsBindOf(target, in.StagePath)
+		same, err := obs.IsBindOf(target, source)
 		if err != nil {
 			return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 		}
 		if !same {
-			return fmt.Errorf("volume %s: %w: %s is mounted as %s from %q, which is not a bind of the stage path",
-				in.VolumeID, ErrPublishConflict, target, top.FSType, top.Source)
+			return fmt.Errorf("volume %s: %w: %s is mounted as %s from %q, which is not a bind of the volume's source %s",
+				in.VolumeID, ErrPublishConflict, target, top.FSType, top.Source, source)
 		}
 		if top.ReadOnly() == pub.ReadOnly {
 			return nil
@@ -534,7 +621,7 @@ func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) 
 			return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 		}
 	}
-	err := r.m.Bind(p.ctx, in.StagePath, target, pub.ReadOnly)
+	err = r.m.Bind(p.ctx, source, target, pub.ReadOnly)
 	if errors.Is(err, mount.ErrConflict) && !errors.Is(err, ErrPublishConflict) {
 		err = fmt.Errorf("%w: %w", ErrPublishConflict, err)
 	}
@@ -558,4 +645,50 @@ func (r *Reconciler) makeTarget(ctx context.Context, target string) error {
 		return struct{}{}, err
 	})
 	return err
+}
+
+// probe asks a transport that is mounted whether it answers: a statfs of its
+// mount directory under the stat deadline (the Mounter runs it in a goroutine
+// of its own that is abandoned, never joined, and refuses a second one while
+// the first has not returned). statfs always asks the server, where a stat can
+// be answered from the attribute cache and so look healthy after the server is
+// gone. It sets the up metric: 1 when the call answers, 0 when it times out, is
+// busy or fails, and 0 for a transport that is not mounted. A timeout or busy
+// is noted as a hung transport, like any other in the pass, so the volumes on
+// it wait for the next pass instead of each costing a deadline. A change of
+// state is logged once at info level. Nothing is unmounted or remounted.
+func (p *pass) probe(spec transport.Spec, dir string, mounted bool) {
+	r := p.r
+	if p.ctx.Err() != nil {
+		return // shutting down: nothing was asked
+	}
+	var err error
+	if mounted {
+		ctx, cancel := context.WithTimeout(p.ctx, r.opts.StatTimeout)
+		_, err = r.m.Statfs(ctx, dir)
+		cancel()
+		if p.ctx.Err() != nil {
+			return // shutting down: the call was cancelled, not answered
+		}
+		if err != nil {
+			p.noteHung(dir, err)
+			p.count("probe", err)
+		}
+	}
+	up := mounted && err == nil
+	r.metrics.SetTransportUp(spec.Kind, spec.ID(), up)
+
+	if !mounted {
+		// Not a transport that stopped answering, and nothing to recover
+		// from: only a mounted transport has a state to change.
+		return
+	}
+	prev, known := r.up[dir]
+	r.up[dir] = up
+	switch {
+	case !up && (!known || prev):
+		r.log.Info("transport stopped answering", "transport", spec.Canonical(), "dir", dir, "error", err)
+	case up && known && !prev:
+		r.log.Info("transport answers again", "transport", spec.Canonical(), "dir", dir)
+	}
 }

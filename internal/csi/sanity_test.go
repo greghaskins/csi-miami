@@ -33,7 +33,8 @@ import (
 // against the identity, controller and node services served together on one
 // real unix socket, on a local transport: the controller touches no file system
 // for it, and the node creates the volume's directory at first stage (decision
-// 23), binds it at the stage path and at the publish targets with real mounts,
+// 23), binds it at the publish targets with real mounts (nothing is mounted at
+// the stage path),
 // through the same reconciler, intent store and Mounter that `miami node`
 // builds. The
 // tests below it in this file mount real file systems and need root and a
@@ -572,7 +573,7 @@ func TestSanityCreateRefusesAMountPointOnTheWay(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = unix.Unmount(teams, 0) })
 
-	created, err := ensureItemDir(tr.mount, filepath.Join(teams, nameB))
+	created, err := ensureItemDir(tr.mount, filepath.Join(teams, nameB), 0o755)
 	if codeOf(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "mount point") || created {
 		t.Fatalf("created = %v, error = %v; want FailedPrecondition naming a mount point", created, err)
 	}

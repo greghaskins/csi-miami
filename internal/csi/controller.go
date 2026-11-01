@@ -140,7 +140,9 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 // capabilities (mount access only, no fsType, an accepted access mode), the
 // capacity range and, for a local transport, the node. For an nfs3 transport
 // the transport is then mounted under the controller's root and the directory
-// made with mkdir -p semantics, mode 0755, never through a symlink.
+// made with mkdir -p semantics, never through a symlink, with the StorageClass's
+// mode parameter (0755 by default) whatever the umask; an existing directory is
+// adopted as it is and not chmod'ed.
 //
 // A local transport's volume belongs to one node's disk, and the controller
 // runs on whichever node it runs on (in the scratch image the host path is not
@@ -214,7 +216,7 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 		if err != nil {
 			return nil, err
 		}
-		made, err = blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) { return ensureItemDir(tr.Dir(), dir) })
+		made, err = blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) { return ensureItemDir(tr.Dir(), dir, vctx.DirMode()) })
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, contextStatus(ctx.Err())

@@ -166,7 +166,7 @@ func TestDecodeContext(t *testing.T) {
 		{name: "literal token in subdir", in: nfsContext(map[string]string{"miami/subdir": "${pvc.name}"}), wantErr: "unresolved token"},
 		{name: "PV-shaped subdir element", in: nfsContext(map[string]string{"miami/subdir": "a/" + pvUUID1}), wantErr: "PV name"},
 
-		{name: "unknown miami key", in: nfsContext(map[string]string{"miami/mode": "0777"}), wantErr: `unknown volume context key "miami/mode"`},
+		{name: "unknown miami key", in: nfsContext(map[string]string{"miami/owner": "0777"}), wantErr: `unknown volume context key "miami/owner"`},
 		{name: "prefix alone is an unknown key", in: nfsContext(map[string]string{"miami/": "x"}), wantErr: "unknown volume context key"},
 	}
 	for _, tc := range tests {

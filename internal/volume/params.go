@@ -12,6 +12,7 @@ import (
 const (
 	ParamKind   = "kind"
 	ParamSubdir = "subdir"
+	ParamMode   = "mode"
 )
 
 // Parameters the external-provisioner injects when --extra-create-metadata
@@ -33,6 +34,7 @@ type Params struct {
 	Kind           Kind
 	Transport      transport.Spec
 	SubdirTemplate string // empty when the StorageClass sets none: no prefix
+	Mode           string // canonical four-digit octal text; empty when the StorageClass sets none: DefaultMode
 	Tokens         Tokens // from the provisioner's extra create metadata
 }
 
@@ -40,7 +42,8 @@ type Params struct {
 // names are case-sensitive and an unknown one is InvalidArgument, so a typo
 // cannot silently mean the default. Keys under csi.storage.k8s.io/ other
 // than the two the provisioner uses for tokens are ignored. An empty or
-// absent subdir means no prefix.
+// absent subdir means no prefix, and an empty or absent mode means
+// DefaultMode; a mode that is set must satisfy ParseMode.
 func ParseParameters(params map[string]string) (Params, error) {
 	// Sorted, so that which unknown key is named does not depend on map
 	// order.
@@ -52,7 +55,7 @@ func ParseParameters(params map[string]string) (Params, error) {
 
 	for _, k := range keys {
 		switch k {
-		case ParamKind, ParamSubdir,
+		case ParamKind, ParamSubdir, ParamMode,
 			transport.ParamKind, transport.ParamServer, transport.ParamExport, transport.ParamPath:
 		default:
 			if strings.HasPrefix(k, providerPrefix) {
@@ -75,6 +78,14 @@ func ParseParameters(params map[string]string) (Params, error) {
 	}
 	if !p.Kind.Valid() {
 		return Params{}, invalid("parameter " + ParamKind + " must be directory")
+	}
+
+	if raw := params[ParamMode]; raw != "" {
+		_, canonical, err := ParseMode(raw)
+		if err != nil {
+			return Params{}, err
+		}
+		p.Mode = canonical
 	}
 
 	spec, err := transport.ParseSpec(params)

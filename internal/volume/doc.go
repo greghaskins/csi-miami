@@ -19,6 +19,12 @@
 // a PV name while every volume name does, no subdir element can be a volume
 // and no volume can nest inside another's.
 //
+// The optional mode parameter is the mode of the volume's own directory when
+// the driver creates it (ParseMode: up to four octal digits, 0755 by default).
+// The context carries it in the canonical four-digit form under miami/mode,
+// and only when the StorageClass sets it, so that the node, which creates a
+// local volume's directory, sees it too.
+//
 // StorageClass parameters are parsed by ParseParameters, the subdir template
 // is expanded by ResolveSubdir, and NewContext does both and validates the
 // result in one call. DecodeContext accepts exactly what NewContext

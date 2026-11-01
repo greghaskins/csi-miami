@@ -5,7 +5,10 @@ metadata:
 spec:
   attachRequired: true
   podInfoOnMount: false
-  fsGroupPolicy: File
+  # Applies fsGroup only to volumes with an fsType that are RWO or RWOP, so the
+  # kubelet never chowns a directory item (no fsType). Immutable on a live
+  # object (decision 27).
+  fsGroupPolicy: ReadWriteOnceWithFSType
   volumeLifecycleModes:
     - Persistent
   requiresRepublish: false

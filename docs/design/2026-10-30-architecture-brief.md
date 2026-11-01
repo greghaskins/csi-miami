@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 23 recorded (section 9)
+**Status:** Draft, decisions 1 to 27 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -93,6 +93,36 @@ design treats them as constraints.
 11. **Tests that pin argv strings don't catch behaviour.** An NFSv3 mount
     can break in the container image while every unit test stays green.
     End-to-end on NFSv3 from the first milestone.
+12. **After an NFS server restart there is a window of stale handles.** In
+    that window the transport's directories answer `ESTALE`. Directories
+    recover when the server is back; a file held open across the window may
+    not. The driver reports the condition (transport unavailable, with the
+    health gauge and event T14 adds) and does not unmount or remount in M1;
+    what remediation looks like is 4.6's question for M2, which also records
+    what the restart end-to-end test saw of a file held open.
+13. **An external watchdog that lazy-unmounts NFS mounts is a failure source,
+    not a safety net.** A lazy unmount detaches the mount from every running
+    pod's view while the processes keep working on a detached tree, and it
+    hides the mount from monitoring. A host-side tool must leave the
+    transports root and the stage root alone.
+14. **Read-only is a publish property, never a health signal.** NFS does not
+    flip a mount read-only when the server fails; a read-only mount that is
+    unhealthy shows as errors and timeouts, so health is judged by asking the
+    server, never by the mount's flags.
+15. **Ownership changes by the kubelet fail on every file of a squashing
+    export and flood the logs.** A root-squashed export refuses `chown`, so a
+    recursive fsGroup change reports one error per file, and on a large share
+    it also takes minutes. The CSIDriver's `fsGroupPolicy` is therefore
+    `ReadWriteOnceWithFSType` (decision 27), which leaves directory items
+    alone.
+16. **A mount-health signal belongs in the first deployment.** "Is it
+    mounted" is not "does the server answer": a dead server leaves the mount
+    in place. The signal that matters is a bounded probe of each transport
+    and a metric for its outcome; T14 adds it.
+17. **Transport lifetime and node drain interact.** A cluster whose drains
+    expect no NFS mounts left on a node sets a finite `--transport-idle` in
+    its overlay so idle transports unmount; the driver's default stays
+    "never" (4.3), because remounting on demand costs a first-use delay.
 
 ## 3. Principles
 
@@ -123,7 +153,8 @@ design treats them as constraints.
 ### 4.1 Vocabulary and layers
 
 ```
-pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    bind of a subdirectory
+pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    (no mount at the stage path:
+                                                                  the pod binds the subdirectory)
                     ▲                         ▲                             ▲
                   Item                   ImageItem                    DirectoryItem
                     ▲                         ▲                             ▲
@@ -141,7 +172,9 @@ pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    b
   `image` (sparse ext4 `.img`, optional LUKS2, single-node) and
   `directory` (a subdirectory bound straight into the pod, many-node,
   with the transport's own semantics).
-- **Mount**: the staged filesystem plus its bind mounts into pods.
+- **Mount**: the staged filesystem plus its bind mounts into pods. An image
+  item has one, at the stage path. A directory item has none there: its pods
+  are bound straight from the directory in the transport (decision 25).
 
 Package boundaries follow these nouns. Each layer exposes `Observe(ctx)
 (state, error)` and `Converge(ctx, desired, observed) error`; the glue is
@@ -161,7 +194,9 @@ the reconciler, not the RPC handlers.
 - **Converge loop**: on every RPC, on a timer, and at startup. For each
   intended volume: transport present → holder held → loop attached (direct
   I/O, recorded sector size) → dm-crypt open → fsck and resize if needed →
-  mounted at the stage path → binds present. For each observed artifact
+  mounted at the stage path (images only; a directory item makes no mount
+  there) → binds present, of the stage path for an image and of the item
+  directory in the transport for a directory. For each observed artifact
   with no intent: release holder, close mapping, detach loop, unmount.
 - **Health loop**: the same observers report forced read-only and shutdown
   flags into `VolumeCondition`; remediation (4.6) consumes it.
@@ -177,7 +212,8 @@ volume stay serialized.
   IPs only), privileged for loop and dm, kubelet dir `Bidirectional`, host
   `/dev`. One CSI socket, one registrar. `CSIDriver` name
   `miami.csi.greghaskins.com` (decision 1): `attachRequired: true`,
-  `podInfoOnMount: false`, `fsGroupPolicy: File`, `Persistent` lifecycle,
+  `podInfoOnMount: false`, `fsGroupPolicy: ReadWriteOnceWithFSType`
+  (decision 27), `Persistent` lifecycle,
   `requiresRepublish: false`. Directory items ride the same settings; the
   attacher creates one `VolumeAttachment` per node for them, which is
   harmless.
@@ -190,10 +226,11 @@ volume stay serialized.
   already privileged on every node, so the alternative (an unprivileged
   controller delegating delete and expand to a node agent through a PV
   annotation handshake) buys little and adds a cross-component protocol.
-- **Transport mounts on the host mount table**: the agent mounts into a
-  `hostPath` directory with `mountPropagation: Bidirectional`, so the mount
-  persists across plugin restarts, loop back-files always show the host
-  path, and host-side watchdogs can see them. Transports are
+- **Transport mounts on the host mount table**: the agent mounts under the
+  kubelet directory (`<kubelet-dir>/plugins/miami.csi.greghaskins.com/transports`,
+  decision 27), which is a `hostPath` with `mountPropagation: Bidirectional`,
+  so the mount persists across plugin restarts, loop back-files always show
+  the host path, and the mounts are visible in the kubelet's mount namespace. Transports are
   reference-counted by intent and unmounted when idle for a configurable
   period (default: never).
 
@@ -206,8 +243,9 @@ the ID, so the controller reads the PV for those two calls (Kubernetes
 1.31+ keeps the PV until delete returns; on older clusters a delete with
 no PV succeeds without deleting and logs it). This maximizes flexibility:
 no 128-byte constraint on the ID, a transport change (server address,
-export path) is corrected by editing a PV rather than re-provisioning, and
-static provisioning works, which both migration (4.11) and adopting
+export path) is a static-PV recreation (4.11's tool) rather than an edit,
+because a PV's volume source is immutable and the volume context lives in it,
+and static provisioning works, which both migration (4.11) and adopting
 pre-existing images need. The controller never deletes on doubt: if the
 rebuilt transport config does not contain the named file, it returns
 `Unavailable`.
@@ -271,6 +309,35 @@ loops always on NFS transports.
   joined, because a hung NFS call does not return. Probe results are
   exported as metrics so a wedge is visible before a pod notices.
 - Report: `VolumeCondition` abnormal; one event per consuming pod.
+- **What M1 does about a transport that does not answer (decision 28).** It
+  reports and does not remediate. Each pass asks every transport the intents
+  reference whether it answers (`statfs` of its mount directory under the stat
+  deadline), exported as `miami_transport_up{kind,id}`; a stat of a volume's
+  item directory that returns ESTALE, times out or is busy is the same
+  condition, counted in `miami_volume_condition{condition="transport-unavailable"}`
+  and raised once as a `TransportUnavailable` event on the PersistentVolume.
+  Nothing is unmounted, remounted or killed on account of it, and the next pass
+  looks again; remediation is the work of this section's later steps, which M1
+  does not build.
+
+  What the NFS server restart end-to-end test observed (the server container
+  stopped and started, its export on a docker volume, the `softerr` profile, on
+  both architectures): the gauge went to 0 and the condition to
+  `transport-unavailable` within 12 seconds of the stop, and both recovered
+  within 26 seconds of it, 12 seconds after the server was back; the transport
+  and publish mounts kept their mount IDs throughout; the writing pod's numbered
+  sequence had no gap. **A file a pod held open across the restart** (fsynced
+  every second) kept working: the export keeps its file system and `fsid=0`, so
+  the client's file handles stay valid, nothing returned ESTALE, and with the
+  server back after 14 seconds no write on the held descriptor failed. The wait
+  of a soft mount is bounded by its major timeout, 40 seconds for the profile
+  (`timeo` of 10 seconds times `retrans` 3 plus 1, which the first run of the
+  test matched): in that run the server was held down for about 40 seconds,
+  and the write in flight on the held descriptor failed with ETIMEDOUT
+  ("Connection timed out", returned by the fsync), its data was not in the file,
+  and later writes through the same descriptor succeeded. So an application that
+  holds a file open across a server restart must check the errors of `fsync` and
+  `close` and write again; the driver cannot and does not mask it.
 - Remediation: a shared package for all item kinds deletes controller-owned
   pods on this node that mount the failed volume, with a UID precondition,
   a rate limit, and a ValidatingAdmissionPolicy narrowing the grant to own
@@ -296,7 +363,9 @@ exists so that one driver covers both needs of a shared NAS: image items
 where a workload needs a real local filesystem, directory items where
 plain shared files are enough, both under the same driver-owned transport
 profile and per-namespace subtree rules. Create is `mkdir`, delete is
-`rm -r`, expand is a no-op (reported capacity is the export's).
+`rm -r`, expand is a no-op (reported capacity is the export's). Staging
+records the volume and checks that the directory exists; nothing is mounted
+at the stage path, and each publish is a bind of the directory (decision 25).
 
 The documented contract: close-to-open consistency (a reader that opens
 after the writer closes sees the new content); `flock` and `fcntl` locks
@@ -710,12 +779,213 @@ Recorded:
     `readOnlyRootFilesystem: true` and `seccompProfile: RuntimeDefault` (the
     API server accepts it; the runtime ignores the profile for a privileged
     container). The sidecars run as root so they can open the socket the driver
-    creates. Whether an nfs3 mount works with `allowPrivilegeEscalation: false`
-    on the controller is unverified until the nfs3 e2e. The namespace carries
+    creates. An nfs3 mount works with `allowPrivilegeEscalation: false` on the
+    controller (verified by the T10 e2e: CreateVolume and DeleteVolume make and
+    remove the directory on a kernel NFS export through it). The namespace carries
     the `privileged` Pod Security level. The deploy check runs on kind with a
     control plane and two workers (the shape the end-to-end tests need), from a
     node image pinned by digest; the DaemonSet tolerates every taint, so it
     runs on all three nodes.
+
+25. **A directory item makes no stage mount**: the NFS client reports `/` as
+    the root of every mount of an export, a bind of a subdirectory included
+    (it carries the directory in the mount source instead). Before it calls
+    `NodeUnstageVolume`, kubelet lists every other mount with the same
+    device and root as the staging path and refuses while one exists, so a
+    bind of the item directory at the stage path matched the transport and
+    every other volume's bind and the stage could never be unstaged (the
+    VolumeAttachment stayed, the PV delete hung). Kubelet's search finds no
+    references for a staging path that is not itself a mount point, and the
+    CSI attacher calls stage and unstage without checking that the path is
+    mounted. So `NodeStageVolume` still records the volume (transport
+    mounted, item directory present) but mounts nothing at the stage path,
+    and each publish target is bound directly from the volume's directory in
+    the transport. The item reports `PublishSource` for this: the directory
+    for a directory item, the stage path for an image item (M2). Anything
+    mounted at a directory volume's stage path is `ErrStageConflict`, reported
+    and left, since the driver cannot show it made it. The transport model
+    (one host-visible mount per server, adoption, deadlines, garbage rules)
+    is unchanged. A stage bind from before this decision is recognised as
+    the driver's own and removed on the first pass.
+
+26. **Kind end-to-end tests (M1, T10)**: the tests in `test/e2e` are Go
+    (build tag `e2e`), driven through the API with client-go against a
+    cluster the harness (`hack/e2e-kind.sh`, reached from `make e2e
+    E2E_MODE=kind`) has created; they never create one. The cluster is the deploy
+    check's: one control plane and two workers from the digest-pinned node
+    image, the e2e overlay, the driver image loaded and never pulled. For
+    `nfs3` the kernel NFS server of `hack/nfs-server` runs on the docker
+    network the kind nodes are on and its IPv4 address goes into the overlay.
+    Test pods use one image, busybox from the Kubernetes end-to-end test
+    images, pinned by the digest of its multi-arch index. **The reboot
+    stand-in** is `docker restart` of a kind worker (one the controller is not
+    on): every mount in the node's namespace is gone, the kubelet and
+    containerd start from nothing and the pods' containers are recreated,
+    while the node's disk survives, as a machine's does; it exercises the
+    kubelet's and the driver's recovery without a VM. The tests shell out to
+    docker for exactly four things: the restart, a node's mount table
+    (`docker exec <node> cat /proc/1/mountinfo`), a node's files (the intent
+    record, a local volume's directory) and a directory on the NFS server
+    container's export. **A docs-only change** is
+    detected by the `changes` job, which lists the pull request's changed files
+    from the API (renames count both names) and says "code" unless every file
+    is under `docs/`, is a Markdown file or is `LICENSE`; a push to `main`, an
+    empty list or a possibly truncated one is "code". On a docs-only change
+    `envtest`, `sanity`, `smoke`, `e2e`, `e2e-kind`, `build`, `manifest` and
+    `deploy` are skipped (`static` and `unit` still run) and `ci-ok` accepts
+    exactly those as skipped; on code, a skipped, cancelled or failed job
+    fails `ci-ok`.
+
+27. **Deploy portability (M1, T13)**: eight settings that real clusters need.
+    (a) *The kubelet directory is one parameter.* The node pod's containers
+    carry `KUBELET_DIR`; every in-container path in their args derives from it
+    by `$(KUBELET_DIR)` expansion, and the kubelet directory is mounted whole
+    (the one hostPath), so the socket directory and the registry directory are
+    subdirectories of it; only the `miami` container mounts the whole
+    directory, and each sidecar mounts just its `subPath` (`plugins/<driver>`
+    at `/csi`, plus `plugins_registry` at `/registration` for the registrar),
+    so the sidecars never see other pods' volumes. The fields that cannot expand (env value, hostPath
+    path, mount path) come from one `replacements` entry whose source is the
+    ConfigMap literal `kubeletDir`; kustomize runs a base's replacements
+    before an overlay's generators, so an overlay merges the literal and
+    repeats that entry, and writes no patch (the snippet is in the base
+    kustomization and a test renders it). (b) *The controller's `miami`
+    container is AppArmor `Unconfined`*: containerd's default profile on
+    Ubuntu denies `mount(2)` in a container that is not privileged, even with
+    `CAP_SYS_ADMIN`. The kind end-to-end tests cannot show it (the nfs3
+    transport test runs under `unshare`, and kind nodes do not enforce the
+    host's profile), so it rests on reasoning about the profile. Capabilities,
+    `allowPrivilegeEscalation: false` and the seccomp profile are unchanged.
+    (c) *The node's transports root defaults to
+    `<kubelet-dir>/plugins/miami.csi.greghaskins.com/transports`*, derived like
+    `--state-dir`; an explicit flag wins. The kubelet requires its directory to
+    be a shared mount, so Bidirectional propagation is guaranteed there and
+    not under an arbitrary hostPath on every distribution; it also removes one
+    hostPath. The controller keeps `/var/lib/miami`, an emptyDir. (d) *The
+    namespace sets `enforce: privileged` and `enforce-version: latest` only*;
+    warn and audit are the cluster's choice. (e) *Release images pin the CPU
+    baselines* `GOAMD64=v1` and `GOARM64=v8.0` (older x86 without SSE4.2,
+    Raspberry Pi 4). (f) *`fsGroupPolicy` is `ReadWriteOnceWithFSType`*:
+    fsGroup applies only to volumes that have an fsType and are RWO or RWOP.
+    Directory items have no fsType, so the kubelet never changes their
+    ownership (no error per file on a squashing export, no recursive change of
+    a large share); M2 image items (ext4, RWO) still get fsGroup. The field is
+    immutable on a live CSIDriver, so a cluster that already created the
+    object deletes and recreates it. (g) *The provisioner runs with
+    `--timeout=60s`*: the default 15s is shorter than a first `CreateVolume`
+    that pays for an NFS mount. (h) *`ENODEV` from `mount(2)`* is reported as
+    "the kernel has no NFS client; load the nfs module".
+
+28. **Transport health and directory modes (M1, T14)**: the worst storage
+    outages of clusters on shared NFS are an NFS server restart (minutes of stale
+    handles), mounts detached by an external watchdog, and pods that cannot write
+    to directories created as root on a squashing export. M1 reports the first
+    and does not repair it, and fixes the third.
+    (1) **`mode` StorageClass parameter**: the mode of a directory item
+    (up to four octal digits, `0755` by default, for example `0777` or `2775`;
+    the setgid and sticky bits are allowed, the leading digit is 0 to 3, and
+    setuid is refused because it has no meaning on a directory),
+    read by `volume.NewContext`, carried in the volume context as `miami/mode`
+    only when set (so existing contexts and the golden intent record are
+    unchanged) and in the intent. The controller applies it to the directory it
+    creates on nfs3, and the directory item to the one the node creates at the
+    first stage of a local volume, with `fchmod` on the new directory's own
+    descriptor so that the umask does not decide it. Only the volume's own
+    directory takes it, never the subdir elements above it (0755), and an
+    existing directory is adopted without a chmod. An invalid value is
+    `InvalidArgument` at `CreateVolume`. Between the `mkdirat` and the `openat2`
+    that follows, both create paths have a window in which a directory (a
+    symlink or a mount is refused) renamed into place by someone with write
+    access to the parent would receive the `fchmod`; that someone already
+    controls the parent and could make the directory with any mode themselves,
+    so the window is accepted, and a uid check would gain nothing and would
+    break on a root-squashing export, where the created directory is not owned
+    by our euid. **Upgrade order:** a node plugin from before this change
+    refuses a volume context carrying `miami/mode` (unknown `miami/` keys are
+    `InvalidArgument`), so `NodeStageVolume` on a not-yet-upgraded node fails,
+    and an old node that rewrites a record (`clearEnsureItem`, a prune) drops
+    the field, after which a repeated stage is `AlreadyExists` until the volume
+    is unstaged: upgrade every node plugin before setting `mode` on a class.
+    (2) **A stale, timed-out or busy stat of the item directory is the
+    transport's condition**: ESTALE (the server restarted and its file handles
+    are gone), `mount.ErrTimeout` and `mount.ErrBusy` from the stat are
+    `ErrTransportUnavailable` (also `item.ErrTransportUnavailable`), event reason
+    `TransportUnavailable`, never `Internal` and never a reason to unmount;
+    ESTALE and busy are `Unavailable` to CSI (a timeout stays
+    `DeadlineExceeded` by the precedence table), and a stale handle on a volume
+    stats call is `Unavailable` too. The next pass retries.
+    (3) **`miami_transport_up{kind,id}`**: each pass, for every transport the
+    intents reference, a deadline-bounded `statfs` of its mount directory
+    (statfs always asks the server, where a stat can be answered from the
+    attribute cache): 1 when it answers, 0 when it times out, is busy or fails,
+    and 0 for a transport that is not mounted. It runs once per transport per
+    pass in the transport step under the hung-transport rule, and its change is
+    logged once at info level.
+    (4) **`miami_volume_condition{condition}`**: the number of volumes in each
+    condition after the pass, `ok` or the key events already use
+    (`unresponsive`, `transport-unavailable`, `transport-conflict`,
+    `stage-conflict`, `publish-conflict`, `item-missing`, `item-not-directory`,
+    `failed`), every value present at zero and no volume ID in a label. A
+    transport that does not answer is `transport-unavailable` however it is
+    first reported, ahead of the timeout it wraps; `unresponsive` is a timeout
+    or busy that is not traced to the transport.
+    **The NFS server restart e2e** (`test/e2e`, nfs3) stops and starts the
+    server container, whose export is now a docker volume instead of a tmpfs, so
+    the files and the file handles survive, and checks that its address is the
+    same. It is the observation that must be short: the node plugin's pass runs
+    every 30 seconds and a pass that probes the dead server takes its 10 second
+    deadline, and waiting for the timer holds the server down for about as long
+    as a soft mount takes to give up (about 40 seconds), when a write in flight
+    fails with ETIMEDOUT. So the test starts a pod during the outage, whose
+    publish request wakes the loop at once, and the outage is about 15 seconds.
+    What it observed about a file held open is in 4.6.
+
+29. **The `miami lock` contract (M1, T11)**: seven choices that the helper's
+    users see on the export. (a) *The lock is the directory
+    `<dir>/<name>.lock`*, holding `holder` (the caller's string, default
+    `<hostname>:<pid>`) and `since` (empty; its modification time is the
+    stamp), each created under a temporary name and renamed into place so a
+    reader never sees a partial file. The suffix is part of the contract: a
+    user can list the export and see the locks. (b) *A stale lock is broken by
+    rename, then remove.* The acquirer renames the lock directory to a unique
+    hidden name (atomic, so two breakers cannot both win), removes it and
+    makes the directory; a breaker that loses the rename tries once more and
+    reports contended. After winning the rename it checks that what it moved
+    has the holder and stamp it judged stale, and puts it back if not (a
+    renewal landed between the judgement and the rename). (c) *Age comes from
+    a probe file, not a clock.* The acquirer creates a file in the directory
+    under a unique name, reads its modification time (the server's "now") and
+    removes it; the lock is stale when `since` (or, if the holder died before
+    writing it, the lock directory) is older than the probe by more than
+    `--stale`. The probe is read before the stamp, so a renewal that lands
+    in between makes the stamp newer than the probe, which is never stale.
+    (d) *`--stale` is at least 60s* (default 5m). A holder that cannot renew
+    must stop its work before another acquirer may break the lock, which
+    takes a renewal period, a call that hangs until its deadline
+    (`--timeout`), the grace the work needs to stop (another `--timeout`) and
+    the stamp's own latency; 60s leaves room for that with the default
+    timeout. The nfs3 profile's 30s attribute cache (`actimeo=30`) is the
+    secondary reason: another client's stamp can look up to 30s old, though
+    the helper reads every time from an open file, which revalidates.
+    (e) *`--renew` is at most a third of `--stale`* (default 30s), so two
+    renewals can fail in a row without the lock going stale, and `--renew`
+    plus twice `--timeout` is less than `--stale`. `run` stops its command
+    when a renewal finds the lock lost, or when no renewal has succeeded for
+    `--stale` minus twice `--timeout`: a timer armed at the last success, so
+    it fires at that instant whatever the phase of the renewal ticks, and
+    SIGTERM (up to `--timeout`) and then SIGKILL fit before the lock can be
+    stale. That is a duration on the local monotonic clock, not a staleness
+    decision about anyone's lock. The command runs in a process group of its
+    own and the group is signalled. (f) *The holder pins its lock directory.*
+    It keeps the directory it made open and works relative to that handle,
+    so a lock broken and taken under the same path is never written to or
+    removed by the holder that lost it (a stamp lands in the moved directory;
+    release renames the directory away and checks device and inode before
+    removing it). (g) *Exit codes*: `acquire` 0 held, 1 held by another, 2
+    error; `release` 0 released, 1 not held by `--holder`, 2 error; `run`
+    the command's own status (128+n if a signal n killed it), 1 if the lock
+    is held by another (the command was not started), 2 on an error or a lost
+    lock (the command was terminated, nothing was released).
 
 Pending: none that block M1.
 

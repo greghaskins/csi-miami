@@ -119,12 +119,14 @@ func (n *node) tdir() string {
 // otherwise.
 type passMetrics struct{ ch chan struct{} }
 
-func (m passMetrics) SetIntents(string, int)            {}
-func (m passMetrics) SetTransport(string, string, bool) {}
-func (m passMetrics) IncReconcileError(string)          {}
-func (m passMetrics) IncObservationTimeout(string)      {}
-func (m passMetrics) IncGarbageUnmount()                {}
-func (m passMetrics) SetIntentLoadFailures(int)         {}
+func (m passMetrics) SetIntents(string, int)              {}
+func (m passMetrics) SetTransport(string, string, bool)   {}
+func (m passMetrics) SetTransportUp(string, string, bool) {}
+func (m passMetrics) SetVolumeConditions(map[string]int)  {}
+func (m passMetrics) IncReconcileError(string)            {}
+func (m passMetrics) IncObservationTimeout(string)        {}
+func (m passMetrics) IncGarbageUnmount()                  {}
+func (m passMetrics) SetIntentLoadFailures(int)           {}
 func (m passMetrics) ObserveReconcile(d time.Duration) {
 	select {
 	case m.ch <- struct{}{}:
@@ -207,12 +209,23 @@ func (n *node) requireBind(mountPoint, dir string, want bool) {
 	}
 }
 
-// requireAll checks the transport, the stage and a publish of a volume.
+// requireAll checks the transport, that nothing is mounted at the stage path,
+// and that a publish of a volume is a bind of its directory in the transport.
 func (n *node) requireAll(name, target string) {
 	n.t.Helper()
 	n.requireBind(n.tdir(), n.host, true)
-	n.requireBind(n.intent(name).StagePath, filepath.Join(n.tdir(), name), true)
-	n.requireBind(target, n.intent(name).StagePath, true)
+	n.requireNoStage(name)
+	n.requireBind(target, filepath.Join(n.tdir(), name), true)
+}
+
+// requireNoStage checks that nothing is mounted at the stage path of a volume:
+// a directory volume leaves it to kubelet, so that kubelet's reference check
+// finds no mount of the same device and root and the stage can be unstaged.
+func (n *node) requireNoStage(name string) {
+	n.t.Helper()
+	if m, ok := currentTable(n.t).At(n.intent(name).StagePath); ok {
+		n.t.Errorf("something is mounted at the stage path of %s: %+v", name, m)
+	}
 }
 
 // (1) Stage and publish, then a plugin restart: a new process over the same
@@ -273,9 +286,9 @@ func TestSmokeRebootRestoresTheNode(t *testing.T) {
 	}
 	stop()
 
-	// Unmount the transport, the stage and the publish; the source tmpfs
+	// Unmount the transport and the publish; the source tmpfs
 	// stays, since it stands for the disk the data is on.
-	for _, p := range []string{target, in.StagePath, n.tdir()} {
+	for _, p := range []string{target, n.tdir()} {
 		if err := unix.Unmount(p, 0); err != nil {
 			t.Fatalf("unmounting %s: %v", p, err)
 		}
@@ -352,16 +365,15 @@ func TestSmokeGarbageAndUnstage(t *testing.T) {
 	if _, ok := tbl.At(target); ok {
 		t.Error("the publish is still mounted")
 	}
-	if _, ok := tbl.At(in.StagePath); ok {
-		t.Error("the stage is still mounted")
-	}
+	n.requireNoStage(pvc1)
 	if _, ok := tbl.At(n.tdir()); !ok {
 		t.Error("the transport was unmounted")
 	}
 	if _, ok, err := n.store.Get(in.VolumeID); err != nil || ok {
 		t.Errorf("the intent is still recorded: %v, %v", ok, err)
 	}
-	n.requireBind(in2.StagePath, filepath.Join(n.tdir(), pvc2), true)
+	n.requireBind(n.tdir(), n.host, true)
+	n.requireNoStage(pvc2)
 }
 
 // ---- kernel helpers, as in the other packages' smoke tests ----
@@ -465,7 +477,7 @@ func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
 		t.Fatalf("Unpublish = %v, want ErrIntentsUnknown", err)
 	}
 	// A stray is not collected while a record is unreadable, and the pod's
-	// publish and the stage stay.
+	// publish stays.
 	stray := filepath.Join(n.sRoot, "stray")
 	mkdir(t, stray)
 	if err := unix.Mount(filepath.Join(n.host, pvc2), stray, "", unix.MS_BIND, ""); err != nil {
@@ -476,7 +488,7 @@ func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
 	}
 	n.waitPass()
 	tbl := currentTable(t)
-	for _, p := range []string{target, in.StagePath, stray} {
+	for _, p := range []string{target, stray} {
 		if _, ok := tbl.At(p); !ok {
 			t.Errorf("%s was unmounted while a record was unreadable", p)
 		}
@@ -512,9 +524,7 @@ func TestSmokeUnreadableRecordAndForeignMountsAreLeftAlone(t *testing.T) {
 	if m, ok := tbl.At(target); !ok || m.FSType != "tmpfs" {
 		t.Error("the foreign mount at the target was removed")
 	}
-	if _, ok := tbl.At(in.StagePath); !ok {
-		t.Error("the stage was unmounted while a publish was in the way")
-	}
+	n.requireNoStage(pvc1)
 	if _, ok, err := n.store.Get(in.VolumeID); err != nil || !ok {
 		t.Errorf("the record was deleted: %v, %v", ok, err)
 	}
@@ -544,8 +554,8 @@ func (n *node) mountsAt(path string) int {
 }
 
 // (5) DeleteVolume can win the race against a lagging NodeUnstageVolume. The
-// kernel then shows the stage (and any publish) with a root marked deleted,
-// and the Unstage must still be able to take them down.
+// kernel then shows any publish with a root marked deleted, and the Unstage
+// must still be able to take it down. The stage path holds no mount.
 func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
 	n := newNode(t)
 	ctx := context.Background()
@@ -566,15 +576,11 @@ func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
 	if err := os.Remove(filepath.Join(n.host, pvc1)); err != nil {
 		t.Fatal(err)
 	}
-	if m, ok := currentTable(t).At(a.StagePath); !ok || !m.Deleted {
-		t.Fatalf("the stage is not shown as deleted: %+v, %v", m, ok)
-	}
+	n.requireNoStage(pvc1)
 	if err := r.Unstage(ctx, a.VolumeID); err != nil {
 		t.Fatalf("Unstage of a volume whose directory is gone: %v", err)
 	}
-	if _, ok := currentTable(t).At(a.StagePath); ok {
-		t.Error("the stage is still mounted")
-	}
+	n.requireNoStage(pvc1)
 	if _, ok, err := n.store.Get(a.VolumeID); err != nil || ok {
 		t.Errorf("the record is still there: %v, %v", ok, err)
 	}
@@ -590,6 +596,9 @@ func TestSmokeUnstageAfterTheVolumeDirectoryIsDeleted(t *testing.T) {
 	}
 	if err := os.Remove(filepath.Join(n.host, pvc2)); err != nil {
 		t.Fatal(err)
+	}
+	if m, ok := currentTable(t).At(tb); !ok || !m.Deleted {
+		t.Fatalf("the publish is not shown as deleted: %+v, %v", m, ok)
 	}
 	if err := r.Unstage(ctx, b.VolumeID); err != nil {
 		t.Fatalf("Unstage with a publish of a deleted directory: %v", err)
@@ -720,7 +729,9 @@ func TestSmokeLocalItemDirectoryIsCreatedAtStage(t *testing.T) {
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
 		t.Fatalf("the item directory: %v, %v", fi, err)
 	}
-	n.requireBind(in.StagePath, filepath.Join(n.tdir(), "ns", "pvc-00000000-0000-4000-8000-000000000009"), true)
+	if m, ok := currentTable(t).At(in.StagePath); ok {
+		t.Errorf("something is mounted at the stage path: %+v", m)
+	}
 
 	// A subdir that is a symlink out of the transport is not followed.
 	outside := filepath.Join(n.base, "outside")
@@ -737,4 +748,72 @@ func TestSmokeLocalItemDirectoryIsCreatedAtStage(t *testing.T) {
 	if ents, _ := os.ReadDir(outside); len(ents) != 0 {
 		t.Errorf("something was created outside the transport: %v", ents)
 	}
+}
+
+// (8) Anything on the stage path of a directory volume is a conflict that is
+// reported and left, on the kernel: the driver mounts nothing there, so it
+// cannot show it made what is there.
+func TestSmokeAMountAtTheStagePathIsAConflictAndIsLeft(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+	in := n.intent(pvc1)
+	mkdir(t, in.StagePath)
+	if err := unix.Mount("tmpfs", in.StagePath, "tmpfs", 0, "size=1m"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stage(ctx, in); !errors.Is(err, reconcile.ErrStageConflict) {
+		t.Fatalf("Stage = %v, want ErrStageConflict", err)
+	}
+	if err := r.Unstage(ctx, in.VolumeID); !errors.Is(err, reconcile.ErrStageConflict) {
+		t.Fatalf("Unstage = %v, want ErrStageConflict", err)
+	}
+	n.runPass(r)
+	if c := n.mountsAt(in.StagePath); c != 1 {
+		t.Errorf("%d mounts at the stage path, want the one left alone", c)
+	}
+}
+
+// (9) A node upgraded in place still has the stage bind, and the publish bound
+// from it, that the previous build made. On the kernel the first pass
+// recognises the stage bind as the driver's own and unmounts it, the publish
+// is adopted (it is a bind of the item directory), and Unstage succeeds.
+func TestSmokeAStageBindFromAnEarlierBuildIsRemoved(t *testing.T) {
+	n := newNode(t)
+	ctx := context.Background()
+	r, _, _ := n.run(nil)
+	in := n.intent(pvc1)
+	target := n.target("pod1")
+	if err := r.Stage(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Publish(ctx, in.VolumeID, intent.Publish{TargetPath: target}); err != nil {
+		t.Fatal(err)
+	}
+
+	item := filepath.Join(n.tdir(), pvc1)
+	mkdir(t, in.StagePath)
+	if err := unix.Mount(item, in.StagePath, "", unix.MS_BIND, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Unmount(target, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount(in.StagePath, target, "", unix.MS_BIND, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	n.runPass(r)
+	n.requireNoStage(pvc1)
+	n.requireBind(target, item, true)
+	if c := n.mountsAt(target); c != 1 {
+		t.Errorf("%d mounts at the target, want the adopted one", c)
+	}
+	if err := r.Unstage(ctx, in.VolumeID); err != nil {
+		t.Fatalf("Unstage: %v", err)
+	}
+	if _, ok := currentTable(t).At(target); ok {
+		t.Error("the publish is still mounted")
+	}
+	n.requireNoStage(pvc1)
 }

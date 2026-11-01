@@ -29,8 +29,10 @@ const nfs3Flags = unix.MS_NOATIME
 //	vers=3,proto=tcp      the protocol the target servers speak; tcp so that a
 //	                      socket reset is a real fence
 //	softerr,timeo=100,retrans=3
-//	                      bounded failure: about 100s major timeout, and
-//	                      ETIMEDOUT instead of EIO (needs Linux 5.3)
+//	                      bounded failure: a 40s major timeout, timeo x
+//	                      (retrans+1) (TCP backs off linearly and the major
+//	                      timeout is capped there), and ETIMEDOUT instead of
+//	                      EIO (needs Linux 5.3)
 //	nolock                locks are node-local; no NLM, no lockd state to hang
 //	lookupcache=positive  never cache a negative lookup
 //	actimeo=30            attribute cache of 30s; close-to-open still holds
@@ -204,6 +206,9 @@ func (n *nfs3) Mount(ctx context.Context) error {
 	err = n.m.Mount(ctx, n.source, n.dir, nfs3FSType, nfs3Flags, nfs3Data(addr))
 	if errors.Is(err, unix.EINVAL) {
 		return fmt.Errorf("nfs3 mount of %s: the kernel rejected the mount options (EINVAL); the profile's softerr option needs Linux 5.3 or newer, and there is no fallback to soft or hard: %w", n.source, err)
+	}
+	if errors.Is(err, unix.ENODEV) {
+		return fmt.Errorf("nfs3 mount of %s: the kernel has no NFS client (ENODEV); load the nfs module on the node: %w", n.source, err)
 	}
 	return err
 }

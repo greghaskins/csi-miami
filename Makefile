@@ -104,15 +104,22 @@ envtest:
 sanity:
 	hack/sanity.sh
 
-# End-to-end tests of one transport against a real server, chosen by
-# E2E_TRANSPORT (nfs3: a kernel NFSv3 server in a privileged container, see
-# hack/nfs-server). ROOT ONLY, and Docker is needed: run it as
-# `sudo -E make e2e E2E_TRANSPORT=nfs3`, with the pinned Go on PATH. A
-# separate CI job, not part of `check`.
+# End-to-end tests of one transport, chosen by E2E_TRANSPORT, in the mode
+# E2E_MODE (default transport).
+#   transport: the transport package's test against a real server (nfs3: a
+#     kernel NFSv3 server in a privileged container, see hack/nfs-server).
+#   kind: the driver on a kind cluster of one control plane and two workers and
+#     the criteria tests of test/e2e (hack/e2e-kind.sh). E2E_IMAGE is a driver
+#     image in the local Docker daemon; `make image` builds one.
+# ROOT ONLY (nfs3 loads kernel modules), and Docker is needed: run it as
+# `sudo -E env "PATH=$PATH" make e2e E2E_TRANSPORT=nfs3`, with the pinned Go on
+# PATH. A separate CI job, not part of `check`.
 E2E_TRANSPORT ?=
+E2E_MODE ?=
+E2E_IMAGE ?=
 
 e2e:
-	E2E_TRANSPORT="$(E2E_TRANSPORT)" hack/e2e.sh
+	E2E_TRANSPORT="$(E2E_TRANSPORT)" E2E_MODE="$(E2E_MODE)" E2E_IMAGE="$(E2E_IMAGE)" hack/e2e.sh
 
 # The deploy check: the e2e overlay on a kind cluster (one control plane, two
 # workers), both pods Ready, /healthz and /metrics scraped through the API

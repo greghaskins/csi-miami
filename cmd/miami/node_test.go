@@ -34,7 +34,7 @@ func TestRunNodeFlags(t *testing.T) {
 			wantCode: 0,
 			wantStdout: []string{
 				"Usage of miami node:", "-endpoint", "unix:///csi/csi.sock", "-node-id", "-kubelet-dir", "/var/lib/kubelet",
-				"-transports-root", "/var/lib/miami", "-state-dir", "-stage-root", "-metrics-addr", ":9810",
+				"-transports-root", "plugins/miami.csi.greghaskins.com/transports", "-state-dir", "-stage-root", "-metrics-addr", ":9810",
 				"-reconcile-interval", "-deadline", "-transport-idle", "-kubeconfig", "-no-events",
 			},
 		},
@@ -91,9 +91,12 @@ func TestNodeConfigDefaultsFollowTheKubeletDir(t *testing.T) {
 	if c.stateDir != "/k/plugins/miami.csi.greghaskins.com/intents" || c.stageRoot != "/k/plugins/kubernetes.io/csi/miami.csi.greghaskins.com" {
 		t.Errorf("defaults: %q, %q", c.stateDir, c.stageRoot)
 	}
-	c = nodeConfig{kubeletDir: "/k", stateDir: "/s", stageRoot: "/r"}.withDefaults()
-	if c.stateDir != "/s" || c.stageRoot != "/r" {
-		t.Errorf("explicit values changed: %q, %q", c.stateDir, c.stageRoot)
+	if c.transportsRoot != "/k/plugins/miami.csi.greghaskins.com/transports" {
+		t.Errorf("transports root default: %q", c.transportsRoot)
+	}
+	c = nodeConfig{kubeletDir: "/k", stateDir: "/s", stageRoot: "/r", transportsRoot: "/t"}.withDefaults()
+	if c.stateDir != "/s" || c.stageRoot != "/r" || c.transportsRoot != "/t" {
+		t.Errorf("explicit values changed: %q, %q, %q", c.stateDir, c.stageRoot, c.transportsRoot)
 	}
 }
 

@@ -1,6 +1,6 @@
 // Command miami is the csi-miami driver: one binary with a subcommand per
 // role. The controller and the node serve CSI (controller.go, node.go); lock
-// is still only a placeholder that reports its name and the build version.
+// is the helper that serializes writers to a directory item (lock.go).
 package main
 
 import (
@@ -48,9 +48,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "node":
 		return runNode(args[1:], stdout, stderr)
 	case "lock":
-		return runCommand("lock", args[1:], stdout, stderr, func() {
-			_, _ = fmt.Fprintf(stdout, "miami lock %s\n", version)
-		})
+		return runLock(args[1:], stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "miami: unknown command %q\n\n%s", args[0], usage)
 		return 2

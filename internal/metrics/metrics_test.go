@@ -109,6 +109,71 @@ func TestReconcileMetricsHaveThePlansNamesAndLabels(t *testing.T) {
 
 var _ reconcile.Metrics = (*Registry)(nil)
 
+func TestTransportUpIsOneWhenTheTransportAnswersAndZeroWhenItDoesNot(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	r.SetTransportUp("nfs3", "def456", true)
+	r.SetTransportUp("nfs3", "aaa111", false)
+	for _, tt := range []struct {
+		id   string
+		want float64
+	}{{"def456", 1}, {"aaa111", 0}} {
+		if v := sample(t, r, "miami_transport_up", map[string]string{"kind": "nfs3", "id": tt.id}).GetGauge().GetValue(); v != tt.want {
+			t.Errorf("miami_transport_up{id=%s} = %v, want %v", tt.id, v, tt.want)
+		}
+	}
+	r.SetTransportUp("nfs3", "def456", false)
+	if v := sample(t, r, "miami_transport_up", map[string]string{"kind": "nfs3", "id": "def456"}).GetGauge().GetValue(); v != 0 {
+		t.Errorf("after the transport stopped answering = %v", v)
+	}
+	// Not served without the reconciler's family.
+	if f := family(t, New(), "miami_transport_up"); f != nil {
+		t.Errorf("the controller serves miami_transport_up")
+	}
+}
+
+// Every condition has a series from the start, at zero, and the label is the
+// condition and nothing else (no volume ID).
+func TestVolumeConditionHasEveryConditionAtZeroAndNoOtherLabel(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	f := family(t, r, "miami_volume_condition")
+	if f == nil {
+		t.Fatal("no miami_volume_condition family")
+	}
+	got := map[string]float64{}
+	for _, m := range f.GetMetric() {
+		if len(m.GetLabel()) != 1 || m.GetLabel()[0].GetName() != "condition" {
+			t.Fatalf("labels = %v, want only condition", m.GetLabel())
+		}
+		got[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
+	}
+	want := []string{"ok", "unresponsive", "transport-unavailable", "transport-conflict", "stage-conflict",
+		"publish-conflict", "item-missing", "item-not-directory", "failed"}
+	if len(got) != len(want) {
+		t.Errorf("series = %v, want exactly %v", got, want)
+	}
+	for _, c := range want {
+		if v, ok := got[c]; !ok || v != 0 {
+			t.Errorf("condition %q = %v (present %v), want 0 from the start", c, v, ok)
+		}
+	}
+
+	r.SetVolumeConditions(map[string]int{"ok": 3, "transport-unavailable": 2, "invented": 9})
+	for c, v := range map[string]float64{"ok": 3, "transport-unavailable": 2, "failed": 0} {
+		if got := sample(t, r, "miami_volume_condition", map[string]string{"condition": c}).GetGauge().GetValue(); got != v {
+			t.Errorf("condition %q = %v, want %v", c, got, v)
+		}
+	}
+	if len(family(t, r, "miami_volume_condition").GetMetric()) != len(want) {
+		t.Error("a condition the reconciler does not name made a series")
+	}
+	r.SetVolumeConditions(map[string]int{})
+	if got := sample(t, r, "miami_volume_condition", map[string]string{"condition": "ok"}).GetGauge().GetValue(); got != 0 {
+		t.Errorf("ok after the volumes went = %v, want 0", got)
+	}
+}
+
 func TestMetricsInterceptorCountsByMethodAndCode(t *testing.T) {
 	t.Parallel()
 	r := New()
@@ -266,4 +331,51 @@ func TestReconcilerFamilyOnlyOnRequest(t *testing.T) {
 	if family(t, New(WithReconciler()), "miami_intent_load_failures") == nil {
 		t.Error("WithReconciler did not register the family")
 	}
+}
+
+// The exported family lists are what a running driver serves: the node's
+// registry, once every family has a sample, gathers exactly NodeFamilies (and
+// the Go and process collectors), and the controller's exactly
+// ControllerFamilies, so a test that reads the lists is not reading a stale
+// copy.
+func TestFamilyListsMatchTheRegistry(t *testing.T) {
+	served := func(r *Registry) map[string]bool {
+		fams, err := r.Gatherer().Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, f := range fams {
+			if strings.HasPrefix(f.GetName(), "miami_") {
+				got[f.GetName()] = true
+			}
+		}
+		return got
+	}
+	check := func(who string, got map[string]bool, want []string) {
+		t.Helper()
+		for _, n := range want {
+			if !got[n] {
+				t.Errorf("%s does not serve %s", who, n)
+			}
+			delete(got, n)
+		}
+		for n := range got {
+			t.Errorf("%s serves %s, which its family list does not name", who, n)
+		}
+	}
+
+	node := New(WithReconciler())
+	node.SetIntents("directory", 1)
+	node.SetTransport("local", "abc", true)
+	node.SetTransportUp("local", "abc", true)
+	node.ObserveReconcile(time.Millisecond)
+	node.requests.WithLabelValues("NodeStageVolume", "OK").Inc()
+	node.requestDuration.WithLabelValues("NodeStageVolume").Observe(0.001)
+	check("the node registry", served(node), NodeFamilies)
+
+	ctrl := New()
+	ctrl.requests.WithLabelValues("CreateVolume", "OK").Inc()
+	ctrl.requestDuration.WithLabelValues("CreateVolume").Observe(0.001)
+	check("the controller registry", served(ctrl), ControllerFamilies)
 }

@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Starts the kernel NFSv3 server of the e2e tests in a privileged container on
 # the local docker network and prints its IP address on stdout (and nothing
-# else there). The export is a tmpfs at NFS_EXPORT (default /export). Run as
-# root: it loads kernel modules. hack/nfs-server/stop.sh removes it.
+# else there). The export is a docker volume (named <container>-export) mounted
+# at NFS_EXPORT (default /export), so its files survive a restart of the
+# container: `docker restart` of the server keeps its data and its address, and
+# the kernel client's file handles stay valid. Run as root: it loads kernel
+# modules. hack/nfs-server/stop.sh removes the container and the volume.
+#
+# NFS_SERVER_NETWORK names the docker network to start the container on (the
+# kind end-to-end tests pass "kind", so the cluster's nodes can reach it);
+# unset, it is the default bridge and the address printed is that network's.
 #
 # The host kernel must have the nfsd module available. If it does not, this
 # fails with a message that says so; it never falls back to a user-space
@@ -45,11 +52,19 @@ for fstype in nfsd nfs; do
   log "$fstype is available"
 done
 
+volume="${name}-export"
 docker rm -f "$name" >/dev/null 2>&1 || true
+docker volume rm -f "$volume" >/dev/null 2>&1 || true
+docker volume create "$volume" >/dev/null
 docker build --quiet -t "$image" . >/dev/null
 
-docker run -d --name "$name" --privileged \
+network_args=()
+if [ -n "${NFS_SERVER_NETWORK:-}" ]; then
+  network_args=(--network "$NFS_SERVER_NETWORK")
+fi
+docker run -d --name "$name" --privileged "${network_args[@]}" \
   -e "EXPORT_DIR=${NFS_EXPORT:-/export}" \
+  -v "$volume:${NFS_EXPORT:-/export}" \
   "$image" >/dev/null
 
 for _ in $(seq "$wait_seconds"); do
