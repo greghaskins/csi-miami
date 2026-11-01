@@ -492,7 +492,9 @@ jobs:
   # also across a controller restart, a node plugin restart changes nothing, a
   # node reboot (docker restart of a worker) loses nothing and leaks nothing,
   # and the metrics are served. For nfs3 the kernel NFSv3 server of
-  # hack/nfs-server runs on the docker network of the kind nodes. A failing
+  # hack/nfs-server runs on the docker network of the kind nodes, and a
+  # restart of that server (its export is a docker volume) is reported by the
+  # node plugin and changes none of the mounts. A failing
   # run uploads what the tests dumped (driver logs, YAML, events, mountinfo),
   # the test output, kind's logs and the NFS server's output.
   e2e-kind:

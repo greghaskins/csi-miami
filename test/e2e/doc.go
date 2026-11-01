@@ -23,6 +23,7 @@
 // node's mount table to the artifact directory.
 //
 // The test shells out to docker for exactly these reasons: to read a node's
-// mount table, list and read a node's files, restart a node, and look at the
-// NFS server container's export. Nothing else leaves the API.
+// mount table, list and read a node's files, restart a node, look at the NFS
+// server container's export, and stop and start that container (the server
+// restart test). Nothing else leaves the API.
 package e2e

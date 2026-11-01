@@ -1,9 +1,13 @@
 #!/bin/sh
-# Starts a kernel NFSv3 server exporting a tmpfs. Runs as the container's
+# Starts a kernel NFSv3 server. Runs as the container's
 # process 1 and needs --privileged: it mounts filesystems and starts nfsd
-# threads in the host kernel. Prints "nfs-server: ready" when the export is
-# live, and stops the nfsd threads on SIGTERM, because threads left running
-# keep the container's network namespace alive.
+# threads in the host kernel. The export is whatever is mounted at EXPORT_DIR
+# when the container starts (run.sh mounts a docker volume there, so the files
+# survive a restart of the container, which the server-restart end-to-end test
+# relies on); if nothing is, a tmpfs is mounted there and the files go with the
+# container. Prints "nfs-server: ready" when the export is live, and stops the
+# nfsd threads on SIGTERM, because threads left running keep the container's
+# network namespace alive.
 set -eu
 
 export_dir="${EXPORT_DIR:-/export}"
@@ -20,7 +24,11 @@ stop() {
 trap stop TERM INT
 
 mkdir -p "$export_dir"
-mount -t tmpfs -o size=256m tmpfs "$export_dir"
+if mountpoint -q "$export_dir"; then
+  log "exporting the volume mounted at $export_dir"
+else
+  mount -t tmpfs -o size=256m tmpfs "$export_dir"
+fi
 chmod 0777 "$export_dir"
 
 # The nfsd control file system; the image may be run with it already mounted.
@@ -28,8 +36,9 @@ if ! grep -qw nfsd /proc/mounts; then
   mount -t nfsd nfsd /proc/fs/nfsd
 fi
 
-# fsid=0 is needed for a tmpfs (it has no UUID); insecure admits the client's
-# unprivileged source ports; no_root_squash lets the tests write as root.
+# fsid=0 is needed for a tmpfs (it has no UUID) and keeps the file handles the
+# same across a restart of the server; insecure admits the client's unprivileged
+# source ports; no_root_squash lets the tests write as root.
 echo "$export_dir *(fsid=0,rw,no_root_squash,insecure,no_subtree_check,async)" > /etc/exports
 
 log "starting rpcbind"
