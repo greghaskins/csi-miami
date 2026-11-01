@@ -19,8 +19,9 @@ import (
 )
 
 // teardown is the unstage half of a pass: for each volume with an unstage
-// request, unmount its publishes, then its stage path (item.Teardown), then
-// delete its record, stopping at the first failure so the record stays and
+// request, unmount its publishes, then undo its item (item.Teardown; for a
+// directory it checks that nothing is mounted at the stage path), then delete
+// its record, stopping at the first failure so the record stays and
 // the next Unstage retries. The transport is not touched. A volume with no
 // record in this pass has nothing to undo.
 //
@@ -111,19 +112,19 @@ func (p *pass) deleteRecord(in intent.Intent) error {
 	return fmt.Errorf("%w: the record of %s changed while it was being unstaged, so it was kept", ErrSuperseded, in.VolumeID)
 }
 
-// teardownVolume unmounts the publishes and then the stage path. Each unmount
-// is without MNT_DETACH: a busy mount stays and is an error, because a lazy
-// detach would leave a pod writing into a mount nobody tracks. Each is also
-// once, and only if the table shows the mount to be a bind of what the
+// teardownVolume unmounts the publishes and then tears down the item. Each
+// unmount is without MNT_DETACH: a busy mount stays and is an error, because a
+// lazy detach would leave a pod writing into a mount nobody tracks. Each is
+// also once, and only if the table shows the mount to be a bind of what the
 // intent says it should be (item.UnmountIf): a publish target must be a bind
-// of the volume's directory in its transport (publishOwnership), the stage
-// path (in the item) a bind of the same directory. Anything else is
-// ErrPublishConflict or ErrStageConflict, left in
-// place and reported, so an Unstage can never unmount a mount the driver did
-// not make; the price is that it fails until a person clears the conflict.
-// The first publish that fails ends the teardown with that one error, so what
-// reaches the caller has one meaning; the stage path is only unmounted when
-// every publish is gone, since the binds are of it.
+// of the volume's directory in its transport (publishOwnership). Anything
+// else is ErrPublishConflict, left in place and reported, so an Unstage can
+// never unmount a mount the driver did not make; the price is that it fails
+// until a person clears the conflict. A directory item has no mount at the
+// stage path to take down, and a mount found there is ErrStageConflict, left
+// in place too. The first publish that fails ends the teardown with that one
+// error, so what reaches the caller has one meaning; the item is only torn
+// down when every publish is gone. The transport stays mounted.
 func (p *pass) teardownVolume(in intent.Intent) error {
 	r := p.r
 	for _, pub := range in.Publishes {
@@ -145,9 +146,6 @@ func (p *pass) teardownVolume(in intent.Intent) error {
 		return err
 	}
 	err = it.Teardown(p.ctx, in, item.Observed{Mounts: obs})
-	if errors.Is(err, item.ErrTransportNotMounted) {
-		err = fmt.Errorf("%w: %w", ErrTransportUnavailable, err)
-	}
 	return err
 }
 
@@ -156,7 +154,7 @@ func (p *pass) teardownVolume(in intent.Intent) error {
 // and never with another's: one publish whose pod is gone must not fail the
 // Stage of the volume or the Publish of a different pod.
 type volumeResult struct {
-	// stage is the outcome of the transport and the item (the stage bind).
+	// stage is the outcome of the transport and the item.
 	// When it is not nil the publishes were not attempted.
 	stage error
 	// publish is the outcome of each publish, by target path. A pruned
@@ -182,8 +180,9 @@ func (p *pass) convergeAll() {
 	}
 }
 
-// convergeVolume brings one volume up: the transport, then the item (its
-// directory and the stage bind), then each publish, each step a no-op when it
+// convergeVolume brings one volume up: the transport, then the item (for a
+// directory, that its directory exists and the stage path is clear), then each
+// publish, each step a no-op when it
 // is already true. A failing step ends the volume's stage convergence, and the
 // publishes are then not attempted. The publishes are independent of each
 // other: one that fails does not keep another from being bound.
@@ -498,9 +497,11 @@ func (r *Reconciler) transportFor(spec transport.Spec) (transport.Transport, err
 	return tr, nil
 }
 
-// publish makes one publish target a bind of the stage path with the
-// requested read-only flag, from the table obs. A visible mount that is a
-// bind of the stage path is adopted without a mount call when its flag
+// publish makes one publish target a bind of the item's publish source (for a
+// directory, the volume's directory in its transport) with the requested
+// read-only flag, from the table obs. A visible mount that is a bind of the
+// source (observe.Table.IsBindOf, which compares the NFS way, so that it holds
+// on nfs3) is adopted without a mount call when its flag
 // already matches, and has the flag set with a remount (Mounter.Bind) when it
 // does not; anything else visible at the target, or hidden under a parent's
 // mount, is ErrPublishConflict and is left alone. When nothing is mounted
@@ -509,14 +510,22 @@ func (r *Reconciler) transportFor(spec transport.Spec) (transport.Transport, err
 func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) error {
 	r := p.r
 	target := pub.TargetPath
+	it, ok := r.items[in.Kind]
+	if !ok {
+		return fmt.Errorf("volume %s: no item handles kind %q", in.VolumeID, in.Kind)
+	}
+	source, err := it.PublishSource(in)
+	if err != nil {
+		return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
+	}
 	if top, ok := obs.At(target); ok {
-		same, err := obs.IsBindOf(target, in.StagePath)
+		same, err := obs.IsBindOf(target, source)
 		if err != nil {
 			return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 		}
 		if !same {
-			return fmt.Errorf("volume %s: %w: %s is mounted as %s from %q, which is not a bind of the stage path",
-				in.VolumeID, ErrPublishConflict, target, top.FSType, top.Source)
+			return fmt.Errorf("volume %s: %w: %s is mounted as %s from %q, which is not a bind of the volume's source %s",
+				in.VolumeID, ErrPublishConflict, target, top.FSType, top.Source, source)
 		}
 		if top.ReadOnly() == pub.ReadOnly {
 			return nil
@@ -534,7 +543,7 @@ func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) 
 			return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 		}
 	}
-	err := r.m.Bind(p.ctx, in.StagePath, target, pub.ReadOnly)
+	err = r.m.Bind(p.ctx, source, target, pub.ReadOnly)
 	if errors.Is(err, mount.ErrConflict) && !errors.Is(err, ErrPublishConflict) {
 		err = fmt.Errorf("%w: %w", ErrPublishConflict, err)
 	}

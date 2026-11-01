@@ -71,8 +71,9 @@ func TestStageDoesNotRewriteAnUnreadableRecord(t *testing.T) {
 	if _, ok := e.visible(target); !ok {
 		t.Fatalf("the pod's publish was unmounted; events %+v", e.events.all())
 	}
-	if _, ok := e.visible(in.StagePath); !ok {
-		t.Error("the stage was unmounted")
+	e.noStageMount(in)
+	if _, ok := e.visible(e.tdir("a")); !ok {
+		t.Error("the transport was unmounted")
 	}
 	if u := e.unmountCalls(); len(u) != 0 {
 		t.Errorf("unmounts = %v", u)
@@ -101,8 +102,8 @@ func TestStageAfterAPassThatSawAnUnreadableRecord(t *testing.T) {
 	e.breakRecord(in.VolumeID)
 
 	e.freshPass(e.r.nudge)
-	if _, ok := e.visible(in.StagePath); !ok {
-		t.Error("the failure pass unmounted the stage")
+	if _, ok := e.visible(e.tdir("a")); !ok {
+		t.Error("the failure pass unmounted the transport")
 	}
 	if err := e.r.Stage(bg, in); !errors.Is(err, ErrIntentsUnknown) {
 		t.Fatalf("Stage = %v, want ErrIntentsUnknown", err)
@@ -136,7 +137,7 @@ func TestNothingIsCollectedWhileAnyRecordIsUnreadable(t *testing.T) {
 
 	e.pass()
 	e.pass()
-	for _, p := range []string{targetA, targetB, a.StagePath, b.StagePath, stray, e.tdir("a"), e.tdir("b")} {
+	for _, p := range []string{targetA, targetB, stray, e.tdir("a"), e.tdir("b")} {
 		if _, ok := e.visible(p); !ok {
 			t.Errorf("%s was unmounted while a record was unreadable", p)
 		}
@@ -159,7 +160,7 @@ func TestNothingIsCollectedWhileAnyRecordIsUnreadable(t *testing.T) {
 	// Once every record reads, collection resumes.
 	e.restoreRecord(a.VolumeID, good)
 	e.pass()
-	for _, p := range []string{stray, targetB, b.StagePath} {
+	for _, p := range []string{stray, targetB} {
 		if _, ok := e.visible(p); ok {
 			t.Errorf("%s survived the first clean pass", p)
 		}
@@ -209,7 +210,7 @@ func TestUnstageWithAnUnreadableRecordTouchesNothing(t *testing.T) {
 	if now, err := os.ReadFile(e.recordPath(in.VolumeID)); err != nil || !bytes.Equal(now, junk) {
 		t.Errorf("the record was deleted or changed: %v", err)
 	}
-	for _, p := range []string{target, in.StagePath} {
+	for _, p := range []string{target} {
 		if _, ok := e.visible(p); !ok {
 			t.Errorf("%s was unmounted", p)
 		}

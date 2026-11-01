@@ -208,8 +208,9 @@ func singleCapability(c *csi.VolumeCapability) error {
 	return nil
 }
 
-// NodeStageVolume records the volume as staged and waits for its stage path to
-// be a mount of it. A repeat with the same context and stage path is a
+// NodeStageVolume records the volume as staged and waits for it to be staged
+// (its transport mounted and its directory present; no mount is made at the
+// stage path). A repeat with the same context and stage path is a
 // success, and with another one is AlreadyExists.
 func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	id, err := requireID(req.GetVolumeId())
@@ -347,9 +348,11 @@ func (n *Node) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVo
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-// NodeGetVolumeStats reports the capacity and inode usage of a staged volume's
-// stage path or of one of its publish targets. A volume that is not staged, or
-// a path that is neither, is NotFound. A file system that cannot be read
+// NodeGetVolumeStats reports the capacity and inode usage of one of a staged
+// volume's publish targets. The stage path is not a mount (a directory volume
+// makes none there, and kubelet asks with the pod's path anyway), so it is
+// NotFound like any path that is not a publish target. A volume that is not
+// staged is NotFound. A file system that cannot be read
 // (a statfs that fails or times out) fails the call with the code of its class
 // (DeadlineExceeded for a timeout, Unavailable for a busy path, Internal for
 // an unexpected errno), so that a wedged transport is counted as the failure it
@@ -386,12 +389,8 @@ func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeSta
 	return &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}, nil
 }
 
-// hasPath reports whether p is the volume's stage path or one of its publish
-// targets.
+// hasPath reports whether p is one of the volume's publish targets.
 func hasPath(in intent.Intent, p string) bool {
-	if in.StagePath == p {
-		return true
-	}
 	for _, pub := range in.Publishes {
 		if pub.TargetPath == p {
 			return true

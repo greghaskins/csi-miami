@@ -81,35 +81,12 @@ func (d dirInfo) ModTime() time.Time { return time.Time{} }
 func (d dirInfo) IsDir() bool        { return d.dir }
 func (d dirInfo) Sys() any           { return nil }
 
-// popper removes the mount at a path when it is unmounted.
-type popper struct {
-	*fake.Mounter
-	table observe.Table
-}
-
-func (p *popper) Unmount(ctx context.Context, target string, flags int) error {
-	if err := p.Mounter.Unmount(ctx, target, flags); err != nil {
-		return err
-	}
-	var keep observe.Table
-	for _, m := range p.table {
-		if m.MountPoint != target {
-			keep = append(keep, m)
-		}
-	}
-	p.table = keep
-	p.SetTable(keep)
-	return nil
-}
-
 type fixture struct {
 	mu     sync.Mutex
 	f      *fake.Mounter
 	item   *Item
 	stats  []string
-	made   []string
 	statFn func(string) (fs.FileInfo, error)
-	mkdir  func(string, fs.FileMode) error
 	// ensure, when set, replaces the creation of an item directory; ensured
 	// lists the (mountDir, dir) pairs it was called with.
 	ensure  func(mountDir, dir string) error
@@ -138,13 +115,6 @@ func newFixture(t *testing.T, table ...observe.Mount) *fixture {
 			fx.mu.Unlock()
 			if fn != nil {
 				return fn(mountDir, dir)
-			}
-			return nil
-		},
-		MkdirAll: func(p string, m fs.FileMode) error {
-			fx.made = append(fx.made, p)
-			if fx.mkdir != nil {
-				return fx.mkdir(p, m)
 			}
 			return nil
 		},
@@ -188,12 +158,9 @@ func TestNewValidation(t *testing.T) {
 	if _, err := it.cfg.Stat(os.DevNull); err != nil {
 		t.Errorf("default stat: %v", err)
 	}
-	if err := it.cfg.MkdirAll(t.TempDir(), 0o700); err != nil {
-		t.Errorf("default MkdirAll: %v", err)
-	}
 }
 
-func TestConvergeBindsTheItemDirectoryOnTheStagePath(t *testing.T) {
+func TestConvergeMakesNoMountAtTheStagePath(t *testing.T) {
 	t.Parallel()
 	fx := newFixture(t, rootMount(), transportMount())
 	if err := fx.converge(theIntent()); err != nil {
@@ -202,38 +169,37 @@ func TestConvergeBindsTheItemDirectoryOnTheStagePath(t *testing.T) {
 	if !slices.Equal(fx.stats, []string{itemDir()}) {
 		t.Errorf("stats = %v", fx.stats)
 	}
-	if !slices.Equal(fx.made, []string{stage}) {
-		t.Errorf("made = %v", fx.made)
+	if got := fx.binds(); len(got) != 0 {
+		t.Errorf("calls = %+v, want none", got)
 	}
-	want := []fake.Call{{Op: fake.OpBind, Source: itemDir(), Target: stage}}
-	if got := fx.binds(); !slices.Equal(got, want) {
-		t.Errorf("calls = %+v, want %+v", got, want)
-	}
-}
-
-func TestConvergeAdoptsAnIdenticalBindWithoutACall(t *testing.T) {
-	t.Parallel()
-	fx := newFixture(t, rootMount(), transportMount(), stageBind())
+	// Repeating changes nothing.
 	if err := fx.converge(theIntent()); err != nil {
 		t.Fatal(err)
 	}
 	if got := fx.binds(); len(got) != 0 {
-		t.Errorf("calls = %+v", got)
-	}
-	if len(fx.made) != 0 {
-		t.Errorf("made = %v", fx.made)
+		t.Errorf("calls = %+v, want none", got)
 	}
 }
 
-func TestConvergeClearsReadOnlyOnTheStage(t *testing.T) {
+func TestPublishSourceIsTheItemDirectory(t *testing.T) {
 	t.Parallel()
-	fx := newFixture(t, rootMount(), transportMount(), stageBind("ro"))
-	if err := fx.converge(theIntent()); err != nil {
-		t.Fatal(err)
+	fx := newFixture(t)
+	got, err := fx.item.PublishSource(theIntent())
+	if err != nil || got != itemDir() {
+		t.Fatalf("got %q, %v, want %q", got, err, itemDir())
 	}
-	want := []fake.Call{{Op: fake.OpBind, Source: itemDir(), Target: stage, ReadOnly: false}}
-	if got := fx.binds(); !slices.Equal(got, want) {
-		t.Errorf("calls = %+v", got)
+	nfs := theIntent()
+	nfs.Transport = nfsSpec
+	want, _ := nfsSpec.MountPoint(root)
+	if got, err := fx.item.PublishSource(nfs); err != nil || got != filepath.Join(want, pvc1) {
+		t.Errorf("nfs3: got %q, %v", got, err)
+	}
+	for _, id := range []string{pvc1, "directory:a b"} {
+		bad := theIntent()
+		bad.VolumeID = id
+		if _, err := fx.item.PublishSource(bad); err == nil {
+			t.Errorf("volume ID %q accepted", id)
+		}
 	}
 }
 
@@ -282,19 +248,14 @@ func TestConvergeErrors(t *testing.T) {
 			[]error{item.ErrStageConflict}},
 		{"a stage hidden under another mount", []observe.Mount{rootMount(), transportMount(), hiddenStage, cover}, nil,
 			[]error{item.ErrStageConflict}},
-		{"no mount contains the item directory", []observe.Mount{rootMount(), stageBind()},
-			func(*fixture, *intent.Intent) {}, nil},
-		{"the stage directory cannot be made", []observe.Mount{rootMount(), transportMount()},
-			func(fx *fixture, _ *intent.Intent) {
-				fx.mkdir = func(string, fs.FileMode) error { return os.ErrPermission }
-			},
-			[]error{os.ErrPermission}},
-		{"the bind conflicts", []observe.Mount{rootMount(), transportMount()},
-			func(fx *fixture, _ *intent.Intent) { fx.f.FailOp(fake.OpBind, stage, mount.ErrConflict) },
+		{"even a bind of the item directory is a conflict", []observe.Mount{rootMount(), transportMount(), stageBind()}, nil,
 			[]error{item.ErrStageConflict, mount.ErrConflict}},
-		{"the bind fails", []observe.Mount{rootMount(), transportMount()},
-			func(fx *fixture, _ *intent.Intent) { fx.f.FailOp(fake.OpBind, stage, mount.ErrBusy) },
-			[]error{mount.ErrBusy}},
+		{"a conflict at the stage path creates nothing", []observe.Mount{rootMount(), transportMount(), foreign},
+			func(fx *fixture, in *intent.Intent) {
+				in.EnsureItem = true
+				fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
+			},
+			[]error{item.ErrStageConflict}},
 		{"a malformed volume ID", []observe.Mount{rootMount(), transportMount()},
 			func(_ *fixture, in *intent.Intent) { in.VolumeID = pvc1 }, nil},
 		{"a name that is not valid", []observe.Mount{rootMount(), transportMount()},
@@ -311,6 +272,12 @@ func TestConvergeErrors(t *testing.T) {
 			err := fx.converge(in)
 			if err == nil {
 				t.Fatal("want an error")
+			}
+			if got := fx.binds(); len(got) != 0 {
+				t.Errorf("calls = %+v, want none", got)
+			}
+			if len(fx.ensured) != 0 {
+				t.Errorf("created %v", fx.ensured)
 			}
 			for _, w := range tt.want {
 				if !errors.Is(err, w) {
@@ -356,130 +323,101 @@ func unmounts(f *fake.Mounter) []string {
 	return out
 }
 
-func newPopperItem(t *testing.T, ms ...observe.Mount) (*Item, *popper) {
+func teardownFixture(t *testing.T, ms ...observe.Mount) (*Item, *fake.Mounter, observe.Table) {
 	t.Helper()
-	p := &popper{Mounter: &fake.Mounter{}, table: observe.Table(ms)}
-	p.SetTable(p.table)
-	it, err := New(Config{Root: root, Mounter: p})
+	f := &fake.Mounter{}
+	f.SetTable(ms)
+	it, err := New(Config{Root: root, Mounter: f})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return it, p
+	return it, f, observe.Table(ms)
 }
 
-func TestTeardownUnmountsOurBindOnce(t *testing.T) {
+// Nothing is mounted at the stage path, so there is nothing to undo, with the
+// transport mounted or not.
+func TestTeardownWithNothingAtTheStagePathIsANoOp(t *testing.T) {
 	t.Parallel()
-	it, p := newPopperItem(t, rootMount(), transportMount(), stageBind())
-	if err := it.Teardown(context.Background(), theIntent(), item.Observed{}); err != nil {
-		t.Fatal(err)
-	}
-	if got := unmounts(p.Mounter); !slices.Equal(got, []string{stage}) {
-		t.Errorf("unmounts = %v", got)
-	}
-	// Nothing to undo is no call.
-	if err := it.Teardown(context.Background(), theIntent(), item.Observed{}); err != nil {
-		t.Fatal(err)
-	}
-	if got := unmounts(p.Mounter); len(got) != 1 {
-		t.Errorf("unmounts after the second Teardown = %v", got)
-	}
-}
-
-// What is not a bind of the volume's directory is not the driver's to remove.
-func TestTeardownLeavesWhatIsNotOurs(t *testing.T) {
-	t.Parallel()
-	foreign := stageBind()
-	foreign.Major, foreign.Minor, foreign.FSType = 0, 55, "tmpfs"
-	other := stageBind()
-	other.Root = host + "/" + pvc2
-	stacked := foreign
-	stacked.ID = 4
-	tests := []struct {
-		name  string
-		table []observe.Mount
-		left  int
-	}{
-		{"a foreign file system", []observe.Mount{rootMount(), transportMount(), foreign}, 1},
-		{"a bind of another volume's directory", []observe.Mount{rootMount(), transportMount(), other}, 1},
-		{"something stacked on our bind", []observe.Mount{rootMount(), transportMount(), stageBind(), stacked}, 2},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for name, table := range map[string][]observe.Mount{
+		"the transport mounted": {rootMount(), transportMount()},
+		"the transport gone":    {rootMount()},
+	} {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			it, p := newPopperItem(t, tt.table...)
-			err := it.Teardown(context.Background(), theIntent(), item.Observed{})
-			if !errors.Is(err, item.ErrStageConflict) || !errors.Is(err, mount.ErrConflict) {
-				t.Fatalf("got %v, want ErrStageConflict", err)
-			}
-			if got := unmounts(p.Mounter); len(got) != 0 {
-				t.Errorf("unmounted %v", got)
-			}
-			n := 0
-			for _, m := range p.table {
-				if m.MountPoint == stage {
-					n++
+			it, f, tab := teardownFixture(t, table...)
+			for range 2 {
+				if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: tab}); err != nil {
+					t.Fatal(err)
 				}
 			}
-			if n != tt.left {
-				t.Errorf("%d mounts at the stage path, want %d left alone", n, tt.left)
+			if got := f.Calls(); len(got) != 0 {
+				t.Errorf("calls = %+v, want none", got)
 			}
 		})
 	}
 }
 
-// A stage that is mounted while its transport is not cannot be recognised.
-// Teardown says so, and does not call the driver's own mount a foreign one.
-func TestTeardownWithTheTransportNotMounted(t *testing.T) {
+// Whatever is mounted at the stage path is not the driver's, and is left.
+func TestTeardownLeavesAnythingMountedAtTheStagePath(t *testing.T) {
 	t.Parallel()
-	it, p := newPopperItem(t, rootMount(), stageBind())
-	err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: p.table})
-	if !errors.Is(err, item.ErrTransportNotMounted) || errors.Is(err, item.ErrStageConflict) {
-		t.Fatalf("got %v, want ErrTransportNotMounted and not a conflict", err)
-	}
-	if got := unmounts(p.Mounter); len(got) != 0 {
-		t.Errorf("unmounted %v", got)
-	}
-	// Nothing staged: nothing to say.
-	it, p = newPopperItem(t, rootMount())
-	if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: p.table}); err != nil {
-		t.Errorf("got %v", err)
-	}
-}
-
-// The stage bind of a directory that has been removed is the driver's.
-func TestTeardownUnmountsABindOfARemovedDirectory(t *testing.T) {
-	t.Parallel()
+	foreign := stageBind()
+	foreign.Major, foreign.Minor, foreign.FSType = 0, 55, "tmpfs"
+	stacked := foreign
+	stacked.ID = 4
 	gone := stageBind()
 	gone.Deleted = true
-	it, p := newPopperItem(t, rootMount(), transportMount(), gone)
-	if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: p.table}); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name  string
+		table []observe.Mount
+	}{
+		{"a foreign file system", []observe.Mount{rootMount(), transportMount(), foreign}},
+		{"a bind of the volume's directory", []observe.Mount{rootMount(), transportMount(), stageBind()}},
+		{"a bind of a removed directory", []observe.Mount{rootMount(), transportMount(), gone}},
+		{"a stack of mounts", []observe.Mount{rootMount(), transportMount(), stageBind(), stacked}},
 	}
-	if got := unmounts(p.Mounter); len(got) != 1 {
-		t.Errorf("unmounts = %v", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			it, f, tab := teardownFixture(t, tt.table...)
+			err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: tab})
+			if !errors.Is(err, item.ErrStageConflict) || !errors.Is(err, mount.ErrConflict) {
+				t.Fatalf("got %v, want ErrStageConflict", err)
+			}
+			if got := unmounts(f); len(got) != 0 {
+				t.Errorf("unmounted %v", got)
+			}
+		})
 	}
 }
 
-func TestTeardownErrors(t *testing.T) {
+// A mount hidden under a parent's is not reported by Teardown, so a stale one
+// cannot make a volume impossible to unstage.
+func TestTeardownIgnoresAHiddenMount(t *testing.T) {
 	t.Parallel()
-	it, p := newPopperItem(t, rootMount(), transportMount(), stageBind())
-	p.FailOp(fake.OpUnmount, stage, mount.ErrBusy)
-	if err := it.Teardown(context.Background(), theIntent(), item.Observed{}); !errors.Is(err, mount.ErrBusy) {
-		t.Errorf("got %v", err)
+	cover := observe.Mount{ID: 9, ParentID: 1, Major: 0, Minor: 9, Root: "/", MountPoint: filepath.Dir(stage), FSType: "tmpfs", Source: "t"}
+	it, f, tab := teardownFixture(t, rootMount(), transportMount(), stageBind(), cover)
+	if err := it.Teardown(context.Background(), theIntent(), item.Observed{Mounts: tab}); err != nil {
+		t.Fatal(err)
 	}
-	bad := theIntent()
-	bad.VolumeID = pvc1
-	if err := it.Teardown(context.Background(), bad, item.Observed{}); err == nil {
-		t.Error("a malformed volume ID was accepted")
+	if got := unmounts(f); len(got) != 0 {
+		t.Errorf("unmounted %v", got)
 	}
-	bad.VolumeID = "directory:a b"
-	if err := it.Teardown(context.Background(), bad, item.Observed{}); err == nil {
-		t.Error("an invalid volume name was accepted")
+}
+
+func TestTeardownRejectsAnInvalidVolumeID(t *testing.T) {
+	t.Parallel()
+	it, _, _ := teardownFixture(t, rootMount())
+	for _, id := range []string{pvc1, "directory:a b"} {
+		bad := theIntent()
+		bad.VolumeID = id
+		if err := it.Teardown(context.Background(), bad, item.Observed{}); err == nil {
+			t.Errorf("volume ID %q accepted", id)
+		}
 	}
 }
 
 // A local volume's directory is created at first stage, with the transport's
-// mount directory as the base, and then checked and bound like any other.
+// mount directory as the base, and then checked like any other.
 func TestConvergeCreatesAMissingLocalItemDirectory(t *testing.T) {
 	t.Parallel()
 	fx := newFixture(t, rootMount(), transportMount())
@@ -497,9 +435,8 @@ func TestConvergeCreatesAMissingLocalItemDirectory(t *testing.T) {
 	if want := [][2]string{{tdir(), itemDir()}}; !slices.Equal(fx.ensured, want) {
 		t.Errorf("ensure calls = %v, want %v", fx.ensured, want)
 	}
-	want := []fake.Call{{Op: fake.OpBind, Source: itemDir(), Target: stage, ReadOnly: false}}
-	if got := fx.binds(); !slices.Equal(got, want) {
-		t.Errorf("calls = %+v", got)
+	if got := fx.binds(); len(got) != 0 {
+		t.Errorf("calls = %+v, want none", got)
 	}
 }
 
@@ -540,20 +477,6 @@ func TestConvergeNeverCreatesAnNFSItemDirectory(t *testing.T) {
 	}
 	if len(fx.ensured) != 0 || len(fx.binds()) != 0 {
 		t.Errorf("created %v, called %+v", fx.ensured, fx.binds())
-	}
-}
-
-// A directory that vanished under a mounted stage is not made again: the
-// stage is a bind of the one that was removed.
-func TestConvergeDoesNotRecreateUnderAMountedStage(t *testing.T) {
-	t.Parallel()
-	fx := newFixture(t, rootMount(), transportMount(), stageBind())
-	fx.statFn = func(string) (fs.FileInfo, error) { return nil, fs.ErrNotExist }
-	if err := fx.converge(firstStage()); !errors.Is(err, item.ErrItemMissing) {
-		t.Fatalf("got %v, want ErrItemMissing", err)
-	}
-	if len(fx.ensured) != 0 {
-		t.Errorf("created %v", fx.ensured)
 	}
 }
 

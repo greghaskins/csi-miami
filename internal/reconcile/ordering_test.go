@@ -45,9 +45,10 @@ func TestAStageSupersedesAnAbandonedUnstage(t *testing.T) {
 	if _, ok := e.intentOf(in.VolumeID); !ok {
 		t.Error("the Stage's record was deleted by the stale Unstage")
 	}
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
-		t.Error("the volume is not staged")
+	if !e.isBind(e.tdir("a"), e.host("a")) {
+		t.Error("the volume's transport is not mounted")
 	}
+	e.noStageMount(in)
 }
 
 func TestAPublishSupersedesAnAbandonedUnstage(t *testing.T) {
@@ -67,7 +68,7 @@ func TestAPublishSupersedesAnAbandonedUnstage(t *testing.T) {
 	if err := <-res; err != nil {
 		t.Fatalf("Publish = %v (an abandoned Unstage must not take the volume from a new pod)", err)
 	}
-	if !e.isBind(e.target("pod2"), in.StagePath) {
+	if !e.isBind(e.target("pod2"), e.srcOf(in)) {
 		t.Error("the publish is not bound")
 	}
 }
@@ -123,11 +124,11 @@ func TestUnstageDoesNotDeleteAnIdenticalStageWrittenDuringTheTeardown(t *testing
 	e := newEnv(t)
 	e.start()
 	in := e.vol("a", pvc1)
-	mustNil(t, "Stage", e.r.Stage(bg, in))
+	target := e.stageAndPublish(in, "pod1", false)
 	loaded, _ := e.intentOf(in.VolumeID)
 
 	e.setHook(func(c fake.Call) {
-		if c.Op == fake.OpUnmount && c.Target == in.StagePath {
+		if c.Op == fake.OpUnmount && c.Target == target {
 			// What Stage writes: the same record again.
 			mustNil(t, "identical Stage", e.store.Save(in))
 		}
@@ -145,9 +146,10 @@ func TestUnstageDoesNotDeleteAnIdenticalStageWrittenDuringTheTeardown(t *testing
 	}
 	e.hook.Store(nil)
 	e.freshPass(e.r.nudge)
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) {
-		t.Error("the volume was not restored")
+	if _, ok := e.intentOf(in.VolumeID); !ok {
+		t.Error("the volume was not kept")
 	}
+	e.noStageMount(in)
 }
 
 // A Publish recorded after the pass loaded the record is invisible to the
@@ -157,12 +159,12 @@ func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
 	e := newEnv(t)
 	e.start()
 	in := e.vol("a", pvc1)
-	mustNil(t, "Stage", e.r.Stage(bg, in))
+	first := e.stageAndPublish(in, "pod1", false)
 	e.mkTargetParent("pod9")
 	late := e.target("pod9")
 
 	e.setHook(func(c fake.Call) {
-		if c.Op == fake.OpUnmount && c.Target == in.StagePath {
+		if c.Op == fake.OpUnmount && c.Target == first {
 			mustNil(t, "late publish", e.store.Update(in.VolumeID, func(r *intent.Intent) error {
 				r.Publishes = append(r.Publishes, intent.Publish{TargetPath: late})
 				return nil
@@ -174,13 +176,13 @@ func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
 		t.Fatalf("Unstage = %v, want ErrSuperseded", err)
 	}
 	got, ok := e.intentOf(in.VolumeID)
-	if !ok || len(got.Publishes) != 1 || got.Publishes[0].TargetPath != late {
+	if !ok || len(got.Publishes) != 2 || got.Publishes[1].TargetPath != late {
 		t.Fatalf("the newer record was lost: %+v, %v", got, ok)
 	}
-	// The next pass brings the volume back, stage and the late publish.
+	// The next pass brings the volume back: the first publish and the late one.
 	e.hook.Store(nil)
 	e.freshPass(e.r.nudge)
-	if !e.isBind(in.StagePath, e.itemDir("a", pvc1)) || !e.isBind(late, in.StagePath) {
+	if !e.isBind(first, e.srcOf(in)) || !e.isBind(late, e.srcOf(in)) {
 		t.Error("the volume was not restored from the newer record")
 	}
 }
@@ -198,20 +200,20 @@ func TestARequestMadeDuringAPassIsServedByTheNextOne(t *testing.T) {
 	entered := make(chan struct{})
 	gate := make(chan struct{})
 	e.setHook(func(c fake.Call) {
-		if c.Op == fake.OpBind && c.Target == v1.StagePath {
+		if c.Op == fake.OpBind && c.Target == e.tdir("a") {
 			close(entered)
 			<-gate
 		}
 	})
 	res1 := make(chan error, 1)
 	go func() { res1 <- e.r.Stage(bg, v1) }()
-	<-entered // the pass is inside v1's bind
+	<-entered // the pass is inside the bind of v1's transport
 	done := e.passes()
 
 	res2 := make(chan error, 1)
 	go func() { res2 <- e.r.Stage(bg, v2) }()
 	waitUntil(t, "the second Stage to queue", func() bool { return e.r.queued() == 1 })
-	if _, ok := e.visible(v2.StagePath); ok {
+	if _, ok := e.visible(e.tdir("b")); ok {
 		t.Fatal("the running pass served a request made after it began")
 	}
 	close(gate)
@@ -222,7 +224,7 @@ func TestARequestMadeDuringAPassIsServedByTheNextOne(t *testing.T) {
 	// count can lag the answer by one: wait for it to reach the two passes the
 	// first Stage and the second one's own need.
 	e.waitPasses(done + 2)
-	if !e.isBind(v2.StagePath, e.itemDir("b", pvc2)) {
+	if !e.isBind(e.tdir("b"), e.host("b")) {
 		t.Error("the second volume is not staged")
 	}
 }

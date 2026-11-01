@@ -123,7 +123,8 @@ design treats them as constraints.
 ### 4.1 Vocabulary and layers
 
 ```
-pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    bind of a subdirectory
+pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    (no mount at the stage path:
+                                                                  the pod binds the subdirectory)
                     ▲                         ▲                             ▲
                   Item                   ImageItem                    DirectoryItem
                     ▲                         ▲                             ▲
@@ -141,7 +142,9 @@ pod ──bind──▶ Mount (stage path)      ext4 over loop (+ dm-crypt)    b
   `image` (sparse ext4 `.img`, optional LUKS2, single-node) and
   `directory` (a subdirectory bound straight into the pod, many-node,
   with the transport's own semantics).
-- **Mount**: the staged filesystem plus its bind mounts into pods.
+- **Mount**: the staged filesystem plus its bind mounts into pods. An image
+  item has one, at the stage path. A directory item has none there: its pods
+  are bound straight from the directory in the transport (decision 25).
 
 Package boundaries follow these nouns. Each layer exposes `Observe(ctx)
 (state, error)` and `Converge(ctx, desired, observed) error`; the glue is
@@ -161,7 +164,9 @@ the reconciler, not the RPC handlers.
 - **Converge loop**: on every RPC, on a timer, and at startup. For each
   intended volume: transport present → holder held → loop attached (direct
   I/O, recorded sector size) → dm-crypt open → fsck and resize if needed →
-  mounted at the stage path → binds present. For each observed artifact
+  mounted at the stage path (images only; a directory item makes no mount
+  there) → binds present, of the stage path for an image and of the item
+  directory in the transport for a directory. For each observed artifact
   with no intent: release holder, close mapping, detach loop, unmount.
 - **Health loop**: the same observers report forced read-only and shutdown
   flags into `VolumeCondition`; remediation (4.6) consumes it.
@@ -296,7 +301,9 @@ exists so that one driver covers both needs of a shared NAS: image items
 where a workload needs a real local filesystem, directory items where
 plain shared files are enough, both under the same driver-owned transport
 profile and per-namespace subtree rules. Create is `mkdir`, delete is
-`rm -r`, expand is a no-op (reported capacity is the export's).
+`rm -r`, expand is a no-op (reported capacity is the export's). Staging
+records the volume and checks that the directory exists; nothing is mounted
+at the stage path, and each publish is a bind of the directory (decision 25).
 
 The documented contract: close-to-open consistency (a reader that opens
 after the writer closes sees the new content); `flock` and `fcntl` locks
@@ -718,7 +725,27 @@ Recorded:
     node image pinned by digest; the DaemonSet tolerates every taint, so it
     runs on all three nodes.
 
-25. **Kind end-to-end tests (M1, T10)**: the tests in `test/e2e` are Go
+25. **A directory item makes no stage mount**: the NFS client reports `/` as
+    the root of every mount of an export, a bind of a subdirectory included
+    (it carries the directory in the mount source instead). Before it calls
+    `NodeUnstageVolume`, kubelet lists every other mount with the same
+    device and root as the staging path and refuses while one exists, so a
+    bind of the item directory at the stage path matched the transport and
+    every other volume's bind and the stage could never be unstaged (the
+    VolumeAttachment stayed, the PV delete hung). Kubelet's search finds no
+    references for a staging path that is not itself a mount point, and the
+    CSI attacher calls stage and unstage without checking that the path is
+    mounted. So `NodeStageVolume` still records the volume (transport
+    mounted, item directory present) but mounts nothing at the stage path,
+    and each publish target is bound directly from the volume's directory in
+    the transport. The item reports `PublishSource` for this: the directory
+    for a directory item, the stage path for an image item (M2). Anything
+    mounted at a directory volume's stage path is `ErrStageConflict`, reported
+    and left, since the driver cannot show it made it. The transport model
+    (one host-visible mount per server, adoption, deadlines, garbage rules)
+    is unchanged.
+
+26. **Kind end-to-end tests (M1, T10)**: the tests in `test/e2e` are Go
     (build tag `e2e`), driven through the API with client-go against a
     cluster the harness (`hack/e2e-kind.sh`, reached from `make e2e
     E2E_MODE=kind`) has created; they never create one. The cluster is the deploy
@@ -746,27 +773,7 @@ Recorded:
     exactly those as skipped; on code, a skipped, cancelled or failed job
     fails `ci-ok`.
 
-Pending, and it blocks the `nfs3` exit criteria of M1 (found by the T10 e2e on
-a kind cluster; `local` passes all six):
-
-- **An NFS volume cannot be unstaged.** The NFS client reports `/` as the root
-  of every mount of an export, a bind of a subdirectory included, and puts the
-  directory in the source (`server:/export/dir`). Before it calls
-  `NodeUnstageVolume` the kubelet lists the other mounts with the same device
-  and root as the staging path and refuses while any exists ("the device mount
-  path ... is still mounted by other references"). Two kinds of mount match: the
-  transport mount (when it is on the host table), and the stage bind of every
-  other volume of the same export on the node. The pod's publish is removed,
-  the stage stays, the VolumeAttachment is not detached and the PV delete
-  hangs. Taking the transport off the host table (no propagation on the
-  transports root) fixes one volume per node and was tried in T10; two volumes
-  of one export on a node still block each other. `local` is not affected: its
-  roots are the volume paths. A stage that does not share a superblock with
-  any other host-visible mount is needed, for example a stage that is its own
-  NFS mount with `nosharecache`, or no stage mount for a directory item (the
-  publish binds the item directory from the transport). Either changes the
-  reconciler's model (stage as a bind of the item), so it is for the
-  architect to choose.
+Pending: none that block M1.
 
 ## 10. Milestones
 

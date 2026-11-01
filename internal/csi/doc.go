@@ -9,7 +9,7 @@
 // stage with another volume context or staging path is AlreadyExists, a publish
 // whose staging path is not the volume's is FailedPrecondition, and the
 // reconciler's errors become the gRPC code of their class (nodeStatus, one
-// function for all of them). NodeGetVolumeStats answers for the stage path and
+// function for all of them). NodeGetVolumeStats answers for
 // the publish targets of a staged volume only, and a file system that cannot be
 // read costs the answer its usage, not the call its success.
 //

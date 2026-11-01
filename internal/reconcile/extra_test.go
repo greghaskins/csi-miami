@@ -14,9 +14,9 @@ import (
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
-// One publish that cannot be unmounted keeps the stage mounted (the binds are
-// of it) and the intent recorded, and the other publishes still go.
-func TestUnstageWithABusyPublishKeepsTheStageAndTheIntent(t *testing.T) {
+// One publish that cannot be unmounted keeps the intent recorded, and ends the
+// teardown at that publish.
+func TestUnstageWithABusyPublishKeepsTheIntent(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.start()
@@ -31,14 +31,11 @@ func TestUnstageWithABusyPublishKeepsTheStageAndTheIntent(t *testing.T) {
 	if !errors.Is(err, unix.EBUSY) {
 		t.Fatalf("got %v, want EBUSY", err)
 	}
-	if _, ok := e.visible(in.StagePath); !ok {
-		t.Error("the stage was unmounted while a bind of it is still in use")
-	}
 	if _, ok := e.visible(busy); !ok {
 		t.Error("the busy publish went")
 	}
 	// The first failure ends the teardown: one error, and nothing else is
-	// touched while a bind of the stage is still in the way.
+	// touched.
 	if _, ok := e.visible(other); !ok {
 		t.Error("a publish after the failing one was unmounted")
 	}

@@ -192,8 +192,8 @@ with the name taken from the volume ID and never from a parameter.
   (accept-all for directory items; exists so M2 needs no capability
   change), `LIST_VOLUMES` (walk the transports the controller currently has
   mounted; `Aborted` on a starting token, as before).
-- **Node**: `STAGE_UNSTAGE_VOLUME`, `GET_VOLUME_STATS` (`statfs` on the
-  stage path, in a goroutine with a deadline).
+- **Node**: `STAGE_UNSTAGE_VOLUME`, `GET_VOLUME_STATS` (`statfs` on a
+  publish target, in a goroutine with a deadline).
 - **Access modes**: `SINGLE_NODE_WRITER`, `SINGLE_NODE_MULTI_WRITER`,
   `MULTI_NODE_MULTI_WRITER`, `MULTI_NODE_READER_ONLY` for directory items.
 - **fsType**: none accepted for directory items (`InvalidArgument` if set).
@@ -203,8 +203,8 @@ with the name taken from the volume ID and never from a parameter.
 Error mapping: `InvalidArgument` for bad parameters; `NotFound` for an
 unknown volume; `Unavailable` for a transport that cannot be mounted or a
 PV that cannot be read; `DeadlineExceeded` from any observation that hits
-its deadline; `FailedPrecondition` for a stage path mounted from something
-other than this volume's transport directory. Never `panic` in a handler.
+its deadline; `FailedPrecondition` for anything mounted at a directory volume's stage
+path, or at a publish target from something other than the volume's directory. Never `panic` in a handler.
 
 Choices made in T8 where the plan was silent:
 
@@ -248,8 +248,9 @@ Choices made in T7 where the plan was silent:
   Stage never gives it back once the loop has cleared it). The flag is
   informational in the record format (omitted when false), so it needs no
   version bump.
-- `NodeGetVolumeStats` answers for the stage path and the publish targets of a
-  staged volume (`NotFound` otherwise). A statfs that fails or times out fails
+- `NodeGetVolumeStats` answers for the publish targets of a staged volume
+  (`NotFound` otherwise, the stage path included: nothing is mounted there,
+  and kubelet asks with the pod's path; decision 25). A statfs that fails or times out fails
   the call with the code of its class (`DeadlineExceeded` for a timeout,
   `Unavailable` for a busy path, `Internal` for an unexpected errno) and a
   warning in the log, so a wedged transport is not counted as a success. The
@@ -398,14 +399,18 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
    has converged; a directory missing without it is `NotFound`, as for `nfs3`,
    so a disk that is not mounted, or a reboot, never gives a pod an empty
    volume.
-3. Stage path is a bind mount of that directory (adopt if mountinfo shows
-   exactly that source; `FailedPrecondition` if it shows something else;
-   bind if absent).
-4. Each publish target is a bind of the stage path with the requested
-   read-only flag (remount read-only if needed).
+3. The item directory exists; nothing is mounted at the stage path
+   (decision 25). Anything mounted there is `FailedPrecondition`, reported and
+   left, since the driver makes no mount there and cannot show it made that
+   one.
+4. Each publish target is a bind of the item directory with the requested
+   read-only flag (adopt if mountinfo shows that directory, compared the NFS
+   way; remount read-only if needed).
 
 **Garbage.** Any mount strictly under the stage root that no volume's stage
-path covers is unmounted, deepest first, and so is a mount at a publish target
+path covers is unmounted, deepest first (the driver makes none at a stage
+path, so a mount at exactly a live stage path, or inside it, is the volume's
+conflict and is left), and so is a mount at a publish target
 that no intent claims but that an `Unpublish` named or that the previous pass
 saw claimed; a publish target is unmounted only if it is a bind of the
 volume's directory in its transport (the same device and root path, also for a
@@ -418,8 +423,8 @@ past the idle TTL, which is off by default (never).
 **CSI mapping.** `NodeStageVolume` writes the intent (without publishes)
 and waits for converge; `NodePublishVolume` adds a publish and waits;
 `NodeUnpublishVolume` removes it and waits; `NodeUnstageVolume` unmounts the
-publishes and the stage path, and only then removes the intent, so a failed
-unmount keeps the intent and is retried. All four are idempotent by
+publishes (a directory volume has nothing mounted at the stage path to take
+down), and only then removes the intent, so a failed unmount keeps the intent and is retried. All four are idempotent by
 construction.
 
 **Kubelet directory.** `--kubelet-dir` (default `/var/lib/kubelet`) because
@@ -566,10 +571,7 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
   reason the transports root is a hostPath; adoption across a process
   restart is retired by the T4 smoke (one private mount namespace, so it
   does not exercise propagation); propagation is proven by the e2e on a real
-  cluster in T10 and by exit criterion 4. The T10 e2e also found that the
-  kubelet will not unstage an NFS volume while another mount of the same
-  export is visible on the host (brief, Pending), which `nfs3` exit criteria 1
-  and 3 to 6 depend on.
+  cluster in T10 and by exit criterion 4.
 - **Kubelet path differences across distributions**: one replacement in
   the kustomize base, checked by a render test in T9.
 - **A hung NFS mount blocking the reconciler**: every observation has a
@@ -578,6 +580,13 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
 - **`attachRequired: true` with `ReadWriteMany` directory items**: the
   attacher creates one VolumeAttachment per node; retired by exit criterion
   1 (two nodes, one PVC).
+- **A directory bind at the stage path cannot be unstaged on NFS**: the T10
+  end-to-end test on kind found that the NFS client reports `/` as the root of
+  every mount of an export, so kubelet's reference check (same device and root
+  as the staging path) found the transport and every other volume's bind and
+  refused to unstage. Resolved by decision 25 (T10a): a directory item makes
+  no stage mount and publishes bind the item directory. The nfs3 e2e on the
+  T10 branch is rerun after T10a merges.
 - **client-go binary size on small nodes**: accepted; measured in T1 and
   recorded in the README.
 

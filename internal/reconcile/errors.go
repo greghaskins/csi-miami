@@ -139,12 +139,13 @@ var (
 	ErrTransportUnavailable = errors.New("the transport is unavailable")
 
 	// ErrStageConflict is returned when the stage path holds a mount that is
-	// not a bind of the volume's directory. It wraps mount.ErrConflict.
-	// Nothing is changed.
+	// not the volume's: for a directory volume any mount, since the driver
+	// makes none there. It wraps mount.ErrConflict. Nothing is changed.
 	ErrStageConflict = item.ErrStageConflict
 
 	// ErrPublishConflict is returned when a publish target holds a mount that
-	// is not a bind of the volume's stage path. It wraps mount.ErrConflict.
+	// is not a bind of the volume's publish source (for a directory, its
+	// directory in the transport). It wraps mount.ErrConflict.
 	// Nothing is changed.
 	ErrPublishConflict = fmt.Errorf("the publish target is mounted from something else: %w", mount.ErrConflict)
 

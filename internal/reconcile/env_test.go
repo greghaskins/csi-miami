@@ -282,6 +282,26 @@ func (e *env) isBind(mountPoint, src string) bool {
 	return ok
 }
 
+// srcOf is what each publish of the volume is a bind of: its directory in the
+// transport.
+func (e *env) srcOf(in intent.Intent) string {
+	e.t.Helper()
+	src, err := e.r.items[in.Kind].PublishSource(in)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return src
+}
+
+// noStageMount fails the test if anything is mounted at the volume's stage
+// path: a directory volume leaves it empty.
+func (e *env) noStageMount(in intent.Intent) {
+	e.t.Helper()
+	if m, ok := e.visible(in.StagePath); ok {
+		e.t.Errorf("something is mounted at the stage path %s: %+v", in.StagePath, m)
+	}
+}
+
 func (e *env) visible(path string) (observe.Mount, bool) {
 	return e.sim.table().At(path)
 }
