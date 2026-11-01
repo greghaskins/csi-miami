@@ -89,14 +89,14 @@ Each StorageClass picks one option per dimension, in any combination.
 | k3s | `/var/lib/rancher/k3s/agent/kubelet` |
 | microk8s | `/var/snap/microk8s/common/var/lib/kubelet` |
 
-An overlay that sets a different path must repeat the kustomization.yaml replacement (the base snippet is in comments there):
+An overlay (at `deploy/kustomize/overlays/<name>/kustomization.yaml`, or with `../../base` replaced if elsewhere) that sets a different path must repeat the kustomization.yaml replacement (the base snippet is in comments there). Set `newTag` to a commit sha (the publish job tags images by sha) or a release tag:
 
 ```yaml
 resources:
   - ../../base
 images:
   - name: ghcr.io/greghaskins/csi-miami
-    newTag: v0.1.0
+    newTag: <sha or tag>
 configMapGenerator:
   - name: miami-deploy
     namespace: miami-system
@@ -158,9 +158,13 @@ Exit codes of `run`: the command's status (0–255; 128+n if killed by signal n)
 Example wrapper with retry on contention:
 
 ```sh
-until miami lock run --dir /nfs/export --name mylock -- mycommand; do
-  [ $? -eq 1 ] || exit $?  # exit on error; retry on 1 (contended)
+while true; do
+  miami lock run --dir /nfs/export --name mylock -- mycommand
+  rc=$?
+  [ $rc -eq 1 ] || break
+  sleep 1
 done
+exit $rc
 ```
 
 The helper runs the command in its own process group. SIGTERM or SIGINT sent to the helper is forwarded to that group. A wrapper script should `exec` its command so the group's leader is the real program and will receive the signal.
