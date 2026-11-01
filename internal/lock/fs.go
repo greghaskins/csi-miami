@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"golang.org/x/sys/unix"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,16 +15,12 @@ import (
 // fsys is the file system as the lock sees it: one method per server round
 // trip or short run of them, so that each is bounded by one deadline. The
 // production implementation is osFS; the tests substitute fakes that return
-// injected modification times or block.
+// injected modification times, block, or interleave another acquirer.
 type fsys interface {
 	// Mkdir makes the directory, failing with fs.ErrExist if it exists.
 	Mkdir(path string) error
 	// Rename atomically renames a directory or file.
 	Rename(oldpath, newpath string) error
-	// WriteAtomic writes dir/name with data, creating it under a temporary
-	// name in dir and renaming it into place. The temporary file is removed
-	// if anything fails.
-	WriteAtomic(dir, name string, data []byte) error
 	// ReadFile returns the content of a file, opening it first so that the
 	// client revalidates its cache.
 	ReadFile(path string) ([]byte, error)
@@ -35,8 +33,27 @@ type fsys interface {
 	Probe(dir, name string) (time.Time, error)
 	// RemoveAll removes a directory and what is in it.
 	RemoveAll(path string) error
-	// Remove removes one file or an empty directory.
-	Remove(path string) error
+	// OpenDir opens the directory at path and pins it: the handle keeps
+	// naming that directory when it is renamed, and fails once it is removed.
+	OpenDir(path string) (dirHandle, error)
+}
+
+// dirHandle is a pinned lock directory. Its methods work relative to the
+// directory itself (openat and friends), never by its path, so that a lock
+// broken and taken by someone else under the same path is never touched by
+// the holder that lost it. A removed directory answers fs.ErrNotExist.
+type dirHandle interface {
+	// ReadFile reads a file of the directory.
+	ReadFile(name string) ([]byte, error)
+	// WriteAtomic writes name with data, creating it under a temporary name
+	// in the directory and renaming it into place. The temporary file is
+	// removed if anything fails.
+	WriteAtomic(name string, data []byte) error
+	// Same reports whether path, opened afresh (an open revalidates), is
+	// this directory: the same device and inode.
+	Same(path string) (bool, error)
+	// Close releases the handle.
+	Close() error
 }
 
 // osFS is the real file system.
@@ -49,32 +66,6 @@ func (osFS) Rename(oldpath, newpath string) error { return os.Rename(oldpath, ne
 func (osFS) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) } //nolint:gosec // the path is built from a validated lock name
 
 func (osFS) RemoveAll(path string) error { return os.RemoveAll(path) }
-
-func (osFS) Remove(path string) error { return os.Remove(path) }
-
-func (osFS) WriteAtomic(dir, name string, data []byte) (err error) {
-	tmp := filepath.Join(dir, "."+name+".tmp-"+randomSuffix())
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // readable by other nodes' users
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if len(data) > 0 {
-		if _, err = f.Write(data); err != nil {
-			_ = f.Close()
-			return err
-		}
-	}
-	// Close is where an NFS client reports a failed write.
-	if err = f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(dir, name))
-}
 
 func (osFS) ModTime(path string) (time.Time, error) {
 	f, err := os.Open(path) //nolint:gosec // the path is built from a validated lock name
@@ -122,3 +113,95 @@ func randomSuffix() string {
 	}
 	return hex.EncodeToString(b[:])
 }
+
+// osDir is a directory held open by file descriptor.
+type osDir struct {
+	fd  int
+	dev uint64
+	ino uint64
+}
+
+const dirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+
+func (osFS) OpenDir(path string) (dirHandle, error) {
+	fd, err := unix.Open(path, dirFlags, 0)
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: path, Err: gone(err)}
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		_ = unix.Close(fd)
+		return nil, &fs.PathError{Op: "stat", Path: path, Err: gone(err)}
+	}
+	return &osDir{fd: fd, dev: uint64(st.Dev), ino: uint64(st.Ino)}, nil //nolint:unconvert // the field types differ between architectures
+}
+
+// gone maps what a removed NFS directory answers (a stale file handle) to
+// "does not exist", which is what it means here.
+func gone(err error) error {
+	if errors.Is(err, unix.ESTALE) {
+		return fs.ErrNotExist
+	}
+	return err
+}
+
+func (d *osDir) ReadFile(name string) ([]byte, error) {
+	fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: gone(err)}
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer func() { _ = f.Close() }()
+	b, err := io.ReadAll(io.LimitReader(f, 4096))
+	if err != nil {
+		return nil, &fs.PathError{Op: "read", Path: name, Err: gone(err)}
+	}
+	return b, nil
+}
+
+func (d *osDir) WriteAtomic(name string, data []byte) (err error) {
+	tmp := "." + name + ".tmp-" + randomSuffix()
+	fd, err := unix.Openat(d.fd, tmp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o644)
+	if err != nil {
+		return &fs.PathError{Op: "open", Path: name, Err: gone(err)}
+	}
+	f := os.NewFile(uintptr(fd), tmp)
+	defer func() {
+		if err != nil {
+			_ = unix.Unlinkat(d.fd, tmp, 0)
+		}
+	}()
+	if len(data) > 0 {
+		if _, err = f.Write(data); err != nil {
+			_ = f.Close()
+			return &fs.PathError{Op: "write", Path: name, Err: gone(err)}
+		}
+	}
+	// Close is where an NFS client reports a failed write.
+	if err = f.Close(); err != nil {
+		return &fs.PathError{Op: "close", Path: name, Err: gone(err)}
+	}
+	if err = unix.Renameat(d.fd, tmp, d.fd, name); err != nil {
+		return &fs.PathError{Op: "rename", Path: name, Err: gone(err)}
+	}
+	return nil
+}
+
+func (d *osDir) Same(path string) (bool, error) {
+	fd, err := unix.Open(path, dirFlags, 0)
+	switch {
+	case err == nil:
+	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ESTALE), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ELOOP):
+		return false, nil
+	default:
+		return false, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return false, &fs.PathError{Op: "stat", Path: path, Err: gone(err)}
+	}
+	return uint64(st.Dev) == d.dev && uint64(st.Ino) == d.ino, nil //nolint:unconvert // the field types differ between architectures
+}
+
+func (d *osDir) Close() error { return unix.Close(d.fd) }

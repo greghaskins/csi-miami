@@ -19,10 +19,16 @@
 //     is the renewal stamp.
 //   - Renew rewrites since. The stamp is the modification time the server
 //     gives the new file; the holder's clock is never used.
-//   - Release removes holder, since and the directory. A holder that was
-//     broken out of the lock must not remove the new holder's files, so
-//     Release and Renew first read holder and report ErrLost if it is not
-//     the caller's.
+//   - Release renames the lock directory away, removes it and what is in it.
+//   - The holder keeps the directory it made open, and everything it does to
+//     the lock is relative to that handle, never to the path. A lock that is
+//     broken and taken by someone else under the same path is therefore never
+//     written to or removed by the holder that lost it: a stamp written in
+//     that instant lands in the directory that was moved away, and Release
+//     checks, by device and inode, that the directory it renamed is the one
+//     it holds, and puts it back if not. Renew and Release read holder and
+//     compare the path with the handle; they report ErrLost if the lock is
+//     not the caller's, or has been removed.
 //
 // # Staleness
 //
@@ -45,18 +51,24 @@
 // if not (a holder renewed, or the lock changed hands, between the judgement
 // and the rename).
 //
-// # Attribute caching sets the floor on Stale
+// # The floor on Stale
+//
+// A holder that cannot renew must stop its work before another acquirer may
+// break the lock, and that takes time: a renewal period, a call that hangs
+// until its deadline (Options.Timeout), the grace the work needs to stop
+// (another Timeout) and the latency of the last stamp. The miami command
+// requires renew plus twice the timeout to be less than Stale, and renew at
+// most a third of Stale, so one missed renewal never makes a live lock stale.
+// The smallest Stale accepted is MinStale, 60 seconds, which leaves room for
+// that margin with the default timeout; the default is DefaultStale, five
+// minutes.
 //
 // The nfs3 transport mounts with actimeo=30 and lookupcache=positive: a
 // client may serve file attributes up to 30 seconds old, so another client's
-// since can look older than it is, and a directory created elsewhere can look
-// younger. Every modification time the package reads is read after opening
-// the file or directory, which revalidates its attributes, and the probe
-// is a file this client just created; but the cache is the reason Stale must
-// be well above its window. The smallest Stale accepted is MinStale, 60
-// seconds, and the default is DefaultStale, five minutes. A holder must renew
-// at least three times per Stale (the miami command enforces it), so one
-// missed renewal never makes a live lock stale.
+// since can look older than it is. That is the secondary reason for the floor:
+// every modification time the package reads is read after opening the file
+// or directory, which revalidates its attributes, and the probe is a file this
+// client just created, so a stale cache does not enter a decision.
 //
 // # Failure
 //
@@ -67,6 +79,12 @@
 // completes later it may still have its effect, which for the call that makes
 // the lock directory means a lock nobody holds, which goes stale and is
 // broken like any other.
+//
+// A process killed in the middle of a call can leave entries in the directory
+// that holds the lock, hidden and named .NAME.probe-*, .NAME.tmp-*,
+// .NAME.broken-* or .NAME.removed-*, and temporary files inside a lock
+// directory. They are harmless to the lock (nothing reads them, and a lock
+// directory holding one is removed with it) and can be deleted by hand.
 //
 // Errors other than ErrContended and ErrLost are *Error values carrying the
 // operation and the lock name, never a path.

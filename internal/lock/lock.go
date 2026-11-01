@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
+	"github.com/greghaskins/csi-miami/internal/mount"
 )
 
 // Suffix is appended to the lock's name to name the lock directory:
@@ -26,9 +28,11 @@ const (
 
 // Bounds and defaults of Options.
 const (
-	// MinStale is the smallest Options.Stale accepted. It is more than twice
-	// the 30-second attribute cache of the nfs3 transport, so a stamp that
-	// looks old because of the cache never looks stale.
+	// MinStale is the smallest Options.Stale accepted. A holder that cannot
+	// renew needs a renewal period, a hung call's deadline, the time its work
+	// takes to stop and the latency of its last stamp before the lock may be
+	// broken; 60 seconds leaves room for that with the default timeout. The
+	// 30-second attribute cache of the nfs3 transport is the secondary reason.
 	MinStale = 60 * time.Second
 	// DefaultStale is the Options.Stale used when it is zero.
 	DefaultStale = 5 * time.Minute
@@ -87,8 +91,9 @@ func DefaultHolder() string {
 // from different goroutines; they run one at a time.
 type Lock struct {
 	e    *env
+	dir  dirHandle // the lock directory, pinned when it was made
 	mu   sync.Mutex
-	done bool // released, or found lost
+	done bool // released, or found lost; dir is closed
 }
 
 // Name is the lock's name.
@@ -107,6 +112,19 @@ type env struct {
 	holder  string
 	stale   time.Duration
 	timeout time.Duration
+
+	// hung is set once a call has been abandoned at its deadline. Such a call
+	// may still use the pinned directory's descriptor, so the descriptor is
+	// then never closed: a closed number can be reused, and the late call would
+	// act on whatever got it.
+	hung atomic.Bool
+}
+
+// closeDir closes a pinned directory unless a call may still be using it.
+func (e *env) closeDir(h dirHandle) {
+	if !e.hung.Load() {
+		_ = h.Close()
+	}
 }
 
 func newEnv(fsys fsys, dir, name string, opts Options) (*env, error) {
@@ -168,18 +186,13 @@ func clean(err error) error {
 // step runs one file system call under the deadline. what names the call in
 // the error and never contains a path.
 func (e *env) step(ctx context.Context, what string, fn func() error) error {
-	_, err := deadline.Run(ctx, e.timeout, what, &e.set, e.dir, func(context.Context) (struct{}, error) {
-		if err := fn(); err != nil {
-			return struct{}{}, fmt.Errorf("%s: %w", what, clean(err))
-		}
-		return struct{}{}, nil
-	})
+	_, err := stepValue(ctx, e, what, func() (struct{}, error) { return struct{}{}, fn() })
 	return err
 }
 
 // stepValue is step for a call that returns a value.
 func stepValue[T any](ctx context.Context, e *env, what string, fn func() (T, error)) (T, error) {
-	return deadline.Run(ctx, e.timeout, what, &e.set, e.dir, func(context.Context) (T, error) {
+	v, err := deadline.Run(ctx, e.timeout, what, &e.set, e.dir, func(context.Context) (T, error) {
 		v, err := fn()
 		if err != nil {
 			var zero T
@@ -187,6 +200,10 @@ func stepValue[T any](ctx context.Context, e *env, what string, fn func() (T, er
 		}
 		return v, nil
 	})
+	if errors.Is(err, mount.ErrTimeout) || errors.Is(err, mount.ErrBusy) {
+		e.hung.Store(true)
+	}
+	return v, err
 }
 
 // Acquire takes the lock name in dir with one attempt: it returns the held
@@ -222,10 +239,21 @@ func acquire(ctx context.Context, fsys fsys, dir, name string, opts Options) (*L
 			return nil, e.fail("acquire", ErrContended)
 		}
 	}
-	if err := e.publish(ctx); err != nil {
+	// Pin the directory we made. Everything after this works relative to the
+	// handle, so a lock that is broken and taken by someone else under the same
+	// path is never written to or removed by us.
+	h, err := stepValue(ctx, e, "open lock", func() (dirHandle, error) { return e.fs.OpenDir(e.lockDir) })
+	if err != nil {
+		// A directory that is gone was moved by a breaker (or removed); any
+		// other failure leaves an empty lock directory, which goes stale like
+		// any other. It is not removed by path: the path may not be ours now.
 		return nil, e.fail("acquire", err)
 	}
-	return &Lock{e: e}, nil
+	if err := e.publish(ctx, h); err != nil {
+		e.closeDir(h)
+		return nil, e.fail("acquire", err)
+	}
+	return &Lock{e: e, dir: h}, nil
 }
 
 // mkdir reports whether it made the lock directory; false means it exists.
@@ -241,15 +269,18 @@ func (e *env) mkdir(ctx context.Context) (bool, error) {
 }
 
 // publish writes the holder and the first stamp into the lock directory we
-// just made. On failure it removes the directory so that no half-made lock
-// waits out Stale.
-func (e *env) publish(ctx context.Context) error {
-	err := e.step(ctx, "write holder", func() error { return e.fs.WriteAtomic(e.lockDir, holderFile, []byte(e.holder)) })
+// just made, through its handle: a breaker that moves the directory while it is
+// half made (it judged the previous lock stale and was slow) does not lose
+// the writes, which go with the directory and are in place when it puts it
+// back. On failure it removes the directory so that no half-made lock waits
+// out Stale.
+func (e *env) publish(ctx context.Context, h dirHandle) error {
+	err := e.step(ctx, "write holder", func() error { return h.WriteAtomic(holderFile, []byte(e.holder)) })
 	if err == nil {
-		err = e.step(ctx, "write since", func() error { return e.fs.WriteAtomic(e.lockDir, sinceFile, nil) })
+		err = e.step(ctx, "write since", func() error { return h.WriteAtomic(sinceFile, nil) })
 	}
 	if err != nil {
-		_ = e.step(context.WithoutCancel(ctx), "remove", func() error { return e.fs.RemoveAll(e.lockDir) })
+		_ = e.removeDir(context.WithoutCancel(ctx), h)
 	}
 	return err
 }
@@ -354,9 +385,12 @@ func (e *env) breakIfStale(ctx context.Context) (retry bool, err error) {
 	return true, nil
 }
 
-// held checks that the lock is still ours.
-func (e *env) held(ctx context.Context) error {
-	raw, err := stepValue(ctx, e, "read holder", func() ([]byte, error) { return e.fs.ReadFile(filepath.Join(e.lockDir, holderFile)) })
+// held checks that the directory we pinned still says it is ours. It reads
+// through the handle, so it answers for our directory wherever it now is; that
+// it is still at the lock's path is checked by whoever acts on it.
+func (l *Lock) held(ctx context.Context) error {
+	e := l.e
+	raw, err := stepValue(ctx, e, "read holder", func() ([]byte, error) { return l.dir.ReadFile(holderFile) })
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return ErrLost
@@ -368,9 +402,31 @@ func (e *env) held(ctx context.Context) error {
 	return nil
 }
 
-// Renew stamps the lock again: it rewrites since, and the server sets its
-// modification time. It returns ErrLost (inside an *Error) if the lock is
-// no longer ours, and after that every call does.
+// atPath reports whether the lock's path still names the directory we pinned.
+func (l *Lock) atPath(ctx context.Context) error {
+	same, err := stepValue(ctx, l.e, "check lock", func() (bool, error) { return l.dir.Same(l.e.lockDir) })
+	if err != nil {
+		return err
+	}
+	if !same {
+		return ErrLost
+	}
+	return nil
+}
+
+// finish marks the lock finished and closes the handle. l.mu is held.
+func (l *Lock) finish() {
+	if !l.done {
+		l.done = true
+		l.e.closeDir(l.dir)
+	}
+}
+
+// Renew stamps the lock again: it rewrites since inside the pinned
+// directory, and the server sets its modification time. It returns ErrLost
+// (inside an *Error) if the lock is no longer ours, and after that every call
+// does. A stamp written in the instant the lock was broken lands in the
+// directory that was moved away, never in the new holder's.
 func (l *Lock) Renew(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -378,15 +434,18 @@ func (l *Lock) Renew(ctx context.Context) error {
 	if l.done {
 		return e.fail("renew", ErrLost)
 	}
-	if err := e.held(ctx); err != nil {
-		l.done = errors.Is(err, ErrLost)
-		return e.fail("renew", err)
+	err := l.held(ctx)
+	if err == nil {
+		err = e.step(ctx, "write since", func() error { return l.dir.WriteAtomic(sinceFile, nil) })
 	}
-	err := e.step(ctx, "write since", func() error { return e.fs.WriteAtomic(e.lockDir, sinceFile, nil) })
 	if errors.Is(err, fs.ErrNotExist) {
-		// The directory was moved away between the check and the write.
-		l.done = true
-		return e.fail("renew", ErrLost)
+		err = ErrLost // the directory was removed
+	}
+	if err == nil {
+		err = l.atPath(ctx)
+	}
+	if errors.Is(err, ErrLost) {
+		l.finish()
 	}
 	if err != nil {
 		return e.fail("renew", err)
@@ -394,19 +453,22 @@ func (l *Lock) Renew(ctx context.Context) error {
 	return nil
 }
 
-// Release gives the lock up: it removes holder, since and the directory. It
-// returns ErrLost (inside an *Error) and removes nothing if the lock is not
-// ours, so a holder that was broken out cannot take the new holder's lock
-// away.
+// Release gives the lock up: the directory is renamed away, checked to be
+// the one we pinned, and removed with what is in it. It returns ErrLost
+// (inside an *Error) and removes nothing if the lock is not ours, so a holder
+// that was broken out cannot take the new holder's lock away.
 func (l *Lock) Release(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.done {
 		return l.e.fail("release", ErrLost)
 	}
-	err := l.e.release(ctx)
+	err := l.held(ctx)
+	if err == nil {
+		err = l.e.removeDir(ctx, l.dir)
+	}
 	if err == nil || errors.Is(err, ErrLost) {
-		l.done = true
+		l.finish()
 	}
 	if err != nil {
 		return l.e.fail("release", err)
@@ -427,25 +489,52 @@ func releaseFS(ctx context.Context, fsys fsys, dir, name string, opts Options) e
 	if err != nil {
 		return &Error{Op: "release", Name: name, Err: err}
 	}
-	if err := e.release(ctx); err != nil {
+	h, err := stepValue(ctx, e, "open lock", func() (dirHandle, error) { return e.fs.OpenDir(e.lockDir) })
+	if errors.Is(err, fs.ErrNotExist) {
+		return e.fail("release", ErrLost)
+	}
+	if err != nil {
+		return e.fail("release", err)
+	}
+	l := &Lock{e: e, dir: h}
+	defer l.finish()
+	err = l.held(ctx)
+	if err == nil {
+		err = e.removeDir(ctx, h)
+	}
+	if err != nil {
 		return e.fail("release", err)
 	}
 	return nil
 }
 
-func (e *env) release(ctx context.Context) error {
-	if err := e.held(ctx); err != nil {
+// removeDir removes the lock directory we pinned: it renames the directory at
+// the lock's path to a unique hidden name (atomic, and it frees the name at
+// once), checks that what it moved is the directory it pinned by device and
+// inode, and removes it with whatever is in it, such as a stamp an abandoned
+// call wrote late. If it moved someone else's directory (the lock was broken
+// and taken between our last look and the rename) it puts it back and reports
+// ErrLost.
+func (e *env) removeDir(ctx context.Context, h dirHandle) error {
+	junk := filepath.Join(e.dir, "."+e.name+".removed-"+randomSuffix())
+	if err := e.step(ctx, "rename", func() error { return e.fs.Rename(e.lockDir, junk) }); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return ErrLost
+		}
 		return err
 	}
-	for _, f := range []string{holderFile, sinceFile} {
-		err := e.step(ctx, "remove "+f, func() error { return e.fs.Remove(filepath.Join(e.lockDir, f)) })
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	same, err := stepValue(ctx, e, "check lock", func() (bool, error) { return h.Same(junk) })
+	if err != nil || !same {
+		restore := e.step(context.WithoutCancel(ctx), "restore", func() error { return e.fs.Rename(junk, e.lockDir) })
+		switch {
+		case err != nil && restore != nil:
+			return fmt.Errorf("%w (and putting the lock back failed: %w)", err, restore)
+		case err != nil:
 			return err
+		case restore != nil && !errors.Is(restore, fs.ErrNotExist):
+			return fmt.Errorf("the lock changed while it was being removed and putting it back failed: %w", restore)
 		}
-	}
-	err := e.step(ctx, "remove lock", func() error { return e.fs.Remove(e.lockDir) })
-	if errors.Is(err, fs.ErrNotExist) {
 		return ErrLost
 	}
-	return err
+	return e.step(ctx, "remove lock", func() error { return e.fs.RemoveAll(junk) })
 }

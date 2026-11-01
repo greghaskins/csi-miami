@@ -36,7 +36,11 @@ type fakeFS struct {
 
 	// Hooks run in place of the real call (they may call it).
 	rename func(oldpath, newpath string) error
-	write  func(dir, name string, data []byte) error
+	write  func(name string, data []byte) error // a pinned directory's WriteAtomic
+
+	// Interleavings: another acquirer acts at exactly these points.
+	afterOpen func()            // after OpenDir returns
+	afterRead func(name string) // after a pinned directory's ReadFile returns
 }
 
 func newFake(t *testing.T) *fakeFS {
@@ -91,8 +95,6 @@ func (f *fakeFS) ReadFile(p string) ([]byte, error) {
 	return f.osFS.ReadFile(p)
 }
 
-func (f *fakeFS) Remove(p string) error { defer f.enter("Remove")(); return f.osFS.Remove(p) }
-
 func (f *fakeFS) RemoveAll(p string) error { defer f.enter("RemoveAll")(); return f.osFS.RemoveAll(p) }
 
 func (f *fakeFS) Rename(o, n string) error {
@@ -103,12 +105,45 @@ func (f *fakeFS) Rename(o, n string) error {
 	return f.osFS.Rename(o, n)
 }
 
-func (f *fakeFS) WriteAtomic(dir, name string, data []byte) error {
-	defer f.enter("WriteAtomic")()
-	if f.write != nil {
-		return f.write(dir, name, data)
+// OpenDir pins the real directory and returns a handle that records its calls.
+func (f *fakeFS) OpenDir(p string) (dirHandle, error) {
+	defer f.enter("OpenDir")()
+	h, err := f.osFS.OpenDir(p)
+	if err != nil {
+		return nil, err
 	}
-	return f.osFS.WriteAtomic(dir, name, data)
+	if f.afterOpen != nil {
+		f.afterOpen()
+	}
+	return &fakeDir{f: f, dirHandle: h}, nil
+}
+
+// fakeDir is a pinned directory of the fake.
+type fakeDir struct {
+	f *fakeFS
+	dirHandle
+}
+
+func (d *fakeDir) ReadFile(name string) ([]byte, error) {
+	defer d.f.enter("Dir.ReadFile")()
+	b, err := d.dirHandle.ReadFile(name)
+	if d.f.afterRead != nil {
+		d.f.afterRead(name)
+	}
+	return b, err
+}
+
+func (d *fakeDir) WriteAtomic(name string, data []byte) error {
+	defer d.f.enter("Dir.WriteAtomic")()
+	if d.f.write != nil {
+		return d.f.write(name, data)
+	}
+	return d.dirHandle.WriteAtomic(name, data)
+}
+
+func (d *fakeDir) Same(p string) (bool, error) {
+	defer d.f.enter("Dir.Same")()
+	return d.dirHandle.Same(p)
 }
 
 // ModTime answers with the injected stamps, after checking the path exists.

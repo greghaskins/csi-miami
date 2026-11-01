@@ -232,23 +232,25 @@ func TestReleaseByHolderString(t *testing.T) {
 func TestRenewWhenTheDirectoryIsMovedAway(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	l, err := Acquire(context.Background(), dir, "web", Options{Holder: "a"})
+	f := newFake(t)
+	l, err := acquire(context.Background(), f, dir, "web", opts("a"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := newFake(t)
-	f.write = func(d, _ string, _ []byte) error {
-		return &fs.PathError{Op: "open", Path: d, Err: fs.ErrNotExist}
+	f.write = func(string, []byte) error {
+		return &fs.PathError{Op: "open", Path: "since", Err: fs.ErrNotExist}
 	}
-	l.e.fs = f
+	f.mu.Lock()
+	f.count = map[string]int{}
+	f.mu.Unlock()
 	if err := l.Renew(context.Background()); !errors.Is(err, ErrLost) {
 		t.Errorf("Renew = %v, want ErrLost", err)
 	}
 	if err := l.Renew(context.Background()); !errors.Is(err, ErrLost) {
 		t.Errorf("Renew after loss = %v, want ErrLost without asking the file system again", err)
 	}
-	if f.called("WriteAtomic") != 1 {
-		t.Errorf("WriteAtomic called %d times, want 1", f.called("WriteAtomic"))
+	if f.called("Dir.WriteAtomic") != 1 {
+		t.Errorf("WriteAtomic called %d times, want 1", f.called("Dir.WriteAtomic"))
 	}
 }
 
@@ -261,11 +263,13 @@ func TestAcquireRemovesAHalfMadeLock(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
 			f := newFake(t)
-			f.write = func(d, name string, data []byte) error {
+			var pinned dirHandle
+			f.afterOpen = func() { pinned, _ = f.osFS.OpenDir(filepath.Join(dir, "web"+Suffix)) }
+			f.write = func(name string, data []byte) error {
 				if name == failing {
-					return &fs.PathError{Op: "write", Path: d, Err: fs.ErrPermission}
+					return &fs.PathError{Op: "write", Path: name, Err: fs.ErrPermission}
 				}
-				return f.osFS.WriteAtomic(d, name, data)
+				return pinned.WriteAtomic(name, data)
 			}
 			_, err := acquire(context.Background(), f, dir, "web", opts("a"))
 			if err == nil || errors.Is(err, ErrContended) || !errors.Is(err, fs.ErrPermission) {
@@ -402,35 +406,47 @@ func TestEveryCallIsBoundedByTheDeadline(t *testing.T) {
 			setup: staleBy("dead"), op: acquireOp,
 		},
 		{
-			name: "acquire: write holder", block: hangOn("WriteAtomic", 1),
+			name: "acquire: open lock", block: hangOn("OpenDir", 1),
 			op: acquireOp,
 		},
 		{
-			name: "acquire: write since", block: hangOn("WriteAtomic", 2),
+			name: "acquire: write holder", block: hangOn("Dir.WriteAtomic", 1),
 			op: acquireOp,
 		},
 		{
-			name: "renew: read holder", block: hangOn("ReadFile", 1),
+			name: "acquire: write since", block: hangOn("Dir.WriteAtomic", 2),
+			op: acquireOp,
+		},
+		{
+			name: "renew: read holder", block: hangOn("Dir.ReadFile", 1),
 			setup: ownedBy("me"), op: renewOp,
 		},
 		{
-			name: "renew: write since", block: hangOn("WriteAtomic", 1),
+			name: "renew: write since", block: hangOn("Dir.WriteAtomic", 1),
 			setup: ownedBy("me"), op: renewOp,
 		},
 		{
-			name: "release: read holder", block: hangOn("ReadFile", 1),
+			name: "renew: check the lock is still at its path", block: hangOn("Dir.Same", 1),
+			setup: ownedBy("me"), op: renewOp,
+		},
+		{
+			name: "release: open lock", block: hangOn("OpenDir", 1),
 			setup: ownedBy("me"), op: releaseOp,
 		},
 		{
-			name: "release: remove holder", block: hangOn("Remove", 1),
+			name: "release: read holder", block: hangOn("Dir.ReadFile", 1),
 			setup: ownedBy("me"), op: releaseOp,
 		},
 		{
-			name: "release: remove since", block: hangOn("Remove", 2),
+			name: "release: rename the lock away", block: hangOn("Rename", 1),
 			setup: ownedBy("me"), op: releaseOp,
 		},
 		{
-			name: "release: remove the directory", block: hangOn("Remove", 3),
+			name: "release: check what was moved", block: hangOn("Dir.Same", 1),
+			setup: ownedBy("me"), op: releaseOp,
+		},
+		{
+			name: "release: remove the lock", block: hangOn("RemoveAll", 1),
 			setup: ownedBy("me"), op: releaseOp,
 		},
 	}
@@ -457,7 +473,7 @@ func TestEveryCallIsBoundedByTheDeadline(t *testing.T) {
 
 // shortTimeout is the deadline of each call in the deadline tests: long enough
 // that only the call that hangs is ever late, short enough to keep the suite fast.
-const shortTimeout = 250 * time.Millisecond
+const shortTimeout = time.Second
 
 func acquireOp(ctx context.Context, f *fakeFS, dir string) error {
 	_, err := acquire(ctx, f, dir, "web", Options{Holder: "me", Stale: testStale, Timeout: shortTimeout})
@@ -482,7 +498,14 @@ func releaseOp(ctx context.Context, f *fakeFS, dir string) error {
 // acquireWith builds a Lock over f for a lock that setup made held by "me".
 func acquireWith(_ context.Context, f *fakeFS, dir string) (*Lock, error) {
 	e, err := newEnv(f, dir, "web", Options{Holder: "me", Stale: testStale, Timeout: shortTimeout})
-	return &Lock{e: e}, err
+	if err != nil {
+		return nil, err
+	}
+	h, err := f.osFS.OpenDir(e.lockDir)
+	if err != nil {
+		return nil, err
+	}
+	return &Lock{e: e, dir: &fakeDir{f: f, dirHandle: h}}, nil
 }
 
 // heldBy makes a fresh lock held by holder; staleBy one that the fake's
