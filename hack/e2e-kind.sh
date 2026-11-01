@@ -92,6 +92,11 @@ if [ "$transport" = nfs3 ]; then
   server="$(NFS_SERVER_NETWORK=kind hack/nfs-server/run.sh)"
   echo "e2e: NFS server at $server"
 fi
+# The local transport's path (the example class uses /export/data) is a
+# directory on each node that the overlay mounts into the node plugin.
+for node in $(kind get nodes --name "$cluster"); do
+  docker exec "$node" mkdir -p /export/data
+done
 kind_apply "$image" "$server"
 kind_wait
 

@@ -712,7 +712,8 @@ func TestExampleStorageClasses(t *testing.T) {
 
 // TestE2EOverlay: the overlay renders, adds the two example StorageClasses,
 // and otherwise differs from the base only in the driver image and its pull
-// policy.
+// policy, and the node plugin's mount of the host's /export for the example
+// local class.
 func TestE2EOverlay(t *testing.T) {
 	t.Parallel()
 	b, o := base(t), overlay(t)
@@ -737,7 +738,12 @@ func TestE2EOverlay(t *testing.T) {
 					if img, _ := cm["image"].(string); strings.HasPrefix(img, driverImage) {
 						delete(cm, "image")
 						delete(cm, "imagePullPolicy")
+						cm["volumeMounts"] = without(cm["volumeMounts"], localExport)
 					}
+				}
+				if ob.kind == "DaemonSet" {
+					spec := v["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+					spec["volumes"] = without(spec["volumes"], localExport)
 				}
 			}
 			out[ob.kind+"/"+ob.name] = v
@@ -756,6 +762,23 @@ func TestE2EOverlay(t *testing.T) {
 			t.Errorf("%s: image = %q", role, c.Image)
 		}
 	}
+}
+
+// localExport is the name of the volume the e2e overlay adds to the node
+// plugin for the example local class.
+const localExport = "local-export"
+
+// without returns the list of volumes or mounts minus the one named name.
+func without(list any, name string) []any {
+	var out []any
+	items, _ := list.([]any)
+	for _, it := range items {
+		if m, ok := it.(map[string]any); ok && m["name"] == name {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 func nestedSlice(m map[string]any, keys ...string) ([]any, bool, error) {
