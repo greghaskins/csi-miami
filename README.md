@@ -32,7 +32,8 @@ projects run off the shelf.
 │  ┌─ miami node (DaemonSet) ─────────────┐  │
 │  │  mounts the NAS export on the host   │  │
 │  │  directory: bind the subdirectory    │  │
-│  │  image: loop ▶ (LUKS2) ▶ ext4        │  │
+│  │  image: loop ▶ ext4                  │  │
+│  │  encryption: optional, either form   │  │
 │  └──────┬─────────────────────┬─────────┘  │
 │         │                     │            │
 │  ┌──────▼──────────┐          │            │
@@ -50,19 +51,29 @@ projects run off the shelf.
 
 The `miami node` DaemonSet runs on every node and does all the mounting. A
 small `miami controller` Deployment creates and deletes volumes on the NAS.
-Images are held by one node at a time (attach plus the `.holder` heartbeat).
 Details: [architecture brief](docs/design/2026-10-30-architecture-brief.md).
+
+## Four independent choices
+
+Each StorageClass picks one option per dimension, in any combination.
+
+| Dimension | Options |
+|---|---|
+| Location | local disk, NAS (NFSv3) |
+| Form | directory, image (ext4 on a loop device) |
+| Sharing | single node (RWO), shared (RWX) |
+| Encryption | off, on |
 
 ## Milestones
 
-| | Mode | Where the data lives | Access |
-|---|---|---|---|
-| **M1** (building) | Shared directory | a subdirectory on the NAS | many nodes |
-| **M1** (building) | Local directory | a subdirectory on the local disk | one node |
-| **M2** (next) | Image on the NAS | an ext4 `.img` on the NAS | one node at a time |
-| **M3** | Shared image | an M2 image, re-exported over NFSv4 by its holder node | many nodes |
-| **M4** | Local image | an ext4 `.img` on the local disk, moved with `miami move` | one node |
-| Later, maybe | Blob storage | content-addressed, encrypted blobs on an image volume (an S3 interface on top is out of scope) | — |
+| | Adds |
+|---|---|
+| **M1** (building) | directories, on local disk and on the NAS, shared |
+| **M2** (next) | images on the NAS, single node with exclusivity and fencing, encryption |
+| **M3** | shared images, re-exported over NFSv4 by the node holding them |
+| **M4** | images on local disk, moved between nodes with `miami move` |
+| Not yet planned | encrypted directories |
+| Later, maybe | blob storage on a directory, content-addressed and encrypted (an S3 interface on top is out of scope) |
 
 ## Installation
 
