@@ -96,6 +96,32 @@ func TestE2ENFS3(t *testing.T) {
 		t.Fatalf("read through the second transport: %q, %v; want %q", got, err, payload)
 	}
 
+	// The fact the directory item's publishes rest on: the NFS client reports
+	// "/" as the root of a bind of a subdirectory and carries the directory in
+	// the mount source instead, so IsBindOf must still tell the right directory
+	// from another one. Printed first, then asserted.
+	sub, other := filepath.Join(a.Dir(), "sub"), filepath.Join(a.Dir(), "other")
+	mkdir(t, sub, other)
+	bound := filepath.Join(base, "bound")
+	mkdir(t, bound)
+	if err := unix.Mount(sub, bound, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("binding a subdirectory of the transport: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(bound, unix.MNT_DETACH) })
+	for _, line := range mountinfoLines(t, bound) {
+		t.Logf("mountinfo of a bind of a subdirectory: %s", line)
+	}
+	tbl := currentTable(t)
+	if ok, err := tbl.IsBindOf(bound, sub); err != nil || !ok {
+		t.Errorf("IsBindOf(bound, transport/sub) = %v, %v; want true", ok, err)
+	}
+	if ok, err := tbl.IsBindOf(bound, other); err != nil || ok {
+		t.Errorf("IsBindOf(bound, transport/other) = %v, %v; want false", ok, err)
+	}
+	if err := unix.Unmount(bound, 0); err != nil {
+		t.Fatalf("unmounting the bind: %v", err)
+	}
+
 	// The restart: new Transports over a new Mounter share nothing with the
 	// old ones but the kernel's table.
 	for _, root := range []string{rootA, rootB} {
