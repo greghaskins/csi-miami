@@ -18,7 +18,7 @@
 #   image       the driver image reference (name:tag or name@digest); it
 #               replaces the `images:` entry below.
 #   nfs server  the IPv4 address of the NFS server container; it replaces
-#               transport.server of StorageClass miami-dir-remote-rwx (the RFC 5737
+#               transport.server of StorageClass miami-remote-dir-rwx (the RFC 5737
 #               placeholder below when not given).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

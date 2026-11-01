@@ -1,10 +1,10 @@
-# Named miami-TYPE-LOCATION-SHARING[-CRYPT]: dir is a directory item, remote is
+# Named miami-LOCATION-TYPE-SHARING[-CRYPT]: dir is a directory item, remote is
 # a network server (NFSv3 today), rwx is many nodes. The crypt suffix is for M2.
 # The server is an IPv4 address or a host name that resolves to one.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: miami-dir-remote-rwx
+  name: miami-remote-dir-rwx
 provisioner: miami.csi.greghaskins.com
 volumeBindingMode: Immediate
 reclaimPolicy: Delete

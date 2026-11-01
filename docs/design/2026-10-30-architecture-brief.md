@@ -1216,12 +1216,12 @@ Recorded:
       the control plane. A cluster that wants the driver on control planes
       removes the affinity with a JSON patch in its overlay (the snippet is in
       the base kustomization).
-    - StorageClass names follow `miami-<type>-<location>-<sharing>[-<crypt>]`:
+    - StorageClass names follow `miami-<location>-<type>-<sharing>[-<crypt>]`:
       type `dir` (a directory item; `img` for image items later), location
       `local` (the node's disk) or `remote` (a network server, NFSv3 today),
       sharing `rwo` (one node) or `rwx` (many nodes), and an optional crypt
       suffix when encrypted, whose token is defined with M2's encryption. The
-      example classes are `miami-dir-remote-rwx` and `miami-dir-local-rwo`.
+      example classes are `miami-remote-dir-rwx` and `miami-local-dir-rwo`.
       Names carry no meaning to the driver: parameters, code and the volume
       context are unchanged.
 
