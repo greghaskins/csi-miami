@@ -49,6 +49,8 @@ resources:
   - role-controller.yaml
   - rolebinding-controller.yaml
   - clusterrolebinding-node.yaml
+  - role-node.yaml
+  - rolebinding-node.yaml
   - deployment-controller.yaml
   - daemonset-node.yaml
 configMapGenerator:

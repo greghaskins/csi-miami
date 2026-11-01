@@ -1,0 +1,13 @@
+# The node binary's event recorder (internal/kube/events.go) writes events to
+# the `default` namespace only, the place for the events of a cluster-scoped
+# PersistentVolume, so it creates, reads and patches (to bump the count of a
+# repeat) events there and nowhere else. deploy/policy_test.go holds this list.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: miami-node
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [get, create, patch]
