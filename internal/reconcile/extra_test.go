@@ -247,3 +247,40 @@ func TestTwoTransportsSharingAMountPointAreAConflict(t *testing.T) {
 		}
 	}
 }
+
+// A publish bind made by an earlier build lacks nosuid and nodev. The pass
+// does not adopt it as it is: Bind is called, and its remount step adds them,
+// keeping the read-only state.
+func TestAnExistingPublishWithoutNosuidAndNodevIsRepaired(t *testing.T) {
+	t.Parallel()
+	for _, ro := range []bool{false, true} {
+		e := newEnv(t)
+		e.start()
+		in := e.vol("a", pvc1)
+		target := e.stageAndPublish(in, "pod1", ro)
+		e.stop()
+
+		tbl := e.sim.table()
+		for i := range tbl {
+			if tbl[i].MountPoint == target {
+				tbl[i].Options = []string{map[bool]string{false: "rw", true: "ro"}[ro], "relatime"}
+			}
+		}
+		e.sim.set(tbl)
+		before := len(e.sim.mutating())
+
+		e.pass()
+
+		top, ok := e.visible(target)
+		if !ok || !top.NoSuidNoDev() || top.ReadOnly() != ro {
+			t.Errorf("ro=%t: publish after the pass = %v, %+v; want nosuid, nodev and the same read-only state", ro, ok, top.Options)
+		}
+		if n := len(e.sim.mutating()) - before; n != 1 {
+			t.Errorf("ro=%t: %d calls that change mounts, want the one Bind", ro, n)
+		}
+		e.pass()
+		if n := len(e.sim.mutating()) - before; n != 1 {
+			t.Errorf("ro=%t: a second pass changed mounts again", ro)
+		}
+	}
+}

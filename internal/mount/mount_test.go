@@ -896,8 +896,8 @@ func TestUnmount(t *testing.T) {
 		// Judged as 70; by the time of the unmount another mount covers it.
 		k.add(observe.Mount{ID: 71, ParentID: 70, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "other"})
 		err := m.Unmount(bg(), "/mnt/s", 0, 70)
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("got %v, want ErrConflict", err)
+		if !errors.Is(err, ErrChanged) {
+			t.Fatalf("got %v, want ErrChanged", err)
 		}
 		for _, c := range k.callsCopy() {
 			if c.op == "unmount" {

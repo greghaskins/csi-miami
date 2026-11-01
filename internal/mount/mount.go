@@ -40,6 +40,12 @@ var (
 	// first and leak it, so the caller decides what to do.
 	ErrConflict = errors.New("mount: target is already mounted from something else")
 
+	// ErrChanged is returned by Unmount when the mount visible at the target
+	// is not the one the caller judged: it was replaced or covered between the
+	// judgement and the call. It is a race, not a lasting conflict, and wraps
+	// nothing conflict-like: the caller looks again.
+	ErrChanged = errors.New("mount: the mount at the path changed since it was judged")
+
 	// ErrNotMounted is returned by RemountReadOnly when nothing is mounted at
 	// the target.
 	ErrNotMounted = errors.New("mount: target is not a mount point")
@@ -139,7 +145,7 @@ type Mounter interface {
 	// id is the mount ID of the mount the caller judged, read from the table
 	// it judged it in. The call reads the table again, and when the mount
 	// visible at target is not id (it was replaced or covered between the
-	// judgement and now) it unmounts nothing and returns ErrConflict. AnyID
+	// judgement and now) it unmounts nothing and returns ErrChanged. AnyID
 	// skips the comparison, for callers that made no judgement.
 	Unmount(ctx context.Context, target string, flags int, id int) error
 
@@ -182,11 +188,11 @@ func CheckUnmount(target string, flags int) error {
 }
 
 // CheckUnmountID is the comparison Unmount makes: nil when id is AnyID or
-// names top, ErrConflict when the visible mount is another. The fake calls it
+// names top, ErrChanged when the visible mount is another. The fake calls it
 // too.
 func CheckUnmountID(top observe.Mount, id int) error {
 	if id != AnyID && top.ID != id {
-		return fmt.Errorf("unmount %s: the mount there is %d, not the %d that was judged: %w", top.MountPoint, top.ID, id, ErrConflict)
+		return fmt.Errorf("unmount %s: the mount there is %d, not the %d that was judged: %w", top.MountPoint, top.ID, id, ErrChanged)
 	}
 	return nil
 }

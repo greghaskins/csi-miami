@@ -612,7 +612,9 @@ func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) 
 			return fmt.Errorf("volume %s: %w: %s is mounted as %s from %q, which is not a bind of the volume's source %s",
 				in.VolumeID, ErrPublishConflict, target, top.FSType, top.Source, source)
 		}
-		if top.ReadOnly() == pub.ReadOnly {
+		// A bind without nosuid and nodev (made by an earlier build) falls
+		// through to Bind, whose remount step adds them and keeps the rest.
+		if top.ReadOnly() == pub.ReadOnly && top.NoSuidNoDev() {
 			return nil
 		}
 	} else {

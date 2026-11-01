@@ -1125,13 +1125,14 @@ Recorded:
       `index_digest`) rather than by tag; signing is planned for the release
       pipeline.
 
-34. **The mount lifecycle's remaining review findings (M1, T20)**: six
-    fixes and five accepted limits, each the smallest change that closes the
+34. **The mount lifecycle's remaining review findings (M1, T20)**: seven
+    fixes and six accepted limits, each the smallest change that closes the
     finding, and no new mechanism.
 
     *Fixed.* (M-4) `Mounter.Unmount` takes the mount ID the caller judged and
-    refuses with `ErrConflict`, unmounting nothing, when the mount visible at
-    the path in its own, fresh read of the table is another one: the judgement
+    refuses with `mount.ErrChanged`, unmounting nothing, when the mount visible
+    at the path in its own, fresh read of the table is another one (a race the
+    next pass looks at again, so it is `Unavailable` to CSI, not a conflict): the judgement
     and the unmount used to be made on two tables. `item.UnmountIf`, the
     stray and idle-transport garbage rules and the transport's own `Unmount`
     pass the ID of the mount they judged; `mount.AnyID` (0, never a real ID)
@@ -1141,11 +1142,15 @@ Recorded:
     a pod that writes a shared volume cannot plant a setuid or device file
     for the others. `Mounter.Bind` sets both on its remount step beside the
     read-only handling, which covers the publish bind and the local
-    transport's bind, and a retry repairs a bind that lacks them. *Upgrade*:
-    as with decision 30, a transport mounted by the previous profile lacks
+    transport's bind. The reconciler does not adopt an existing publish bind
+    that lacks them: it calls `Bind`, whose remount step adds them and keeps
+    the read-only state and `noatime`, so a bind of an older build is repaired
+    on the next pass. *Upgrade*: as with decision 30, a transport mounted by the previous profile lacks
     them, is not adopted, and is reported as `ErrTransportConflict` for every
     volume on it until it is unmounted, by draining the node or by hand; the
-    driver does not remount it. (M-7) `NodePublishVolume` publishes read-only
+    driver does not remount it. A `local` transport is adopted without a
+    remount, but the publish binds made from it are repaired on the next
+    pass, and those are what a pod sees. (M-7) `NodePublishVolume` publishes read-only
     when the request says so or the record's access mode is
     `SINGLE_NODE_READER_ONLY` or `MULTI_NODE_READER_ONLY`. (M-8) The
     reconciler applies the request-time rules to every record it loads (the
@@ -1173,7 +1178,9 @@ Recorded:
     second transport at the same mount point, as the controller already
     refuses the pair.
 
-    *Accepted, and why.* (M-1) Garbage rules (a) and (c) unmount strays below
+    *Accepted, and why.* (M-7 upgrade) A reader-only volume already published
+    read-write before the upgrade stays read-write until it is republished:
+    the access-mode rule applies when a NodePublish arrives. (M-1) Garbage rules (a) and (c) unmount strays below
     the stage root and idle transports without a proof of ownership. That is
     acceptable while no M1 item mounts at a stage path and nothing else
     belongs there; revisit it when image items do (M2). (M-2) A foreign

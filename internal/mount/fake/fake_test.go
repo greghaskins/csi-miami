@@ -409,7 +409,7 @@ func TestUnmountHonoursTheExpectedMountID(t *testing.T) {
 	f := &Mounter{}
 	f.SetTable(observe.Table{{ID: 7, MountPoint: "/mnt/a", Root: "/", FSType: "tmpfs", Source: "t"}})
 	ctx := context.Background()
-	if err := f.Unmount(ctx, "/mnt/a", 0, 8); !errors.Is(err, mount.ErrConflict) {
+	if err := f.Unmount(ctx, "/mnt/a", 0, 8); !errors.Is(err, mount.ErrChanged) {
 		t.Errorf("a different ID: got %v, want ErrConflict", err)
 	}
 	if err := f.Unmount(ctx, "/mnt/a", 0, 7); err != nil {

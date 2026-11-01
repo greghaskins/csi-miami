@@ -535,8 +535,9 @@ func (r *Reconciler) checkRecord(in intent.Intent) error {
 // another volume's record claims as its publish target (ErrPublishConflict,
 // naming the claimant): two volumes cannot be bound at one path, and an
 // unpublish for one must not unmount the other's. A store that cannot be read
-// is ErrIntentsUnknown. Records that fail to load cannot be consulted; their
-// stage paths are below the staging root, which checkTargetPath refuses.
+// is ErrIntentsUnknown. Records that fail to load, or that break the request rules (load), cannot be consulted
+// and are left out: a new publish can claim a target that such a record names,
+// and that becomes a conflict only once the record is repaired.
 func (r *Reconciler) checkTargetScope(volumeID, target string) error {
 	loaded, err := r.load()
 	if err != nil {

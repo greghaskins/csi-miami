@@ -453,8 +453,8 @@ func TestAStrayReplacedBetweenJudgementAndUnmountIsNotUnmountedByTheOldJudgement
 
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if !errors.Is(cm.first, mount.ErrConflict) {
-		t.Errorf("the first unmount answered %v, want mount.ErrConflict", cm.first)
+	if !errors.Is(cm.first, mount.ErrChanged) {
+		t.Errorf("the first unmount answered %v, want mount.ErrChanged", cm.first)
 	}
 }
 

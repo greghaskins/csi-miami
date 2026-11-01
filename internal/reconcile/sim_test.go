@@ -91,9 +91,9 @@ func (s *sim) removeLocked(path string) bool {
 
 func rwOptions(ro bool) []string {
 	if ro {
-		return []string{"ro", "relatime"}
+		return []string{"ro", "nosuid", "nodev", "relatime"}
 	}
-	return []string{"rw", "relatime"}
+	return []string{"rw", "nosuid", "nodev", "relatime"}
 }
 
 func (s *sim) setReadOnly(id int, ro bool) {

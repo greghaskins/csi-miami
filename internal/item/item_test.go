@@ -146,8 +146,8 @@ func TestUnmountIfRefusesAMountReplacedSinceTheJudgement(t *testing.T) {
 	p := &swapper{popper: newPopper(rootMount(), bindOf(2, source)),
 		after: observe.Table{rootMount(), bindOf(2, source), {ID: 3, ParentID: 2, Major: 0, Minor: 41, Root: "/", MountPoint: mountPoint, FSType: "tmpfs", Source: "t"}}}
 	err := UnmountBind(context.Background(), p, mountPoint, source, errConflict)
-	if !errors.Is(err, mount.ErrConflict) {
-		t.Fatalf("err = %v, want mount.ErrConflict", err)
+	if !errors.Is(err, mount.ErrChanged) {
+		t.Fatalf("err = %v, want mount.ErrChanged", err)
 	}
 	if got := len(p.table); got != 3 {
 		t.Errorf("%d mounts left, want all 3", got)
