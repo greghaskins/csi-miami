@@ -292,19 +292,26 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 	}
 	defer unlock()
 
-	in.Publishes = nil
-	prev, ok, err := r.store.Get(in.VolumeID)
+	// One read-modify-write in the store: the loop updates the record too
+	// (it clears EnsureItem, it prunes publishes), and a Get followed by a Save
+	// could write back what the loop had just changed.
+	err = r.store.Update(in.VolumeID, func(rec *intent.Intent) error {
+		merged := in
+		merged.Publishes = nil
+		if rec.VolumeID != "" {
+			merged.Publishes = rec.Publishes
+			// The record is the truth about whether the item has converged: a
+			// caller that read it earlier must not give the permission back
+			// after the loop took it.
+			merged.EnsureItem = rec.EnsureItem
+		}
+		*rec = merged
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, in.VolumeID, err)
-	}
-	if ok {
-		in.Publishes = prev.Publishes
-		// Under the volume's lock the record is the truth about whether the
-		// item has converged: a caller that read it earlier must not give the
-		// permission back after the loop took it.
-		in.EnsureItem = prev.EnsureItem
-	}
-	if err := r.store.Save(in); err != nil {
+		if _, _, gerr := r.store.Get(in.VolumeID); gerr != nil {
+			return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, in.VolumeID, gerr)
+		}
 		return fmt.Errorf("recording the intent of %s: %w", in.VolumeID, err)
 	}
 	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID})

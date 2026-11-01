@@ -289,16 +289,17 @@ func (p *pass) clearEnsureItem(volumeID string) {
 var errNoChange = errors.New("no change")
 
 // prune removes a publish from the volume's record because its target's
-// parent directory is gone. The check is repeated inside the store's
-// read-modify-write: a Publish for the same target that made the directory
-// again and recorded it after this pass loaded the record is kept.
+// parent directory is gone. The directory is looked at before the store's
+// lock is taken, since a stat can hang on a dead mount and the lock is held
+// by every request; only the cheap condition (the record still has the
+// publish) is checked again inside the read-modify-write.
 func (p *pass) prune(in intent.Intent, target string) {
 	r := p.r
+	if _, err := os.Stat(filepath.Dir(target)); !errors.Is(err, fs.ErrNotExist) {
+		return
+	}
 	err := r.store.Update(in.VolumeID, func(rec *intent.Intent) error {
 		if !hasPublish(*rec, target) {
-			return errNoChange
-		}
-		if _, err := os.Stat(filepath.Dir(target)); !errors.Is(err, fs.ErrNotExist) {
 			return errNoChange
 		}
 		kept := rec.Publishes[:0]

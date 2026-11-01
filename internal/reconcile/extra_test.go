@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -155,5 +156,64 @@ func TestStageKeepsTheRecordsEnsureItem(t *testing.T) {
 	mustNil(t, "second Stage", e.r.Stage(bg, in)) // a caller with a stale read
 	if got, _ = e.intentOf(in.VolumeID); got.EnsureItem {
 		t.Error("a Stage gave the permission back")
+	}
+}
+
+// A retried Stage racing the loop's clearing of EnsureItem cannot give the
+// permission back: its merge with the record is one read-modify-write in the
+// store. A watcher sees the flag go false once and never true again.
+func TestARetriedStageRacingTheClearOfEnsureItemDoesNotRestoreIt(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", pvc1)
+	in.EnsureItem = true
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	restored := make(chan string, 1)
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		cleared := false
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			got, ok := e.intentOf(in.VolumeID)
+			switch {
+			case !ok:
+			case !got.EnsureItem:
+				cleared = true
+			case cleared:
+				select {
+				case restored <- "EnsureItem went true after it was cleared":
+				default:
+				}
+				return
+			}
+		}
+	}()
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 15 {
+				if err := e.r.Stage(bg, in); err != nil {
+					t.Errorf("Stage: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-watched
+	select {
+	case msg := <-restored:
+		t.Error(msg)
+	default:
 	}
 }
