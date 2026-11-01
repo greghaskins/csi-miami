@@ -430,7 +430,7 @@ func (c *coveringMounter) Unmount(ctx context.Context, target string, fl int, id
 	c.once = true
 	c.mu.Unlock()
 	if cover {
-		c.sim.addMount(target, "tmpfs", "cover")
+		c.addMount(target, "tmpfs", "cover")
 	}
 	err := c.sim.Unmount(ctx, target, fl, id)
 	if cover {

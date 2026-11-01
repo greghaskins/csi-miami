@@ -267,7 +267,7 @@ func TestTheLogLineForAnUnreadableRecordWarnsAboutRemovingIt(t *testing.T) {
 func TestARecordBreakingTheRequestRulesIsTreatedAsUnreadable(t *testing.T) {
 	t.Parallel()
 	tests := map[string]func(e *env, in *intent.Intent){
-		"a stage path outside the stage root": func(e *env, in *intent.Intent) {
+		"a stage path outside the stage root": func(_ *env, in *intent.Intent) {
 			in.StagePath = "/elsewhere/stage"
 		},
 		"the stage root itself": func(e *env, in *intent.Intent) {

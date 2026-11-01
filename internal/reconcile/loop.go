@@ -47,7 +47,7 @@ type trResult struct {
 	// whose IDs collide share a mount point; the second to ask is refused.
 	canonical string
 	err       error
-	mounted bool
+	mounted   bool
 }
 
 // runPass runs one pass over every intent and then collects garbage, and
