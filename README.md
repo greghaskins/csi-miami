@@ -1,8 +1,8 @@
 # csi-miami
 
 **MIAMI**: **M**ounting **I**tems **A**cross **M**y **I**nfrastructure. A
-Kubernetes CSI driver for my own clusters: real ext4 volumes on a NAS that
-only speaks NFSv3, plus plain shared and node-local directories.
+Kubernetes CSI driver for my own personal needs, on a bare-metal cluster with
+a NAS, attached storage, and self-hosted workloads.
 
 > **TECH:** Pod's stuck. The events keep piling up.
 >
@@ -30,10 +30,10 @@ local image · one node · M4
 ```
 
 Images can add LUKS2 and are held by one node at a time (attach plus a
-heartbeat file on the NAS). Scratch is any of these with a path outside the
-backup set. Details: [architecture brief](docs/design/2026-10-30-architecture-brief.md).
+heartbeat file on the NAS). Details:
+[architecture brief](docs/design/2026-10-30-architecture-brief.md).
 
-## Try it
+## Installation
 
 ```sh
 kubectl apply -k deploy/kustomize/base
@@ -50,3 +50,8 @@ to run. CI reads a secret of the same name.
 
 `make check` runs CI's `static` and `unit` jobs, `make build` builds
 `bin/miami`, and `make image` builds the image for the host architecture.
+
+## Contributing
+
+This is my own personal pet project. Others are welcome to use the code
+under the [GPLv3](LICENSE) and modify it to their hearts' content.

@@ -4,9 +4,9 @@
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
-MIAMI = Mounting Items Atop My Infrastructure. csi-miami is a Kubernetes
+MIAMI = Mounting Items Across My Infrastructure. csi-miami is a Kubernetes
 CSI driver that mounts *items* (an ext4 image file, a node-local image, a
-plain shared directory) *atop* *transports* (NFSv3 first; local paths;
+plain shared directory) on *transports* (NFSv3 first; local paths;
 later SMB or anything that yields a directory on a node). Its reason to exist is
 the same as every file-backed block driver's: shared storage that only
 speaks NFSv3 loses POSIX mode bits and locking semantics, and workloads
