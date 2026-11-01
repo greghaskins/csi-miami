@@ -9,8 +9,9 @@
 # the kind nodes and never pulled by them.
 #
 # It passes when: the controller Deployment is available; the node DaemonSet's
-# desired count equals its ready count, which is the number of nodes (it
-# tolerates every taint); every node's CSINode lists the driver; and each pod's
+# desired count equals its ready count, which is the number of workers (the
+# affinity of decision 35 keeps the plugin off the control plane); every
+# worker's CSINode lists the driver; and each pod's
 # /healthz and /metrics, fetched through the API server's pod proxy, answer
 # with miami_ metrics present. Nothing here waits for a fixed time: waits are
 # `kubectl wait`, or a loop with a deadline and a one-second interval for the

@@ -40,6 +40,13 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       priorityClassName: system-node-critical
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+                  - {key: node-role.kubernetes.io/master, operator: DoesNotExist}
       tolerations:
         - operator: Exists
       containers:

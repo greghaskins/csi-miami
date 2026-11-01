@@ -50,7 +50,7 @@ projects run off the shelf.
                      └─────────────────────┘
 ```
 
-The `miami node` DaemonSet runs on every node and does all the mounting. A
+The `miami node` DaemonSet runs on every worker node and does all the mounting. A
 small `miami controller` Deployment creates and deletes volumes on the NAS.
 Details: [architecture brief](docs/design/2026-10-30-architecture-brief.md).
 
@@ -114,6 +114,8 @@ replacements:
           - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path
 ```
 
+**Control planes.** The driver runs on worker nodes by default: a required node affinity on the node DaemonSet and the controller Deployment excludes nodes labelled `node-role.kubernetes.io/control-plane` or `node-role.kubernetes.io/master`. The DaemonSet tolerates every taint, so custom taints on workers do not keep it off. To run the driver on control planes, remove the affinity in your overlay with a JSON patch (the base kustomization.yaml has the snippet).
+
 **Local transport.** A `local` transport requires its host directory mounted into the node container. Add a volumeMount to the miami container with `mountPropagation: HostToContainer` and a hostPath volume to the pod spec.
 
 **Host watchdogs.** Host NFS watchdogs or scanners must exclude the driver's transports and stage roots. In `<kubelet-dir>/plugins/miami.csi.greghaskins.com/` exclude `transports` (the mounts) and `intents` (the intent records). Also exclude `<kubelet-dir>/plugins/kubernetes.io/csi/miami.csi.greghaskins.com` (the stage root). In the controller's `/var/lib/miami` (an emptyDir mount inside the container) exclude `transports`.
@@ -125,7 +127,7 @@ kubectl apply -k deploy/kustomize/base
 kubectl apply -k deploy/kustomize/examples
 ```
 
-Edit `deploy/kustomize/examples/miami-nfs3.yaml` and `miami-local.yaml` first: set `transport.server` and `transport.export` for nfs3, and `transport.path` for local.
+Edit `deploy/kustomize/examples/miami-dir-remote-rwx.yaml` and `miami-dir-local-rwo.yaml` first: set `transport.server` and `transport.export` for nfs3, and `transport.path` for local.
 
 ## StorageClass parameters
 

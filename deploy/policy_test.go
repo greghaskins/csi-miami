@@ -390,6 +390,26 @@ type mount struct {
 	propagation corev1.MountPropagationMode
 }
 
+// checkNoControlPlaneAffinity asserts the required node affinity of decision
+// 35: one term whose expressions exclude the control-plane and master roles.
+func checkNoControlPlaneAffinity(t *testing.T, a *corev1.Affinity) {
+	t.Helper()
+	if a == nil || a.NodeAffinity == nil || a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		t.Errorf("affinity = %v, want a required node affinity", a)
+		return
+	}
+	want := []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{
+		{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.NodeSelectorOpDoesNotExist},
+		{Key: "node-role.kubernetes.io/master", Operator: corev1.NodeSelectorOpDoesNotExist},
+	}}}
+	if got := a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms; !reflect.DeepEqual(got, want) {
+		t.Errorf("node selector terms = %v, want %v", got, want)
+	}
+	if len(a.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) != 0 || a.PodAffinity != nil || a.PodAntiAffinity != nil {
+		t.Errorf("affinity = %v, want only the required node affinity", a)
+	}
+}
+
 func TestNodeDaemonSet(t *testing.T) {
 	t.Parallel()
 	ds := node(t, base(t))
@@ -416,6 +436,7 @@ func TestNodeDaemonSet(t *testing.T) {
 	if !reflect.DeepEqual(spec.Tolerations, []corev1.Toleration{{Operator: corev1.TolerationOpExists}}) {
 		t.Errorf("tolerations = %v, want to tolerate everything", spec.Tolerations)
 	}
+	checkNoControlPlaneAffinity(t, spec.Affinity)
 
 	// Privileged on the miami container only; read-only root everywhere.
 	for _, c := range spec.Containers {
@@ -753,6 +774,7 @@ func TestControllerDeployment(t *testing.T) {
 	t.Parallel()
 	d := controller(t, base(t))
 	spec := d.Spec.Template.Spec
+	checkNoControlPlaneAffinity(t, spec.Affinity)
 
 	if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 {
 		t.Errorf("replicas = %v, want 1", d.Spec.Replicas)
@@ -769,8 +791,8 @@ func TestControllerDeployment(t *testing.T) {
 	if spec.ServiceAccountName != "miami-controller" || spec.AutomountServiceAccountToken == nil || !*spec.AutomountServiceAccountToken {
 		t.Errorf("service account %q automount %v", spec.ServiceAccountName, spec.AutomountServiceAccountToken)
 	}
-	if len(spec.NodeSelector) != 0 || spec.Affinity != nil {
-		t.Error("the controller has no node selection in M1")
+	if len(spec.NodeSelector) != 0 {
+		t.Error("the controller has no node selector")
 	}
 
 	var names []string
