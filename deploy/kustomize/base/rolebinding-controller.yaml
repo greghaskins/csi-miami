@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: miami-controller
+  namespace: miami-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: miami-controller
+subjects:
+  - kind: ServiceAccount
+    name: miami-controller
+    namespace: miami-system
