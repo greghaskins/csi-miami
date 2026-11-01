@@ -7,10 +7,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/mount"
@@ -49,6 +52,11 @@ var (
 	// ErrLost is returned by Renew and Release when the lock is not held by
 	// this holder: it was released, or it went stale and was broken.
 	ErrLost = errors.New("the lock is not held by this holder")
+	// ErrNotALock is returned by Acquire when the entry at the lock's path is
+	// not a lock directory, or the directory holds something the protocol
+	// never writes. The entry is reported and left alone: a person has to look
+	// at it. The error names what was found.
+	ErrNotALock = errors.New("the lock path holds something that is not a lock")
 )
 
 // Error is a failure of one operation on one lock. It carries the operation
@@ -94,7 +102,15 @@ type Lock struct {
 	dir  dirHandle // the lock directory, pinned when it was made
 	mu   sync.Mutex
 	done bool // released, or found lost; dir is closed
+	// broke is why a stale lock was broken to take this one; empty if the
+	// lock was free.
+	broke string
 }
+
+// Broke is the reason the stale lock that was in the way was broken to take
+// this one, such as "the stamp is 6m0s old" or "the stamp is 1h0m0s ahead of
+// the server's clock"; empty if the lock was free.
+func (l *Lock) Broke() string { return l.broke }
 
 // Name is the lock's name.
 func (l *Lock) Name() string { return l.e.name }
@@ -222,14 +238,16 @@ func acquire(ctx context.Context, fsys fsys, dir, name string, opts Options) (*L
 	if err != nil {
 		return nil, e.fail("acquire", err)
 	}
+	broke := ""
 	if !created {
-		retry, err := e.breakIfStale(ctx)
+		retry, reason, err := e.breakIfStale(ctx)
 		if err != nil {
 			return nil, e.fail("acquire", err)
 		}
 		if !retry {
 			return nil, e.fail("acquire", ErrContended)
 		}
+		broke = reason
 		// One more attempt, whether we broke it, lost the break to another
 		// acquirer or found the lock gone; whoever got there first keeps it.
 		if created, err = e.mkdir(ctx); err != nil {
@@ -253,12 +271,14 @@ func acquire(ctx context.Context, fsys fsys, dir, name string, opts Options) (*L
 		e.closeDir(h)
 		return nil, e.fail("acquire", err)
 	}
-	return &Lock{e: e, dir: h}, nil
+	return &Lock{e: e, dir: h, broke: broke}, nil
 }
 
 // mkdir reports whether it made the lock directory; false means it exists.
-func (e *env) mkdir(ctx context.Context) (bool, error) {
-	err := e.step(ctx, "mkdir", func() error { return e.fs.Mkdir(e.lockDir) })
+func (e *env) mkdir(ctx context.Context) (bool, error) { return e.mkdirAt(ctx, e.lockDir) }
+
+func (e *env) mkdirAt(ctx context.Context, path string) (bool, error) {
+	err := e.step(ctx, "mkdir", func() error { return e.fs.Mkdir(path) })
 	switch {
 	case err == nil:
 		return true, nil
@@ -297,11 +317,94 @@ func (a observation) same(b observation) bool {
 	return a.holder == b.holder && a.hasSince == b.hasSince && (!a.hasSince || a.stamp.Equal(b.stamp))
 }
 
-// isStale is the comparison: the stamp is older than the server's now by
-// more than after. Both times are the server's; a stamp newer than now
-// (attribute skew) is not stale.
+// maxSkew is how far ahead of the server's now a stamp may be before it is
+// taken for corrupt. A renewal that lands between the probe and the
+// observation is ahead by a round trip; the server's clock stepped backwards,
+// or a stamp set into the future (utimensat), is ahead by the step or the
+// lie. Such a stamp would keep the lock unbreakable for that long, so beyond
+// maxSkew it is stale, and a live holder's next renewal restamps it with the
+// server's clock.
+const maxSkew = 30 * time.Second
+
+// staleness is the comparison, on the server's times only: the stamp is older
+// than now by more than after, or ahead of it by more than maxSkew. reason
+// says which.
+func staleness(now, stamp time.Time, after time.Duration) (stale bool, reason string) {
+	if ahead := stamp.Sub(now); ahead > maxSkew {
+		return true, fmt.Sprintf("the stamp is %s ahead of the server's clock", ahead.Round(time.Second))
+	}
+	if age := now.Sub(stamp); age > after {
+		return true, fmt.Sprintf("the stamp is %s old", age.Round(time.Second))
+	}
+	return false, ""
+}
+
 func isStale(now, stamp time.Time, after time.Duration) bool {
-	return now.Sub(stamp) > after
+	stale, _ := staleness(now, stamp, after)
+	return stale
+}
+
+// protocolName reports whether name is a file the protocol writes inside a
+// lock directory: holder, since, or the temporary name WriteAtomic gives
+// either one while it writes it.
+func protocolName(name string) bool {
+	if name == holderFile || name == sinceFile {
+		return true
+	}
+	for _, f := range []string{holderFile, sinceFile} {
+		if rest, ok := strings.CutPrefix(name, "."+f+".tmp-"); ok && len(rest) == 16 && strings.Trim(rest, "0123456789abcdef") == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// notALock is ErrNotALock with what was found.
+func notALock(found string) error { return fmt.Errorf("%w: %s", ErrNotALock, found) }
+
+// checkShape returns ErrNotALock unless the entry at path is a lock-shaped
+// directory: a real directory (not a symbolic link) that holds regular files
+// the protocol writes and nothing else. An empty one is lock-shaped, it is a
+// holder that died before its first write. Anything else may be somebody's
+// data and is never broken. A directory that is gone answers fs.ErrNotExist.
+func (e *env) checkShape(ctx context.Context, path string) error {
+	mode, err := stepValue(ctx, e, "stat lock", func() (fs.FileMode, error) { return e.fs.Lstat(path) })
+	if err != nil {
+		return err
+	}
+	if !mode.IsDir() {
+		return notALock("it is " + describe(mode))
+	}
+	ents, err := stepValue(ctx, e, "list lock", func() ([]fs.DirEntry, error) { return e.fs.ReadDir(path) })
+	if err != nil {
+		return err
+	}
+	var odd []string
+	for _, ent := range ents {
+		if !protocolName(ent.Name()) || !ent.Type().IsRegular() {
+			odd = append(odd, strconv.Quote(ent.Name()))
+		}
+	}
+	if len(odd) > 0 {
+		if len(odd) > 5 {
+			odd = append(odd[:5], "...")
+		}
+		return notALock("the directory holds entries the protocol never writes: " + strings.Join(odd, ", "))
+	}
+	return nil
+}
+
+// describe says what kind of entry mode is.
+func describe(mode fs.FileMode) string {
+	switch {
+	case mode&fs.ModeSymlink != 0:
+		return "a symbolic link"
+	case mode.IsRegular():
+		return "a regular file"
+	case mode.IsDir():
+		return "a directory"
+	}
+	return "a special file"
 }
 
 // observe reads the holder and the stamp of the lock directory at dir.
@@ -335,54 +438,182 @@ func (e *env) observe(ctx context.Context, dir string) (obs observation, found b
 	return obs, true, nil
 }
 
+// verdict is one look at a contended lock.
+type verdict struct {
+	now    time.Time // the server's now, read before the lock was
+	seen   observation
+	found  bool // false: the lock is gone
+	stale  bool
+	reason string // why it is stale
+}
+
+// judge looks at the lock at its path: the server's now first (a renewal that
+// lands after it makes the stamp newer than now, which is not stale), then
+// whether the entry is a lock at all, then its holder and stamp. It returns
+// ErrNotALock for anything that is not lock-shaped.
+func (e *env) judge(ctx context.Context) (v verdict, err error) {
+	v.now, err = stepValue(ctx, e, "probe", func() (time.Time, error) { return e.fs.Probe(e.dir, e.name) })
+	if err != nil {
+		return v, err
+	}
+	if err = e.checkShape(ctx, e.lockDir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return v, nil
+		}
+		return v, err
+	}
+	v.seen, v.found, err = e.observe(ctx, e.lockDir)
+	if err != nil || !v.found {
+		return v, err
+	}
+	v.stale, v.reason = staleness(v.now, v.seen.stamp, e.stale)
+	return v, nil
+}
+
 // breakIfStale looks at the contended lock and breaks it if it is stale. It
-// reports whether the caller should try to make the directory again.
-func (e *env) breakIfStale(ctx context.Context) (retry bool, err error) {
-	// The server's now is read first: a renewal that lands after it makes the
-	// stamp newer than now, which is never stale.
-	now, err := stepValue(ctx, e, "probe", func() (time.Time, error) { return e.fs.Probe(e.dir, e.name) })
+// reports whether the caller should try to make the directory again, and why
+// it broke the lock if it did.
+//
+// Only lock-shaped directories are ever broken (see checkShape). Breakers are
+// serialised by a directory of their own, and each judges the lock again once
+// it holds that directory: a breaker that stalled between judging and
+// renaming, for as long as another breaker took to break the lock and take
+// it, would otherwise move that live lock, and putting it back races with the
+// next acquirer. With the serialisation it judges the live lock fresh, finds
+// it not stale and leaves it. What remains is a holder renewing in the
+// instant between the second judgement and the rename; the directory is then
+// put back (see the doc comment of the package for what that can cost).
+func (e *env) breakIfStale(ctx context.Context) (retry bool, reason string, err error) {
+	v, err := e.judge(ctx)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
-	seen, found, err := e.observe(ctx, e.lockDir)
-	if err != nil {
-		return false, err
+	if !v.found {
+		return true, "", nil
 	}
-	if !found {
-		return true, nil
+	if !v.stale {
+		return false, "", nil
 	}
-	if !isStale(now, seen.stamp, e.stale) {
-		return false, nil
+
+	unlock, ok, err := e.enterBreakers(ctx, v.now)
+	if err != nil || !ok {
+		return false, "", err // not ok: another breaker is at work, the lock is contended
+	}
+	defer unlock()
+	if v, err = e.judge(ctx); err != nil {
+		return false, "", err
+	}
+	if !v.found {
+		return true, "", nil
+	}
+	if !v.stale {
+		return false, "", nil
 	}
 
 	broken := filepath.Join(e.dir, "."+e.name+".broken-"+randomSuffix())
 	if err := e.step(ctx, "rename", func() error { return e.fs.Rename(e.lockDir, broken) }); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return true, nil // another acquirer broke it, or the holder released
+			return true, "", nil // the holder released
 		}
-		return false, err
+		return false, "", err
 	}
 
 	// Between the judgement and the rename the lock may have been renewed, or
-	// broken and taken by someone else; what we moved must be what we judged.
+	// changed in some other way; what we moved must be what we judged, and a
+	// lock.
 	moved, found, err := e.observe(ctx, broken)
-	if err == nil && (!found || !seen.same(moved)) {
+	if err == nil {
+		err = e.checkShape(ctx, broken)
+	}
+	alive := false
+	if err == nil && (!found || !v.seen.same(moved)) {
+		alive = found
 		err = errors.New("the lock changed while it was being broken")
 	}
 	if err != nil {
 		restore := e.step(context.WithoutCancel(ctx), "restore", func() error { return e.fs.Rename(broken, e.lockDir) })
 		if restore != nil {
-			return false, fmt.Errorf("%w (and putting it back failed: %w)", err, restore)
+			return false, "", fmt.Errorf("%w (and putting it back failed: %w)", err, restore)
 		}
-		if found {
-			return false, nil // it was alive after all: contended
+		if alive {
+			return false, "", nil // it was alive after all: contended
 		}
-		return false, err
+		return false, "", err
 	}
 	if err := e.step(ctx, "remove broken lock", func() error { return e.fs.RemoveAll(broken) }); err != nil {
-		return false, err
+		// A breaker running as another user than the holder can rename the
+		// directory but not empty it. The lock is broken all the same: what is
+		// left is a hidden directory nothing reads, so the attempt goes on.
+		if !errors.Is(err, unix.EACCES) && !errors.Is(err, unix.EPERM) {
+			return false, "", err
+		}
 	}
-	return true, nil
+	return true, v.reason, nil
+}
+
+// enterBreakers takes the directory that serialises breakers of this lock. ok
+// is false if another breaker holds it. A breaker that died leaves it behind:
+// one older than the stale period on the server's clock (now) is reclaimed, by
+// renaming it away so that two reclaimers cannot both remove it. It is a
+// directory the protocol makes empty; anything else under that name is left
+// alone and reported.
+func (e *env) enterBreakers(ctx context.Context, now time.Time) (unlock func(), ok bool, err error) {
+	mutex := filepath.Join(e.dir, "."+e.name+".breaking")
+	unlock = func() {
+		_ = e.step(context.WithoutCancel(ctx), "leave breakers", func() error { return e.fs.RemoveAll(mutex) })
+	}
+	created, err := e.mkdirAt(ctx, mutex)
+	if err != nil || created {
+		return unlock, created, err
+	}
+	if err = e.checkEmptyDir(ctx, mutex); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			created, err = e.mkdirAt(ctx, mutex)
+			return unlock, created, err
+		}
+		return nil, false, err
+	}
+	stamp, err := stepValue(ctx, e, "stat breakers", func() (time.Time, error) { return e.fs.ModTime(mutex) })
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			created, err = e.mkdirAt(ctx, mutex)
+			return unlock, created, err
+		}
+		return nil, false, err
+	}
+	if stale, _ := staleness(now, stamp, e.stale); !stale {
+		return nil, false, nil
+	}
+	junk := filepath.Join(e.dir, "."+e.name+".breaking-dead-"+randomSuffix())
+	if err = e.step(ctx, "rename", func() error { return e.fs.Rename(mutex, junk) }); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, false, err
+	}
+	if err == nil {
+		if err = e.step(ctx, "remove dead breakers", func() error { return e.fs.RemoveAll(junk) }); err != nil {
+			return nil, false, err
+		}
+	}
+	created, err = e.mkdirAt(ctx, mutex)
+	return unlock, created, err
+}
+
+// checkEmptyDir returns ErrNotALock unless path is an empty directory.
+func (e *env) checkEmptyDir(ctx context.Context, path string) error {
+	mode, err := stepValue(ctx, e, "stat breakers", func() (fs.FileMode, error) { return e.fs.Lstat(path) })
+	if err != nil {
+		return err
+	}
+	if !mode.IsDir() {
+		return notALock("the breakers' directory is " + describe(mode))
+	}
+	ents, err := stepValue(ctx, e, "list breakers", func() ([]fs.DirEntry, error) { return e.fs.ReadDir(path) })
+	if err != nil {
+		return err
+	}
+	if len(ents) > 0 {
+		return notALock("the breakers' directory is not empty")
+	}
+	return nil
 }
 
 // held checks that the directory we pinned still says it is ours. It reads
@@ -492,6 +723,9 @@ func releaseFS(ctx context.Context, fsys fsys, dir, name string, opts Options) e
 	h, err := stepValue(ctx, e, "open lock", func() (dirHandle, error) { return e.fs.OpenDir(e.lockDir) })
 	if errors.Is(err, fs.ErrNotExist) {
 		return e.fail("release", ErrLost)
+	}
+	if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+		return e.fail("release", notALock("the lock path is not a directory"))
 	}
 	if err != nil {
 		return e.fail("release", err)
