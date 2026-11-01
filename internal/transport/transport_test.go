@@ -28,7 +28,7 @@ import (
 // is a deliberate change to the driver.
 func TestNFS3DataIsPinned(t *testing.T) {
 	t.Parallel()
-	const want = "vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10"
+	const want = "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10"
 	if got := nfs3Data("192.0.2.10"); got != want {
 		t.Errorf("nfs3Data = %q, want %q", got, want)
 	}
@@ -205,6 +205,14 @@ func TestNFS3Mounted(t *testing.T) {
 				}
 			}
 		}, nil, false},
+		{"the previous major timeout (retrans=3)", func(m *observe.Mount) {
+			m.SuperOptions = slices.Clone(m.SuperOptions)
+			for i, o := range m.SuperOptions {
+				if o == "retrans=17" {
+					m.SuperOptions[i] = "retrans=3"
+				}
+			}
+		}, nil, false},
 		{"soft instead of softerr", func(m *observe.Mount) {
 			without("softerr")(m)
 			m.SuperOptions = append(m.SuperOptions, "soft")
@@ -291,7 +299,7 @@ func TestNFS3MountSendsTheProfile(t *testing.T) {
 		Target: tr.Dir(),
 		FSType: "nfs",
 		Flags:  unix.MS_NOATIME,
-		Data:   "vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10",
+		Data:   "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10",
 	}
 	if got := kernelCalls(f); len(got) != 1 || got[0] != want {
 		t.Errorf("calls = %+v, want exactly %+v", got, want)
