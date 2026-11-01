@@ -23,6 +23,7 @@ const (
 	exitHeld      = 0 // acquire: held; release: released; run: the command's status
 	exitContended = 1 // acquire and run: someone else holds it; release: not held by --holder
 	exitError     = 2 // the lock could not be decided, or a usage error
+	exitNotALock  = 3 // acquire and run: the lock path holds something that is not a lock; nothing was touched
 )
 
 const lockUsage = `usage: miami lock acquire --dir <path> --name <lock> --holder <string> [flags]
@@ -31,13 +32,16 @@ const lockUsage = `usage: miami lock acquire --dir <path> --name <lock> --holder
 
 A lock is the directory <dir>/<lock>.lock on a shared export.
 
-acquire   one attempt; prints nothing; exit 0 held, 1 held by another, 2 error
-release   exit 0 released, 1 not held by --holder, 2 error
+acquire   one attempt; exit 0 held, 1 held by another, 2 error, 3 the lock path
+          holds something that is not a lock (a file, a symbolic link, a
+          directory with other contents); it is reported and left alone. Prints
+          nothing, except a line on stderr when it broke a stale lock
+release   exit 0 released, 1 not held by --holder, 2 error, 3 not a lock
 run       acquire, run the command with stdio inherited, renew while it runs,
           release when it exits; exits with the command's status (128+n if
-          killed by signal n), 1 if the lock is held by another, and 2 on an
-          error or if the lock was lost, in which case the command was
-          terminated
+          killed by signal n), 1 if the lock is held by another, 3 if the lock
+          path is not a lock, and 2 on an error or if the lock was lost, in
+          which case the command was terminated
 
 The command runs in a process group of its own, and a signal (SIGTERM,
 SIGINT, or the SIGTERM and SIGKILL of a lost lock) goes to the whole group.
@@ -49,6 +53,11 @@ reached, and the helper cannot stop what it cannot signal.
 must be less than --stale: after a failed renewal run stops the command at
 --stale minus twice --timeout, so that SIGTERM (up to --timeout) and the last
 stamp's own latency fit before another acquirer may break the lock.
+
+The default holder of run is <hostname>:<pid>. Two containers of one pod that
+are both PID 1 get the same one, and each would then treat the other's lock as
+its own: containers that share a pod pass --holder with a value that tells
+them apart.
 `
 
 // lockConfig is what the flags of `miami lock` set.
@@ -155,7 +164,10 @@ func interrupted() (context.Context, context.CancelFunc) {
 func lockAcquire(cfg lockConfig, stderr io.Writer) int {
 	ctx, stop := interrupted()
 	defer stop()
-	_, err := lock.Acquire(ctx, cfg.dir, cfg.name, cfg.options())
+	l, err := lock.Acquire(ctx, cfg.dir, cfg.name, cfg.options())
+	if err == nil {
+		reportBroke("acquire", l, stderr)
+	}
 	return lockResult("acquire", err, stderr)
 }
 
@@ -176,7 +188,17 @@ func lockResult(verb string, err error, stderr io.Writer) int {
 	if errors.Is(err, lock.ErrContended) || errors.Is(err, lock.ErrLost) {
 		return exitContended
 	}
+	if errors.Is(err, lock.ErrNotALock) {
+		return exitNotALock
+	}
 	return exitError
+}
+
+// reportBroke tells stderr why a stale lock was broken to take this one.
+func reportBroke(verb string, l *lock.Lock, stderr io.Writer) {
+	if r := l.Broke(); r != "" {
+		_, _ = fmt.Fprintf(stderr, "miami lock %s: broke a stale lock: %s\n", verb, r)
+	}
 }
 
 // renewer is the part of a lock the renewal loop uses.
@@ -206,9 +228,9 @@ func (r *realExpiry) Stop()                 { r.t.Stop() }
 
 // renewLoop renews on every tick until ctx is done. It returns nil then, and
 // an error when the lock is lost or when no renewal has succeeded for limit.
-// The limit is a timer armed at the last success (the acquisition counts), so
-// it fires at that instant whatever the phase of the ticks, and it interrupts
-// a renewal that is still in flight. It measures how long this process can go
+// The limit is a timer armed at the start of the last successful renewal (the
+// acquisition counts), so it fires at that instant whatever the phase of the
+// ticks, and it interrupts a renewal that is still in flight. It measures how long this process can go
 // without knowing that its own lock may have been broken, on the local
 // monotonic clock; it is not a staleness decision about anyone's lock. Errors
 // shorter than that are retried at the next tick.
@@ -230,6 +252,7 @@ func renewLoop(ctx context.Context, r renewer, ticks <-chan time.Time, exp expir
 			return tooLong()
 		case <-ticks:
 		}
+		began := time.Now() // the renewal's stamp is set during the call, no later than its end
 		rctx, cancel := context.WithCancel(ctx)
 		res := make(chan error, 1)
 		go func() { res <- r.Renew(rctx) }()
@@ -247,7 +270,10 @@ func renewLoop(ctx context.Context, r renewer, ticks <-chan time.Time, exp expir
 		switch {
 		case err == nil:
 			lastErr = nil
-			exp.Reset(limit)
+			// From when the write began, not from when the call returned: a
+			// slow success must not push the stop past the moment a breaker
+			// may act on the stamp it wrote.
+			exp.Reset(limit - time.Since(began))
 		case ctx.Err() != nil:
 			return nil
 		case errors.Is(err, lock.ErrLost):
@@ -298,6 +324,7 @@ func lockRun(cfg lockConfig, argv []string, stdout, stderr io.Writer) int {
 		}
 		return lockResult("run", err, stderr)
 	}
+	reportBroke("run", l, stderr)
 	if early != nil {
 		_, _ = fmt.Fprintf(stderr, "miami lock run: %v while acquiring the lock\n", early)
 		return releaseAfter(l, exitError, stderr)

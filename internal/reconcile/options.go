@@ -68,8 +68,13 @@ type Metrics interface {
 // loop goroutine, when a volume's condition changes (not on every pass).
 // volumeID is empty when the reconciler does not know the volume, as for a
 // stray mount. Implementations must not block.
+//
+// There is no message: events are readable by anyone who can view the
+// namespace they land in, so their text is fixed per reason and chosen by the
+// recorder, and the error behind a condition (which can name an NFS server, an
+// export or a host path) goes to the node's log only.
 type Events interface {
-	Event(volumeID, reason, message string)
+	Event(volumeID, reason string)
 }
 
 type noopMetrics struct{}
@@ -86,7 +91,7 @@ func (noopMetrics) SetIntentLoadFailures(int)           {}
 
 type noopEvents struct{}
 
-func (noopEvents) Event(string, string, string) {}
+func (noopEvents) Event(string, string) {}
 
 // Options configure a Reconciler. TransportsRoot and StageRoot are required;
 // everything else has a usable zero value.

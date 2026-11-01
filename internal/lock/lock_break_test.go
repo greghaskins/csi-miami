@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/greghaskins/csi-miami/internal/mount"
 )
 
@@ -39,7 +41,10 @@ func TestBreakerThatLosesTheRenameReportsContended(t *testing.T) {
 	t.Parallel()
 	dir, f := staleLock(t)
 	lockDir := filepath.Join(dir, "web"+Suffix)
-	f.rename = func(oldpath, _ string) error {
+	f.rename = func(oldpath, newpath string) error {
+		if filepath.Base(oldpath) != "web"+Suffix {
+			return os.Rename(oldpath, newpath) // the breakers' directory
+		}
 		// The other breaker wins: it moves the lock away, removes it and takes
 		// the name.
 		if err := os.RemoveAll(oldpath); err != nil {
@@ -60,8 +65,10 @@ func TestBreakerThatLosesTheRenameReportsContended(t *testing.T) {
 	if got := read(t, filepath.Join(lockDir, "holder")); got != "winner" {
 		t.Errorf("holder = %q, want the winner's", got)
 	}
-	if f.called("Mkdir") != 2 || f.called("RemoveAll") != 0 {
-		t.Errorf("Mkdir %d times (want 2), RemoveAll %d times (want 0): the loser retries once and removes nothing", f.called("Mkdir"), f.called("RemoveAll"))
+	// Mkdir: the breakers' directory, then the loser's retry and the first try;
+	// RemoveAll: only the breakers' directory.
+	if f.called("Mkdir") != 3 || f.called("RemoveAll") != 1 {
+		t.Errorf("Mkdir %d times (want 3), RemoveAll %d times (want 1): the loser retries once and removes only its breakers' directory", f.called("Mkdir"), f.called("RemoveAll"))
 	}
 }
 
@@ -70,7 +77,10 @@ func TestBreakerThatLosesTheRenameReportsContended(t *testing.T) {
 func TestBreakerThatLosesTheRenameTakesAFreeLock(t *testing.T) {
 	t.Parallel()
 	dir, f := staleLock(t)
-	f.rename = func(oldpath, _ string) error {
+	f.rename = func(oldpath, newpath string) error {
+		if filepath.Base(oldpath) != "web"+Suffix {
+			return os.Rename(oldpath, newpath) // the breakers' directory
+		}
 		if err := os.RemoveAll(oldpath); err != nil {
 			return err
 		}
@@ -144,30 +154,6 @@ func TestBreakerReportsAFailureToPutBack(t *testing.T) {
 	_, err := acquire(context.Background(), f, dir, "web", opts("breaker"))
 	if err == nil || errors.Is(err, ErrContended) || !strings.Contains(err.Error(), "putting it back failed") {
 		t.Fatalf("acquire = %v, want an error naming the failed restore", err)
-	}
-}
-
-func TestBreakRemoveFailureIsAnError(t *testing.T) {
-	t.Parallel()
-	if os.Geteuid() == 0 {
-		t.Skip("root removes anything")
-	}
-	dir, f := staleLock(t)
-	// The moved directory is made read-only, so removing its files fails.
-	f.rename = func(oldpath, newpath string) error {
-		if err := os.Rename(oldpath, newpath); err != nil {
-			return err
-		}
-		return os.Chmod(newpath, 0o500) //nolint:gosec // a directory that cannot be written
-	}
-	_, err := acquire(context.Background(), f, dir, "web", opts("breaker"))
-	// Let the temporary directory be removed.
-	ents, _ := os.ReadDir(dir)
-	for _, e := range ents {
-		_ = os.Chmod(filepath.Join(dir, e.Name()), 0o700) //nolint:gosec // let the temporary directory be removed
-	}
-	if err == nil || errors.Is(err, ErrContended) {
-		t.Fatalf("acquire = %v, want the removal error", err)
 	}
 }
 
@@ -530,3 +516,59 @@ func staleBy(holder string) func(*testing.T, string, *fakeFS) {
 }
 
 func ownedBy(holder string) func(*testing.T, string, *fakeFS) { return heldBy(holder) }
+
+// M-13: a breaker running as another user than the holder can rename the lock
+// directory but not empty it. The lock is broken all the same: the attempt
+// goes on and takes the lock, leaving the hidden directory behind.
+func TestBreakerToleratesNotBeingAbleToEmptyTheBrokenLock(t *testing.T) {
+	t.Parallel()
+	for _, errno := range []error{unix.EACCES, unix.EPERM} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			t.Parallel()
+			dir, f := staleLock(t)
+			f.remove = func(p string) error {
+				if strings.Contains(filepath.Base(p), ".broken-") {
+					return &fs.PathError{Op: "unlinkat", Path: p, Err: errno}
+				}
+				return os.RemoveAll(p)
+			}
+			l, err := acquire(context.Background(), f, dir, "web", opts("breaker"))
+			if err != nil {
+				t.Fatalf("acquire = %v, want the lock", err)
+			}
+			if l.Broke() == "" {
+				t.Error("Broke is empty, want the reason")
+			}
+			if got := read(t, filepath.Join(dir, "web"+Suffix, "holder")); got != "breaker" {
+				t.Errorf("holder = %q", got)
+			}
+			var left []string
+			for _, n := range names(t, dir) {
+				if strings.HasPrefix(n, ".web.broken-") {
+					left = append(left, n)
+				}
+			}
+			if len(left) != 1 {
+				t.Errorf("hidden broken directories = %v, want exactly one left behind", left)
+			}
+			if got := names(t, dir); slices.Contains(got, ".web.breaking") {
+				t.Errorf("the breakers' directory was left: %v", got)
+			}
+		})
+	}
+}
+
+// Any other failure to remove the broken lock still fails the attempt.
+func TestBreakerFailsOnOtherErrorsRemovingTheBrokenLock(t *testing.T) {
+	t.Parallel()
+	dir, f := staleLock(t)
+	f.remove = func(p string) error {
+		if strings.Contains(filepath.Base(p), ".broken-") {
+			return &fs.PathError{Op: "unlinkat", Path: p, Err: unix.EIO}
+		}
+		return os.RemoveAll(p)
+	}
+	if _, err := acquire(context.Background(), f, dir, "web", opts("breaker")); !errors.Is(err, unix.EIO) {
+		t.Fatalf("acquire = %v, want EIO", err)
+	}
+}

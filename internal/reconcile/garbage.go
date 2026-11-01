@@ -239,7 +239,7 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 					// names no volume (the stage directory is a hash of the ID),
 					// so it is logged and not made an event.
 					r.log.Info("unmounted a publish target no intent claims", "path", c.path, "volume", c.drop.volume)
-					r.events.Event(c.drop.volume, ReasonGarbageUnmounted, "unmounted "+c.path+", which no intent claims")
+					r.events.Event(c.drop.volume, ReasonGarbageUnmounted)
 				} else {
 					r.log.Info("unmounted a mount below the staging root that no intent claims", "path", c.path)
 				}

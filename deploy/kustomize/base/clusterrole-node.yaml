@@ -1,6 +1,8 @@
 # What the node binary's event recorder (internal/kube/events.go) does: it
-# reads the PersistentVolume an event is about, and creates, reads and patches
-# the event. The registrar and the liveness probe call no API.
+# reads the PersistentVolume an event is about. A PersistentVolume is
+# cluster-scoped, so this is the one cluster-wide grant the node holds. The
+# events it writes are namespaced (the `default` namespace) and have their own
+# Role, role-node.yaml. The registrar and the liveness probe call no API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -9,6 +11,3 @@ rules:
   - apiGroups: [""]
     resources: [persistentvolumes]
     verbs: [get]
-  - apiGroups: [""]
-    resources: [events]
-    verbs: [get, create, patch]
