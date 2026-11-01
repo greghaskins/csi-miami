@@ -267,3 +267,49 @@ func TestReconcilerFamilyOnlyOnRequest(t *testing.T) {
 		t.Error("WithReconciler did not register the family")
 	}
 }
+
+// The exported family lists are what a running driver serves: the node's
+// registry, once every family has a sample, gathers exactly NodeFamilies (and
+// the Go and process collectors), and the controller's exactly
+// ControllerFamilies, so a test that reads the lists is not reading a stale
+// copy.
+func TestFamilyListsMatchTheRegistry(t *testing.T) {
+	served := func(r *Registry) map[string]bool {
+		fams, err := r.Gatherer().Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, f := range fams {
+			if strings.HasPrefix(f.GetName(), "miami_") {
+				got[f.GetName()] = true
+			}
+		}
+		return got
+	}
+	check := func(who string, got map[string]bool, want []string) {
+		t.Helper()
+		for _, n := range want {
+			if !got[n] {
+				t.Errorf("%s does not serve %s", who, n)
+			}
+			delete(got, n)
+		}
+		for n := range got {
+			t.Errorf("%s serves %s, which its family list does not name", who, n)
+		}
+	}
+
+	node := New(WithReconciler())
+	node.SetIntents("directory", 1)
+	node.SetTransport("local", "abc", true)
+	node.ObserveReconcile(time.Millisecond)
+	node.requests.WithLabelValues("NodeStageVolume", "OK").Inc()
+	node.requestDuration.WithLabelValues("NodeStageVolume").Observe(0.001)
+	check("the node registry", served(node), NodeFamilies)
+
+	ctrl := New()
+	ctrl.requests.WithLabelValues("CreateVolume", "OK").Inc()
+	ctrl.requestDuration.WithLabelValues("CreateVolume").Observe(0.001)
+	check("the controller registry", served(ctrl), ControllerFamilies)
+}
