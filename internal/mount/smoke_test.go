@@ -656,10 +656,14 @@ func TestSmokeBindBeneathARoot(t *testing.T) {
 	pub2 := filepath.Join(base, "pub2")
 	mkdir(t, vol, outside, pub, pub2)
 
+	fdsBefore := openFds(t)
 	if err := m.Bind(ctx, root, vol, pub, false); err != nil {
 		t.Fatalf("bind %s beneath %s: %v", vol, root, err)
 	}
 	requireBind(t, pub, vol, true)
+	if after := openFds(t); after != fdsBefore {
+		t.Errorf("descriptors after a bind: %d, before %d", after, fdsBefore)
+	}
 	// Retrying the bind of an existing target is still a no-op.
 	if err := m.Bind(ctx, root, vol, pub, true); err != nil {
 		t.Fatalf("second bind: %v", err)
@@ -687,6 +691,9 @@ func TestSmokeBindBeneathARoot(t *testing.T) {
 	}
 	if _, ok := currentTable(t).At(pub2); ok {
 		t.Errorf("%s is mounted after a refused bind", pub2)
+	}
+	if after := openFds(t); after != fdsBefore {
+		t.Errorf("descriptors after the refused binds: %d, before %d", after, fdsBefore)
 	}
 }
 
@@ -719,6 +726,13 @@ func TestSmokeBindOnATransportMount(t *testing.T) {
 	requireBind(t, pub, vol, true)
 	if after := openFds(t); after != before {
 		t.Errorf("descriptors after a bind: %d, before %d", after, before)
+	}
+	// Writing through the target lands in the source directory.
+	if err := os.WriteFile(filepath.Join(pub, "probe"), []byte("through"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(vol, "probe")); err != nil || string(got) != "through" {
+		t.Errorf("read back from the source: %q, %v", got, err)
 	}
 
 	// A mount point as the source, and one on the way.

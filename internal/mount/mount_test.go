@@ -1676,6 +1676,102 @@ func TestBindClosesTheDescriptorOnEveryPath(t *testing.T) {
 			t.Errorf("%d descriptors left open", n)
 		}
 	})
+	t.Run("resolve times out, the late open arrives after the release", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		k.evalBlockAt = src
+		k.evalRelease = make(chan struct{})
+		k.evalEntered = make(chan struct{})
+		m := newMounter(k, time.Hour)
+		ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
+		defer cancel()
+		if err := m.Bind(ctx, "", src, "/mnt/dst", false); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("got %v, want ErrTimeout", err)
+		}
+		<-k.evalEntered
+		if n, c := k.openFDs(), len(k.closed); n != 0 || c != 0 {
+			t.Fatalf("while the open hangs: %d open, %d closed; want none of either", n, c)
+		}
+		close(k.evalRelease)
+		// The late goroutine opens the descriptor, finds the caller gone and
+		// closes it itself.
+		waitFor(t, func() bool { o, f, c := k.counts(); return o == 1 && f == 0 && c == 1 })
+		if len(k.closed) != 1 || k.closed[0] != k.opens[0].fd {
+			t.Errorf("closed %v, want exactly the opened descriptor %d", k.closed, k.opens[0].fd)
+		}
+		if n := k.countOps("mount"); n != 0 {
+			t.Errorf("%d mount calls, want none", n)
+		}
+	})
+	t.Run("a take after the release fails and closes nothing twice", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		h := &fdHolder{k: k}
+		fd, err := k.openDir("/", "data/src", resolveHost)
+		if err != nil || !h.put(fd) {
+			t.Fatalf("open %v, put failed", err)
+		}
+		h.release()
+		if n, c := k.openFDs(), len(k.closed); n != 0 || c != 1 {
+			t.Fatalf("after release: %d open, %d closed; want 0 and 1", n, c)
+		}
+		if _, ok := h.take(); ok {
+			t.Error("take succeeded after release")
+		}
+		h.release()
+		if fd2, err := k.openDir("/", "data/src", resolveHost); err != nil || h.put(fd2) {
+			t.Errorf("a put after release must be refused (err %v)", err)
+		}
+		if n, c := k.openFDs(), len(k.closed); n != 0 || c != 2 {
+			t.Errorf("end: %d open, closed %v; want 0 open and each descriptor closed once", n, k.closed)
+		}
+		if n := k.countOps("mount"); n != 0 {
+			t.Errorf("%d mount calls, want none", n)
+		}
+	})
+	t.Run("mount abandoned after take keeps the descriptor until it returns", func(t *testing.T) {
+		t.Parallel()
+		k := blockedKernel("mount")
+		m := newMounter(k, time.Hour)
+		ctx, cancel := context.WithTimeout(bg(), 50*time.Millisecond)
+		defer cancel()
+		if err := m.Bind(ctx, "", src, "/mnt/dst", false); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("got %v, want ErrTimeout", err)
+		}
+		<-k.entered
+		if n, c := k.openFDs(), len(k.closed); n != 1 || c != 0 {
+			t.Fatalf("while the mount hangs: %d open, %d closed; want 1 and 0", n, c)
+		}
+		close(k.release)
+		<-k.exited
+		waitFor(t, func() bool { _, f, c := k.counts(); return f == 0 && c == 1 })
+		if len(k.closed) != 1 || k.closed[0] != k.opens[0].fd {
+			t.Errorf("closed %v, want exactly the opened descriptor", k.closed)
+		}
+	})
+}
+
+// counts is the number of opens made, descriptors open and descriptors closed.
+func (s *simKernel) counts() (opens, open, closed int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.opens), len(s.fds), len(s.closed)
+}
+
+// waitFor polls cond until it holds.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("condition not reached")
+		}
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // The real openat2: a symlink anywhere on the way is refused, a plain
