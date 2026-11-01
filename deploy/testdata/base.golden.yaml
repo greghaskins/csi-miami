@@ -106,15 +106,6 @@ rules:
   - create
   - update
   - patch
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - get
-  - create
-  - update
-  - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -143,6 +134,36 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: miami-controller
+subjects:
+- kind: ServiceAccount
+  name: miami-controller
+  namespace: miami-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: miami-controller
+  namespace: miami-system
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - create
+  - update
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: miami-controller
+  namespace: miami-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: miami-controller
 subjects:
 - kind: ServiceAccount

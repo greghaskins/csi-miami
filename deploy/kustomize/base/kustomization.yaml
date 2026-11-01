@@ -46,6 +46,8 @@ resources:
   - clusterrole-controller.yaml
   - clusterrole-node.yaml
   - clusterrolebinding-controller.yaml
+  - role-controller.yaml
+  - rolebinding-controller.yaml
   - clusterrolebinding-node.yaml
   - deployment-controller.yaml
   - daemonset-node.yaml
