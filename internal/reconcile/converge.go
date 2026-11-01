@@ -367,7 +367,7 @@ func (p *pass) noteVolume(id string, res *volumeResult) {
 	}
 	r.lastErr[id] = key
 	r.log.Warn("volume did not converge", "volume", id, "error", err)
-	r.events.Event(id, reason, err.Error())
+	r.events.Event(id, reason)
 }
 
 // key names the condition of a volume by the kind of each thing that is wrong
@@ -482,7 +482,7 @@ func (p *pass) reportConditions() {
 }
 
 // problem names the event reason for what is wrong with the volume and joins
-// everything that is, for logs and events. A publish that was pruned is not
+// everything that is, for the log; only the reason reaches an event. A publish that was pruned is not
 // wrong.
 func (res *volumeResult) problem() (string, error) {
 	reason := ReasonMountFailed
