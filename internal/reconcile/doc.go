@@ -44,6 +44,19 @@
 // call has not returned fails at once wrapping mount.ErrBusy; neither stacks
 // calls, and both are retried by the next pass.
 //
+// # A transport's health is reported, not remediated
+//
+// Each pass asks every transport the intents reference whether it answers: a
+// statfs of its mount directory under the stat deadline (statfs always asks
+// the server, where a stat can come from the attribute cache), reported as the
+// up metric and logged once per change. A stat of a volume's item directory
+// that returns ESTALE (the server restarted and its file handles are gone),
+// times out or is busy is the same condition, ErrTransportUnavailable: the
+// volume's condition metric and its event say so, and nothing is unmounted,
+// remounted or rebound on account of it. The next pass looks again, and the
+// volume is ok when the server answers. What to do about a transport that
+// stays down is a person's call (or a later milestone's remediation).
+//
 // # Requests
 //
 // Stage, Unstage, Publish and Unpublish are idempotent and serialised per

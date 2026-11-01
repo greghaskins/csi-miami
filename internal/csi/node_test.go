@@ -598,7 +598,8 @@ func TestNodeGetVolumeStats(t *testing.T) {
 		}{
 			{fmt.Errorf("x: %w", mount.ErrTimeout), codes.DeadlineExceeded},
 			{mount.ErrBusy, codes.Unavailable},
-			{unix.ESTALE, codes.Internal},
+			{unix.ESTALE, codes.Unavailable}, // the server restarted: retry, never Internal
+			{unix.EIO, codes.Internal},
 		} {
 			sf := &fakeStatfs{err: tt.err}
 			resp, err := newTestNode(t, &fakeRec{record: stagedRecord()}, sf).NodeGetVolumeStats(ctx, req(podTarget))

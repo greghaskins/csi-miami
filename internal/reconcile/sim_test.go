@@ -183,6 +183,8 @@ type recMetrics struct {
 	mu             sync.Mutex
 	intents        map[string]int
 	transports     map[string]bool
+	up             map[string]bool
+	conditions     map[string]int
 	errors         map[string]int
 	timeouts       map[string]int
 	garbage        int
@@ -191,7 +193,7 @@ type recMetrics struct {
 }
 
 func newRecMetrics() *recMetrics {
-	return &recMetrics{intents: map[string]int{}, transports: map[string]bool{}, errors: map[string]int{}, timeouts: map[string]int{}}
+	return &recMetrics{intents: map[string]int{}, transports: map[string]bool{}, up: map[string]bool{}, errors: map[string]int{}, timeouts: map[string]int{}}
 }
 
 func (m *recMetrics) SetIntents(kind string, n int) {
@@ -204,6 +206,32 @@ func (m *recMetrics) SetTransport(kind, id string, mounted bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.transports[kind+"/"+id] = mounted
+}
+
+func (m *recMetrics) SetTransportUp(kind, id string, up bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.up[kind+"/"+id] = up
+}
+
+func (m *recMetrics) SetVolumeConditions(counts map[string]int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.conditions = counts
+}
+
+// upOf and conditionCount read what the latest pass reported.
+func (m *recMetrics) upOf(kind, id string) (up, reported bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	up, reported = m.up[kind+"/"+id]
+	return up, reported
+}
+
+func (m *recMetrics) conditionCount(condition string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.conditions[condition]
 }
 
 func (m *recMetrics) ObserveReconcile(time.Duration) {

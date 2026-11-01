@@ -119,12 +119,14 @@ func (n *node) tdir() string {
 // otherwise.
 type passMetrics struct{ ch chan struct{} }
 
-func (m passMetrics) SetIntents(string, int)            {}
-func (m passMetrics) SetTransport(string, string, bool) {}
-func (m passMetrics) IncReconcileError(string)          {}
-func (m passMetrics) IncObservationTimeout(string)      {}
-func (m passMetrics) IncGarbageUnmount()                {}
-func (m passMetrics) SetIntentLoadFailures(int)         {}
+func (m passMetrics) SetIntents(string, int)              {}
+func (m passMetrics) SetTransport(string, string, bool)   {}
+func (m passMetrics) SetTransportUp(string, string, bool) {}
+func (m passMetrics) SetVolumeConditions(map[string]int)  {}
+func (m passMetrics) IncReconcileError(string)            {}
+func (m passMetrics) IncObservationTimeout(string)        {}
+func (m passMetrics) IncGarbageUnmount()                  {}
+func (m passMetrics) SetIntentLoadFailures(int)           {}
 func (m passMetrics) ObserveReconcile(d time.Duration) {
 	select {
 	case m.ch <- struct{}{}:

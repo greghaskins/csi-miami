@@ -393,28 +393,92 @@ func (res *volumeResult) key() string {
 	return strings.Join(keys, ",")
 }
 
-// conditionOf classifies an error by the sentinel it wraps. A transport or a
-// path that does not answer, however it is first reported (a timeout, or busy
-// because an earlier call is still stuck), is one condition.
+// The conditions of a volume after a pass, as conditionOf names them: the keys
+// of the events and logs, and the values of the volume condition metric's
+// label. A volume is in one: the condition of its stage if that failed,
+// otherwise of its first failing publish, otherwise ConditionOK.
+const (
+	ConditionOK                   = "ok"
+	ConditionUnresponsive         = "unresponsive"
+	ConditionTransportUnavailable = "transport-unavailable"
+	ConditionTransportConflict    = "transport-conflict"
+	ConditionStageConflict        = "stage-conflict"
+	ConditionPublishConflict      = "publish-conflict"
+	ConditionItemMissing          = "item-missing"
+	ConditionItemNotDirectory     = "item-not-directory"
+	ConditionFailed               = "failed"
+)
+
+// Conditions lists every condition, so that a metric can create them all at
+// zero.
+var Conditions = []string{
+	ConditionOK, ConditionUnresponsive, ConditionTransportUnavailable, ConditionTransportConflict,
+	ConditionStageConflict, ConditionPublishConflict, ConditionItemMissing, ConditionItemNotDirectory,
+	ConditionFailed,
+}
+
+// conditionOf classifies an error by the sentinel it wraps. A transport that
+// does not answer or has restarted is one condition however it is first
+// reported (a timeout, busy because an earlier call is still stuck, a stale
+// handle): ErrTransportUnavailable decides it before the timeout it wraps
+// does. A timeout or busy on its own, from a call that is not the transport's
+// (a bind), is unresponsive.
 func conditionOf(err error) string {
 	switch {
-	case errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
-		return "unresponsive"
-	case errors.Is(err, ErrTransportConflict):
-		return "transport-conflict"
-	case errors.Is(err, ErrStageConflict):
-		return "stage-conflict"
-	case errors.Is(err, ErrPublishConflict):
-		return "publish-conflict"
-	case errors.Is(err, ErrItemMissing):
-		return "item-missing"
-	case errors.Is(err, ErrItemNotDirectory):
-		return "item-not-directory"
 	case errors.Is(err, ErrTransportUnavailable):
-		return "transport-unavailable"
+		return ConditionTransportUnavailable
+	case errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
+		return ConditionUnresponsive
+	case errors.Is(err, ErrTransportConflict):
+		return ConditionTransportConflict
+	case errors.Is(err, ErrStageConflict):
+		return ConditionStageConflict
+	case errors.Is(err, ErrPublishConflict):
+		return ConditionPublishConflict
+	case errors.Is(err, ErrItemMissing):
+		return ConditionItemMissing
+	case errors.Is(err, ErrItemNotDirectory):
+		return ConditionItemNotDirectory
 	default:
-		return "failed"
+		return ConditionFailed
 	}
+}
+
+// condition is the one condition a volume is in after a pass.
+func (res *volumeResult) condition() string {
+	if res.stage != nil {
+		return conditionOf(res.stage)
+	}
+	targets := make([]string, 0, len(res.publish))
+	for t := range res.publish {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+	for _, t := range targets {
+		if err := res.publish[t]; err != nil && !errors.Is(err, errTargetGone) {
+			return conditionOf(err)
+		}
+	}
+	return ConditionOK
+}
+
+// reportConditions sets the volume condition metric: how many of the volumes
+// converged in this pass are in each condition. Volumes that were not
+// converged (being unstaged, or with no readable record) are not counted. It
+// is skipped while shutting down, when the steps that failed were cancelled
+// and not broken.
+func (p *pass) reportConditions() {
+	if p.ctx.Err() != nil {
+		return
+	}
+	counts := make(map[string]int, len(Conditions))
+	for _, c := range Conditions {
+		counts[c] = 0
+	}
+	for _, res := range p.results {
+		counts[res.condition()]++
+	}
+	p.r.metrics.SetVolumeConditions(counts)
 }
 
 // problem names the event reason for what is wrong with the volume and joins
@@ -484,6 +548,7 @@ func (p *pass) ensureTransport(in intent.Intent, dir string) error {
 		res.err = fmt.Errorf("%w: %s is %s, not %s", ErrTransportConflict, dir, st, canonical)
 	}
 	r.metrics.SetTransport(spec.Kind, spec.ID(), res.mounted)
+	p.probe(spec, dir, res.mounted)
 	r.reported[dir] = spec.Kind
 	if res.err != nil {
 		p.noteHung(dir, res.err)
@@ -580,4 +645,45 @@ func (r *Reconciler) makeTarget(ctx context.Context, target string) error {
 		return struct{}{}, err
 	})
 	return err
+}
+
+// probe asks a transport that is mounted whether it answers: a statfs of its
+// mount directory under the stat deadline (the Mounter runs it in a goroutine
+// of its own that is abandoned, never joined, and refuses a second one while
+// the first has not returned). statfs always asks the server, where a stat can
+// be answered from the attribute cache and so look healthy after the server is
+// gone. It sets the up metric: 1 when the call answers, 0 when it times out, is
+// busy or fails, and 0 for a transport that is not mounted. A timeout or busy
+// is noted as a hung transport, like any other in the pass, so the volumes on
+// it wait for the next pass instead of each costing a deadline. A change of
+// state is logged once at info level. Nothing is unmounted or remounted.
+func (p *pass) probe(spec transport.Spec, dir string, mounted bool) {
+	r := p.r
+	if p.ctx.Err() != nil {
+		return // shutting down: nothing was asked
+	}
+	var err error
+	if mounted {
+		ctx, cancel := context.WithTimeout(p.ctx, r.opts.StatTimeout)
+		_, err = r.m.Statfs(ctx, dir)
+		cancel()
+		if p.ctx.Err() != nil {
+			return // shutting down: the call was cancelled, not answered
+		}
+		if err != nil {
+			p.noteHung(dir, err)
+			p.count("probe", err)
+		}
+	}
+	up := mounted && err == nil
+	r.metrics.SetTransportUp(spec.Kind, spec.ID(), up)
+
+	prev, known := r.up[dir]
+	r.up[dir] = up
+	switch {
+	case !up && mounted && (!known || prev):
+		r.log.Info("transport stopped answering", "transport", spec.Canonical(), "dir", dir, "error", err)
+	case up && known && !prev:
+		r.log.Info("transport answers again", "transport", spec.Canonical(), "dir", dir)
+	}
 }

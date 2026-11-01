@@ -40,10 +40,19 @@ type Metrics interface {
 	// SetTransport sets whether a transport (by kind and ID) was found mounted.
 	// It is observed in the pass, never remembered between passes.
 	SetTransport(kind, id string, mounted bool)
+	// SetTransportUp sets whether a transport (by kind and ID) answered a
+	// deadline-bounded statfs of its mount directory in the pass: true when it
+	// did, false when the call timed out, was held busy by an earlier one that
+	// has not returned, or failed, and for a transport that is not mounted.
+	SetTransportUp(kind, id string, up bool)
+	// SetVolumeConditions sets the number of volumes in each condition after
+	// the pass. counts has a key for every name in Conditions, zero included,
+	// so a condition that empties reads 0.
+	SetVolumeConditions(counts map[string]int)
 	// ObserveReconcile records the duration of one pass.
 	ObserveReconcile(d time.Duration)
-	// IncReconcileError counts one failed step: "load", "transport", "item",
-	// "publish", "teardown", "garbage" or "observe".
+	// IncReconcileError counts one failed step: "load", "transport", "probe",
+	// "item", "publish", "teardown", "garbage" or "observe".
 	IncReconcileError(step string)
 	// IncObservationTimeout counts one step that hit its deadline, by the same
 	// step names.
@@ -65,13 +74,15 @@ type Events interface {
 
 type noopMetrics struct{}
 
-func (noopMetrics) SetIntents(string, int)            {}
-func (noopMetrics) SetTransport(string, string, bool) {}
-func (noopMetrics) ObserveReconcile(time.Duration)    {}
-func (noopMetrics) IncReconcileError(string)          {}
-func (noopMetrics) IncObservationTimeout(string)      {}
-func (noopMetrics) IncGarbageUnmount()                {}
-func (noopMetrics) SetIntentLoadFailures(int)         {}
+func (noopMetrics) SetIntents(string, int)              {}
+func (noopMetrics) SetTransport(string, string, bool)   {}
+func (noopMetrics) SetTransportUp(string, string, bool) {}
+func (noopMetrics) SetVolumeConditions(map[string]int)  {}
+func (noopMetrics) ObserveReconcile(time.Duration)      {}
+func (noopMetrics) IncReconcileError(string)            {}
+func (noopMetrics) IncObservationTimeout(string)        {}
+func (noopMetrics) IncGarbageUnmount()                  {}
+func (noopMetrics) SetIntentLoadFailures(int)           {}
 
 type noopEvents struct{}
 

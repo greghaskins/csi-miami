@@ -208,6 +208,11 @@ func (d *Item) checkDir(ctx context.Context, volumeID, dir string) error {
 	case errors.Is(err, syscall.ENOTDIR):
 		// An element of the path is a file: the item path is not a directory.
 		return fmt.Errorf("directory item %s: %w: %s", volumeID, item.ErrItemNotDirectory, dir)
+	case errors.Is(err, syscall.ESTALE), errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
+		// The server restarted (its file handles are stale) or does not
+		// answer: the transport's condition, not the item's. Nothing is
+		// unmounted or mounted for it; the next pass looks again.
+		return fmt.Errorf("directory item %s: %w: %w", volumeID, item.ErrTransportUnavailable, err)
 	case err != nil:
 		return fmt.Errorf("directory item %s: %w", volumeID, err)
 	case !fi.IsDir():

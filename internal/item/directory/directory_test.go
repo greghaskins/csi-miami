@@ -796,3 +796,39 @@ func TestEnsureBeneathAppliesTheModeUnderAnyUmask(t *testing.T) {
 		}
 	})
 }
+
+// A stat of the item directory that fails because the transport restarted or
+// does not answer is item.ErrTransportUnavailable, wrapping the cause, and
+// changes nothing; other failures are not.
+func TestConvergeStatFailuresThatAreTheTransports(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		err       error
+		transport bool
+		cause     error
+	}{
+		{"stale handle", &fs.PathError{Op: "stat", Path: itemDir(), Err: syscall.ESTALE}, true, syscall.ESTALE},
+		{"timeout", mount.ErrTimeout, true, mount.ErrTimeout},
+		{"busy", mount.ErrBusy, true, mount.ErrBusy},
+		{"permission", os.ErrPermission, false, os.ErrPermission},
+		{"i/o error", syscall.EIO, false, syscall.EIO},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newFixture(t, rootMount(), transportMount())
+			fx.statFn = func(string) (fs.FileInfo, error) { return nil, tt.err }
+			err := fx.converge(theIntent())
+			if got := errors.Is(err, item.ErrTransportUnavailable); got != tt.transport {
+				t.Errorf("ErrTransportUnavailable = %v, want %v (%v)", got, tt.transport, err)
+			}
+			if !errors.Is(err, tt.cause) {
+				t.Errorf("%v does not wrap %v", err, tt.cause)
+			}
+			if len(fx.binds()) != 0 || len(fx.ensured) != 0 {
+				t.Errorf("something was changed: calls %+v, created %v", fx.binds(), fx.ensured)
+			}
+		})
+	}
+}
