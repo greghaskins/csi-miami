@@ -103,3 +103,32 @@ func TestDescribeHeldFailure(t *testing.T) {
 		t.Errorf("failure = %q", got)
 	}
 }
+
+func TestCheckHeldRecovered(t *testing.T) {
+	t.Parallel()
+	ok := func(n int) heldWrite { return heldWrite{N: n, OK: true} }
+	fail := func(n int, why string) heldWrite { return heldWrite{N: n, Err: why} }
+	tests := []struct {
+		name    string
+		writes  []heldWrite
+		wantErr string
+	}{
+		{"all ok", []heldWrite{ok(1), ok(2), ok(3)}, ""},
+		{"a timeout during the outage", []heldWrite{ok(1), fail(2, "dd: standard output: Connection timed out"), ok(3), ok(4)}, ""},
+		{"the attempt in flight when the plugin said so may fail", []heldWrite{ok(1), ok(2), fail(3, "Connection timed out"), ok(4)}, ""},
+		{"a failure after that is a descriptor that did not recover", []heldWrite{ok(1), ok(2), ok(3), fail(4, "Connection timed out"), ok(5)}, "did not recover"},
+		{"a stale handle", []heldWrite{ok(1), fail(2, "dd: fsync failed for 'standard output': Stale file handle"), ok(3)}, "stale file handle"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := checkHeldRecovered(tt.writes, 2)
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("checkHeldRecovered = %v", err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Errorf("checkHeldRecovered = %v, want an error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}

@@ -63,27 +63,27 @@ func parseHeld(log string) []heldWrite {
 	return out
 }
 
-// heldSummary is what the holder pod saw, split at the write after which the
-// server was back.
+// heldSummary is what the holder pod saw, split at an attempt: the last one
+// made before the node plugin reported the server back.
 type heldSummary struct {
-	OKBefore, FailedBefore int // writes up to and including backAt
-	OKAfter, FailedAfter   int // writes after it
+	OKBefore, FailedBefore int // attempts up to and including the split
+	OKAfter, FailedAfter   int // attempts after it
 	FirstFailure           *heldWrite
 	LastFailure            *heldWrite
 }
 
-// summarizeHeld splits the holder's attempts at backAt, the number of the last
-// attempt made before the server was back.
-func summarizeHeld(writes []heldWrite, backAt int) heldSummary {
+// summarizeHeld splits the holder's attempts at splitAt, the number of the last
+// attempt made before the node plugin reported the server back.
+func summarizeHeld(writes []heldWrite, splitAt int) heldSummary {
 	var s heldSummary
 	for i := range writes {
 		w := writes[i]
 		switch {
-		case w.OK && w.N <= backAt:
+		case w.OK && w.N <= splitAt:
 			s.OKBefore++
 		case w.OK:
 			s.OKAfter++
-		case w.N <= backAt:
+		case w.N <= splitAt:
 			s.FailedBefore++
 		default:
 			s.FailedAfter++
@@ -124,6 +124,26 @@ func checkHeld(writes []heldWrite, file string) error {
 	}
 	if len(lost) > 0 {
 		return fmt.Errorf("the holder was told writes %s succeeded (fsync included) but they are not in the file", strings.Join(lost, ", "))
+	}
+	return nil
+}
+
+// checkHeldRecovered is what must hold once the server is back and the node
+// plugin has said so: the descriptor works. No attempt after recoveredAt (but
+// the one that may have been in flight) failed, and no failure at all was a
+// stale handle, which the export keeping its file system and fsid is there to
+// prevent.
+func checkHeldRecovered(writes []heldWrite, recoveredAt int) error {
+	for _, w := range writes {
+		if w.OK {
+			continue
+		}
+		if strings.Contains(strings.ToLower(w.Err), "stale") {
+			return fmt.Errorf("attempt %d failed with a stale file handle (%s): the export did not keep its file handles across the restart", w.N, w.Err)
+		}
+		if w.N > recoveredAt+1 {
+			return fmt.Errorf("attempt %d failed (%s) after the server was back and the node plugin had said so (attempt %d): the open file did not recover", w.N, w.Err, recoveredAt)
+		}
 	}
 	return nil
 }
@@ -193,10 +213,13 @@ func (e *env) pvEvents(ctx context.Context, pv, reason string) ([]corev1.Event, 
 // log and reported, and the one thing asserted of it is what must hold either
 // way (checkHeld).
 //
-// The outage is as long as the plugin needs to notice it (its pass runs every
-// 30 seconds and probes under a 10 second deadline), which is shorter than the
-// soft mount's major timeout of about 100 seconds, so the pod's blocked writes
-// are expected to complete and not to fail.
+// The outage is as long as the plugin needs to notice it: a pod started during
+// it wakes the plugin's loop, whose probe of the dead server takes its 10 second
+// deadline. That is well under the soft mount's major timeout (timeo 10s times
+// retrans 3 plus 1, about 40 seconds), so the writer's blocked writes complete
+// and do not fail. (A first version waited for the loop's 30 second timer, held
+// the server down for about 40 seconds, and a write in flight then failed with
+// ETIMEDOUT and its data was dropped, in both architectures.)
 func TestNFSServerRestart(t *testing.T) {
 	e := loadEnv(t)
 	runVariant(t, e, transportNFS3, func(t *testing.T) { nfsServerRestart(t, e) })
@@ -291,6 +314,16 @@ func nfsServerRestart(t *testing.T, e *env) {
 	}
 	t.Logf("the NFS server at %s is stopped; the writer had written %d lines", address, wroteBefore)
 
+	// The node plugin's pass runs every 30 seconds, and a pass that probes the
+	// dead server takes its 10 second deadline: waiting for the timer would hold
+	// the server down for about as long as the soft mount takes to give up (a
+	// major timeout of timeo 10s times retrans 3 plus 1, about 40 seconds), and
+	// a write in flight then may fail with ETIMEDOUT. A request wakes the loop at
+	// once, so a pod that starts during the outage is the cheap way to have the
+	// plugin look now: its NodePublishVolume cannot complete while the server is
+	// down, is recorded, and is bound by a pass after the server is back.
+	n.createPod(t, podSpec{Name: "late", Claim: "data", Node: node, Run: stay("echo late > /data/late")})
+
 	// The node plugin notices: the transport is down and the volume says why.
 	e.waitFor(t, fmt.Sprintf("%s to report the transport down (%s=0) and the volume transport-unavailable", plugin.Name, metrics.NameTransportUp), func(ctx context.Context) (string, bool, error) {
 		h, err := health(ctx)
@@ -306,17 +339,7 @@ func nfsServerRestart(t *testing.T, e *env) {
 	}
 	t.Logf("%s after the server stopped, the node plugin reports: %s", noticed, h)
 	ctx, cancel = e.withDeadline()
-	hlogDown, hlogErr := e.logs(ctx, n.Name, "holder")
 	cancel()
-	if hlogErr != nil {
-		t.Fatal(hlogErr)
-	}
-	backAt := 0
-	for _, w := range parseHeld(hlogDown) {
-		if w.N > backAt {
-			backAt = w.N
-		}
-	}
 
 	// The mounts are exactly the ones from before: nothing was unmounted.
 	e.waitFor(t, "the transport and publish mounts to be the same mounts (same mount IDs) during the outage", func(ctx context.Context) (string, bool, error) {
@@ -360,6 +383,18 @@ func nfsServerRestart(t *testing.T, e *env) {
 			h.Conditions[reconcile.ConditionTransportUnavailable] == 0, nil
 	})
 	t.Logf("%s after the server stopped, the node plugin reports the transport up and the volume ok again", time.Since(stopped).Round(time.Second))
+	ctx, cancel = e.withDeadline()
+	hlogBack, hlogErr := e.logs(ctx, n.Name, "holder")
+	cancel()
+	if hlogErr != nil {
+		t.Fatal(hlogErr)
+	}
+	recoveredAt := 0
+	for _, w := range parseHeld(hlogBack) {
+		if w.N > recoveredAt {
+			recoveredAt = w.N
+		}
+	}
 
 	e.waitFor(t, fmt.Sprintf("a TransportUnavailable event on PV %s", vol.PV), func(ctx context.Context) (string, bool, error) {
 		evs, err := e.pvEvents(ctx, vol.PV, reconcile.ReasonTransportUnavailable)
@@ -395,10 +430,10 @@ func nfsServerRestart(t *testing.T, e *env) {
 		t.Logf("sequence check: the loop file has %d lines, 1 to %d with no gap (the writer had written %d before the server stopped)", len(strings.Fields(out)), len(strings.Fields(out)), wroteBefore)
 	}
 
-	// The open file. Wait for a few attempts after the server was back, then
-	// say what the kernel did.
+	// The open file. Wait for a few attempts after the plugin reported the
+	// server back, then say what the kernel did.
 	var writes []heldWrite
-	e.waitFor(t, "the holder pod to have made 5 more attempts after the server was back", func(ctx context.Context) (string, bool, error) {
+	e.waitFor(t, fmt.Sprintf("the holder pod to have made 5 more attempts after attempt %d, made when the node plugin reported the server back", recoveredAt), func(ctx context.Context) (string, bool, error) {
 		log, err := e.logs(ctx, n.Name, "holder")
 		if err != nil {
 			return "", false, err
@@ -410,19 +445,19 @@ func nfsServerRestart(t *testing.T, e *env) {
 				last = w.N
 			}
 		}
-		return fmt.Sprintf("holder at attempt %d, the server was back after attempt about %d", last, backAt), last >= backAt+5, nil
+		return fmt.Sprintf("holder at attempt %d", last), last >= recoveredAt+5, nil
 	})
 	file := n.runOnce(t, "data", node, "cat /data/held.log")
 	if err := checkHeld(writes, file); err != nil {
 		t.Errorf("the file held open across the restart: %v", err)
 	}
-	s := summarizeHeld(writes, backAt)
-	t.Logf("open file across the restart (kernel %s, softerr mount): before the restart %d writes ok; from there on %d ok and %d failed; first failure %s",
-		kernel, s.OKBefore, s.OKAfter, s.FailedBefore+s.FailedAfter, describeHeldFailure(s.FirstFailure))
-	if s.LastFailure != nil {
-		t.Logf("open file: last failure %s; writes ok after it: %v", describeHeldFailure(s.LastFailure), s.OKAfter > 0)
+	if err := checkHeldRecovered(writes, recoveredAt); err != nil {
+		t.Errorf("the file held open across the restart: %v", err)
 	}
-	t.Logf("open file: the held file has %d lines, %d attempts were told ok", len(strings.Fields(file)), s.OKBefore+s.OKAfter)
+	s := summarizeHeld(writes, recoveredAt)
+	t.Logf("open file across the restart (kernel %s, softerr mount): %d attempts ok and %d failed up to attempt %d (when the node plugin reported the server back), then %d ok and %d failed; first failure %s",
+		kernel, s.OKBefore, s.FailedBefore, recoveredAt, s.OKAfter, s.FailedAfter, describeHeldFailure(s.FirstFailure))
+	t.Logf("open file: the held file has %d lines and %d attempts were told ok, so the %d that failed are not in it", len(strings.Fields(file)), s.OKBefore+s.OKAfter, s.FailedBefore+s.FailedAfter)
 }
 
 func describeHeldFailure(w *heldWrite) string {
