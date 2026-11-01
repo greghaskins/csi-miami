@@ -282,10 +282,10 @@ idempotent against the file; a size mismatch is `AlreadyExists`.
 
 The simplification is in **who decides fenceability**. **Decision 8:
 the driver owns mount options.** The driver mounts NFSv3 with one fixed option set
-(`vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,
+(`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,
 actimeo=30,noatime`; the reasons are in the M1 plan, section 8), so the NFS
-major timeout `S` is a constant, the takeover timeout `T` is one driver
-flag validated against it at startup, and `FenceAfter = T - S - margin` and
+major timeout `S` (180 seconds; decision 30) is a constant, the takeover
+timeout `T` is one driver flag validated against it at startup, and `FenceAfter = T - S - margin` and
 `ResetAfter = T - margin` are derived once. No per-StorageClass option
 strings, no `hard` variant, no "not fenceable because of option X"
 branches. `local` transports are non-fenceable by kind and get taint-only
@@ -330,10 +330,11 @@ loops always on NFS transports.
   every second) kept working: the export keeps its file system and `fsid=0`, so
   the client's file handles stay valid, nothing returned ESTALE, and with the
   server back after 14 seconds no write on the held descriptor failed. The wait
-  of a soft mount is bounded by its major timeout, 40 seconds for the profile
-  (`timeo` of 10 seconds times `retrans` 3 plus 1, which the first run of the
-  test matched): in that run the server was held down for about 40 seconds,
-  and the write in flight on the held descriptor failed with ETIMEDOUT
+  of a soft mount is bounded by its major timeout. The run measured the first
+  profile, 40 seconds (`timeo` of 10 seconds times `retrans` 3 plus 1, which
+  the first run of the test matched); the profile now has `retrans` 17, 180
+  seconds (decision 30). In that run the server was held down for about 40
+  seconds, and the write in flight on the held descriptor failed with ETIMEDOUT
   ("Connection timed out", returned by the fsync), its data was not in the file,
   and later writes through the same descriptor succeeded. So an application that
   holds a file open across a server restart must check the errors of `fsync` and
@@ -935,8 +936,9 @@ Recorded:
     same. It is the observation that must be short: the node plugin's pass runs
     every 30 seconds and a pass that probes the dead server takes its 10 second
     deadline, and waiting for the timer holds the server down for about as long
-    as a soft mount takes to give up (about 40 seconds), when a write in flight
-    fails with ETIMEDOUT. So the test starts a pod during the outage, whose
+    as the first profile's soft mount took to give up (about 40 seconds; the
+    major timeout is now 180 seconds, decision 30), when a write in flight
+    failed with ETIMEDOUT. So the test starts a pod during the outage, whose
     publish request wakes the loop at once, and the outage is about 15 seconds.
     What it observed about a file held open is in 4.6.
 
@@ -986,6 +988,33 @@ Recorded:
     the command's own status (128+n if a signal n killed it), 1 if the lock
     is held by another (the command was not started), 2 on an error or a lost
     lock (the command was terminated, nothing was released).
+
+30. **The nfs3 major timeout is 180 seconds (M1, T15)**: the profile's
+    `retrans` went from 3 to 17, so the soft mount's major timeout, `timeo`
+    (10 seconds) times (`retrans` plus 1), went from 40 to 180 seconds;
+    nothing else in the profile changed. *Why*: measured outages of the NAS
+    and of the network path to it, from server restarts and firmware updates,
+    run from about 1 minute 40 seconds to about 2 minutes 20 seconds. With a 40
+    second major timeout every such restart fails the writes in flight of every
+    open file with `ETIMEDOUT` and discards their data (4.6 has the run that
+    showed it). 180 seconds is about 1.6 times the longest measured window, so
+    a restart is waited out. *The cost*: during an outage a pod's blocked I/O
+    waits up to 180 seconds instead of 40 before it fails, and anything that
+    waits on the volume (a liveness probe that touches it, an observation
+    goroutine) must budget above 180 seconds. ESTALE during a server restart
+    is unaffected by any timeout (lesson 12). *M2*: the fence math of decision
+    8, `FenceAfter = T - S - margin`, now uses `S` = 180 seconds, so the
+    takeover timeout `T` must exceed 180 seconds plus the margin. *Upgrade*:
+    adoption requires `retrans=17` among the mount's super options, so a
+    transport still mounted with the previous profile after a driver upgrade
+    is not adopted. `Mounted` is false and `State` is foreign, the reconciler
+    reports `ErrTransportConflict` (condition `transport-conflict`, a
+    `FailedPrecondition` to CSI) for every volume on it, changes nothing and
+    stacks nothing over it, and the mount stays in use with its 40 second
+    timeout until it is unmounted, by draining the node or by hand. The driver
+    does not remount it by itself. This is M1 before any release and nothing
+    is installed yet, so no migration is written; a node that ever carried the
+    old profile needs its transports unmounted once.
 
 32. **Breaking a `miami lock` safely (M1, T17; amends 29)**: the security
     review of T11 found three ways to break a lock wrongly, and this closes

@@ -28,17 +28,23 @@ const nfs3Flags = unix.MS_NOATIME
 //
 //	vers=3,proto=tcp      the protocol the target servers speak; tcp so that a
 //	                      socket reset is a real fence
-//	softerr,timeo=100,retrans=3
-//	                      bounded failure: a 40s major timeout, timeo x
+//	softerr,timeo=100,retrans=17
+//	                      bounded failure: a 180s major timeout, timeo x
 //	                      (retrans+1) (TCP backs off linearly and the major
 //	                      timeout is capped there), and ETIMEDOUT instead of
-//	                      EIO (needs Linux 5.3)
+//	                      EIO (needs Linux 5.3). 180s is about 1.6 times the
+//	                      longest measured server restart, so the writes in
+//	                      flight of an open file wait out a restart instead of
+//	                      failing with ETIMEDOUT and losing their data; the
+//	                      price is that blocked I/O on a dead server waits up
+//	                      to 180s before it fails, and anything that waits on
+//	                      the volume must budget above that
 //	nolock                locks are node-local; no NLM, no lockd state to hang
 //	lookupcache=positive  never cache a negative lookup
 //	actimeo=30            attribute cache of 30s; close-to-open still holds
 //
 // There is no hard, and no fallback to soft. addr= is added by nfs3Data.
-const nfs3Profile = "vers=3,proto=tcp,softerr,timeo=100,retrans=3,nolock,lookupcache=positive,actimeo=30"
+const nfs3Profile = "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30"
 
 // nfs3Data renders the data string of mount(2): the profile and the address
 // of the server, resolved by the driver so that no helper is needed.
@@ -60,7 +66,7 @@ func nfs3Data(addr string) string { return nfs3Profile + ",addr=" + addr }
 //
 //	rw,vers=3,rsize=1048576,wsize=1048576,namlen=255,
 //	acregmin=30,acregmax=30,acdirmax=30,softerr,softreval,nolock,
-//	fatal_neterrors=none,proto=tcp,timeo=100,retrans=3,sec=sys,
+//	fatal_neterrors=none,proto=tcp,timeo=100,retrans=17,sec=sys,
 //	mountaddr=<ip>,mountvers=3,mountproto=tcp,lookupcache=pos,
 //	local_lock=all,addr=<ip>
 //
@@ -77,7 +83,7 @@ var nfs3SuperOptions = []string{
 	"proto=tcp",
 	"softerr",
 	"timeo=100",
-	"retrans=3",
+	"retrans=17",
 	"nolock",
 	"local_lock=all",
 	"lookupcache=pos",
