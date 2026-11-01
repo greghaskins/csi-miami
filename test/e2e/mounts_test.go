@@ -30,18 +30,6 @@ func (m mountTable) at(path string) []observe.Mount {
 	return out
 }
 
-// stages returns the mount points of every volume staged by the kubelet for
-// the driver.
-func (m mountTable) stages() []string {
-	var out []string
-	for _, x := range m {
-		if strings.HasPrefix(x.MountPoint, stageRoot+"/") && strings.HasSuffix(x.MountPoint, "/globalmount") {
-			out = append(out, x.MountPoint)
-		}
-	}
-	return out
-}
-
 // publishPath is where the kubelet asks the driver to publish a volume for a
 // pod.
 func publishPath(pod types.UID, pv string) string {
@@ -51,13 +39,13 @@ func publishPath(pod types.UID, pv string) string {
 // mountIDs are the kernel's mount IDs of one volume's mounts on a node.
 type mountIDs struct {
 	Transport int
-	Stage     int
 	Publish   int
 }
 
-// volumeMounts finds a volume's transport mount, stage bind and the publish
-// bind for one pod, each exactly once. The stage path comes from the node's
-// intent record. It returns an error that says which mount is missing or
+// volumeMounts finds a volume's transport mount and the publish bind for one
+// pod, each exactly once, and checks that nothing at all is mounted at the
+// volume's stage path (a directory item makes no stage mount, decision 25).
+// The stage path comes from the node's intent record. It returns an error that says which mount is missing or
 // duplicated and lists what the table has near it.
 func volumeMounts(ctx context.Context, node string, vol volumeInfo, pod types.UID) (mountIDs, error) {
 	table, err := nodeMounts(ctx, node)
@@ -89,14 +77,16 @@ func volumeMounts(ctx context.Context, node string, vol volumeInfo, pod types.UI
 		id   *int
 	}{
 		{"transport mount", transportDir, &ids.Transport},
-		{"stage bind", in.StagePath, &ids.Stage},
 		{"publish bind", want, &ids.Publish},
 	} {
 		got := table.at(c.path)
 		if len(got) != 1 {
-			return mountIDs{}, fmt.Errorf("%s of %s on %s: %d mounts at %s, want exactly 1 (stage mounts on the node: %v)", c.what, vol.PV, node, len(got), c.path, table.stages())
+			return mountIDs{}, fmt.Errorf("%s of %s on %s: %d mounts at %s, want exactly 1", c.what, vol.PV, node, len(got), c.path)
 		}
 		*c.id = got[0].ID
+	}
+	if got := table.at(in.StagePath); len(got) != 0 {
+		return mountIDs{}, fmt.Errorf("%d mounts at the stage path %s of %s on %s, want none: a directory item makes no stage mount", len(got), in.StagePath, vol.PV, node)
 	}
 	return ids, nil
 }
@@ -106,7 +96,7 @@ func volumeMounts(ctx context.Context, node string, vol volumeInfo, pod types.UI
 func (e *env) mustVolumeMounts(t *testing.T, node string, vol volumeInfo, pod types.UID) mountIDs {
 	t.Helper()
 	var ids mountIDs
-	e.waitFor(t, fmt.Sprintf("the transport, stage and publish mounts of %s on %s, each exactly once", vol.PV, node), func(ctx context.Context) (string, bool, error) {
+	e.waitFor(t, fmt.Sprintf("the transport and publish mounts of %s on %s, each exactly once, and nothing at the stage path", vol.PV, node), func(ctx context.Context) (string, bool, error) {
 		var err error
 		ids, err = volumeMounts(ctx, node, vol, pod)
 		if err != nil {
@@ -125,8 +115,8 @@ type liveVolume struct {
 
 // noLeakedMounts checks the node's mount table against the volumes pods on it
 // use: under the kubelet's CSI staging directory and the pods' CSI volume
-// directories there is exactly the stage and publish mounts of those volumes,
-// each once, and under the transports root exactly one mount at each
+// directories there are no stage mounts and exactly the publish mounts of
+// those volumes, each once, and under the transports root exactly one mount at each
 // transport directory, with the live volumes' transports among them. (An idle
 // transport stays mounted by design: the idle TTL is off by default.)
 func noLeakedMounts(ctx context.Context, node string, live []liveVolume) error {
@@ -136,11 +126,6 @@ func noLeakedMounts(ctx context.Context, node string, live []liveVolume) error {
 	}
 	allowed := map[string]bool{}
 	for _, l := range live {
-		in, err := readIntent(ctx, node, l.Vol.ID)
-		if err != nil {
-			return fmt.Errorf("reading the intent of %s on %s: %w", l.Vol.PV, node, err)
-		}
-		allowed[in.StagePath] = true
 		allowed[publishPath(l.Pod, l.Vol.PV)] = true
 	}
 	var problems []string
@@ -152,7 +137,7 @@ func noLeakedMounts(ctx context.Context, node string, live []liveVolume) error {
 			strings.HasPrefix(mp, filepath.Join(kubeletDir, "pods")+"/") && strings.Contains(mp, "/volumes/kubernetes.io~csi/"):
 			seen[mp]++
 			if !allowed[mp] {
-				problems = append(problems, fmt.Sprintf("%s (mount %d) belongs to no volume a pod on %s uses", mp, m.ID, node))
+				problems = append(problems, fmt.Sprintf("%s (mount %d) belongs to no volume a pod on %s uses (a directory item has no stage mount at all)", mp, m.ID, node))
 			}
 		case strings.HasPrefix(mp, transportsRoot+"/"):
 			seen[mp]++
@@ -193,16 +178,17 @@ func (e *env) waitNoLeakedMounts(t *testing.T, node string, live []liveVolume) {
 	})
 }
 
-// waitMountsGone waits for a volume's stage and publish mounts to go from the
-// node: the volume was unpublished and unstaged. The transport stays.
+// waitMountsGone waits for a volume's publish mount to go from the node and
+// checks that nothing is mounted at its stage path: the volume was unpublished
+// and unstaged. The transport stays.
 func (e *env) waitMountsGone(t *testing.T, node string, stagePath, publish string) {
 	t.Helper()
-	e.waitFor(t, fmt.Sprintf("the stage mount %s and publish mount %s to be gone from %s", stagePath, publish, node), func(ctx context.Context) (string, bool, error) {
+	e.waitFor(t, fmt.Sprintf("the publish mount %s to be gone from %s, with nothing mounted at the stage path %s", publish, node, stagePath), func(ctx context.Context) (string, bool, error) {
 		table, err := nodeMounts(ctx, node)
 		if err != nil {
 			return "", false, err
 		}
 		left := len(table.at(stagePath)) + len(table.at(publish))
-		return fmt.Sprintf("%d of them remain; stage mounts on the node: %v", left, table.stages()), left == 0, nil
+		return fmt.Sprintf("%d of them remain", left), left == 0, nil
 	})
 }

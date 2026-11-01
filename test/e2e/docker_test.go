@@ -137,3 +137,20 @@ func (e *env) withDeadline() (context.Context, context.CancelFunc) {
 func shortDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, 30*time.Second)
 }
+
+// nodeIntentCount is the number of volumes the node plugin has a record for,
+// which is the number of volumes staged on the node: the stage leaves no mount
+// to count.
+func nodeIntentCount(ctx context.Context, node string) (int, error) {
+	out, err := nodeExec(ctx, node, "ls", intentDir)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, f := range strings.Fields(out) {
+		if strings.HasSuffix(f, ".json") {
+			n++
+		}
+	}
+	return n, nil
+}

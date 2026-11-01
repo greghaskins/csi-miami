@@ -79,10 +79,11 @@ func (e *env) waitPluginBack(t *testing.T, node string, oldUID types.UID, oldCon
 }
 
 // Exit criterion 4: restarting the node plugin pod while a pod writes to a
-// volume changes nothing. The writes keep landing, the transport mount, the
-// stage bind and the publish bind are the same mounts (same mount IDs) before
-// and after, the plugin comes back Ready, and a new claim and pod on that node
-// stage and publish, and unstage cleanly when the pod goes.
+// volume changes nothing. The writes keep landing, the transport mount and the
+// publish bind are the same mounts (same mount IDs) before and after, nothing is
+// mounted at the stage path (a directory item makes no stage mount, decision
+// 25), the plugin comes back Ready, and a new claim and pod on that node stage
+// and publish, and unstage cleanly when the pod goes.
 func TestNodePluginRestartChangesNothing(t *testing.T) {
 	e := loadEnv(t)
 	for _, variant := range []string{transportLocal, transportNFS3} {
@@ -166,8 +167,8 @@ func nodePluginRestart(t *testing.T, e *env) {
 // Exit criterion 5: a node reboot. `docker restart` of a kind worker is the
 // stand-in: every mount in its namespace is gone and the kubelet starts from
 // nothing, while its disk survives. Afterwards the pod is back and Ready, the
-// transport is remounted, the stage bind and the publish bind exist exactly
-// once each, nothing is leaked, and the data is there: for a local volume the
+// transport is remounted, the transport mount and the publish bind exist
+// exactly once each, nothing is mounted at the stage path, nothing is leaked, and the data is there: for a local volume the
 // directory was not recreated empty (the first-stage rule), for nfs3 the
 // export never went away.
 func TestNodeReboot(t *testing.T) {

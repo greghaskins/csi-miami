@@ -15,8 +15,8 @@ import (
 // Exit criterion 6: /metrics of the node plugin, through the API server's pod
 // proxy, has every family the plan lists (the names come from
 // internal/metrics); miami_intents{kind="directory"} equals the number of
-// volumes staged on the node at that moment (counted in the node's mount
-// table); the transport gauge reports the transport mounted; and the request
+// volumes staged on the node at that moment (counted from the node's intent records); the transport gauge reports
+// the transport mounted; and the request
 // counters show the methods the test drove. The controller's endpoint shows
 // CreateVolume and DeleteVolume.
 func TestMetrics(t *testing.T) {
@@ -67,11 +67,10 @@ func metricsCriterion(t *testing.T, e *env) {
 		if err != nil {
 			return "", false, err
 		}
-		table, err := nodeMounts(ctx, node)
+		staged, err := nodeIntentCount(ctx, node)
 		if err != nil {
 			return "", false, err
 		}
-		staged := len(table.stages())
 		intents, have := ms.value(metrics.NameIntents, map[string]string{"kind": "directory"})
 		missing := ms.missingFamilies(metrics.NodeFamilies)
 		transport := len(vols) > 0
@@ -83,7 +82,7 @@ func metricsCriterion(t *testing.T, e *env) {
 		}
 		stageOK := ms.requests(metrics.NameCSIRequests, "NodeStageVolume", "OK")
 		pubOK := ms.requests(metrics.NameCSIRequests, "NodePublishVolume", "OK")
-		seen := fmt.Sprintf("%s; missing families %v; intents %v (present %v) with %d staged in the mount table; transport gauges %v; NodeStageVolume OK %v, NodePublishVolume OK %v",
+		seen := fmt.Sprintf("%s; missing families %v; intents %v (present %v) with %d records on the node; transport gauges %v; NodeStageVolume OK %v, NodePublishVolume OK %v",
 			ms, missing, intents, have, staged, gauges, stageOK, pubOK)
 		done := len(missing) == 0 && have && int(intents) == staged && staged == len(claims) && transport &&
 			stageOK >= float64(len(claims)) && pubOK >= float64(len(claims))
@@ -100,15 +99,14 @@ func metricsCriterion(t *testing.T, e *env) {
 		if err != nil {
 			return "", false, err
 		}
-		table, err := nodeMounts(ctx, node)
+		staged, err := nodeIntentCount(ctx, node)
 		if err != nil {
 			return "", false, err
 		}
-		staged := len(table.stages())
 		intents, have := ms.value(metrics.NameIntents, map[string]string{"kind": "directory"})
 		unpub := ms.requests(metrics.NameCSIRequests, "NodeUnpublishVolume", "OK")
 		unstage := ms.requests(metrics.NameCSIRequests, "NodeUnstageVolume", "OK")
-		seen := fmt.Sprintf("intents %v (present %v) with %d staged; NodeUnpublishVolume OK %v, NodeUnstageVolume OK %v", intents, have, staged, unpub, unstage)
+		seen := fmt.Sprintf("intents %v (present %v) with %d records on the node; NodeUnpublishVolume OK %v, NodeUnstageVolume OK %v", intents, have, staged, unpub, unstage)
 		done := have && int(intents) == staged && staged == 0 &&
 			unpub >= float64(len(claims)) && unstage >= float64(len(claims))
 		return seen, done, nil
