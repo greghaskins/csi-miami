@@ -69,9 +69,9 @@ Each StorageClass picks one option per dimension, in any combination.
 
 | | Location | Sharing | Encryption |
 |---|---|---|---|
-| **Directories** | local disk: in progress<br>NAS: in progress | single node: in progress<br>shared: in progress | off: in progress<br>on: not yet |
-| **Images** | local disk: not yet<br>NAS: not yet | single node: not yet<br>shared: not yet | off: not yet<br>on: not yet |
-| **Blobs** | local disk: not yet<br>NAS: not yet | single node: not yet<br>shared: not yet | off: not yet<br>on: not yet |
+| **Directories** | **local disk:** in progress<br>**NAS:** in progress | **single node:** in progress<br>**shared:** in progress | **off:** in progress<br>**on:** not yet |
+| **Images** | **local disk:** not yet<br>**NAS:** not yet | **single node:** not yet<br>**shared:** not yet | **off:** not yet<br>**on:** not yet |
+| **Blobs** | **local disk:** not yet<br>**NAS:** not yet | **single node:** not yet<br>**shared:** not yet | **off:** not yet<br>**on:** not yet |
 
 ## Installation
 
