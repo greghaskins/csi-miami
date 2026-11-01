@@ -7,7 +7,7 @@ a NAS, attached storage, and self-hosted workloads.
 The goal: make bare-metal hardware behave like a proper Kubernetes storage
 layer. csi-miami is responsible for:
 
-1. **Flexibility** across directories and images, local disks and a remote NAS.
+1. **Flexibility** across directories, images and blobs, local disks and a remote NAS.
 2. **Strong RWO and RWX semantics**, available when a workload needs them.
 3. **Encryption at rest.**
 
@@ -33,6 +33,7 @@ projects run off the shelf.
 │  │  mounts the NAS export on the host   │  │
 │  │  directory: bind the subdirectory    │  │
 │  │  image: loop ▶ ext4                  │  │
+│  │  blobs: opaque, content-addressed    │  │
 │  │  encryption: optional, either form   │  │
 │  └──────┬─────────────────────┬─────────┘  │
 │         │                     │            │
@@ -60,7 +61,7 @@ Each StorageClass picks one option per dimension, in any combination.
 | Dimension | Options |
 |---|---|
 | Location | local disk, NAS (NFSv3) |
-| Form | directory, image (ext4 on a loop device) |
+| Item type | flat files in a directory, filesystem image (ext4 on a loop device), opaque blobs |
 | Sharing | single node (RWO), shared (RWX) |
 | Encryption | off, on |
 
@@ -73,7 +74,7 @@ Each StorageClass picks one option per dimension, in any combination.
 | **M3** | shared images, re-exported over NFSv4 by the node holding them |
 | **M4** | images on local disk, moved between nodes with `miami move` |
 | Not yet planned | encrypted directories |
-| Later, maybe | blob storage on a directory, content-addressed and encrypted (an S3 interface on top is out of scope) |
+| Later, maybe | blobs: opaque, content-addressed (an S3 interface on top is out of scope) |
 
 ## Installation
 
