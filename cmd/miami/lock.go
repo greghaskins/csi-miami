@@ -229,8 +229,8 @@ func (r *realExpiry) Stop()                 { r.t.Stop() }
 // renewLoop renews on every tick until ctx is done. It returns nil then, and
 // an error when the lock is lost or when no renewal has succeeded for limit.
 // The limit is a timer armed at the start of the last successful renewal (the
-// acquisition counts), so it fires at that instant whatever the phase of the ticks, and it interrupts
-// a renewal that is still in flight. It measures how long this process can go
+// acquisition counts), so it fires at that instant whatever the phase of the
+// ticks, and it interrupts a renewal that is still in flight. It measures how long this process can go
 // without knowing that its own lock may have been broken, on the local
 // monotonic clock; it is not a staleness decision about anyone's lock. Errors
 // shorter than that are retried at the next tick.
