@@ -205,6 +205,9 @@ func (n *nfs3) Mount(ctx context.Context) error {
 	if errors.Is(err, unix.EINVAL) {
 		return fmt.Errorf("nfs3 mount of %s: the kernel rejected the mount options (EINVAL); the profile's softerr option needs Linux 5.3 or newer, and there is no fallback to soft or hard: %w", n.source, err)
 	}
+	if errors.Is(err, unix.ENODEV) {
+		return fmt.Errorf("nfs3 mount of %s: the kernel has no NFS client (ENODEV); load the nfs module on the node: %w", n.source, err)
+	}
 	return err
 }
 

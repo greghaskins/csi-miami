@@ -549,6 +549,25 @@ func TestNFS3MountErrors(t *testing.T) {
 			t.Errorf("error %q shows the data string", err)
 		}
 	})
+	t.Run("ENODEV says the kernel has no NFS client", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		f := newFake(table(rootMount()))
+		tr := newTransport(t, nfsSpec, root, f, Options{})
+		f.FailOp(fake.OpMount, tr.Dir(), fmt.Errorf("mount %s: %w", tr.Dir(), unix.ENODEV))
+		err := tr.Mount(context.Background())
+		if !errors.Is(err, unix.ENODEV) {
+			t.Fatalf("got %v, want the ENODEV kept in the chain", err)
+		}
+		for _, want := range []string{"no NFS client", "load the nfs module", nfsSource} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "softerr") {
+			t.Errorf("error %q carries the EINVAL advice", err)
+		}
+	})
 	t.Run("another error is passed through", func(t *testing.T) {
 		t.Parallel()
 		root := t.TempDir()

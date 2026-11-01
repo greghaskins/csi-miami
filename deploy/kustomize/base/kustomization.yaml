@@ -2,6 +2,37 @@
 # directory creates the namespace, the CSIDriver, the RBAC, the controller and
 # the node DaemonSet, and no StorageClass (see ../examples).
 #
+# The kubelet directory is one parameter, the ConfigMap literal `kubeletDir`
+# below (default /var/lib/kubelet). The `replacements` entry copies it into the
+# node DaemonSet's KUBELET_DIR env values (the miami container and the
+# registrar), the kubelet-dir hostPath and the miami container's mount path,
+# the only fields Kubernetes cannot expand; everything else derives from
+# KUBELET_DIR in the container args or is a subPath of the one volume. The controller needs none of
+# this. The ConfigMap is also applied to the cluster; nothing reads it there.
+#
+# Kustomize runs a base's replacements while it builds the base, before an
+# overlay's generators, so an overlay that merges a new literal must run the
+# same replacement again over the merged value. The overlay writes no patch:
+#
+#   configMapGenerator:
+#     - name: miami-deploy
+#       namespace: miami-system
+#       behavior: merge
+#       literals:
+#         - kubeletDir=/var/lib/k0s/kubelet
+#   replacements:
+#     - source: {kind: ConfigMap, name: miami-deploy, fieldPath: data.kubeletDir}
+#       targets:
+#         - select: {kind: DaemonSet, name: miami-node}
+#           fieldPaths:
+#             - spec.template.spec.containers.[name=miami].env.[name=KUBELET_DIR].value
+#             - spec.template.spec.containers.[name=csi-node-driver-registrar].env.[name=KUBELET_DIR].value
+#             - spec.template.spec.containers.[name=miami].volumeMounts.[name=kubelet-dir].mountPath
+#             - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path
+#
+# Known roots: k0s /var/lib/k0s/kubelet, k3s /var/lib/rancher/k3s/agent/kubelet,
+# microk8s /var/snap/microk8s/common/var/lib/kubelet.
+#
 # The driver image below is a placeholder; every overlay sets the real one with
 # `images:`. The sidecar images carry a tag for the reader and the digest of the
 # multi-arch index for the runtime.
@@ -18,3 +49,24 @@ resources:
   - clusterrolebinding-node.yaml
   - deployment-controller.yaml
   - daemonset-node.yaml
+configMapGenerator:
+  - name: miami-deploy
+    namespace: miami-system
+    options:
+      disableNameSuffixHash: true
+    literals:
+      - kubeletDir=/var/lib/kubelet
+replacements:
+  - source:
+      kind: ConfigMap
+      name: miami-deploy
+      fieldPath: data.kubeletDir
+    targets:
+      - select:
+          kind: DaemonSet
+          name: miami-node
+        fieldPaths:
+          - spec.template.spec.containers.[name=miami].env.[name=KUBELET_DIR].value
+          - spec.template.spec.containers.[name=csi-node-driver-registrar].env.[name=KUBELET_DIR].value
+          - spec.template.spec.containers.[name=miami].volumeMounts.[name=kubelet-dir].mountPath
+          - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path

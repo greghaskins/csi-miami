@@ -6,6 +6,10 @@ FROM --platform=$BUILDPLATFORM golang:1.27.3@sha256:2920bb124f1a2e12a1d39f0cab75
 ARG TARGETARCH
 ARG VERSION=dev
 ENV GOTOOLCHAIN=local
+# CPU baselines, pinned so a default change in the toolchain cannot raise them:
+# amd64 v1 runs on older x86 without SSE4.2 or AVX, arm64 v8.0 on the
+# Raspberry Pi 4. Only the matching variable takes effect for each target.
+ENV GOAMD64=v1 GOARM64=v8.0
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
