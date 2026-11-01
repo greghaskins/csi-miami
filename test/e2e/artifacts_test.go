@@ -99,7 +99,8 @@ func (e *env) dump(t *testing.T, ns string) {
 
 	// Events.
 	var events bytes.Buffer
-	for _, n := range []string{ns, e.DriverNS} {
+	// The events of a PersistentVolume are in the default namespace.
+	for _, n := range []string{ns, e.DriverNS, "default"} {
 		evs, err := e.Client.CoreV1().Events(n).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			note("listing events in "+n, err)
@@ -111,7 +112,7 @@ func (e *env) dump(t *testing.T, ns string) {
 		}
 	}
 	write("events.txt", events.Bytes())
-	t.Logf("events of %s and %s:\n%s", ns, e.DriverNS, tailLines(events.String(), 60))
+	t.Logf("events of %s, %s and default:\n%s", ns, e.DriverNS, tailLines(events.String(), 60))
 
 	// Each node's mount table.
 	if nodesErr == nil {

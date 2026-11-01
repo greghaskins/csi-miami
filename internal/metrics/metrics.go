@@ -34,6 +34,8 @@ var reconcileBuckets = []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 3
 const (
 	NameIntents             = "miami_intents"
 	NameTransports          = "miami_transports"
+	NameTransportUp         = "miami_transport_up"
+	NameVolumeCondition     = "miami_volume_condition"
 	NameReconcileDuration   = "miami_reconcile_duration_seconds"
 	NameReconcileErrors     = "miami_reconcile_errors_total"
 	NameObservationTimeouts = "miami_observation_timeouts_total"
@@ -46,7 +48,7 @@ const (
 // NodeFamilies are the families a node plugin serves: its reconciler's and the
 // two CSI request metrics.
 var NodeFamilies = []string{
-	NameIntents, NameTransports, NameReconcileDuration, NameReconcileErrors,
+	NameIntents, NameTransports, NameTransportUp, NameVolumeCondition, NameReconcileDuration, NameReconcileErrors,
 	NameObservationTimeouts, NameGarbageUnmounts, NameIntentLoadFailures,
 	NameCSIRequests, NameCSIRequestDuration,
 }
@@ -58,7 +60,7 @@ var ControllerFamilies = []string{NameCSIRequests, NameCSIRequestDuration}
 // ReconcileSteps are the step names the reconciler passes to IncReconcileError
 // and IncObservationTimeout (see reconcile.Metrics). Their counters are
 // created at zero.
-var ReconcileSteps = []string{"load", "transport", "item", "publish", "teardown", "garbage", "observe"}
+var ReconcileSteps = []string{"load", "transport", "probe", "item", "publish", "teardown", "garbage", "observe"}
 
 // Registry holds the driver's metrics. Build one with New. It implements
 // reconcile.Metrics and is safe for concurrent use.
@@ -67,6 +69,8 @@ type Registry struct {
 
 	intents         *prometheus.GaugeVec
 	transports      *prometheus.GaugeVec
+	transportUp     *prometheus.GaugeVec
+	volumeCondition *prometheus.GaugeVec
 	reconcileDur    prometheus.Histogram
 	reconcileErrs   *prometheus.CounterVec
 	obsTimeouts     *prometheus.CounterVec
@@ -107,6 +111,12 @@ func New(opts ...Option) *Registry {
 	r.transports = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: NameTransports, Help: "Whether a transport was found mounted in the latest pass: 1 mounted, 0 not.",
 	}, []string{"kind", "id"})
+	r.transportUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameTransportUp, Help: "Whether a mounted transport answered a deadline-bounded statfs in the latest pass: 1 it did, 0 it timed out, was busy or failed (or is not mounted).",
+	}, []string{"kind", "id"})
+	r.volumeCondition = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameVolumeCondition, Help: "Volumes staged on this node in each condition after the latest pass (ok, or what is wrong).",
+	}, []string{"condition"})
 	r.reconcileDur = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: NameReconcileDuration, Help: "Duration of one converge pass.", Buckets: reconcileBuckets,
 	})
@@ -132,6 +142,10 @@ func New(opts ...Option) *Registry {
 	// The steps the reconciler reports are a fixed list (reconcile.Metrics), so
 	// their counters exist at zero from the start: a series that appears only
 	// at the first failure cannot be rated or alerted on before it.
+	// The same goes for every condition a volume can be in.
+	for _, c := range reconcile.Conditions {
+		r.volumeCondition.WithLabelValues(c)
+	}
 	for _, step := range ReconcileSteps {
 		r.reconcileErrs.WithLabelValues(step)
 		r.obsTimeouts.WithLabelValues(step)
@@ -144,7 +158,7 @@ func New(opts ...Option) *Registry {
 	)
 	if o.reconciler {
 		r.reg.MustRegister(
-			r.intents, r.transports, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
+			r.intents, r.transports, r.transportUp, r.volumeCondition, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
 			r.garbage, r.loadFailures,
 		)
 	}
@@ -164,6 +178,25 @@ func (r *Registry) SetTransport(kind, id string, mounted bool) {
 		v = 1
 	}
 	r.transports.WithLabelValues(kind, id).Set(v)
+}
+
+// SetTransportUp implements reconcile.Metrics: 1 for a transport that
+// answered its probe, 0 for one that did not.
+func (r *Registry) SetTransportUp(kind, id string, up bool) {
+	v := 0.0
+	if up {
+		v = 1
+	}
+	r.transportUp.WithLabelValues(kind, id).Set(v)
+}
+
+// SetVolumeConditions implements reconcile.Metrics. Only the conditions the
+// reconciler names are set; counts for any other key are dropped, so the label
+// values are a fixed list.
+func (r *Registry) SetVolumeConditions(counts map[string]int) {
+	for _, c := range reconcile.Conditions {
+		r.volumeCondition.WithLabelValues(c).Set(float64(counts[c]))
+	}
 }
 
 // ObserveReconcile implements reconcile.Metrics.

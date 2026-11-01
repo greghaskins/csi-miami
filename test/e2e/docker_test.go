@@ -154,3 +154,52 @@ func nodeIntentCount(ctx context.Context, node string) (int, error) {
 	}
 	return n, nil
 }
+
+// nfsServerAddress is the IPv4 address of the NFS server container on its
+// network.
+func (e *env) nfsServerAddress(ctx context.Context) (string, error) {
+	out, err := docker(ctx, "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", e.NFSContainer)
+	return strings.TrimSpace(out), err
+}
+
+// nfsServerRunning reports whether the NFS server container is running.
+func (e *env) nfsServerRunning(ctx context.Context) (bool, error) {
+	out, err := docker(ctx, "inspect", "-f", "{{.State.Running}}", e.NFSContainer)
+	return strings.TrimSpace(out) == "true", err
+}
+
+// stopNFSServer stops the NFS server container, whose entrypoint stops the
+// nfsd threads on SIGTERM. Its export is a docker volume, so it survives.
+func (e *env) stopNFSServer(ctx context.Context) error {
+	_, err := docker(ctx, "stop", "--time", "10", e.NFSContainer)
+	return err
+}
+
+// startNFSServer starts the stopped NFS server container again: the same
+// export on the same volume, and nfsd, mountd and rpcbind from nothing.
+func (e *env) startNFSServer(ctx context.Context) error {
+	_, err := docker(ctx, "start", e.NFSContainer)
+	return err
+}
+
+// nfsServerReadyCount is how many times the server container has said it is
+// ready: once per start.
+func (e *env) nfsServerReadyCount(ctx context.Context) (int, error) {
+	out, err := docker(ctx, "logs", e.NFSContainer)
+	n := 0
+	for _, l := range strings.Split(out, "\n") {
+		if strings.TrimSpace(l) == "nfs-server: ready" {
+			n++
+		}
+	}
+	return n, err
+}
+
+// nodeKernel is the kernel release a node runs, which is the host's.
+func nodeKernel(ctx context.Context, node string) string {
+	out, err := nodeExec(ctx, node, "uname", "-r")
+	if err != nil {
+		return "unknown (" + err.Error() + ")"
+	}
+	return strings.TrimSpace(out)
+}

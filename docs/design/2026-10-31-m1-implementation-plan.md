@@ -147,6 +147,7 @@ and unstage of the same ID across calls.
 | `miami/transport.export` | nfs3 export path |
 | `miami/transport.path` | local host path |
 | `miami/subdir` | optional prefix under the transport, tokens expanded; omitted when empty. The item directory is `<subdir>/<name>` (decision 20) |
+| `miami/mode` | optional mode of the item directory when the driver creates it, four octal digits (`0755`); omitted when the StorageClass sets none (decision 28) |
 
 - Delete and expand get only the ID, so the controller fetches the PV by
   name (`pvc-<uuid>` is the PV name) and rebuilds the `Spec` from its
@@ -165,6 +166,7 @@ and unstage of the same ID across calls.
 | `transport.export` | nfs3 | export path |
 | `transport.path` | local | absolute host path |
 | `subdir` | no | optional prefix under the transport with `${pvc.namespace}` and `${pvc.name}` tokens; default none. The volume's own name is always appended (decision 20) |
+| `mode` | no | the mode of the volume's directory when the driver creates it: an octal number of up to four digits, `0755` by default; `0777` (any user may write, for an export that squashes root) and `2775` (setgid) are the documented examples (decision 28) |
 
 Validation: `subdir` must be relative, must not contain `..` as a path
 element, a NUL or any control character, and no element may be longer than
@@ -174,6 +176,18 @@ means no prefix, as does an empty or omitted `subdir`. Each token value must
 be a single non-empty path element. An unresolved or unknown token is
 `InvalidArgument`. Unknown parameters are `InvalidArgument` so a typo cannot
 silently mean the default.
+
+`mode` is `InvalidArgument` unless it is one to four octal digits (a sign, a
+prefix such as `0o`, a digit above 7 or more than four digits is refused); the
+setgid and sticky bits are the leading digit (0 to 3); setuid (a leading 4 to
+7) is refused because it has no meaning on a directory, and nothing above four
+digits is allowed. Upgrade every node plugin before setting `mode` on a class:
+an older node refuses a volume context with `miami/mode`, and one that rewrites
+a record drops the field. It is the mode of the volume's own directory only: the `subdir`
+elements above it are made 0755, and a directory that already exists is adopted
+as it is and never chmod'ed. The controller applies it for `nfs3` and the node at
+the first stage of a `local` volume, with `fchmod` so that the umask does not
+decide it.
 
 A given server is named one way across all StorageClasses on a cluster (the
 normal form already collapses case). The kernel reports a shared NFS
@@ -277,7 +291,8 @@ Choices made in T7 where the plan was silent:
   statelessness is the point, nothing must survive a restart).
 - `CreateVolume`: validate, resolve `subdir`. For `nfs3`: mount the
   transport, `mkdir -p <transport>/<subdir>/<name>` (idempotent: an existing
-  directory is adopted), return ID and context. For `local` (decision 23):
+  directory is adopted; the new directory gets the `mode` parameter, 0755 by
+  default), return ID and context. For `local` (decision 23):
   return ID, context and the node topology and touch no file system, because
   the directory is on the disk of the node the volume is for, not of the node
   the controller runs on; the node creates it at first stage if it is
@@ -311,7 +326,7 @@ and `noatime` is the generic mount flag `MS_NOATIME`, not a data option.
 | option | reason |
 |---|---|
 | `vers=3,proto=tcp` | the protocol the target NAS speaks; TCP so a socket reset is a real fence (M2) |
-| `softerr,timeo=100,retrans=3` | bounded failure: retries at 10, 20, 30 and 40 seconds, about 100s in all, so the major timeout is a constant the fence math (M2) can use. `softerr` returns `ETIMEDOUT` instead of `EIO`, so a NAS stall is distinguishable from a disk error. Needs kernel 5.3+; on `EINVAL` the mount fails with an explicit message, never a silent fallback to `soft` or `hard` |
+| `softerr,timeo=100,retrans=3` | bounded failure: a 40 second major timeout, `timeo` x (`retrans`+1) (over TCP the retry interval grows linearly and the major timeout is capped there), so it is a constant the fence math (M2) can use. `softerr` returns `ETIMEDOUT` instead of `EIO`, so a NAS stall is distinguishable from a disk error. Needs kernel 5.3+; on `EINVAL` the mount fails with an explicit message, never a silent fallback to `soft` or `hard` |
 | `nolock` | locks are node-local; cross-node coordination uses `mkdir` and `O_EXCL`, which are server round-trips regardless; no NLM, no lockd state to hang |
 | `lookupcache=positive` | never cache a negative lookup, so a file or lock directory created on another node is seen on the next lookup |
 | `actimeo=30` | attribute cache; file contents are unaffected because close-to-open revalidates on every `open` (also how M2 reads another node's holder mtime fresh); directory listings lag by at most 30s |
@@ -391,7 +406,13 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
 
 **Converge, for a directory item.**
 
-1. Transport mounted (adopt or mount).
+1. Transport mounted (adopt or mount), then asked whether it answers: a
+   `statfs` of its mount directory under the stat deadline, once per transport
+   per pass, reported as `miami_transport_up` and logged once per change. A
+   timeout or busy is noted as a hung transport (one deadline per transport per
+   pass, the other volumes on it wait for the next pass). The transport is
+   reported and never repaired: nothing is unmounted or remounted because it
+   does not answer.
 2. `<transport>/<subdir>/<name>` exists and is a directory (adopt). For
    `nfs3` the controller created it, and a missing directory at stage is
    `NotFound`; for `local` the controller creates nothing (decision 23), so
@@ -400,7 +421,11 @@ by intents. No `findmnt`. For `GET_VOLUME_STATS`, `statfs` under a deadline.
    first record of a local volume and cleared by the reconciler once the item
    has converged; a directory missing without it is `NotFound`, as for `nfs3`,
    so a disk that is not mounted, or a reboot, never gives a pod an empty
-   volume.
+   volume. A directory the node creates takes the volume's `mode` (0755 by
+   default). The stat of the directory that returns ESTALE, times out or is
+   busy is `ErrTransportUnavailable`, not a failure of the item: the NFS server
+   has restarted or is not answering, the volume's event is `TransportUnavailable`
+   and the next pass looks again (decision 28).
 3. Nothing is mounted at the stage path (decision 25). A bind of the item
    directory there is the stage bind of a build before the decision, and is
    unmounted; anything else mounted there is `FailedPrecondition`, reported and
@@ -443,7 +468,20 @@ On the node (`--metrics-addr`, default `:9810`, served on the host network):
 - `miami_intents{kind}` gauge; `miami_transports{kind,id}` gauge whose value
   is 1 when the transport was found mounted and 0 when not (a `mounted` label
   would leave a stale series at every change).
-- `miami_reconcile_duration_seconds` histogram; `miami_reconcile_errors_total{step}`.
+- `miami_transport_up{kind,id}` gauge: 1 when a deadline-bounded `statfs` of the
+  transport's mount directory answered in the pass, 0 when it timed out, was
+  busy or failed, or the transport is not mounted (statfs always asks the
+  server, where a stat can come from the attribute cache). One series per
+  transport the intents reference.
+- `miami_volume_condition{condition}` gauge: the number of volumes in each
+  condition after the pass; `condition` is `ok` or one of `unresponsive`,
+  `transport-unavailable`, `transport-conflict`, `stage-conflict`,
+  `publish-conflict`, `item-missing`, `item-not-directory`, `failed`, every
+  value present at zero. No volume ID in a label. A volume is in one condition:
+  its stage's if that failed, else its first failing publish's.
+- `miami_reconcile_duration_seconds` histogram; `miami_reconcile_errors_total{step}`
+  (steps: `load`, `transport`, `probe`, `item`, `publish`, `teardown`, `garbage`,
+  `observe`).
 - `miami_observation_timeouts_total{op}`; `miami_garbage_unmounts_total`.
 - `miami_intent_load_failures`: a gauge, the number of records unreadable in
   the latest pass (it falls when a person repairs one), not the counter the
@@ -538,9 +576,10 @@ Workflows, all pinned by SHA with least permissions:
   end-to-end tests also dump the failed test's YAML and events.
 
 **e2e NFS server.** `hack/nfs-server/` runs the kernel NFS server in a
-privileged container on the runner's docker network, exporting a tmpfs with
-`fsid=0,rw,no_root_squash,insecure` for NFSv3, and the kind nodes mount it
-by container IP. The `nfs3` variant is what proves `mount(2)` without a
+privileged container on the runner's docker network, exporting a docker volume
+(so that its files and the clients' file handles survive a restart of the
+container) with `fsid=0,rw,no_root_squash,insecure` for NFSv3, and the kind
+nodes mount it by container IP. The `nfs3` variant is what proves `mount(2)` without a
 helper; it must exist before the first node-agent PR merges.
 
 ## 15. Work breakdown
@@ -562,6 +601,7 @@ acceptance check. Order matters only where stated.
 | T10 | `test/e2e`: the exit criteria 1 to 6 as tests, `local` and `nfs3` variants; `smoke` and `sanity` and `e2e` jobs wired into `ci.yml` | `ci-ok` green with the full matrix |
 | T11 | `miami lock` and its test against the `nfs3` e2e transport | two pods on two nodes serialize through it; a stale lock is broken |
 | T12 | README: install, StorageClass examples, the lock contract, limitations | reviewed |
+| T14 | the `mode` parameter; ESTALE and deadlines on the item directory as the transport's condition; `miami_transport_up` and `miami_volume_condition`; the NFS server restart e2e on a docker-volume export | `ci-ok` green with the restart test in the nfs3 legs |
 
 T1 first, T2 to T5 in any order, T6 after T3 to T5, T7 after T6, T8 after
 T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
@@ -598,5 +638,8 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
 ## 17. Out of scope for M1
 
 Image items, loop devices, encryption, exclusivity, fencing, expansion,
-failed-volume detection, remediation, the migration tool, RWX images,
+failed-volume detection (M1 reports a transport that does not answer through
+`miami_transport_up`, `miami_volume_condition` and a `TransportUnavailable`
+event, and does not remediate it: no unmount, remount or pod deletion),
+remediation, the migration tool, RWX images,
 node-local tiers, the S3 service. Each has its milestone in the brief.

@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 
 	kubefake "github.com/greghaskins/csi-miami/internal/kube/fake"
@@ -130,6 +132,11 @@ func TestCreateVolumeInvalidArgument(t *testing.T) {
 		{"no kind", func(_ *env, r *csi.CreateVolumeRequest) { delete(r.Parameters, "kind") }, codes.InvalidArgument, "kind"},
 		{"relative export", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["transport.export"] = "rel" }, codes.InvalidArgument, "absolute"},
 		{"unresolved subdir token", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["subdir"] = "${pvc.namespace}" }, codes.InvalidArgument, "extra-create-metadata"},
+		{"mode with a digit above 7", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["mode"] = "0758" }, codes.InvalidArgument, "mode"},
+		{"mode with more than four digits", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["mode"] = "10755" }, codes.InvalidArgument, "mode"},
+		{"mode with a prefix", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["mode"] = "0o755" }, codes.InvalidArgument, "mode"},
+		{"mode that is not a number", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["mode"] = "rwxr-xr-x" }, codes.InvalidArgument, "mode"},
+		{"negative mode", func(_ *env, r *csi.CreateVolumeRequest) { r.Parameters["mode"] = "-755" }, codes.InvalidArgument, "mode"},
 		{"negative capacity", func(_ *env, r *csi.CreateVolumeRequest) {
 			r.CapacityRange = &csi.CapacityRange{RequiredBytes: -1}
 		}, codes.InvalidArgument, "negative"},
@@ -737,5 +744,87 @@ func TestFSStatusMapping(t *testing.T) {
 				t.Errorf("code = %v, want %v", got, tt.code)
 			}
 		})
+	}
+}
+
+// The mode parameter is the mode of the volume's directory, whatever the umask
+// of the controller; the directories above it keep 0755. It sets the process
+// umask, so it is not parallel.
+func TestCreateVolumeModeParameterAppliesUnderAnyUmask(t *testing.T) {
+	old := unix.Umask(0o077)
+	defer unix.Umask(old)
+	tests := []struct {
+		mode, canonical string
+		want            fs.FileMode
+	}{
+		{"0777", "0777", 0o777},
+		{"777", "0777", 0o777},
+		{"2775", "2775", 0o775 | fs.ModeSetgid},
+		{"0700", "0700", 0o700},
+		{"0755", "0755", 0o755},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			e := newEnv(t)
+			req := e.createReq(nameA, "mode", tt.mode, "subdir", "teams")
+			resp, err := e.ctrl.CreateVolume(context.Background(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The context carries the mode in its canonical form, for the node.
+			if got := resp.GetVolume().GetVolumeContext()["miami/mode"]; got != tt.canonical {
+				t.Errorf("miami/mode = %q, want %q", got, tt.canonical)
+			}
+			fi, err := os.Lstat(filepath.Join(e.mountDir(), "teams", nameA))
+			if err != nil || !fi.IsDir() {
+				t.Fatalf("the volume directory is missing: %v", err)
+			}
+			if got := fi.Mode() & (fs.ModePerm | fs.ModeSetgid | fs.ModeSetuid | fs.ModeSticky); got != tt.want {
+				t.Errorf("directory mode = %v, want %v", got, tt.want)
+			}
+			if fi, _ := os.Lstat(filepath.Join(e.mountDir(), "teams")); fi.Mode().Perm() != 0o755 {
+				t.Errorf("subdir mode = %o, want 755", fi.Mode().Perm())
+			}
+		})
+	}
+}
+
+// A directory that exists is adopted as it is: the mode parameter is not
+// applied to it, and a retried create does not change what a person set.
+func TestCreateVolumeModeParameterDoesNotChmodAnAdoptedDirectory(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	dir := filepath.Join(e.mountDir(), nameA)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ctrl.CreateVolume(context.Background(), e.createReq(nameA, "mode", "0777")); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("adopted directory: %v, %v; want mode 0700 untouched", fi, err)
+	}
+}
+
+// For a local transport the mode is only carried to the node: the controller
+// touches no file system.
+func TestCreateVolumeLocalCarriesTheMode(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	req := e.createReq(nameA)
+	req.Parameters = e.localParams()
+	req.Parameters["mode"] = "2775"
+	req.AccessibilityRequirements = &csi.TopologyRequirement{
+		Preferred: []*csi.Topology{{Segments: map[string]string{TopologyKeyNode: "node-a"}}},
+	}
+	resp, err := e.ctrl.CreateVolume(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.GetVolume().GetVolumeContext()["miami/mode"]; got != "2775" {
+		t.Errorf("miami/mode = %q, want 2775", got)
+	}
+	if calls := e.mounter.Calls(); len(calls) != 0 {
+		t.Errorf("the controller touched the mounter for a local volume: %v", calls)
 	}
 }

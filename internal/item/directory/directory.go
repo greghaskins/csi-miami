@@ -21,7 +21,8 @@
 // cannot reach the disk, so the node creates the directory at first stage when
 // it is missing (decision 23; the intent's EnsureItem says it is the first
 // stage, and a later pass that finds the directory missing reports
-// item.ErrItemMissing like nfs3), with mode 0755, relative to descriptors and
+// item.ErrItemMissing like nfs3), with the volume's mode (the StorageClass's
+// mode parameter, 0755 by default; its parents 0755), relative to descriptors and
 // without following a symlink or crossing a mount.
 //
 // A bind of the volume's own item directory at the stage path is the one thing
@@ -75,9 +76,10 @@ type Config struct {
 	Stat func(path string) (fs.FileInfo, error)
 
 	// Ensure makes the item directory dir below the transport mount mountDir,
-	// with its parents, for a local transport. Nil means a safe creation with
-	// openat2(2) that follows no symlink and crosses no mount.
-	Ensure func(mountDir, dir string) error
+	// with its parents, for a local transport; dir gets mode (the volume's
+	// mode, volume.Context.DirMode) and its parents 0755. Nil means a safe
+	// creation with openat2(2) that follows no symlink and crosses no mount.
+	Ensure func(mountDir, dir string, mode uint32) error
 }
 
 // Item is the directory item kind. It is safe for concurrent use.
@@ -206,6 +208,11 @@ func (d *Item) checkDir(ctx context.Context, volumeID, dir string) error {
 	case errors.Is(err, syscall.ENOTDIR):
 		// An element of the path is a file: the item path is not a directory.
 		return fmt.Errorf("directory item %s: %w: %s", volumeID, item.ErrItemNotDirectory, dir)
+	case errors.Is(err, syscall.ESTALE), errors.Is(err, mount.ErrTimeout), errors.Is(err, mount.ErrBusy):
+		// The server restarted (its file handles are stale) or does not
+		// answer: the transport's condition, not the item's. Nothing is
+		// unmounted or mounted for it; the next pass looks again.
+		return fmt.Errorf("directory item %s: %w: %w", volumeID, item.ErrTransportUnavailable, err)
 	case err != nil:
 		return fmt.Errorf("directory item %s: %w", volumeID, err)
 	case !fi.IsDir():
@@ -224,7 +231,7 @@ func (d *Item) ensure(ctx context.Context, in intent.Intent, dir string) error {
 	}
 	what := fmt.Sprintf("creating the item directory %q", dir)
 	if _, err := deadline.Run(ctx, d.cfg.Timeout, what, &d.busy, "ensure\x00"+dir, func(context.Context) (struct{}, error) {
-		return struct{}{}, d.cfg.Ensure(mountDir, dir)
+		return struct{}{}, d.cfg.Ensure(mountDir, dir, in.Context().DirMode())
 	}); err != nil {
 		return fmt.Errorf("directory item %s: %w", in.VolumeID, err)
 	}

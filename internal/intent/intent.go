@@ -52,7 +52,7 @@ type Publish struct {
 }
 
 // Intent says what should be true on this node for one volume. It mirrors
-// volume.Context (Kind, Transport, Subdir) plus the volume ID.
+// volume.Context (Kind, Transport, Subdir, Mode) plus the volume ID.
 //
 // Its JSON form is fixed by this package, not by the field names here or in
 // transport.Spec; see Version.
@@ -66,7 +66,12 @@ type Intent struct {
 	// Subdir is the optional prefix under the transport, empty for none;
 	// the item's directory is <transport mount>/<Subdir>/<volume name>, and
 	// volume.Context.Dir computes it.
-	Subdir     string
+	Subdir string
+	// Mode is the mode the node gives the item directory when it creates it,
+	// as the volume context carries it (volume.Context.Mode): four octal
+	// digits, or empty for the default. Informational for a version 1 reader,
+	// which ignores it and so creates with the default: no Version bump.
+	Mode       string
 	StagePath  string
 	Publishes  []Publish
 	MountFlags []string
@@ -107,9 +112,9 @@ func (in Intent) ID() (volume.ID, error) {
 }
 
 // Context returns the volume context the record mirrors: its kind, transport
-// and subdir.
+// subdir and mode.
 func (in Intent) Context() volume.Context {
-	return volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir}
+	return volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir, Mode: in.Mode}
 }
 
 // Validate reports whether the Intent is a structurally sound record, which
@@ -125,7 +130,7 @@ func (in Intent) Context() volume.Context {
 // path (export, local path, stage path, publish targets) is absolute,
 // cleaned, free of control characters, shorter than 4096 bytes and not "/";
 // the subdir is empty or relative, cleaned and free of ".." and control
-// characters; publish targets are unique, none is the stage path or inside
+// characters; the mode is empty or four octal digits; publish targets are unique, none is the stage path or inside
 // it, and none is inside another; the access mode is a CSI access mode name;
 // and every mount flag is non-empty without commas or control characters.
 //
@@ -153,6 +158,9 @@ func (in Intent) Validate() error {
 	}
 	if err := validateSubdir(in.Subdir); err != nil {
 		return err
+	}
+	if err := volume.CheckMode(in.Mode); err != nil {
+		return errors.New("mode must be empty or four octal digits")
 	}
 	if err := checkAbsPath("stagePath", in.StagePath); err != nil {
 		return err

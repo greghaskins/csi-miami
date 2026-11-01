@@ -515,6 +515,7 @@ func (p *pass) collectIdleTransports(t observe.Table, refs map[string]struct{}, 
 		r.metrics.SetTransport(kind, filepath.Base(dir), false)
 		r.metrics.IncGarbageUnmount()
 		delete(r.warned, dir)
+		delete(r.up, dir)
 		r.log.Info("unmounted an idle transport", "dir", dir)
 	}
 	for dir := range r.idleSince {
