@@ -4,9 +4,10 @@
 #
 # The kubelet directory is one parameter, the ConfigMap literal `kubeletDir`
 # below (default /var/lib/kubelet). The `replacements` entry copies it into the
-# node DaemonSet's KUBELET_DIR env values, the kubelet-dir hostPath and its
-# mount paths, the only fields Kubernetes cannot expand; everything else
-# derives from KUBELET_DIR in the container args. The controller needs none of
+# node DaemonSet's KUBELET_DIR env values (the miami container and the
+# registrar), the kubelet-dir hostPath and the miami container's mount path,
+# the only fields Kubernetes cannot expand; everything else derives from
+# KUBELET_DIR in the container args or is a subPath of the one volume. The controller needs none of
 # this. The ConfigMap is also applied to the cluster; nothing reads it there.
 #
 # Kustomize runs a base's replacements while it builds the base, before an
@@ -26,10 +27,7 @@
 #           fieldPaths:
 #             - spec.template.spec.containers.[name=miami].env.[name=KUBELET_DIR].value
 #             - spec.template.spec.containers.[name=csi-node-driver-registrar].env.[name=KUBELET_DIR].value
-#             - spec.template.spec.containers.[name=livenessprobe].env.[name=KUBELET_DIR].value
 #             - spec.template.spec.containers.[name=miami].volumeMounts.[name=kubelet-dir].mountPath
-#             - spec.template.spec.containers.[name=csi-node-driver-registrar].volumeMounts.[name=kubelet-dir].mountPath
-#             - spec.template.spec.containers.[name=livenessprobe].volumeMounts.[name=kubelet-dir].mountPath
 #             - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path
 #
 # Known roots: k0s /var/lib/k0s/kubelet, k3s /var/lib/rancher/k3s/agent/kubelet,
@@ -70,8 +68,5 @@ replacements:
         fieldPaths:
           - spec.template.spec.containers.[name=miami].env.[name=KUBELET_DIR].value
           - spec.template.spec.containers.[name=csi-node-driver-registrar].env.[name=KUBELET_DIR].value
-          - spec.template.spec.containers.[name=livenessprobe].env.[name=KUBELET_DIR].value
           - spec.template.spec.containers.[name=miami].volumeMounts.[name=kubelet-dir].mountPath
-          - spec.template.spec.containers.[name=csi-node-driver-registrar].volumeMounts.[name=kubelet-dir].mountPath
-          - spec.template.spec.containers.[name=livenessprobe].volumeMounts.[name=kubelet-dir].mountPath
           - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path

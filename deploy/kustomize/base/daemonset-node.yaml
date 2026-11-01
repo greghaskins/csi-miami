@@ -6,7 +6,9 @@
 # in kustomization.yaml from the ConfigMap literal `kubeletDir`; the value
 # written here is only what the replacement overwrites. The kubelet directory
 # is mounted whole, so the CSI socket directory and the registry directory are
-# subdirectories of that one mount. deploy/policy_test.go fails if any
+# subdirectories of that one mount; only the miami container mounts the whole
+# directory (Bidirectional), the sidecars mount just the subPaths they use.
+# deploy/policy_test.go fails if any
 # occurrence disagrees.
 #
 # The miami container is privileged because the kubelet allows
@@ -84,9 +86,9 @@ spec:
         - name: csi-node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0@sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
           args:
-            - --csi-address=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+            - --csi-address=/csi/csi.sock
             - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
-            - --plugin-registration-path=$(KUBELET_DIR)/plugins_registry
+            - --plugin-registration-path=/registration
             - --v=2
           env:
             - name: KUBELET_DIR
@@ -102,18 +104,22 @@ spec:
               drop: [ALL]
             seccompProfile:
               type: RuntimeDefault
+          # Only the two subdirectories the registrar needs, not the whole
+          # kubelet root. A subPath is relative to the volume root, so it needs
+          # no expansion; the kubelet creates a missing one.
           volumeMounts:
             - name: kubelet-dir
-              mountPath: /var/lib/kubelet
+              mountPath: /csi
+              subPath: plugins/miami.csi.greghaskins.com
+            - name: kubelet-dir
+              mountPath: /registration
+              subPath: plugins_registry
         - name: livenessprobe
           image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0@sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8
           args:
-            - --csi-address=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+            - --csi-address=/csi/csi.sock
             - --http-endpoint=:9812
             - --v=2
-          env:
-            - name: KUBELET_DIR
-              value: /var/lib/kubelet
           ports:
             - name: healthz
               containerPort: 9812
@@ -130,7 +136,8 @@ spec:
               type: RuntimeDefault
           volumeMounts:
             - name: kubelet-dir
-              mountPath: /var/lib/kubelet
+              mountPath: /csi
+              subPath: plugins/miami.csi.greghaskins.com
       volumes:
         # The kubelet's root, the one hostPath of the node. Under it live the
         # CSI socket (plugins/<driver>), the registry the registrar writes to

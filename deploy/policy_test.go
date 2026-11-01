@@ -418,8 +418,8 @@ func expand(s, name, value string) string {
 }
 
 // checkKubeletDir asserts that the one kubelet directory dir is what every
-// field of the node DaemonSet that names it says: the three fields Kubernetes
-// cannot expand (the env value, the hostPath and its mount path) and every
+// field of the node DaemonSet that names it says: the fields Kubernetes cannot
+// expand (the env values, the hostPath and the miami container's mount path) and every
 // argument, which derives from $(KUBELET_DIR).
 func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 	t.Helper()
@@ -431,14 +431,24 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 			"kubelet-dir": dir,
 		},
 		"csi-node-driver-registrar": {
-			"csi-address":               driverDir + "/csi.sock",
+			"csi-address":               "/csi/csi.sock",
 			"kubelet-registration-path": driverDir + "/csi.sock",
-			"plugin-registration-path":  dir + "/plugins_registry",
+			"plugin-registration-path":  "/registration",
 		},
 		"livenessprobe": {
-			"csi-address": driverDir + "/csi.sock",
+			"csi-address": "/csi/csi.sock",
 		},
 	}
+	// Only the miami container mounts the whole kubelet directory; each
+	// sidecar mounts just the subPaths it uses.
+	type vm struct{ mountPath, subPath string }
+	wantMounts := map[string][]vm{
+		"miami":                     {{dir, ""}},
+		"csi-node-driver-registrar": {{"/csi", "plugins/" + driverName}, {"/registration", "plugins_registry"}},
+		"livenessprobe":             {{"/csi", "plugins/" + driverName}},
+	}
+	// Only the miami and registrar containers use $(KUBELET_DIR).
+	wantEnv := map[string]bool{"miami": true, "csi-node-driver-registrar": true}
 	for _, c := range spec.Containers {
 		var vals []string
 		for _, e := range c.Env {
@@ -446,8 +456,11 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 				vals = append(vals, e.Value)
 			}
 		}
-		if len(vals) != 1 || vals[0] != dir {
+		switch {
+		case wantEnv[c.Name] && (len(vals) != 1 || vals[0] != dir):
 			t.Errorf("%s: KUBELET_DIR env = %v, want exactly [%s]", c.Name, vals, dir)
+		case !wantEnv[c.Name] && len(vals) != 0:
+			t.Errorf("%s: KUBELET_DIR env = %v, want none", c.Name, vals)
 		}
 		for _, a := range c.Args {
 			if strings.Contains(a, "kubelet") && !strings.Contains(a, "$(KUBELET_DIR)") && !strings.HasPrefix(a, "--kubelet-") {
@@ -455,19 +468,27 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 			}
 		}
 		for name, want := range wantArgs[c.Name] {
-			// --csi-address of the driver itself is not a flag; the endpoint is.
 			if got := expand(flagValue(t, c.Args, name), "KUBELET_DIR", dir); got != want {
 				t.Errorf("%s: --%s expands to %q, want %q", c.Name, name, got, want)
 			}
 		}
-		var mounts []string
-		for _, vm := range c.VolumeMounts {
-			if vm.Name == "kubelet-dir" {
-				mounts = append(mounts, vm.MountPath)
+		var mounts []vm
+		for _, m := range c.VolumeMounts {
+			if m.Name != "kubelet-dir" {
+				t.Errorf("%s: mounts unknown volume %s", c.Name, m.Name)
+				continue
 			}
+			mounts = append(mounts, vm{m.MountPath, m.SubPath})
 		}
-		if len(mounts) != 1 || mounts[0] != dir {
-			t.Errorf("%s: kubelet-dir mounted at %v, want exactly [%s]", c.Name, mounts, dir)
+		if !reflect.DeepEqual(mounts, wantMounts[c.Name]) {
+			t.Errorf("%s: kubelet-dir mounts = %v, want %v", c.Name, mounts, wantMounts[c.Name])
+		}
+		if c.Name != "miami" {
+			for _, m := range c.VolumeMounts {
+				if m.MountPath == dir || m.SubPath == "" {
+					t.Errorf("%s: mounts the kubelet root (%+v); a sidecar mounts only subPaths", c.Name, m)
+				}
+			}
 		}
 	}
 	if len(spec.Volumes) != 1 || spec.Volumes[0].Name != "kubelet-dir" || spec.Volumes[0].HostPath == nil ||

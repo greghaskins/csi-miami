@@ -391,9 +391,9 @@ spec:
           mountPropagation: Bidirectional
           name: kubelet-dir
       - args:
-        - --csi-address=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+        - --csi-address=/csi/csi.sock
         - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
-        - --plugin-registration-path=$(KUBELET_DIR)/plugins_registry
+        - --plugin-registration-path=/registration
         - --v=2
         env:
         - name: KUBELET_DIR
@@ -417,15 +417,16 @@ spec:
           seccompProfile:
             type: RuntimeDefault
         volumeMounts:
-        - mountPath: /var/lib/kubelet
+        - mountPath: /csi
           name: kubelet-dir
+          subPath: plugins/miami.csi.greghaskins.com
+        - mountPath: /registration
+          name: kubelet-dir
+          subPath: plugins_registry
       - args:
-        - --csi-address=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+        - --csi-address=/csi/csi.sock
         - --http-endpoint=:9812
         - --v=2
-        env:
-        - name: KUBELET_DIR
-          value: /var/lib/kubelet
         image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0@sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8
         name: livenessprobe
         ports:
@@ -448,8 +449,9 @@ spec:
           seccompProfile:
             type: RuntimeDefault
         volumeMounts:
-        - mountPath: /var/lib/kubelet
+        - mountPath: /csi
           name: kubelet-dir
+          subPath: plugins/miami.csi.greghaskins.com
       dnsPolicy: ClusterFirstWithHostNet
       hostNetwork: true
       priorityClassName: system-node-critical
