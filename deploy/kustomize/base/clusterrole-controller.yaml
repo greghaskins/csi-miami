@@ -1,0 +1,42 @@
+# What the controller pod's containers need, and no more. deploy/policy_test.go
+# holds this list; a change here without a change there fails the test.
+#
+# csi-provisioner (v6.4.0): PersistentVolumes create, patch and delete as well
+# as read; PVCs update; StorageClasses; events; CSINodes and Nodes for
+# topology. It also reads VolumeAttachments, which the attacher rule covers.
+# Snapshot and capacity rules are left out: the driver supports neither.
+# csi-attacher (v4.13.0): PersistentVolumes patch (its finalizer);
+# VolumeAttachments and their status; CSINodes; Nodes.
+# Both sidecars: Leases for leader election.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: miami-controller
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch, update]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [volumeattachments]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [storage.k8s.io]
+    resources: [volumeattachments/status]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [storage.k8s.io]
+    resources: [csinodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [list, watch, create, update, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update, delete]

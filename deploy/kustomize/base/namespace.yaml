@@ -1,0 +1,11 @@
+# The driver's pods are privileged (node) or hold CAP_SYS_ADMIN on the host
+# network (controller), so a cluster that enforces Pod Security Admission needs
+# the privileged level here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: miami-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

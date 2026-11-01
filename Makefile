@@ -14,7 +14,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check smoke e2e envtest sanity
+.PHONY: build test test-race cover vet fmt-check fmt lint tidy tidy-check vuln content-hash image check smoke e2e envtest sanity deploy-check
 
 build:
 	mkdir -p bin
@@ -113,6 +113,23 @@ E2E_TRANSPORT ?=
 
 e2e:
 	E2E_TRANSPORT="$(E2E_TRANSPORT)" hack/e2e.sh
+
+# The deploy check: the e2e overlay on a kind cluster (one control plane, two
+# workers), both pods Ready, /healthz and /metrics scraped through the API
+# server. DEPLOY_IMAGE is a driver image in the local Docker daemon; by default
+# `make image` builds one. Needs docker, kind and kubectl (mise.toml); CI runs
+# it as the deploy job with the image it pulled. On failure,
+# DEPLOY_ARTIFACT_DIR receives the logs.
+DEPLOY_IMAGE ?=
+
+deploy-check:
+	@image="$(DEPLOY_IMAGE)"; \
+	if [ -z "$$image" ]; then \
+		$(MAKE) image || exit 1; \
+		image="$(IMAGE):x-$$(hack/content-hash.sh)"; \
+		docker image inspect "$$image" >/dev/null 2>&1 || image="$$image-dirty"; \
+	fi; \
+	hack/kind.sh --image "$$image"
 
 # Exactly what CI runs: the static job runs fmt-check vet lint tidy-check vuln
 # and the unit job runs cover.

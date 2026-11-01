@@ -701,6 +701,21 @@ Recorded:
     succeeds, logs at warning, and the directory remains on the node until
     the node-local tier (M4) deletes it, a documented limitation. `nfs3`
     volumes are created and deleted by the controller.
+24. **Deploy shape (M1, T9)**: the controller has no resizer until M2, so
+    its sidecars are provisioner, attacher and livenessprobe. Every driver and
+    sidecar container drops all capabilities except the controller's `miami`
+    container, which adds `SYS_ADMIN`; all set `allowPrivilegeEscalation:
+    false` except the privileged node container, where the field cannot
+    be false. The node's `miami` container is `privileged: true` with
+    `readOnlyRootFilesystem: true` and `seccompProfile: RuntimeDefault` (the
+    API server accepts it; the runtime ignores the profile for a privileged
+    container). The sidecars run as root so they can open the socket the driver
+    creates. Whether an nfs3 mount works with `allowPrivilegeEscalation: false`
+    on the controller is unverified until the nfs3 e2e. The namespace carries
+    the `privileged` Pod Security level. The deploy check runs on kind with a
+    control plane and two workers (the shape the end-to-end tests need), from a
+    node image pinned by digest; the DaemonSet tolerates every taint, so it
+    runs on all three nodes.
 
 Pending: none that block M1.
 

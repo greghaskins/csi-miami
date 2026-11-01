@@ -358,6 +358,70 @@ jobs:
           echo "${index} is ${index_digest}, listing ${amd64} (amd64) and ${arm64} (arm64)"
           echo "index_digest=${index_digest}" >> "$GITHUB_OUTPUT"
 
+  # The deploy check (hack/kind.sh): the e2e overlay on a kind cluster of one
+  # control plane and two workers, with the amd64 image the build job pushed
+  # (the content tag, pulled and loaded into the nodes, never pulled by them).
+  # Passes when both pods are Ready on every node, the driver is registered in
+  # every CSINode and /healthz and /metrics answer through the API server. A
+  # failing run uploads kind's logs, the pods' logs and descriptions and each
+  # node's mountinfo. kind is built, and kubectl downloaded and checked against its
+  # published checksum, at the versions mise.toml pins.
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install kind and kubectl at the versions mise.toml pins
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          kind="$(sed -n 's/^kind = "\(.*\)"$/\1/p' mise.toml)"
+          kubectl="$(sed -n 's/^kubectl = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$kind" && test -n "$kubectl"
+          GOBIN="${RUNNER_TEMP}/bin" go install "sigs.k8s.io/kind@v${kind}"
+          url="https://dl.k8s.io/release/v${kubectl}/bin/linux/amd64/kubectl"
+          curl -fsSL --retry 0 -o "${RUNNER_TEMP}/bin/kubectl" "$url"
+          printf '%s  %s\n' "$(curl -fsSL "${url}.sha256")" "${RUNNER_TEMP}/bin/kubectl" | sha256sum --check -
+          chmod +x "${RUNNER_TEMP}/bin/kubectl"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+      - name: Pull the image the build job pushed
+        id: image
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          hash="$(hack/content-hash.sh)"
+          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
+            echo "::error::unexpected content hash: '${hash}'"
+            exit 1
+          fi
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]'):x-${hash}-amd64"
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker pull "$image"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+      - name: Run the deploy check
+        env:
+          DEPLOY_IMAGE: ${{ steps.image.outputs.image }}
+          DEPLOY_ARTIFACT_DIR: ${{ runner.temp }}/deploy
+        run: make deploy-check DEPLOY_IMAGE="$DEPLOY_IMAGE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: deploy
+          path: ${{ runner.temp }}/deploy/
+          if-no-files-found: ignore
+
   # On main only: add the commit sha as an alias of the index that this run's
   # manifest job created and verified. Idempotent, so a re-run or an
   # out-of-order main job is harmless.
@@ -390,7 +454,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [static, unit, envtest, sanity, smoke, e2e, build, manifest, publish]
+    needs: [static, unit, envtest, sanity, smoke, e2e, build, manifest, deploy, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -405,11 +469,12 @@ jobs:
           E2E: ${{ needs.e2e.result }}
           BUILD: ${{ needs.build.result }}
           MANIFEST: ${{ needs.manifest.result }}
+          DEPLOY: ${{ needs.deploy.result }}
           PUBLISH: ${{ needs.publish.result }}
           PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           fail=0
-          for pair in "static=$STATIC" "unit=$UNIT" "envtest=$ENVTEST" "sanity=$SANITY" "smoke=$SMOKE" "e2e=$E2E" "build=$BUILD" "manifest=$MANIFEST"; do
+          for pair in "static=$STATIC" "unit=$UNIT" "envtest=$ENVTEST" "sanity=$SANITY" "smoke=$SMOKE" "e2e=$E2E" "build=$BUILD" "manifest=$MANIFEST" "deploy=$DEPLOY"; do
             if [ "${pair#*=}" != "success" ]; then
               echo "::error::${pair%%=*} was ${pair#*=}, expected success"
               fail=1

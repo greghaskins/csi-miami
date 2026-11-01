@@ -1,0 +1,13 @@
+# A directory on the node's own disk. The path is on the node the pod runs on,
+# so the class waits for a consumer to learn which node that is.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: miami-local
+provisioner: miami.csi.greghaskins.com
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+parameters:
+  kind: directory
+  transport.kind: local
+  transport.path: /export/data
