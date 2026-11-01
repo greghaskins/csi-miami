@@ -24,9 +24,13 @@ import (
 //  (a) It is strictly below Options.StageRoot, it is visible, and it is
 //      neither a volume's stage path nor inside one. StageRoot is the
 //      driver's own staging directory, so nothing else has business mounting
-//      there; the mount at StageRoot itself is never touched. A mount inside
-//      a live stage path is something a pod or an operator put there and is
-//      left alone.
+//      there; the mount at StageRoot itself is never touched. The driver makes
+//      no mount at a directory volume's stage path, so every mount below the
+//      staging root is a stray; one at exactly a live stage path, or inside
+//      one, is nevertheless left and reported (ErrStageConflict for the
+//      volume), because the driver cannot show that it made it or that it
+//      holds nothing a pod needs, and what it did not make is not its to
+//      remove.
 //
 //  (b) It is at exactly a publish target that no intent claims now and that
 //      the reconciler has reason to believe it made: the target was named by
@@ -488,8 +492,8 @@ func (p *pass) collectIdleTransports(t observe.Table, refs map[string]struct{}, 
 
 // dependents counts the other mounts that are made from the transport mount
 // tm: same file system, rooted at or inside tm's root, not stacked at tm's
-// own mount point. They are binds of the transport (a stage nobody claims, a
-// publish) that unmounting the transport would orphan from their path, and
+// own mount point. They are binds of the transport (a publish, or a stray
+// below the staging root) that unmounting the transport would orphan from their path, and
 // the idle timeout waits for them to go. For a transport that is the whole
 // export every mount of that file system counts; for one that is a host
 // directory, mounts of the host file system outside that directory do not.

@@ -505,9 +505,9 @@ func TestNodeGetVolumeStats(t *testing.T) {
 		return &csi.NodeGetVolumeStatsRequest{VolumeId: nodeVol, VolumePath: path}
 	}
 
-	t.Run("reports bytes and inodes for the stage path and a publish target", func(t *testing.T) {
+	t.Run("reports bytes and inodes for a publish target", func(t *testing.T) {
 		t.Parallel()
-		for _, p := range []string{stagePath, podTarget} {
+		for _, p := range []string{podTarget} {
 			sf := &fakeStatfs{st: st}
 			resp, err := newTestNode(t, &fakeRec{record: stagedRecord()}, sf).NodeGetVolumeStats(ctx, req(p))
 			if err != nil {
@@ -543,6 +543,7 @@ func TestNodeGetVolumeStats(t *testing.T) {
 		unstaged := newTestNode(t, &fakeRec{}, sf)
 		bad := &csi.NodeGetVolumeStatsRequest{VolumeId: "nope", VolumePath: stagePath}
 		for name, call := range map[string]func() error{
+			"the stage path":          func() error { _, err := staged.NodeGetVolumeStats(ctx, req(stagePath)); return err },
 			"an unknown path":         func() error { _, err := staged.NodeGetVolumeStats(ctx, req("/not/a/path")); return err },
 			"a path inside the stage": func() error { _, err := staged.NodeGetVolumeStats(ctx, req(stagePath+"/sub")); return err },
 			"a volume not staged":     func() error { _, err := unstaged.NodeGetVolumeStats(ctx, req(stagePath)); return err },
@@ -558,7 +559,7 @@ func TestNodeGetVolumeStats(t *testing.T) {
 	})
 	t.Run("an unreadable record is Unavailable", func(t *testing.T) {
 		t.Parallel()
-		_, err := newTestNode(t, &fakeRec{getErr: errors.New("io")}, nil).NodeGetVolumeStats(ctx, req(stagePath))
+		_, err := newTestNode(t, &fakeRec{getErr: errors.New("io")}, nil).NodeGetVolumeStats(ctx, req(podTarget))
 		if codeOf(err) != codes.Unavailable {
 			t.Errorf("code %v", codeOf(err))
 		}
@@ -574,7 +575,7 @@ func TestNodeGetVolumeStats(t *testing.T) {
 			{unix.ESTALE, codes.Internal},
 		} {
 			sf := &fakeStatfs{err: tt.err}
-			resp, err := newTestNode(t, &fakeRec{record: stagedRecord()}, sf).NodeGetVolumeStats(ctx, req(stagePath))
+			resp, err := newTestNode(t, &fakeRec{record: stagedRecord()}, sf).NodeGetVolumeStats(ctx, req(podTarget))
 			if codeOf(err) != tt.want || resp != nil {
 				t.Errorf("%v: resp %v, code %v, want %v", tt.err, resp, codeOf(err), tt.want)
 			}
