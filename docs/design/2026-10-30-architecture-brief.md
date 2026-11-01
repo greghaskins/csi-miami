@@ -93,12 +93,12 @@ design treats them as constraints.
 11. **Tests that pin argv strings don't catch behaviour.** An NFSv3 mount
     can break in the container image while every unit test stays green.
     End-to-end on NFSv3 from the first milestone.
-12. **After an NFS server restart there is a window of stale handles.** The
-    transport's directories can answer `ESTALE`, and a handle that went stale
-    stays stale for the life of the open file or mount, so retrying the
-    failing call does not help. Recovery is unmount and remount of the
-    transport, and the driver treats a stale answer as that signal, not as a
-    transient error.
+12. **After an NFS server restart there is a window of stale handles.** In
+    that window the transport's directories answer `ESTALE`. Directories
+    recover when the server is back; a file held open across the window may
+    not. The driver reports the condition (transport unavailable, with the
+    health gauge and event T14 adds) and does not unmount or remount in M1;
+    what remediation looks like is 4.6's question for M2.
 13. **An external watchdog that lazy-unmounts NFS mounts is a failure source,
     not a safety net.** A lazy unmount detaches the mount from every running
     pod's view while the processes keep working on a detached tree, and it
@@ -811,7 +811,10 @@ Recorded:
     carry `KUBELET_DIR`; every in-container path in their args derives from it
     by `$(KUBELET_DIR)` expansion, and the kubelet directory is mounted whole
     (the one hostPath), so the socket directory and the registry directory are
-    subdirectories of it. The fields that cannot expand (env value, hostPath
+    subdirectories of it; only the `miami` container mounts the whole
+    directory, and each sidecar mounts just its `subPath` (`plugins/<driver>`
+    at `/csi`, plus `plugins_registry` at `/registration` for the registrar),
+    so the sidecars never see other pods' volumes. The fields that cannot expand (env value, hostPath
     path, mount path) come from one `replacements` entry whose source is the
     ConfigMap literal `kubeletDir`; kustomize runs a base's replacements
     before an overlay's generators, so an overlay merges the literal and
