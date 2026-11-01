@@ -131,6 +131,8 @@ Edit `deploy/kustomize/examples/miami-dir-remote-rwx.yaml` and `miami-dir-local-
 
 ## StorageClass parameters
 
+**Naming.** A class is named `miami-<type>-<location>-<sharing>`, with a `-<crypt>` suffix when it is encrypted. `type` is `dir` (a directory item; `img` for image items later), `location` is `local` (the node's disk) or `remote` (a network server, NFSv3 today), and `sharing` is `rwo` (one node) or `rwx` (many nodes). The crypt token is defined with encryption in M2. The examples are `miami-dir-remote-rwx` (a directory on NFSv3, many nodes) and `miami-dir-local-rwo` (a directory on the node's disk, one node).
+
 | Parameter | Values | Required | Meaning |
 |---|---|---|---|
 | `kind` | `directory` | yes | Item type; only directories in M1 |
