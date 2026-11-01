@@ -3,9 +3,9 @@
 # /var/lib/miami. The sidecars run as root so they can connect to the driver's
 # socket, which the driver creates as root.
 #
-# allowPrivilegeEscalation is false on every container. Whether an nfs3 mount
-# works with it is unverified until T10's e2e; if it does not, flip it to true
-# on the `miami` container only, here, with a comment saying why.
+# allowPrivilegeEscalation is false on every container. The nfs3 mount works
+# with it: the kind e2e (T10) creates and deletes volume directories on a real
+# kernel NFS export through this container's mount.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -717,8 +717,9 @@ Recorded:
     `readOnlyRootFilesystem: true` and `seccompProfile: RuntimeDefault` (the
     API server accepts it; the runtime ignores the profile for a privileged
     container). The sidecars run as root so they can open the socket the driver
-    creates. Whether an nfs3 mount works with `allowPrivilegeEscalation: false`
-    on the controller is unverified until the nfs3 e2e. The namespace carries
+    creates. An nfs3 mount works with `allowPrivilegeEscalation: false` on the
+    controller (verified by the T10 e2e: CreateVolume and DeleteVolume make and
+    remove the directory on a kernel NFS export through it). The namespace carries
     the `privileged` Pod Security level. The deploy check runs on kind with a
     control plane and two workers (the shape the end-to-end tests need), from a
     node image pinned by digest; the DaemonSet tolerates every taint, so it
@@ -744,6 +745,34 @@ Recorded:
     (one host-visible mount per server, adoption, deadlines, garbage rules)
     is unchanged. A stage bind from before this decision is recognised as
     the driver's own and removed on the first pass.
+
+26. **Kind end-to-end tests (M1, T10)**: the tests in `test/e2e` are Go
+    (build tag `e2e`), driven through the API with client-go against a
+    cluster the harness (`hack/e2e-kind.sh`, reached from `make e2e
+    E2E_MODE=kind`) has created; they never create one. The cluster is the deploy
+    check's: one control plane and two workers from the digest-pinned node
+    image, the e2e overlay, the driver image loaded and never pulled. For
+    `nfs3` the kernel NFS server of `hack/nfs-server` runs on the docker
+    network the kind nodes are on and its IPv4 address goes into the overlay.
+    Test pods use one image, busybox from the Kubernetes end-to-end test
+    images, pinned by the digest of its multi-arch index. **The reboot
+    stand-in** is `docker restart` of a kind worker (one the controller is not
+    on): every mount in the node's namespace is gone, the kubelet and
+    containerd start from nothing and the pods' containers are recreated,
+    while the node's disk survives, as a machine's does; it exercises the
+    kubelet's and the driver's recovery without a VM. The tests shell out to
+    docker for exactly four things: the restart, a node's mount table
+    (`docker exec <node> cat /proc/1/mountinfo`), a node's files (the intent
+    record, a local volume's directory) and a directory on the NFS server
+    container's export. **A docs-only change** is
+    detected by the `changes` job, which lists the pull request's changed files
+    from the API (renames count both names) and says "code" unless every file
+    is under `docs/`, is a Markdown file or is `LICENSE`; a push to `main`, an
+    empty list or a possibly truncated one is "code". On a docs-only change
+    `envtest`, `sanity`, `smoke`, `e2e`, `e2e-kind`, `build`, `manifest` and
+    `deploy` are skipped (`static` and `unit` still run) and `ci-ok` accepts
+    exactly those as skipped; on code, a skipped, cancelled or failed job
+    fails `ci-ok`.
 
 Pending: none that block M1.
 

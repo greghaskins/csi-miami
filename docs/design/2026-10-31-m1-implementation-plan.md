@@ -504,17 +504,36 @@ CI job) is the deploy check on a control plane and two workers.
 
 Workflows, all pinned by SHA with least permissions:
 
-- `ci.yml` on every PR and push to `main`: `static`, `unit`, `envtest`,
-  `build` (matrix amd64 on `ubuntu-latest`, arm64 on the arm runner;
-  content-addressed per-arch tags pushed from the PR, sha alias on `main`), `smoke` (matrix, root, under
-  `unshare --mount`: transport survives a plugin restart, bind adoption,
-  garbage unmount, simulated reboot via a fresh mount namespace),
-  `sanity` (matrix; amd64 only in T8, arm64 joins in T10), `e2e` (matrix `local`, `nfs3` on amd64; `nfs3` also
-  on arm64), `manifest` (every PR: the multi-arch index from the digests
-  the build legs ran), `publish` (`main` only: the sha alias), `ci-ok`.
+- `ci.yml` on every PR and push to `main`:
+  - `changes`: whether the change is more than documentation (`docs/`,
+    Markdown files, `LICENSE`); on a push to `main` always "code".
+  - `static`, `unit`: every change.
+  - `envtest`, `build` (matrix amd64 on `ubuntu-latest`, arm64 on the arm
+    runner; content-addressed per-arch tags pushed from the PR, sha alias on
+    `main`), `manifest` (every PR: the multi-arch index from the digests the
+    build legs ran), `deploy` (the deploy check on kind): skipped when the
+    change is documentation only.
+  - `smoke` (matrix amd64, arm64; root, under `unshare --mount`: transport
+    survives a plugin restart, bind adoption, garbage unmount, simulated
+    reboot via a fresh mount namespace) and `sanity` (matrix amd64, arm64):
+    skipped when documentation only.
+  - `e2e` (`make e2e`, transport mode): the transport package's test against
+    the kernel NFSv3 server, nfs3 on amd64; skipped when documentation only.
+  - `e2e-kind` (`make e2e E2E_MODE=kind`): `local` and `nfs3` on amd64 and
+    `nfs3` on arm64, each from that architecture's `x-<hash>-<arch>` image on
+    a kind cluster of one control plane and two workers; exit criteria 1 to 6
+    as the Go tests of `test/e2e`; skipped when documentation only.
+  - `publish` (`main` only: the sha alias).
+  - `ci-ok`: needs every job; passes when `changes` succeeded and said "true"
+    or "false", `static` and `unit` succeeded, each filterable job succeeded
+    (or, only when `changes` said "false", was skipped) and `publish` ran on
+    `main` and was skipped elsewhere.
 - `secret-scan.yml` and `secret-scan-text.yml`: already present.
-- Path filters skip heavy jobs for docs-only changes; `ci-ok` still runs.
-- No retries. Failure uploads mountinfo, plugin logs and kind logs.
+- Path filters skip the heavy jobs for docs-only changes (the `changes` job);
+  `ci-ok` still runs and still passes, and never accepts a skipped job on a code
+  change.
+- No retries. Failure uploads mountinfo, plugin logs and kind logs; the kind
+  end-to-end tests also dump the failed test's YAML and events.
 
 **e2e NFS server.** `hack/nfs-server/` runs the kernel NFS server in a
 privileged container on the runner's docker network, exporting a tmpfs with
