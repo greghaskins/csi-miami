@@ -145,9 +145,9 @@ func (c *countingMounter) Mount(ctx context.Context, s, t, f string, fl uintptr,
 	return c.Mounter.Mount(ctx, s, t, f, fl, d)
 }
 
-func (c *countingMounter) Bind(ctx context.Context, s, t string, ro bool) error {
+func (c *countingMounter) Bind(ctx context.Context, root, s, t string, ro bool) error {
 	c.changes.Add(1)
-	return c.Mounter.Bind(ctx, s, t, ro)
+	return c.Mounter.Bind(ctx, root, s, t, ro)
 }
 
 func (c *countingMounter) RemountReadOnly(ctx context.Context, t string, ro bool) error {

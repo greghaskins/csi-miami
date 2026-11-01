@@ -125,7 +125,7 @@ func realMountTimeout(t *testing.T) error {
 	t.Helper()
 	f := &fake.Mounter{DefaultTimeout: 10 * time.Millisecond}
 	f.Block("/blocked")
-	err := f.Bind(bg, "/source", "/blocked/target", false)
+	err := f.Bind(bg, "", "/source", "/blocked/target", false)
 	if err == nil {
 		t.Fatal("a blocked bind returned")
 	}
