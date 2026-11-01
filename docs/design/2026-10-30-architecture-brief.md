@@ -1,6 +1,6 @@
 # csi-miami architecture brief
 
-**Status:** Draft, decisions 1 to 23 recorded (section 9)
+**Status:** Draft, decisions 1 to 27 recorded (section 9)
 **Created:** 2026-10-30
 **Updated:** 2026-10-31
 
@@ -93,6 +93,35 @@ design treats them as constraints.
 11. **Tests that pin argv strings don't catch behaviour.** An NFSv3 mount
     can break in the container image while every unit test stays green.
     End-to-end on NFSv3 from the first milestone.
+12. **After an NFS server restart there is a window of stale handles.** The
+    transport's directories can answer `ESTALE`, and a handle that went stale
+    stays stale for the life of the open file or mount, so retrying the
+    failing call does not help. Recovery is unmount and remount of the
+    transport, and the driver treats a stale answer as that signal, not as a
+    transient error.
+13. **An external watchdog that lazy-unmounts NFS mounts is a failure source,
+    not a safety net.** A lazy unmount detaches the mount from every running
+    pod's view while the processes keep working on a detached tree, and it
+    hides the mount from monitoring. A host-side tool must leave the
+    transports root and the stage root alone.
+14. **Read-only is a publish property, never a health signal.** NFS does not
+    flip a mount read-only when the server fails; a read-only mount that is
+    unhealthy shows as errors and timeouts, so health is judged by asking the
+    server, never by the mount's flags.
+15. **Ownership changes by the kubelet fail on every file of a squashing
+    export and flood the logs.** A root-squashed export refuses `chown`, so a
+    recursive fsGroup change reports one error per file, and on a large share
+    it also takes minutes. The CSIDriver's `fsGroupPolicy` is therefore
+    `ReadWriteOnceWithFSType` (decision 27), which leaves directory items
+    alone.
+16. **A mount-health signal belongs in the first deployment.** "Is it
+    mounted" is not "does the server answer": a dead server leaves the mount
+    in place. The signal that matters is a bounded probe of each transport
+    and a metric for its outcome; T14 adds it.
+17. **Transport lifetime and node drain interact.** A cluster whose drains
+    expect no NFS mounts left on a node sets a finite `--transport-idle` in
+    its overlay so idle transports unmount; the driver's default stays
+    "never" (4.3), because remounting on demand costs a first-use delay.
 
 ## 3. Principles
 
@@ -182,7 +211,8 @@ volume stay serialized.
   IPs only), privileged for loop and dm, kubelet dir `Bidirectional`, host
   `/dev`. One CSI socket, one registrar. `CSIDriver` name
   `miami.csi.greghaskins.com` (decision 1): `attachRequired: true`,
-  `podInfoOnMount: false`, `fsGroupPolicy: File`, `Persistent` lifecycle,
+  `podInfoOnMount: false`, `fsGroupPolicy: ReadWriteOnceWithFSType`
+  (decision 27), `Persistent` lifecycle,
   `requiresRepublish: false`. Directory items ride the same settings; the
   attacher creates one `VolumeAttachment` per node for them, which is
   harmless.
@@ -195,10 +225,11 @@ volume stay serialized.
   already privileged on every node, so the alternative (an unprivileged
   controller delegating delete and expand to a node agent through a PV
   annotation handshake) buys little and adds a cross-component protocol.
-- **Transport mounts on the host mount table**: the agent mounts into a
-  `hostPath` directory with `mountPropagation: Bidirectional`, so the mount
-  persists across plugin restarts, loop back-files always show the host
-  path, and host-side watchdogs can see them. Transports are
+- **Transport mounts on the host mount table**: the agent mounts under the
+  kubelet directory (`<kubelet-dir>/plugins/miami.csi.greghaskins.com/transports`,
+  decision 27), which is a `hostPath` with `mountPropagation: Bidirectional`,
+  so the mount persists across plugin restarts, loop back-files always show
+  the host path, and the mounts are visible in the kubelet's mount namespace. Transports are
   reference-counted by intent and unmounted when idle for a configurable
   period (default: never).
 
@@ -211,8 +242,9 @@ the ID, so the controller reads the PV for those two calls (Kubernetes
 1.31+ keeps the PV until delete returns; on older clusters a delete with
 no PV succeeds without deleting and logs it). This maximizes flexibility:
 no 128-byte constraint on the ID, a transport change (server address,
-export path) is corrected by editing a PV rather than re-provisioning, and
-static provisioning works, which both migration (4.11) and adopting
+export path) is a static-PV recreation (4.11's tool) rather than an edit,
+because a PV's volume source is immutable and the volume context lives in it,
+and static provisioning works, which both migration (4.11) and adopting
 pre-existing images need. The controller never deletes on doubt: if the
 rebuilt transport config does not contain the named file, it returns
 `Unavailable`.
@@ -773,6 +805,43 @@ Recorded:
     `deploy` are skipped (`static` and `unit` still run) and `ci-ok` accepts
     exactly those as skipped; on code, a skipped, cancelled or failed job
     fails `ci-ok`.
+
+27. **Deploy portability (M1, T13)**: eight settings that real clusters need.
+    (a) *The kubelet directory is one parameter.* The node pod's containers
+    carry `KUBELET_DIR`; every in-container path in their args derives from it
+    by `$(KUBELET_DIR)` expansion, and the kubelet directory is mounted whole
+    (the one hostPath), so the socket directory and the registry directory are
+    subdirectories of it. The fields that cannot expand (env value, hostPath
+    path, mount path) come from one `replacements` entry whose source is the
+    ConfigMap literal `kubeletDir`; kustomize runs a base's replacements
+    before an overlay's generators, so an overlay merges the literal and
+    repeats that entry, and writes no patch (the snippet is in the base
+    kustomization and a test renders it). (b) *The controller's `miami`
+    container is AppArmor `Unconfined`*: containerd's default profile on
+    Ubuntu denies `mount(2)` in a container that is not privileged, even with
+    `CAP_SYS_ADMIN`. The kind end-to-end tests cannot show it (the nfs3
+    transport test runs under `unshare`, and kind nodes do not enforce the
+    host's profile), so it rests on reasoning about the profile. Capabilities,
+    `allowPrivilegeEscalation: false` and the seccomp profile are unchanged.
+    (c) *The node's transports root defaults to
+    `<kubelet-dir>/plugins/miami.csi.greghaskins.com/transports`*, derived like
+    `--state-dir`; an explicit flag wins. The kubelet requires its directory to
+    be a shared mount, so Bidirectional propagation is guaranteed there and
+    not under an arbitrary hostPath on every distribution; it also removes one
+    hostPath. The controller keeps `/var/lib/miami`, an emptyDir. (d) *The
+    namespace sets `enforce: privileged` and `enforce-version: latest` only*;
+    warn and audit are the cluster's choice. (e) *Release images pin the CPU
+    baselines* `GOAMD64=v1` and `GOARM64=v8.0` (older x86 without SSE4.2,
+    Raspberry Pi 4). (f) *`fsGroupPolicy` is `ReadWriteOnceWithFSType`*:
+    fsGroup applies only to volumes that have an fsType and are RWO or RWOP.
+    Directory items have no fsType, so the kubelet never changes their
+    ownership (no error per file on a squashing export, no recursive change of
+    a large share); M2 image items (ext4, RWO) still get fsGroup. The field is
+    immutable on a live CSIDriver, so a cluster that already created the
+    object deletes and recreates it. (g) *The provisioner runs with
+    `--timeout=60s`*: the default 15s is shorter than a first `CreateVolume`
+    that pays for an NFS mount. (h) *`ENODEV` from `mount(2)`* is reported as
+    "the kernel has no NFS client; load the nfs module".
 
 Pending: none that block M1.
 
