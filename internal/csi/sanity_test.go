@@ -128,7 +128,7 @@ func unmountBelow(t *testing.T, dir string) {
 		if len(under) == 0 {
 			return
 		}
-		if err := m.Unmount(ctx, under[0].MountPoint, 0); err != nil {
+		if err := m.Unmount(ctx, under[0].MountPoint, 0, mount.AnyID); err != nil {
 			t.Errorf("unmounting %s: %v", under[0].MountPoint, err)
 			return
 		}

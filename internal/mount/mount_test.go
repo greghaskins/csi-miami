@@ -358,7 +358,7 @@ func TestPathsMustBeAbsoluteAndClean(t *testing.T) {
 		"Bind source":     func(m Mounter, p string) error { return m.Bind(bg(), "", p, "/ok", false) },
 		"Bind target":     func(m Mounter, p string) error { return m.Bind(bg(), "", "/ok", p, false) },
 		"RemountReadOnly": func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) },
-		"Unmount":         func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) },
+		"Unmount":         func(m Mounter, p string) error { return m.Unmount(bg(), p, 0, AnyID) },
 		"Statfs":          func(m Mounter, p string) error { _, err := m.Statfs(bg(), p); return err },
 	}
 	for name, op := range ops {
@@ -396,7 +396,7 @@ func TestUnmountArguments(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			k := newSim()
-			err := newMounter(k, time.Second).Unmount(bg(), tt.target, tt.flags)
+			err := newMounter(k, time.Second).Unmount(bg(), tt.target, tt.flags, AnyID)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("got %v, want an error containing %q", err, tt.wantErr)
 			}
@@ -810,7 +810,7 @@ func TestUnmount(t *testing.T) {
 	t.Run("not mounted is a no-op", func(t *testing.T) {
 		t.Parallel()
 		k := newSim()
-		if err := newMounter(k, time.Second).Unmount(bg(), "/mnt/none", 0); err != nil {
+		if err := newMounter(k, time.Second).Unmount(bg(), "/mnt/none", 0, AnyID); err != nil {
 			t.Fatal(err)
 		}
 		if n := len(k.callsCopy()); n != 0 {
@@ -827,7 +827,7 @@ func TestUnmount(t *testing.T) {
 				t.Fatal(err)
 			}
 			for i := 0; i < 2; i++ {
-				if err := m.Unmount(bg(), "/mnt/t", flags); err != nil {
+				if err := m.Unmount(bg(), "/mnt/t", flags, AnyID); err != nil {
 					t.Fatalf("flags %d, call %d: %v", flags, i+1, err)
 				}
 			}
@@ -845,7 +845,7 @@ func TestUnmount(t *testing.T) {
 		m := newMounter(k, time.Second)
 		k.add(observe.Mount{ID: 70, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "tmpfs"})
 		k.add(observe.Mount{ID: 71, ParentID: 70, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "tmpfs"})
-		if err := m.Unmount(bg(), "/mnt/s", 0); err != nil {
+		if err := m.Unmount(bg(), "/mnt/s", 0, AnyID); err != nil {
 			t.Fatal(err)
 		}
 		tbl, _ := k.mounts()
@@ -854,11 +854,36 @@ func TestUnmount(t *testing.T) {
 		}
 	})
 
+	t.Run("the mount ID that was judged must still be the visible top", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		m := newMounter(k, time.Second)
+		k.add(observe.Mount{ID: 70, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "tmpfs"})
+		// Judged as 70; by the time of the unmount another mount covers it.
+		k.add(observe.Mount{ID: 71, ParentID: 70, MountPoint: "/mnt/s", Root: "/", FSType: "tmpfs", Source: "other"})
+		err := m.Unmount(bg(), "/mnt/s", 0, 70)
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("got %v, want ErrConflict", err)
+		}
+		for _, c := range k.callsCopy() {
+			if c.op == "unmount" {
+				t.Errorf("a mount was unmounted: %+v", c)
+			}
+		}
+		if err := m.Unmount(bg(), "/mnt/s", 0, 71); err != nil {
+			t.Errorf("the visible top, named: %v", err)
+		}
+		// Nothing mounted: the ID is moot and the call is a no-op.
+		if err := m.Unmount(bg(), "/mnt/none", 0, 12345); err != nil {
+			t.Errorf("nothing mounted: %v", err)
+		}
+	})
+
 	t.Run("a path that does not exist is not mounted", func(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		k.missing = map[string]bool{"/gone": true}
-		if err := newMounter(k, time.Second).Unmount(bg(), "/gone/t", 0); err != nil {
+		if err := newMounter(k, time.Second).Unmount(bg(), "/gone/t", 0, AnyID); err != nil {
 			t.Errorf("got %v, want nil", err)
 		}
 	})
@@ -871,7 +896,7 @@ func TestUnmount(t *testing.T) {
 			t.Fatal(err)
 		}
 		k.failUnmount = unix.EBUSY
-		err := m.Unmount(bg(), "/mnt/t", 0)
+		err := m.Unmount(bg(), "/mnt/t", 0, AnyID)
 		if !errors.Is(err, unix.EBUSY) || !strings.Contains(err.Error(), "unmount /mnt/t") {
 			t.Errorf("got %v, want EBUSY naming the operation and target", err)
 		}
@@ -881,7 +906,7 @@ func TestUnmount(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		k.readErr = errors.New("read failed")
-		if err := newMounter(k, time.Second).Unmount(bg(), "/mnt/t", 0); err == nil {
+		if err := newMounter(k, time.Second).Unmount(bg(), "/mnt/t", 0, AnyID); err == nil {
 			t.Error("want an error")
 		}
 	})
@@ -903,7 +928,7 @@ func TestSymlinksAreRefused(t *testing.T) {
 		{"Mount", func(m Mounter, p string) error { return m.Mount(bg(), "tmpfs", p, "tmpfs", 0, "") }},
 		{"Bind", func(m Mounter, p string) error { return m.Bind(bg(), "", "/data/src", p, false) }},
 		{"RemountReadOnly", func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) }},
-		{"Unmount", func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) }},
+		{"Unmount", func(m Mounter, p string) error { return m.Unmount(bg(), p, 0, AnyID) }},
 	}
 	targets := []struct{ name, path, resolved string }{
 		{"target is a symlink", "/link", "/real"},
@@ -950,7 +975,7 @@ func TestSymlinksAreRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := k.lstats
-		if err := m.Unmount(bg(), "/mnt/t", 0); err != nil {
+		if err := m.Unmount(bg(), "/mnt/t", 0, AnyID); err != nil {
 			t.Fatal(err)
 		}
 		if k.lstats != before {
@@ -981,7 +1006,7 @@ func TestSymlinksAreRefused(t *testing.T) {
 		}
 		k = setup()
 		k.evalErr = unix.EACCES
-		if err := newMounter(k, time.Second).Unmount(bg(), "/mnt/t", 0); !errors.Is(err, unix.EACCES) {
+		if err := newMounter(k, time.Second).Unmount(bg(), "/mnt/t", 0, AnyID); !errors.Is(err, unix.EACCES) {
 			t.Errorf("unmount, evalSymlinks error: got %v, want EACCES", err)
 		}
 	})
@@ -1020,7 +1045,7 @@ func TestDanglingSymlinksAreNotResolved(t *testing.T) {
 		"Bind target":     func(m Mounter, p string) error { return m.Bind(bg(), "", "/data/src", p, false) },
 		"Bind source":     func(m Mounter, p string) error { return m.Bind(bg(), "", p, "/mnt/dst", false) },
 		"RemountReadOnly": func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) },
-		"Unmount":         func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) },
+		"Unmount":         func(m Mounter, p string) error { return m.Unmount(bg(), p, 0, AnyID) },
 	}
 	for name, op := range run {
 		for _, p := range []string{"/dang", "/dang/t"} {
@@ -1071,7 +1096,7 @@ func TestHungSourcePinsOnlyItself(t *testing.T) {
 	}
 	<-k.evalEntered
 
-	if err := m.Unmount(bg(), "/mnt/pub", 0); err != nil {
+	if err := m.Unmount(bg(), "/mnt/pub", 0, AnyID); err != nil {
 		t.Errorf("unmount of the target while the source hangs: %v", err)
 	}
 	if err := m.Mount(bg(), "tmpfs", "/mnt/pub", "tmpfs", 0, ""); err != nil {
@@ -1163,7 +1188,7 @@ func TestDeadline(t *testing.T) {
 			prep: func(k *simKernel) {
 				k.add(observe.Mount{ID: 50, MountPoint: "/mnt/t", Root: "/", FSType: "nfs", Source: "x"})
 			},
-			run: func(ctx context.Context, m Mounter) error { return m.Unmount(ctx, "/mnt/t", unix.MNT_DETACH) },
+			run: func(ctx context.Context, m Mounter) error { return m.Unmount(ctx, "/mnt/t", unix.MNT_DETACH, AnyID) },
 		},
 		{
 			name: "statfs", block: "statfs", target: "/mnt/t",
@@ -1231,7 +1256,7 @@ func TestBusyWhileAPreviousCallIsStillRunning(t *testing.T) {
 		"Mount":           func() error { return m.Mount(bg(), "tmpfs", "/mnt/t", "tmpfs", 0, "") },
 		"Bind":            func() error { return m.Bind(bg(), "", "/data/src", "/mnt/t", false) },
 		"RemountReadOnly": func() error { return m.RemountReadOnly(bg(), "/mnt/t", true) },
-		"Unmount":         func() error { return m.Unmount(bg(), "/mnt/t", 0) },
+		"Unmount":         func() error { return m.Unmount(bg(), "/mnt/t", 0, AnyID) },
 	} {
 		err := run()
 		if !errors.Is(err, ErrBusy) || errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "/mnt/t") {
@@ -1246,7 +1271,7 @@ func TestBusyWhileAPreviousCallIsStillRunning(t *testing.T) {
 	}
 
 	// Other paths, statfs of the same path, and reading the table are not held up.
-	if err := m.Unmount(bg(), "/mnt/other", 0); err != nil {
+	if err := m.Unmount(bg(), "/mnt/other", 0, AnyID); err != nil {
 		t.Errorf("another path: %v", err)
 	}
 	if _, err := m.Statfs(bg(), "/mnt/t"); err != nil {
@@ -1264,7 +1289,7 @@ func TestBusyWhileAPreviousCallIsStillRunning(t *testing.T) {
 		runtime.Gosched()
 	}
 	m.busy.release(mutKey("/mnt/t"))
-	if err := m.Unmount(bg(), "/mnt/t", 0); err != nil {
+	if err := m.Unmount(bg(), "/mnt/t", 0, AnyID); err != nil {
 		t.Errorf("after the hung call returned: %v", err)
 	}
 }
@@ -1282,7 +1307,7 @@ func TestStatfsBusyOnlyAgainstAnotherStatfs(t *testing.T) {
 	if _, err := m.Statfs(bg(), "/mnt/t"); !errors.Is(err, ErrBusy) {
 		t.Errorf("second statfs: got %v, want ErrBusy", err)
 	}
-	if err := m.Unmount(bg(), "/mnt/t", 0); err != nil {
+	if err := m.Unmount(bg(), "/mnt/t", 0, AnyID); err != nil {
 		t.Errorf("unmount of the path with a hung statfs: %v", err)
 	}
 	close(k.release)
@@ -1433,13 +1458,13 @@ func TestReal(t *testing.T) {
 	})
 	t.Run("unmount of what is not mounted", func(t *testing.T) {
 		t.Parallel()
-		if err := newReal(t).Unmount(bg(), missing, 0); err != nil {
+		if err := newReal(t).Unmount(bg(), missing, 0, AnyID); err != nil {
 			t.Errorf("got %v, want nil", err)
 		}
 	})
 	t.Run("unmount of / is refused", func(t *testing.T) {
 		t.Parallel()
-		if err := newReal(t).Unmount(bg(), "/", 0); err == nil {
+		if err := newReal(t).Unmount(bg(), "/", 0, AnyID); err == nil {
 			t.Error("want an error")
 		}
 	})
@@ -1478,13 +1503,13 @@ func TestReal(t *testing.T) {
 			"mount onto a symlink":        m.Mount(bg(), "tmpfs", link, "tmpfs", 0, ""),
 			"mount under a symlink":       m.Mount(bg(), "tmpfs", filepath.Join(link, "sub"), "tmpfs", 0, ""),
 			"bind from a symlink":         m.Bind(bg(), "", link, filepath.Join(realDir, "t"), false),
-			"unmount of a symlink":        m.Unmount(bg(), link, 0),
+			"unmount of a symlink":        m.Unmount(bg(), link, 0, AnyID),
 			"remount of a symlink":        m.RemountReadOnly(bg(), link, true),
 			"bind onto a symlinked above": m.Bind(bg(), "", realDir, filepath.Join(link, "t"), false),
 			"mount onto a dangling link":  m.Mount(bg(), "tmpfs", dangling, "tmpfs", 0, ""),
 			"mount under a dangling link": m.Mount(bg(), "tmpfs", filepath.Join(dangling, "sub"), "tmpfs", 0, ""),
 			"bind from a dangling link":   m.Bind(bg(), "", dangling, filepath.Join(realDir, "t"), false),
-			"unmount of a dangling link":  m.Unmount(bg(), dangling, 0),
+			"unmount of a dangling link":  m.Unmount(bg(), dangling, 0, AnyID),
 		} {
 			if !errors.Is(err, ErrNotResolved) {
 				t.Errorf("%s: got %v, want ErrNotResolved", name, err)

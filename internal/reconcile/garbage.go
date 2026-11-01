@@ -83,6 +83,7 @@ import (
 // candidate is a mount point that rule (a) or (b) selects.
 type candidate struct {
 	path string
+	id   int      // mount ID of the visible top mount the table showed, for rule (a)
 	drop *dropped // nil for rule (a)
 }
 
@@ -257,7 +258,7 @@ func (p *pass) unmountRounds(claimedStage func(string) bool) (observe.Table, map
 func (p *pass) unmountCandidate(c candidate) error {
 	r := p.r
 	if c.drop == nil {
-		return r.m.Unmount(p.ctx, c.path, 0)
+		return r.m.Unmount(p.ctx, c.path, 0, c.id)
 	}
 	if c.drop.tdir != "" {
 		// Judged only with the transport mounted: without it the directory
@@ -398,11 +399,12 @@ func (p *pass) candidates(t observe.Table, claimedStage func(string) bool) []can
 		if seen[path] || claimedStage(path) {
 			continue
 		}
-		if _, visible := t.At(path); !visible {
+		top, visible := t.At(path)
+		if !visible {
 			continue // hidden: nothing leads to it until the cover is gone
 		}
 		seen[path] = true
-		out = append(out, candidate{path: path})
+		out = append(out, candidate{path: path, id: top.ID})
 	}
 	for path, d := range r.drops {
 		if seen[path] || !p.collect && !d.explicit {
@@ -499,7 +501,7 @@ func (p *pass) collectIdleTransports(t observe.Table, refs map[string]struct{}, 
 			r.log.Debug("an idle transport is still in use and stays mounted", "dir", dir, "mounts", n)
 			continue
 		}
-		if err := r.m.Unmount(p.ctx, dir, 0); err != nil {
+		if err := r.m.Unmount(p.ctx, dir, 0, top.ID); err != nil {
 			r.metrics.IncReconcileError("garbage")
 			if errors.Is(err, mount.ErrTimeout) {
 				r.metrics.IncObservationTimeout("garbage")

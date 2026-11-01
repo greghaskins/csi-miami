@@ -87,8 +87,8 @@ type popper struct {
 	table observe.Table
 }
 
-func (p *popper) Unmount(ctx context.Context, target string, flags int) error {
-	if err := p.Mounter.Unmount(ctx, target, flags); err != nil {
+func (p *popper) Unmount(ctx context.Context, target string, flags int, id int) error {
+	if err := p.Mounter.Unmount(ctx, target, flags, id); err != nil {
 		return err
 	}
 	var keep observe.Table

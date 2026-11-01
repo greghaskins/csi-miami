@@ -40,8 +40,8 @@ func newPopper(ms ...observe.Mount) *popper {
 	return p
 }
 
-func (p *popper) Unmount(ctx context.Context, target string, flags int) error {
-	if err := p.Mounter.Unmount(ctx, target, flags); err != nil {
+func (p *popper) Unmount(ctx context.Context, target string, flags int, id int) error {
+	if err := p.Mounter.Unmount(ctx, target, flags, id); err != nil {
 		return err
 	}
 	top, ok := p.table.At(target)
@@ -118,6 +118,39 @@ func TestUnmountBind(t *testing.T) {
 				t.Errorf("%d mounts left at the path, want %d", n, tt.left)
 			}
 		})
+	}
+}
+
+// swapper replaces the table after the first read, as another process mounting
+// between the judgement and the unmount would.
+type swapper struct {
+	*popper
+	after observe.Table
+	reads int
+}
+
+func (s *swapper) Mounts(ctx context.Context) (observe.Table, error) {
+	t, err := s.popper.Mounts(ctx)
+	s.reads++
+	if s.reads == 1 {
+		s.table = s.after
+		s.SetTable(s.after)
+	}
+	return t, err
+}
+
+// The mount judged ours is replaced by another between the table read and the
+// unmount: nothing is unmounted and the answer is the conflict.
+func TestUnmountIfRefusesAMountReplacedSinceTheJudgement(t *testing.T) {
+	t.Parallel()
+	p := &swapper{popper: newPopper(rootMount(), bindOf(2, source)),
+		after: observe.Table{rootMount(), bindOf(2, source), {ID: 3, ParentID: 2, Major: 0, Minor: 41, Root: "/", MountPoint: mountPoint, FSType: "tmpfs", Source: "t"}}}
+	err := UnmountBind(context.Background(), p, mountPoint, source, errConflict)
+	if !errors.Is(err, mount.ErrConflict) {
+		t.Fatalf("err = %v, want mount.ErrConflict", err)
+	}
+	if got := len(p.table); got != 3 {
+		t.Errorf("%d mounts left, want all 3", got)
 	}
 }
 

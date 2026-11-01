@@ -134,7 +134,13 @@ type Mounter interface {
 	// symlink, and refuses "/". It is a no-op when nothing is mounted at
 	// target. It removes the kernel's top mount at that path only, so a
 	// caller clearing a stack calls it again.
-	Unmount(ctx context.Context, target string, flags int) error
+	//
+	// id is the mount ID of the mount the caller judged, read from the table
+	// it judged it in. The call reads the table again, and when the mount
+	// visible at target is not id (it was replaced or covered between the
+	// judgement and now) it unmounts nothing and returns ErrConflict. AnyID
+	// skips the comparison, for callers that made no judgement.
+	Unmount(ctx context.Context, target string, flags int, id int) error
 
 	// Statfs reports filesystem statistics for path.
 	Statfs(ctx context.Context, path string) (unix.Statfs_t, error)
@@ -143,6 +149,11 @@ type Mounter interface {
 	// mounted. It does not touch any mounted filesystem.
 	Mounts(ctx context.Context) (observe.Table, error)
 }
+
+// AnyID is the id argument of Unmount that accepts whatever mount is visible
+// at the target. Mount IDs are positive, so it can never name a mount. Code
+// that has judged a mount before unmounting it passes that mount's ID instead.
+const AnyID = 0
 
 // CheckPath rejects a path that is not absolute and clean. what names the
 // argument in the error. The real Mounter calls it before any system call, and
@@ -165,6 +176,16 @@ func CheckUnmount(target string, flags int) error {
 	}
 	if flags != 0 && flags != unix.MNT_DETACH {
 		return fmt.Errorf("unmount: flags %#x: only 0 and MNT_DETACH are accepted", flags)
+	}
+	return nil
+}
+
+// CheckUnmountID is the comparison Unmount makes: nil when id is AnyID or
+// names top, ErrConflict when the visible mount is another. The fake calls it
+// too.
+func CheckUnmountID(top observe.Mount, id int) error {
+	if id != AnyID && top.ID != id {
+		return fmt.Errorf("unmount %s: the mount there is %d, not the %d that was judged: %w", top.MountPoint, top.ID, id, ErrConflict)
 	}
 	return nil
 }
@@ -545,7 +566,7 @@ func (m *mounter) remount(target string, readOnly bool) error {
 	return m.k.mount("", target, "", flags, "")
 }
 
-func (m *mounter) Unmount(ctx context.Context, target string, flags int) error {
+func (m *mounter) Unmount(ctx context.Context, target string, flags int, id int) error {
 	const op = "unmount"
 	if err := CheckUnmount(target, flags); err != nil {
 		return err
@@ -561,8 +582,12 @@ func (m *mounter) Unmount(ctx context.Context, target string, flags int) error {
 			}
 			return struct{}{}, err
 		}
-		if _, ok := t.At(target); !ok {
+		top, ok := t.At(target)
+		if !ok {
 			return struct{}{}, nil
+		}
+		if err := CheckUnmountID(top, id); err != nil {
+			return struct{}{}, err
 		}
 		return struct{}{}, m.k.unmount(target, flags|unix.UMOUNT_NOFOLLOW)
 	})

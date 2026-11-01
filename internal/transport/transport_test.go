@@ -647,14 +647,14 @@ func TestUnmount(t *testing.T) {
 		want []fake.Call
 	}{
 		{"nfs3 mounted", nfsSpec, table(rootMount(), kernelNFS3(t, nfsDir)),
-			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0}}},
+			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0, ID: 100}}},
 		{"nfs3 absent", nfsSpec, table(rootMount()), nil},
 		{"local absent", localSpec, table(rootMount()), nil},
 		{"local mounted", localSpec, table(rootMount(), observe.Mount{ID: 100, ParentID: 1, Major: 8, Minor: 1, Root: "/export/data", MountPoint: localDir, FSType: "ext4", Source: "/dev/sda1"}),
-			[]fake.Call{{Op: fake.OpUnmount, Target: localDir, Flags: 0}}},
+			[]fake.Call{{Op: fake.OpUnmount, Target: localDir, Flags: 0, ID: 100}}},
 		{"nfs3 mount made by an older profile is unmounted too", nfsSpec,
 			table(rootMount(), observe.Mount{ID: 100, ParentID: 1, Root: "/", MountPoint: nfsDir, FSType: "nfs", Source: nfsSource, SuperOptions: []string{"rw", "vers=3", "hard"}}),
-			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0}}},
+			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0, ID: 100}}},
 		{"hidden under a cover: nothing is visible", nfsSpec,
 			table(rootMount(), kernelNFS3(t, nfsDir),
 				observe.Mount{ID: 101, ParentID: 1, Root: "/", MountPoint: filepath.Join(root, "transports"), FSType: "tmpfs", Source: "cover"}),

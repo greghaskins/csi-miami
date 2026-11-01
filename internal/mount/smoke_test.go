@@ -179,26 +179,26 @@ func TestSmoke(t *testing.T) {
 	}
 
 	// The Unmount arguments are checked before the kernel is asked.
-	if err := m.Unmount(dctx, "/", 0); err == nil {
+	if err := m.Unmount(dctx, "/", 0, mount.AnyID); err == nil {
 		t.Error("unmounting /: want an error")
 	}
-	if err := m.Unmount(dctx, vol, unix.MNT_FORCE); err == nil {
+	if err := m.Unmount(dctx, vol, unix.MNT_FORCE, mount.AnyID); err == nil {
 		t.Error("unmounting with MNT_FORCE: want an error")
 	}
 	// Unmounting a mount that has others below it must fail; unmounting in
 	// Under's order must not. Each mount is gone afterwards, and unmounting
 	// again is a no-op.
-	if err := m.Unmount(dctx, vol, 0); !errors.Is(err, unix.EBUSY) {
+	if err := m.Unmount(dctx, vol, 0, mount.AnyID); !errors.Is(err, unix.EBUSY) {
 		t.Errorf("unmounting %s while mounts are below it: got %v, want EBUSY", vol, err)
 	}
 	for _, mm := range currentTable(t).Under(base) {
-		if err := m.Unmount(dctx, mm.MountPoint, 0); err != nil {
+		if err := m.Unmount(dctx, mm.MountPoint, 0, mount.AnyID); err != nil {
 			t.Fatalf("unmount %s: %v", mm.MountPoint, err)
 		}
 		if _, ok := currentTable(t).At(mm.MountPoint); ok {
 			t.Errorf("mountinfo still shows %s after unmounting it", mm.MountPoint)
 		}
-		if err := m.Unmount(dctx, mm.MountPoint, 0); err != nil {
+		if err := m.Unmount(dctx, mm.MountPoint, 0, mount.AnyID); err != nil {
 			t.Errorf("second unmount of %s: %v", mm.MountPoint, err)
 		}
 	}
@@ -230,7 +230,7 @@ func TestSmokeOvermountIsTheTop(t *testing.T) {
 	if err := m.Bind(ctx, "", dirA, p2, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Unmount(ctx, p1, 0); err != nil {
+	if err := m.Unmount(ctx, p1, 0, mount.AnyID); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Mount(dirB, p2, "", unix.MS_BIND, ""); err != nil {
@@ -269,7 +269,7 @@ func TestSmokeOvermountIsTheTop(t *testing.T) {
 	}
 
 	// Unmounting removes the cover only, and uncovers the bind of dirA.
-	if err := m.Unmount(ctx, p2, 0); err != nil {
+	if err := m.Unmount(ctx, p2, 0, mount.AnyID); err != nil {
 		t.Fatal(err)
 	}
 	if top, ok := currentTable(t).At(p2); !ok || top.ID != covered.ID {
@@ -322,7 +322,7 @@ func TestSmokeCoveredMountPoint(t *testing.T) {
 
 	// Unmount by path removes what the kernel resolves there; the hidden mount
 	// is not reachable until the cover is gone, so a garbage pass repeats.
-	if err := m.Unmount(ctx, sub, 0); err != nil {
+	if err := m.Unmount(ctx, sub, 0, mount.AnyID); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(currentTable(t).Under(hid)); n != 3 {
@@ -330,7 +330,7 @@ func TestSmokeCoveredMountPoint(t *testing.T) {
 	}
 	for pass := 0; pass < 5 && len(currentTable(t).Under(hid)) > 0; pass++ {
 		for _, mm := range currentTable(t).Under(hid) {
-			if err := m.Unmount(ctx, mm.MountPoint, 0); err != nil {
+			if err := m.Unmount(ctx, mm.MountPoint, 0, mount.AnyID); err != nil {
 				t.Fatalf("pass %d: unmount %s: %v", pass, mm.MountPoint, err)
 			}
 		}
@@ -376,7 +376,7 @@ func TestSmokeHiddenBySiblingCover(t *testing.T) {
 	if err := m.Mount(ctx, "tmpfs", hidden, "tmpfs", 0, ""); !errors.Is(err, unix.ENOENT) {
 		t.Errorf("mount at the hidden path: got %v, want the kernel's ENOENT, not a false no-op", err)
 	}
-	if err := m.Unmount(ctx, hidden, 0); err != nil {
+	if err := m.Unmount(ctx, hidden, 0, mount.AnyID); err != nil {
 		t.Errorf("unmount at the hidden path: %v; nothing is visible there, so there is nothing to do", err)
 	}
 
@@ -500,12 +500,12 @@ func TestSmokeSymlinksAreRefused(t *testing.T) {
 		"bind from a symlink":        m.Bind(ctx, "", link, filepath.Join(realDir, "sub"), false),
 		"bind onto a symlink":        m.Bind(ctx, "", realDir, link, false),
 		"remount through a symlink":  m.RemountReadOnly(ctx, link, true),
-		"unmount through a symlink":  m.Unmount(ctx, filepath.Join(link, "sub"), 0),
-		"unmount of a symlink":       m.Unmount(ctx, link, 0),
+		"unmount through a symlink":  m.Unmount(ctx, filepath.Join(link, "sub"), 0, mount.AnyID),
+		"unmount of a symlink":       m.Unmount(ctx, link, 0, mount.AnyID),
 		"bind under a symlinked dir": m.Bind(ctx, "", realDir, filepath.Join(link, "sub"), false),
 		"mount onto a dangling link": m.Mount(ctx, "tmpfs", dangling, "tmpfs", 0, ""),
 		"bind from a dangling link":  m.Bind(ctx, "", dangling, filepath.Join(realDir, "sub"), false),
-		"unmount a dangling link":    m.Unmount(ctx, dangling, 0),
+		"unmount a dangling link":    m.Unmount(ctx, dangling, 0, mount.AnyID),
 	} {
 		if !errors.Is(err, mount.ErrNotResolved) || errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("%s: got %v, want ErrNotResolved and not a not-exist error", name, err)

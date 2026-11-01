@@ -194,10 +194,11 @@ func (b *base) Unmount(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, ok := t.At(b.dir); !ok {
+	top, ok := t.At(b.dir)
+	if !ok {
 		return nil
 	}
-	return b.m.Unmount(ctx, b.dir, 0)
+	return b.m.Unmount(ctx, b.dir, 0, top.ID)
 }
 
 // verdict is the classification of Dir in one mount table.
