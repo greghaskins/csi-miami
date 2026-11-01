@@ -34,7 +34,7 @@ projects run off the shelf.
 │  │  directory: bind the subdirectory    │  │
 │  │  image: loop ▶ ext4                  │  │
 │  │  blobs: opaque, content-addressed    │  │
-│  │  encryption: optional, either form   │  │
+│  │  encryption: optional, any item      │  │
 │  └──────┬─────────────────────┬─────────┘  │
 │         │                     │            │
 │  ┌──────▼──────────┐          │            │
@@ -70,10 +70,9 @@ Each StorageClass picks one option per dimension, in any combination.
 | | Adds |
 |---|---|
 | **M1** (building) | directories, on local disk and on the NAS, shared |
-| **M2** (next) | images on the NAS, single node with exclusivity and fencing, encryption |
+| **M2** (next) | images on the NAS, single node with exclusivity and fencing, encryption at rest |
 | **M3** | shared images, re-exported over NFSv4 by the node holding them |
 | **M4** | images on local disk, moved between nodes with `miami move` |
-| Not yet planned | encrypted directories |
 | Later, maybe | blobs: opaque, content-addressed (an S3 interface on top is out of scope) |
 
 ## Installation
