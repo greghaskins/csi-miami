@@ -11,9 +11,11 @@
 # In transport mode:
 #
 #   nfs3   starts the kernel NFSv3 server of hack/nfs-server in a privileged
-#          container, runs internal/transport's e2e test as root under
+#          container, runs internal/transport's e2e tests as root under
 #          `unshare --mount --propagation private` against it, and removes the
-#          server.
+#          server. The tests are TestE2ENFS3 (the transport) and
+#          TestE2ENFS3Lock (the miami lock helper, run as two "nodes", each in
+#          a mount namespace of its own, with the helper built here).
 #
 # If E2E_ARTIFACT_DIR is set, a failing run leaves mountinfo-<test>.txt (the
 # lines of /proc/self/mountinfo for the test's own temporary paths) and
@@ -85,18 +87,32 @@ server="$(hack/nfs-server/run.sh)"
 echo "e2e: NFS server at $server"
 
 go test -c -tags e2e -o "$dir/transport.test" ./internal/transport
+go build -o "$dir/miami" ./cmd/miami
 
 # A renamed test or a changed build tag would make the run below print "no
-# tests to run" and exit 0, so the test must be listed first.
-if ! grep -qx 'TestE2ENFS3' <<<"$("$dir/transport.test" -test.list '^TestE2E')"; then
-  echo "e2e: the e2e build of internal/transport does not list TestE2ENFS3" >&2
-  exit 1
-fi
+# tests to run" and exit 0, so each test must be listed first. TestE2ELockChild
+# is the node the lock test starts; it is not run by name here.
+listed="$("$dir/transport.test" -test.list '^TestE2E')"
+for name in TestE2ENFS3 TestE2ENFS3Lock TestE2ELockChild; do
+  if ! grep -qx "$name" <<<"$listed"; then
+    echo "e2e: the e2e build of internal/transport does not list $name" >&2
+    exit 1
+  fi
+done
 
 # The test compares its own mount namespace with the one we are leaving.
 MIAMI_E2E_NFS_SERVER="$server" \
 MIAMI_E2E_NFS_EXPORT="${NFS_EXPORT:-/export}" \
+MIAMI_E2E_MIAMI="$dir/miami" \
 SMOKE_ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-}" \
 SMOKE_PARENT_MNT_NS="$(readlink /proc/self/ns/mnt)" \
 unshare --mount --propagation private \
-  "$dir/transport.test" -test.run '^TestE2ENFS3$' -test.v -test.count=1
+  "$dir/transport.test" -test.run '^(TestE2ENFS3|TestE2ENFS3Lock)$' -test.v -test.count=1 -test.timeout=15m | tee "$dir/e2e.log"
+
+# Every test above passed by name; a run that matched nothing would also exit 0.
+for name in TestE2ENFS3 TestE2ENFS3Lock; do
+  if ! grep -Eq "^--- PASS: ${name} " "$dir/e2e.log"; then
+    echo "e2e: ${name} did not report a pass" >&2
+    exit 1
+  fi
+done
