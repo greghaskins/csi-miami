@@ -846,6 +846,36 @@ Recorded:
     that pays for an NFS mount. (h) *`ENODEV` from `mount(2)`* is reported as
     "the kernel has no NFS client; load the nfs module".
 
+29. **The `miami lock` contract (M1, T11)**: five choices that the helper's
+    users see on the export. (a) *The lock is the directory
+    `<dir>/<name>.lock`*, holding `holder` (the caller's string, default
+    `<hostname>:<pid>`) and `since` (empty; its modification time is the
+    stamp), each created under a temporary name and renamed into place so a
+    reader never sees a partial file. The suffix is part of the contract: a
+    user can list the export and see the locks. (b) *A stale lock is broken by
+    rename, then remove.* The acquirer renames the lock directory to a unique
+    hidden name (atomic, so two breakers cannot both win), removes it and
+    makes the directory; a breaker that loses the rename tries once more and
+    reports contended. After winning the rename it checks that what it moved
+    has the holder and stamp it judged stale, and puts it back if not (a
+    renewal landed between the judgement and the rename). (c) *Age comes from
+    a probe file, not a clock.* The acquirer creates a file in the directory
+    under a unique name, reads its modification time (the server's "now") and
+    removes it; the lock is stale when `since` (or, if the holder died before
+    writing it, the lock directory) is older than the probe by more than
+    `--stale`. The probe is read before the stamp, so a renewal that lands
+    in between makes the stamp newer than the probe, which is never stale.
+    (d) *`--stale` is at least 60s* (default 5m): the nfs3 profile caches
+    attributes for 30s (`actimeo=30`), so another client's stamp can look up
+    to 30s old. The helper reads every time from an open file, which
+    revalidates, but the floor is what makes a live lock safe. (e) *`--renew`
+    is at most a third of `--stale`* (default 30s), so two renewals can fail
+    in a row without the lock going stale; `run` stops its command when a
+    renewal finds the lock lost, or when renewals have failed for `--stale`
+    minus one renewal interval, because by then another acquirer may have
+    broken the lock. The limit is a duration measured on the local monotonic
+    clock, not a staleness decision about anyone's lock.
+
 Pending: none that block M1.
 
 ## 10. Milestones
