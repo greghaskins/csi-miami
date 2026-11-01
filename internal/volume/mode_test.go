@@ -21,13 +21,15 @@ func TestParseMode(t *testing.T) {
 		{in: "0777", mode: 0o777, canonical: "0777"},
 		{in: "2775", mode: 0o2775, canonical: "2775"},
 		{in: "1777", mode: 0o1777, canonical: "1777"},
-		{in: "4755", mode: 0o4755, canonical: "4755"},
-		{in: "7777", mode: 0o7777, canonical: "7777"},
+		{in: "3777", mode: 0o3777, canonical: "3777"},
 		{in: "0", mode: 0, canonical: "0000"},
 		{in: "0000", mode: 0, canonical: "0000"},
 		{in: "70", mode: 0o70, canonical: "0070"},
 
 		{in: "", wantErr: true},
+		{in: "4755", wantErr: true}, // setuid has no meaning on a directory
+		{in: "7777", wantErr: true},
+		{in: "4000", wantErr: true},
 		{in: "10755", wantErr: true},
 		{in: "00755", wantErr: true},
 		{in: "0758", wantErr: true},
@@ -58,6 +60,14 @@ func TestParseMode(t *testing.T) {
 				t.Errorf("ParseMode(%q) = %o, %q; want %o, %q", tc.in, mode, canonical, tc.mode, tc.canonical)
 			}
 		})
+	}
+}
+
+func TestParseModeRefusesSetuidAndSaysWhy(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{"4755", "5000", "6777", "7777"} {
+		_, _, err := ParseMode(in)
+		wantInvalid(t, err, "setuid has no meaning on a directory")
 	}
 }
 

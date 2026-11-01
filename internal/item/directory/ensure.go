@@ -31,7 +31,7 @@ const (
 // point, so a link planted in the transport, or swapped in while this runs,
 // cannot send the new directory somewhere else. An element that exists must be
 // a directory. A directory it makes on the way is set to parentMode and dir
-// itself to mode (permission, setuid, setgid and sticky bits), whatever the
+// itself to mode (permission, setgid and sticky bits), whatever the
 // umask; a dir that exists is adopted and keeps its mode. It needs Linux 5.6.
 func ensureBeneath(mountDir, dir string, mode uint32) error {
 	rel, err := filepath.Rel(mountDir, dir)

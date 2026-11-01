@@ -13,4 +13,5 @@ parameters:
   transport.path: /export/data
   # Optional: the mode of the volume's directory when the node creates it, as
   # up to four octal digits (default 0755), for example "0777" or "2775".
+  # Upgrade every node plugin before setting mode.
   # mode: "0777"

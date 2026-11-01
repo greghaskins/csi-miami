@@ -330,10 +330,9 @@ loops always on NFS transports.
   every second) kept working: the export keeps its file system and `fsid=0`, so
   the client's file handles stay valid, nothing returned ESTALE, and with the
   server back after 14 seconds no write on the held descriptor failed. The wait
-  of a soft mount is bounded by its major timeout, which the first run of the
-  test showed to be near 40 seconds (the profile's `timeo` of 10 seconds times
-  `retrans` 3 plus 1; the comment on the profile that says about 100 seconds is
-  not what was seen): in that run the server was held down for about 40 seconds,
+  of a soft mount is bounded by its major timeout, 40 seconds for the profile
+  (`timeo` of 10 seconds times `retrans` 3 plus 1, which the first run of the
+  test matched): in that run the server was held down for about 40 seconds,
   and the write in flight on the held descriptor failed with ETIMEDOUT
   ("Connection timed out", returned by the fsync), its data was not in the file,
   and later writes through the same descriptor succeeded. So an application that
@@ -884,7 +883,8 @@ Recorded:
     and does not repair it, and fixes the third.
     (1) **`mode` StorageClass parameter**: the mode of a directory item
     (up to four octal digits, `0755` by default, for example `0777` or `2775`;
-    the setuid, setgid and sticky bits are allowed and nothing above them),
+    the setgid and sticky bits are allowed, the leading digit is 0 to 3, and
+    setuid is refused because it has no meaning on a directory),
     read by `volume.NewContext`, carried in the volume context as `miami/mode`
     only when set (so existing contexts and the golden intent record are
     unchanged) and in the intent. The controller applies it to the directory it
@@ -893,7 +893,19 @@ Recorded:
     descriptor so that the umask does not decide it. Only the volume's own
     directory takes it, never the subdir elements above it (0755), and an
     existing directory is adopted without a chmod. An invalid value is
-    `InvalidArgument` at `CreateVolume`.
+    `InvalidArgument` at `CreateVolume`. Between the `mkdirat` and the `openat2`
+    that follows, both create paths have a window in which a directory (a
+    symlink or a mount is refused) renamed into place by someone with write
+    access to the parent would receive the `fchmod`; that someone already
+    controls the parent and could make the directory with any mode themselves,
+    so the window is accepted, and a uid check would gain nothing and would
+    break on a root-squashing export, where the created directory is not owned
+    by our euid. **Upgrade order:** a node plugin from before this change
+    refuses a volume context carrying `miami/mode` (unknown `miami/` keys are
+    `InvalidArgument`), so `NodeStageVolume` on a not-yet-upgraded node fails,
+    and an old node that rewrites a record (`clearEnsureItem`, a prune) drops
+    the field, after which a repeated stage is `AlreadyExists` until the volume
+    is unstaged: upgrade every node plugin before setting `mode` on a class.
     (2) **A stale, timed-out or busy stat of the item directory is the
     transport's condition**: ESTALE (the server restarted and its file handles
     are gone), `mount.ErrTimeout` and `mount.ErrBusy` from the stat are

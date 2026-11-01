@@ -51,7 +51,7 @@ func relativeTo(base, path string) ([]string, bool) {
 // somewhere else. A final element that exists and is a directory is adopted
 // (that is what makes CreateVolume idempotent); one that exists and is anything
 // else is AlreadyExists. A directory the controller makes on the way is set to
-// dirMode, and dir itself to mode (permission, setuid, setgid and sticky bits),
+// dirMode, and dir itself to mode (permission, setgid and sticky bits),
 // whatever the umask; an existing dir keeps its mode.
 func ensureItemDir(mountDir, dir string, mode uint32) (created bool, err error) {
 	return ensureItemDirWith(&treeRemover{}, mountDir, dir, mode)

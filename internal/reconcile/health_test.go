@@ -403,3 +403,50 @@ func TestShutdownReportsNoConditions(t *testing.T) {
 		t.Error("up reported during shutdown")
 	}
 }
+
+// A transport that failed to mount and then mounted and answered did not
+// "answer again": nothing had stopped. A transport that answered, stopped and
+// answered again logs one line of each.
+func TestUpTransitionsAreLoggedOnlyForAMountedTransport(t *testing.T) {
+	t.Parallel()
+	t.Run("mount fails, then mounts and answers", func(t *testing.T) {
+		t.Parallel()
+		lg, buf := logger()
+		e := newEnv(t, func(o *Options) { o.Logger = lg })
+		in := e.vol("a", pvc1)
+		mustNil(t, "save", e.store.Save(in))
+		e.sim.FailOp(fake.OpBind, e.tdir("a"), syscall.ECONNREFUSED)
+		e.pass()
+		e.sim.FailOp(fake.OpBind, e.tdir("a"), nil)
+		e.pass()
+		e.pass()
+		if up, _ := e.metrics.upOf(in.Transport.Kind, in.Transport.ID()); !up {
+			t.Error("up = 0 once mounted and answering")
+		}
+		for _, line := range []string{"stopped answering", "answers again"} {
+			if strings.Contains(buf.String(), line) {
+				t.Errorf("logged %q for a transport that was never mounted and then answering:\n%s", line, buf.String())
+			}
+		}
+	})
+	t.Run("answers, stops, answers again", func(t *testing.T) {
+		t.Parallel()
+		lg, buf := logger()
+		e := newEnv(t, func(o *Options) { o.Logger = lg })
+		in := e.vol("a", pvc1)
+		mustNil(t, "save", e.store.Save(in))
+		tdir := e.tdir("a")
+		e.pass()
+		e.sim.FailOp(fake.OpStatfs, tdir, syscall.EIO)
+		e.pass()
+		e.pass()
+		e.sim.FailOp(fake.OpStatfs, tdir, nil)
+		e.pass()
+		e.pass()
+		for _, line := range []string{"transport stopped answering", "transport answers again"} {
+			if n := strings.Count(buf.String(), line); n != 1 {
+				t.Errorf("%d %q lines, want 1:\n%s", n, line, buf.String())
+			}
+		}
+	})
+}

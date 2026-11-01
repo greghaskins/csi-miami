@@ -678,10 +678,15 @@ func (p *pass) probe(spec transport.Spec, dir string, mounted bool) {
 	up := mounted && err == nil
 	r.metrics.SetTransportUp(spec.Kind, spec.ID(), up)
 
+	if !mounted {
+		// Not a transport that stopped answering, and nothing to recover
+		// from: only a mounted transport has a state to change.
+		return
+	}
 	prev, known := r.up[dir]
 	r.up[dir] = up
 	switch {
-	case !up && mounted && (!known || prev):
+	case !up && (!known || prev):
 		r.log.Info("transport stopped answering", "transport", spec.Canonical(), "dir", dir, "error", err)
 	case up && known && !prev:
 		r.log.Info("transport answers again", "transport", spec.Canonical(), "dir", dir)

@@ -6,7 +6,8 @@ const DefaultMode uint32 = 0o755
 
 // ParseMode parses the value of the mode parameter: an octal number of one to
 // four digits (0755, 0777, 2775, 755), the permission bits with the optional
-// setuid, setgid and sticky bits in the leading digit and no other bit. It
+// setgid and sticky bits in the leading digit (0 to 3) and no other bit. Setuid
+// (a leading 4 to 7) is refused: Linux ignores it on a directory. It
 // returns the mode and its canonical text, always four digits (0755), which is
 // what the volume context carries. Anything else (a sign, a prefix such as
 // 0o, a digit above 7, more than four digits, a space) is InvalidArgument.
@@ -20,6 +21,9 @@ func ParseMode(s string) (mode uint32, canonical string, err error) {
 			return 0, "", invalid("parameter " + ParamMode + " must be an octal mode of at most four digits, such as 0755")
 		}
 		mode = mode<<3 | uint32(c-'0')
+	}
+	if mode&0o4000 != 0 {
+		return 0, "", invalid("parameter " + ParamMode + " must not set the setuid bit (a leading digit of 4 to 7): setuid has no meaning on a directory")
 	}
 	return mode, formatMode(mode), nil
 }
