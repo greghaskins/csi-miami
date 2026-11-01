@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,9 +33,6 @@ var eventResource = schema.GroupVersionResource{Version: "v1", Resource: "events
 const (
 	// eventNamespace is where the events of a cluster-scoped object go.
 	eventNamespace = "default"
-
-	// maxEventMessage is the longest message the API server accepts.
-	maxEventMessage = 1024
 
 	// DefaultEventBuffer is the number of events RecorderOptions.Buffer allows
 	// to wait for the API server when it is not positive.
@@ -65,7 +61,8 @@ type RecorderOptions struct {
 // describe pv` looks. It is deliberately small: the reconciler already
 // reports a condition once per change, so there is no aggregator or spam
 // filter, only a deterministic event name per (PV, reason, message) whose
-// repeats update the count instead of creating a second event.
+// repeats update the count instead of creating a second event. The message is
+// fixed text per reason (eventMessage), so that is in effect per (PV, reason).
 //
 // Event only queues; the API server is spoken to by Run, in its own
 // goroutine, so the converge loop never waits for it. When the queue is full
@@ -82,7 +79,7 @@ type EventRecorder struct {
 
 var _ reconcile.Events = (*EventRecorder)(nil)
 
-type queued struct{ pv, reason, message string }
+type queued struct{ pv, reason string }
 
 // NewEventRecorder returns an EventRecorder for the API server at cfg. cfg is
 // not modified.
@@ -136,13 +133,13 @@ func NewEventRecorderFor(dyn dynamic.Interface, o RecorderOptions) *EventRecorde
 // Event implements reconcile.Events. An event for no volume (a stray mount) or
 // for a volume ID this driver could not have issued has no PV to attach to
 // and is dropped. It never blocks.
-func (r *EventRecorder) Event(volumeID, reason, message string) {
+func (r *EventRecorder) Event(volumeID, reason string) {
 	id, err := volume.ParseID(volumeID)
 	if err != nil {
 		return
 	}
 	select {
-	case r.queue <- queued{pv: id.Name, reason: reason, message: message}:
+	case r.queue <- queued{pv: id.Name, reason: reason}:
 	default:
 		r.log.Warn("event dropped: the queue is full", "reason", reason)
 	}
@@ -175,7 +172,7 @@ func (r *EventRecorder) send(ctx context.Context, q queued) {
 		return
 	}
 	now := metav1.NewTime(r.now())
-	msg := truncate(q.message, maxEventMessage)
+	msg := eventMessage(q.reason, r.opts.Node)
 	ev := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Event",
@@ -233,26 +230,28 @@ func eventType(reason string) string {
 	return "Normal"
 }
 
+// eventMessage is the text of an event: fixed per reason, plus the node. An
+// event lands in a namespace that anyone with view access there can read, so
+// it never carries an error, which can name an NFS server and export, a host
+// path or a kubelet pod path; those stay in the node's log. Because the text
+// is constant per reason, a repeat of a condition bumps the count of one event.
+func eventMessage(reason, node string) string {
+	switch reason {
+	case reconcile.ReasonMountFailed:
+		return "the volume could not be mounted on node " + node + "; see the node plugin's log"
+	case reconcile.ReasonTransportUnavailable:
+		return "the volume's transport did not answer on node " + node + "; see the node plugin's log"
+	case reconcile.ReasonGarbageUnmounted:
+		return "a mount of this volume that no intent claimed was removed on node " + node
+	default:
+		return "the driver reported " + reason + " on node " + node + "; see the node plugin's log"
+	}
+}
+
 // eventName is deterministic in (PV, its UID, reason, message), so that a
 // repeat finds the event it repeats, and a PV deleted and made again under the
 // same name does not bump an event whose involvedObject is the old one.
 func eventName(pv, uid, reason, message string) string {
 	sum := sha256.Sum256([]byte(uid + "\x00" + reason + "\x00" + message))
 	return pv + "." + hex.EncodeToString(sum[:8])
-}
-
-// truncate cuts s to at most n bytes without splitting a UTF-8 sequence.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	s = s[:n]
-	for len(s) > 0 && !validEnd(s) {
-		s = s[:len(s)-1]
-	}
-	return strings.TrimSpace(s)
-}
-
-func validEnd(s string) bool {
-	return strings.ToValidUTF8(s, "") == s
 }

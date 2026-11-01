@@ -179,7 +179,7 @@ func TestRBACRuleSets(t *testing.T) {
 			{"", "persistentvolumes", []string{"get", "list", "watch", "create", "patch", "delete"}},
 			{"", "persistentvolumeclaims", []string{"get", "list", "watch", "update"}},
 			{"storage.k8s.io", "storageclasses", []string{"get", "list", "watch"}},
-			{"storage.k8s.io", "volumeattachments", []string{"get", "list", "watch", "update", "patch"}},
+			{"storage.k8s.io", "volumeattachments", []string{"get", "list", "watch", "patch"}},
 			{"storage.k8s.io", "volumeattachments/status", []string{"patch"}},
 			{"", "nodes", []string{"get", "list", "watch"}},
 			{"storage.k8s.io", "csinodes", []string{"get", "list", "watch"}},
@@ -187,7 +187,6 @@ func TestRBACRuleSets(t *testing.T) {
 		}},
 		{"miami-node", []rule{
 			{"", "persistentvolumes", []string{"get"}},
-			{"", "events", []string{"get", "create", "patch"}},
 		}},
 	}
 	r := base(t)
@@ -282,6 +281,57 @@ func TestControllerLeaseRole(t *testing.T) {
 				if res == "leases" {
 					t.Errorf("ClusterRole %s grants leases cluster-wide", o.name)
 				}
+			}
+		}
+	}
+}
+
+// TestNodeEventsRole: the node's recorder writes events to the default
+// namespace only, so the grant is a namespaced Role there; the only
+// cluster-wide grant the node holds is the PV read (a PV is cluster-scoped),
+// and no ClusterRole grants events to the node.
+func TestNodeEventsRole(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var role rbacv1.Role
+	r.get(t, "Role", "miami-node", &role)
+	if role.Namespace != "default" {
+		t.Errorf("role namespace = %q, want default", role.Namespace)
+	}
+	want := map[string]bool{}
+	for _, v := range []string{"get", "create", "patch"} {
+		want["/events:"+v] = true
+	}
+	if got := ruleSet(role.Rules); !reflect.DeepEqual(got, want) {
+		t.Errorf("role grants %v, want %v", got, want)
+	}
+	for _, ru := range role.Rules {
+		if len(ru.ResourceNames) > 0 || len(ru.NonResourceURLs) > 0 {
+			t.Errorf("unexpected resourceNames or nonResourceURLs in %+v", ru)
+		}
+	}
+
+	var rb rbacv1.RoleBinding
+	r.get(t, "RoleBinding", "miami-node", &rb)
+	if rb.Namespace != "default" {
+		t.Errorf("binding namespace = %q, want default", rb.Namespace)
+	}
+	if rb.RoleRef.Kind != "Role" || rb.RoleRef.Name != "miami-node" {
+		t.Errorf("binding refers to %v", rb.RoleRef)
+	}
+	wantSubject := rbacv1.Subject{Kind: "ServiceAccount", Name: "miami-node", Namespace: "miami-system"}
+	if len(rb.Subjects) != 1 || rb.Subjects[0] != wantSubject {
+		t.Errorf("binding subjects = %v, want [%v]", rb.Subjects, wantSubject)
+	}
+
+	var crb rbacv1.ClusterRoleBinding
+	r.get(t, "ClusterRoleBinding", "miami-node", &crb)
+	var cr rbacv1.ClusterRole
+	r.get(t, "ClusterRole", crb.RoleRef.Name, &cr)
+	for _, ru := range cr.Rules {
+		for _, res := range ru.Resources {
+			if res == "events" || res == "*" {
+				t.Errorf("ClusterRole %s, bound to the node, grants %s cluster-wide", cr.Name, res)
 			}
 		}
 	}
@@ -834,8 +884,8 @@ func TestResourcesAndImages(t *testing.T) {
 			}
 			switch {
 			case c.Name == "miami":
-				if c.Image != driverImage+":latest" {
-					t.Errorf("%s: image = %q, want the placeholder %s:latest", id, c.Image, driverImage)
+				if c.Image != driverImage+":unset" {
+					t.Errorf("%s: image = %q, want the placeholder %s:unset", id, c.Image, driverImage)
 				}
 			case !strings.HasPrefix(c.Image, "registry.k8s.io/sig-storage/"):
 				t.Errorf("%s: image %q is not a sig-storage sidecar", id, c.Image)

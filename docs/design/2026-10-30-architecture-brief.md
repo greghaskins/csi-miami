@@ -462,6 +462,13 @@ can be installed side by side during the window; nothing forces a flag day.
   transport, holder renew latency and failures, transport health, fenced
   count, failed volumes, remediation actions, reconcile duration.
 - Events on the PVC and pod for every state change a human would ask about.
+  The node's events are on the PersistentVolume, in the `default`
+  namespace, where anyone with view access there can read them, so their
+  text is fixed per reason (plus the volume and the node) and never carries
+  an error, which can name a server, an export or a host path; the error is
+  in the node plugin's log. The reconciler's `Events` seam takes a reason
+  only. The node's events grant is a Role in `default`, not a ClusterRole
+  (decision 33).
 - Every API write the node agent can perform is enumerated in RBAC and
   mirrored by a VAP.
 - Image and supply chain: section 7.
@@ -1044,6 +1051,75 @@ Recorded:
     `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` only, since a host path
     crosses mounts by nature.
 
+32. **Breaking a `miami lock` safely (M1, T17; amends 29)**: the security
+    review of T11 found three ways to break a lock wrongly, and this closes
+    them. (a) *Only a lock-shaped directory is broken*: a real directory
+    holding at most nine regular files named `holder`, `since`, their
+    temporary names or a silly-renamed `.nfs<hex>` (NFSv3 leaves one for a
+    moment when a file is renamed over while open), and nothing else, checked
+    before the rename and again on what was moved. Anything else at the
+    lock's path (a directory with other contents, a regular file, a symbolic
+    link, dangling or not) is reported with the error `ErrNotALock` and exit
+    code 3 and is never moved or removed, because it may be someone's data.
+    (b) *No stamp makes a lock unbreakable*: a stamp more than 30 seconds
+    ahead of a probe of the server's now taken after the stamp was read (so a
+    renewal landing during slow calls is not ahead) is stale, and the reason
+    is recorded and printed on stderr. A tenant setting a stamp into the
+    future, or a server clock stepped backwards, then costs a live holder at
+    most one renewal interval of exposure, since its next renewal restamps
+    with the server's clock. (c) *Breakers take turns*: a breaker takes the
+    directory `.NAME.breaking` (mkdir), judges the lock again under it, then
+    renames the lock to a private name, checks it and removes it; one left by
+    a dead breaker is reclaimed after `--stale`. A breaker stalled between
+    judging and renaming therefore finds the lock another breaker took and
+    leaves it. (d) *Accepted overlap*: NFSv3 has no conditional rename. A
+    holder renewing between a breaker's second judgement and its rename is
+    found alive and put back, but if an acquirer's mkdir landed in that gap
+    the restore fails, the error is returned and the live lock is stranded
+    under a hidden `.NAME.broken-*` name: one round trip of bad luck. The
+    same happens to a breaker stalled there for longer than `--stale`, which
+    another breaker reclaims, and which on waking moves the lock that breaker
+    took. The holder of a stranded lock learns at its next renewal. Two
+    holders may overlap for up to `--renew` (30s by default) plus the stop
+    grace `--timeout` (10s by default). The lock is a lease without fencing,
+    and the work it protects must tolerate that. That a restore does not
+    replace an empty directory is Go's `os.Rename` looking at the target with
+    an Lstat first (the raw call replaces it), a tiny window of its own;
+    leaving the breakers' directory moves a replaced one away for two round
+    trips before putting it back, and a mkdir landing then strands it the
+    same way.
+
+33. **Deploy and event minors (M1, T19)**: findings of the security review,
+    four fixed and two accepted.
+    - Event messages are fixed text per reason; the reconciler's `Events`
+      interface takes no message, the recorder chooses the text (`MountFailed`:
+      the volume could not be mounted on the node; `TransportUnavailable`: its
+      transport did not answer on the node; `GarbageUnmounted`: a mount that no
+      intent claimed was removed), and the full error is logged by the
+      reconciler where it already was. The text is constant per reason, so
+      the dedup by (PV, reason, message) folds repeats into one event with a
+      count.
+    - The node's events grant (`get`, `create`, `patch`) is a Role and
+      RoleBinding in `default`, the one namespace the recorder writes to; the
+      PV `get` stays in the ClusterRole because a PV is cluster-scoped.
+    - The controller ClusterRole is the union of what the pinned csi-attacher
+      (v4.13.0) and csi-provisioner (v6.4.0) RBAC files grant, for the
+      resources the driver uses. `update` on `volumeattachments` is dropped:
+      neither grants it.
+    - The base's driver image is the placeholder `:unset`, a tag CI never
+      publishes, so a base applied without an overlay cannot pull a mutable
+      image into the privileged DaemonSet.
+    - Accepted: the metrics and health endpoints listen on the host network
+      without authentication. `hostNetwork` is required so that the NAS sees
+      the node's address in its ACLs, so a NetworkPolicy does not apply. They
+      expose counts, states and a truncated transport hash, not paths or
+      addresses. A cluster that wants them closed can firewall the ports at
+      the node.
+    - Accepted: image tags are mutable. A pull request run can push a content
+      tag that a later `main` run reuses, which decision 19 already names as
+      the write-access trust boundary. Deploy by digest (the manifest job's
+      `index_digest`) rather than by tag; signing is planned for the release
+      pipeline.
 
 Pending: none that block M1.
 

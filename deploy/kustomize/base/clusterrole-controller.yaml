@@ -6,7 +6,8 @@
 # topology. It also reads VolumeAttachments, which the attacher rule covers.
 # Snapshot and capacity rules are left out: the driver supports neither.
 # csi-attacher (v4.13.0): PersistentVolumes patch (its finalizer);
-# VolumeAttachments and their status; CSINodes; Nodes.
+# VolumeAttachments (no update: neither sidecar's own RBAC grants it) and their
+# status; CSINodes; Nodes.
 # Both sidecars' leader election needs Leases only in the driver's own
 # namespace; that grant is the Role in role-controller.yaml, not a cluster-wide
 # one.
@@ -26,7 +27,7 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [storage.k8s.io]
     resources: [volumeattachments]
-    verbs: [get, list, watch, update, patch]
+    verbs: [get, list, watch, patch]
   - apiGroups: [storage.k8s.io]
     resources: [volumeattachments/status]
     verbs: [patch]

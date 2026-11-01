@@ -36,6 +36,7 @@ type fakeFS struct {
 
 	// Hooks run in place of the real call (they may call it).
 	rename func(oldpath, newpath string) error
+	remove func(path string) error              // RemoveAll
 	write  func(name string, data []byte) error // a pinned directory's WriteAtomic
 
 	// Interleavings: another acquirer acts at exactly these points.
@@ -95,7 +96,13 @@ func (f *fakeFS) ReadFile(p string) ([]byte, error) {
 	return f.osFS.ReadFile(p)
 }
 
-func (f *fakeFS) RemoveAll(p string) error { defer f.enter("RemoveAll")(); return f.osFS.RemoveAll(p) }
+func (f *fakeFS) RemoveAll(p string) error {
+	defer f.enter("RemoveAll")()
+	if f.remove != nil {
+		return f.remove(p)
+	}
+	return f.osFS.RemoveAll(p)
+}
 
 func (f *fakeFS) Rename(o, n string) error {
 	defer f.enter("Rename")()
@@ -340,7 +347,8 @@ func TestAcquireBreaksOnlyAStaleLock(t *testing.T) {
 		{name: "fresh since", since: serverNow.Add(-stale / 2)},
 		{name: "since exactly stale", since: serverNow.Add(-stale)},
 		{name: "stale since", since: serverNow.Add(-stale - time.Second), wantBreak: true},
-		{name: "stamp ahead of the probe", since: serverNow.Add(time.Hour)},
+		{name: "stamp slightly ahead of the probe", since: serverNow.Add(5 * time.Second)},
+		{name: "stamp far ahead of the probe (clock stepped back)", since: serverNow.Add(time.Hour), wantBreak: true},
 		{name: "no since, directory fresh", dropSince: true, since: serverNow.Add(-stale / 2)},
 		{name: "no since, directory stale", dropSince: true, since: serverNow.Add(-stale - time.Second), wantBreak: true},
 	}
@@ -366,7 +374,7 @@ func TestAcquireBreaksOnlyAStaleLock(t *testing.T) {
 				f.dirStamp = serverNow // the directory's stamp is not consulted when there is a since
 			}
 
-			_, err := acquire(ctx, f, dir, "web", Options{Holder: "breaker", Stale: stale, Timeout: time.Minute})
+			l, err := acquire(ctx, f, dir, "web", Options{Holder: "breaker", Stale: stale, Timeout: time.Minute})
 			if tt.wantBreak {
 				if err != nil {
 					t.Fatalf("acquire: %v", err)
@@ -374,8 +382,13 @@ func TestAcquireBreaksOnlyAStaleLock(t *testing.T) {
 				if got := read(t, filepath.Join(lockDir, "holder")); got != "breaker" {
 					t.Errorf("holder = %q, want breaker", got)
 				}
-				if f.called("Probe") != 1 {
-					t.Errorf("probes = %d, want 1", f.called("Probe"))
+				// Two probes to judge (before and after the stamp is read), two
+				// more to judge again under the breakers' directory.
+				if f.called("Probe") != 4 {
+					t.Errorf("probes = %d, want 4", f.called("Probe"))
+				}
+				if l.Broke() == "" {
+					t.Error("Broke is empty after a break")
 				}
 			} else {
 				if !errors.Is(err, ErrContended) {

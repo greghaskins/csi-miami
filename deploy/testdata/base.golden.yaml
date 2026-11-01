@@ -72,7 +72,6 @@ rules:
   - get
   - list
   - watch
-  - update
   - patch
 - apiGroups:
   - storage.k8s.io
@@ -118,14 +117,6 @@ rules:
   - persistentvolumes
   verbs:
   - get
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - get
-  - create
-  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -183,6 +174,35 @@ subjects:
   name: miami-node
   namespace: miami-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: miami-node
+  namespace: default
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - get
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: miami-node
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: miami-node
+subjects:
+- kind: ServiceAccount
+  name: miami-node
+  namespace: miami-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -209,7 +229,7 @@ spec:
         - --endpoint=unix:///csi/csi.sock
         - --transports-root=/var/lib/miami
         - --metrics-addr=:9811
-        image: ghcr.io/greghaskins/csi-miami:latest
+        image: ghcr.io/greghaskins/csi-miami:unset
         livenessProbe:
           failureThreshold: 3
           httpGet:
@@ -381,7 +401,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-        image: ghcr.io/greghaskins/csi-miami:latest
+        image: ghcr.io/greghaskins/csi-miami:unset
         livenessProbe:
           failureThreshold: 3
           httpGet:

@@ -31,7 +31,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: miami
-          image: ghcr.io/greghaskins/csi-miami:latest
+          image: ghcr.io/greghaskins/csi-miami:unset
           args:
             - controller
             - --endpoint=unix:///csi/csi.sock

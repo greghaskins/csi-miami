@@ -487,6 +487,26 @@ func TestRenewLoop(t *testing.T) {
 			t.Errorf("timer armed for %s, want %s", h.exp.resets[0], limit)
 		}
 	})
+	t.Run("a slow success arms the timer from when the renewal began", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		h.ticks <- time.Time{}
+		<-h.r.calls
+		time.Sleep(200 * time.Millisecond) // the renewal takes a while, then succeeds
+		h.r.answers <- nil
+		h.ticks <- time.Time{} // taken after the success was handled
+		<-h.r.calls
+		h.cancel()
+		if err := <-h.result; err != nil {
+			t.Errorf("error = %v, want nil", err)
+		}
+		if got := h.exp.resetCount(); got < 2 {
+			t.Fatalf("timer reset %d times, want at least 2", got)
+		}
+		if d := h.exp.resets[1]; d > limit-200*time.Millisecond {
+			t.Errorf("timer re-armed for %s after a renewal that took 200ms, want at most %s", d, limit-200*time.Millisecond)
+		}
+	})
 	t.Run("lost stops at once", func(t *testing.T) {
 		t.Parallel()
 		h := start(t)
@@ -557,4 +577,29 @@ func TestRenewLoop(t *testing.T) {
 			t.Errorf("error = %v, want nil", err)
 		}
 	})
+}
+
+// A lock path that holds something that is not a lock has an exit code of its
+// own, so that a caller can tell it from contention and from an error, and the
+// entry is left alone.
+func TestLockExitCodeWhenThePathIsNotALock(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "web.lock")
+	if err := os.WriteFile(path, []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		lockArgs("acquire", dir, "--holder", "a"),
+		append(lockArgs("run", dir, "--holder", "a"), "--", "true"),
+		lockArgs("release", dir, "--holder", "a"),
+	} {
+		code, stdout, stderr := lockCmd(args...)
+		if code != 3 || stdout != "" || !strings.Contains(stderr, "not a lock") || strings.Contains(stderr, dir) {
+			t.Errorf("%s: exit %d, stdout %q, stderr %q; want exit 3 and a message without a path", args[0], code, stdout, stderr)
+		}
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "mine" { //nolint:gosec // a test reads its own temporary files
+		t.Errorf("entry = %q, %v; want it untouched", got, err)
+	}
 }

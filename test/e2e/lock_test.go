@@ -235,7 +235,7 @@ func lockStale(t *testing.T, n *testNS, image, nodeA, nodeB string) {
 	t.Logf("stale lock broken after %d refusals; the stamp was %ds old before the attempt that took it (period %s)", refusals, age, staleAfter)
 
 	out := n.runOnce(t, "locks", nodeA, `ls -a /data | tr '\n' ' '`)
-	for _, bad := range []string{"db.lock", ".broken", ".probe", ".tmp", ".clock"} {
+	for _, bad := range []string{"db.lock", ".broken", ".probe", ".tmp", ".clock", ".breaking", ".breaking-dead", ".removed"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("the volume still has %q after the break and release: %s", bad, out)
 		}

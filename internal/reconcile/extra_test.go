@@ -54,7 +54,7 @@ func TestDefaultSeamsAreNoOps(t *testing.T) {
 	m.IncObservationTimeout("x")
 	m.IncGarbageUnmount()
 	m.SetIntentLoadFailures(1)
-	noopEvents{}.Event("v", ReasonMountFailed, "m")
+	noopEvents{}.Event("v", ReasonMountFailed)
 
 	// A Reconciler with none of the seams set works.
 	e := newEnv(t, func(o *Options) { o.Metrics, o.Events, o.Logger = nil, nil, nil })
