@@ -757,7 +757,7 @@ func TestSmokeAMountAtTheStagePathIsAConflictAndIsLeft(t *testing.T) {
 	r, _, _ := n.run(nil)
 	in := n.intent(pvc1)
 	mkdir(t, in.StagePath)
-	if err := unix.Mount(filepath.Join(n.host, pvc1), in.StagePath, "", unix.MS_BIND, ""); err != nil {
+	if err := unix.Mount("tmpfs", in.StagePath, "tmpfs", 0, "size=1m"); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Stage(ctx, in); !errors.Is(err, reconcile.ErrStageConflict) {
