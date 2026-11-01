@@ -621,7 +621,12 @@ func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) 
 			return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 		}
 	}
-	err = r.m.Bind(p.ctx, source, target, pub.ReadOnly)
+	// Bound beneath the transport's mount point, by descriptor: see Mounter.Bind.
+	root, err := in.Transport.MountPoint(r.opts.TransportsRoot)
+	if err != nil {
+		return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
+	}
+	err = r.m.Bind(p.ctx, root, source, target, pub.ReadOnly)
 	if errors.Is(err, mount.ErrConflict) && !errors.Is(err, ErrPublishConflict) {
 		err = fmt.Errorf("%w: %w", ErrPublishConflict, err)
 	}

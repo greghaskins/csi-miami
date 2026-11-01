@@ -1023,6 +1023,34 @@ Recorded:
     is installed yet, so no migration is written; a node that ever carried the
     old profile needs its transports unmounted once.
 
+31. **Bind sources are resolved by openat2 beneath the transport root and
+    mounted by descriptor (M1, T16)**: a directory item's publish is a bind of
+    the item directory (decision 25), and that directory sits at
+    `<transport>/<subdir>/<name>` on a share other hosts can write to. Checking
+    the path and then handing the path to mount(2) resolves it twice, and
+    anyone who can rename an entry on the share can turn the directory, or a
+    subdir element, into a symlink in between; the kernel then follows it and
+    binds a directory of the node agent into the pod. So `Mounter.Bind` takes
+    the root the source lives under (the transport's mount point), opens the
+    source once with `openat2(2)` relative to a descriptor of the root with
+    `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV |
+    RESOLVE_NO_MAGICLINKS`, and mounts from `/proc/self/fd/N` with the
+    descriptor held open until mount(2) returns. The descriptor is `O_PATH`:
+    it names the directory for the mount and opens nothing on the file system,
+    and the kernel's walk of the proc link lands on the dentry and mount that
+    openat2 resolved. A symlink anywhere on the way, a mount point, or a source
+    outside the root is `ErrNotResolved`; a kernel without openat2 (before 5.6)
+    fails closed with the error the item package already uses
+    (`ErrNoOpenat2`, now one value in both packages), with no fallback to a
+    path. The goroutine that mounts owns and closes the descriptor, because a
+    call that timed out is abandoned, not stopped, and closing it from the
+    caller would free the number while the abandoned call is about to use it.
+    An existing target is still judged by `IsBindOf` on the path, since
+    mountinfo shows paths. The local transport's resolved host path has no
+    root above it: it passes an empty root and is opened from `/` with
+    `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` only, since a host path
+    crosses mounts by nature.
+
 33. **Deploy and event minors (M1, T19)**: findings of the security review,
     four fixed and two accepted.
     - Event messages are fixed text per reason; the reconciler's `Events`

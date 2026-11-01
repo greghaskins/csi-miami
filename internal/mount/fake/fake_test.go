@@ -21,7 +21,7 @@ func TestRecordsCalls(t *testing.T) {
 	if err := f.Mount(ctx, "198.51.100.10:/export/data", "/mnt/nfs", "nfs", unix.MS_NOATIME, "vers=3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Bind(ctx, "/mnt/nfs/a", "/mnt/stage", true); err != nil {
+	if err := f.Bind(ctx, "", "/mnt/nfs/a", "/mnt/stage", true); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.RemountReadOnly(ctx, "/mnt/stage", false); err != nil {
@@ -71,10 +71,10 @@ func TestValidatesLikeTheRealOne(t *testing.T) {
 		if err := f.Mount(ctx, "tmpfs", p, "tmpfs", 0, ""); err == nil {
 			t.Errorf("Mount(%q): want an error", p)
 		}
-		if err := f.Bind(ctx, p, "/ok", false); err == nil {
+		if err := f.Bind(ctx, "", p, "/ok", false); err == nil {
 			t.Errorf("Bind source %q: want an error", p)
 		}
-		if err := f.Bind(ctx, "/ok", p, false); err == nil {
+		if err := f.Bind(ctx, "", "/ok", p, false); err == nil {
 			t.Errorf("Bind target %q: want an error", p)
 		}
 		if err := f.RemountReadOnly(ctx, p, true); err == nil {
@@ -110,7 +110,7 @@ func TestConfiguredErrors(t *testing.T) {
 	if err := f.Unmount(ctx, "/mnt/a", 0); err != errAny {
 		t.Errorf("Unmount: got %v, want the per-target error", err)
 	}
-	if err := f.Bind(ctx, "/x", "/mnt/a", false); err != errBind {
+	if err := f.Bind(ctx, "", "/x", "/mnt/a", false); err != errBind {
 		t.Errorf("Bind: got %v, want the per-operation error, which takes precedence", err)
 	}
 	if err := f.Unmount(ctx, "/mnt/b", 0); err != nil {
@@ -125,7 +125,7 @@ func TestConfiguredErrors(t *testing.T) {
 
 	f.FailOn("/mnt/a", nil)
 	f.FailOp(OpBind, "/mnt/a", nil)
-	if err := f.Bind(ctx, "/x", "/mnt/a", false); err != nil {
+	if err := f.Bind(ctx, "", "/x", "/mnt/a", false); err != nil {
 		t.Errorf("after clearing: got %v, want nil", err)
 	}
 }
@@ -214,11 +214,11 @@ func TestBlockCoversEverythingBelowAndBindsFromIt(t *testing.T) {
 	}{
 		{"statfs below the dead transport", func() error { _, err := f.Statfs(context.Background(), "/mnt/dead/vols/a"); return err }, true},
 		{"unmount of the transport itself", func() error { return f.Unmount(context.Background(), "/mnt/dead", 0) }, true},
-		{"bind from the dead transport", func() error { return f.Bind(context.Background(), "/mnt/dead/vols/a", "/mnt/stage", false) }, true},
+		{"bind from the dead transport", func() error { return f.Bind(context.Background(), "", "/mnt/dead/vols/a", "/mnt/stage", false) }, true},
 		{"mount below it", func() error { return f.Mount(context.Background(), "x", "/mnt/dead/sub", "tmpfs", 0, "") }, true},
 		{"a name that only shares a string prefix", func() error { return f.Unmount(context.Background(), "/mnt/deadly", 0) }, false},
 		{"the parent directory", func() error { return f.Unmount(context.Background(), "/mnt", 0) }, false},
-		{"a bind to elsewhere from a live path", func() error { return f.Bind(context.Background(), "/mnt/live/a", "/mnt/stage2", false) }, false},
+		{"a bind to elsewhere from a live path", func() error { return f.Bind(context.Background(), "", "/mnt/live/a", "/mnt/stage2", false) }, false},
 	}
 	for _, tt := range tests {
 		err := tt.run()
@@ -360,10 +360,10 @@ func TestUnblockFreesABindFromADeadSource(t *testing.T) {
 	ctx := context.Background()
 	f.Block("/nfs")
 
-	if err := f.Bind(ctx, "/nfs/vol", "/pub/x", false); !errors.Is(err, mount.ErrTimeout) {
+	if err := f.Bind(ctx, "", "/nfs/vol", "/pub/x", false); !errors.Is(err, mount.ErrTimeout) {
 		t.Fatalf("first bind: got %v, want ErrTimeout", err)
 	}
-	err := f.Bind(ctx, "/nfs/vol", "/pub/y", false)
+	err := f.Bind(ctx, "", "/nfs/vol", "/pub/y", false)
 	if !errors.Is(err, mount.ErrBusy) || !strings.Contains(err.Error(), "/nfs/vol") {
 		t.Errorf("a second bind of the dead source: got %v, want ErrBusy naming the source", err)
 	}
@@ -372,10 +372,10 @@ func TestUnblockFreesABindFromADeadSource(t *testing.T) {
 	}
 
 	f.Unblock("/nfs")
-	if err := f.Bind(ctx, "/nfs/vol", "/pub/x", false); err != nil {
+	if err := f.Bind(ctx, "", "/nfs/vol", "/pub/x", false); err != nil {
 		t.Errorf("bind after Unblock: %v", err)
 	}
-	if err := f.Bind(ctx, "/nfs/vol", "/pub/y", false); err != nil {
+	if err := f.Bind(ctx, "", "/nfs/vol", "/pub/y", false); err != nil {
 		t.Errorf("second bind after Unblock: %v", err)
 	}
 }
