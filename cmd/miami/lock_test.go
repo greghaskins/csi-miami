@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -53,6 +54,15 @@ func TestLockHelperProcess(_ *testing.T) {
 		fmt.Println("ready")
 		<-ch
 		os.Exit(7)
+	case mode == "group":
+		// A command that has started a process of its own, as a shell wrapper
+		// does. It prints the pid before "ready".
+		child := exec.Command("sleep", "600")
+		if err := child.Start(); err != nil {
+			os.Exit(98)
+		}
+		fmt.Printf("pid=%d\nready\n", child.Process.Pid)
+		select {}
 	case mode == "ready-ignore-term":
 		signal.Ignore(syscall.SIGTERM)
 		fmt.Println("ready")
@@ -120,6 +130,7 @@ func TestLockFlagValidation(t *testing.T) {
 		{"run without a command", lockArgs("run", dir), "a command is required after --"},
 		{"stale below the floor", lockArgs("acquire", dir, "--holder", "h", "--stale", "59s"), "below the minimum 1m0s"},
 		{"renew over a third of stale", lockArgs("run", dir, "--stale", "90s", "--renew", "31s", "--", "true"), "at most a third"},
+		{"no room for the timeouts", lockArgs("run", dir, "--stale", "60s", "--renew", "20s", "--timeout", "20s", "--", "true"), "less than --stale"},
 		{"renew zero", lockArgs("run", dir, "--renew", "0", "--", "true"), "--renew must be positive"},
 		{"timeout zero", lockArgs("acquire", dir, "--holder", "h", "--timeout", "0"), "--timeout must be positive"},
 		{"bad duration", lockArgs("acquire", dir, "--holder", "h", "--stale", "soon"), "invalid value"},
@@ -303,6 +314,51 @@ func TestLockRunTerminatesTheCommandWhenTheLockIsLost(t *testing.T) {
 	}
 }
 
+// A lost lock stops what the command started too, not only the command.
+func TestLockRunSignalsTheWholeProcessGroup(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	stdout, stderr := newSyncBuffer(), newSyncBuffer()
+	result := make(chan int, 1)
+	go func() {
+		args := append(lockArgs("run", dir, "--holder", "me", "--renew", "10ms", "--timeout", "5s"), helperCommand("group")...)
+		result <- run(append([]string{"lock"}, args...), stdout, stderr)
+	}()
+	select {
+	case <-stdout.ready:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("the command never started; stderr %q", stderr.String())
+	}
+	var pid int
+	if _, err := fmt.Sscanf(stdout.String(), "pid=%d", &pid); err != nil {
+		t.Fatalf("no pid in %q: %v", stdout.String(), err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	if err := os.WriteFile(filepath.Join(dir, "web.lock", "holder"), []byte("other"), 0o600); err != nil { //nolint:gosec // a test's own file
+		t.Fatal(err)
+	}
+	select {
+	case code := <-result:
+		if code != 2 {
+			t.Errorf("exit %d, want 2; stderr %q", code, stderr.String())
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("miami lock run did not return after the lock was lost")
+	}
+	// The process the command started is gone (or a zombie nobody reaped).
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)) //nolint:gosec // a pid
+		if err != nil || strings.Contains(string(raw), ") Z ") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, started by the command, is still running after the lock was lost: %s", pid, raw)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // SIGTERM to `lock run` goes to the command, and the lock is released after
 // the command exits. It signals this process, so it must not run beside the
 // other tests that run the command: it is the only test here that does not
@@ -341,80 +397,164 @@ func TestLockRunForwardsSIGTERM(t *testing.T) {
 	}
 }
 
-// fakeRenewer answers Renew from a script.
-type fakeRenewer struct {
-	results []error
-	calls   int
-	onCall  func(n int)
+// fakeExpiry is a timer the test fires by hand.
+type fakeExpiry struct {
+	ch     chan time.Time
+	mu     sync.Mutex
+	resets []time.Duration
 }
 
-func (f *fakeRenewer) Renew(context.Context) error {
-	n := f.calls
-	f.calls++
-	if f.onCall != nil {
-		f.onCall(n)
+func newFakeExpiry() *fakeExpiry { return &fakeExpiry{ch: make(chan time.Time, 1)} }
+
+func (f *fakeExpiry) C() <-chan time.Time { return f.ch }
+func (f *fakeExpiry) Stop()               {}
+func (f *fakeExpiry) Reset(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resets = append(f.resets, d)
+}
+func (f *fakeExpiry) fire() { f.ch <- time.Time{} }
+func (f *fakeExpiry) resetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.resets)
+}
+
+// scriptedRenewer lets the test decide what each Renew returns, and when.
+type scriptedRenewer struct {
+	calls   chan context.Context // each Renew announces itself here
+	answers chan error           // and waits for an answer, or for its context
+}
+
+func newScriptedRenewer() *scriptedRenewer {
+	return &scriptedRenewer{calls: make(chan context.Context), answers: make(chan error)}
+}
+
+func (r *scriptedRenewer) Renew(ctx context.Context) error {
+	r.calls <- ctx
+	select {
+	case err := <-r.answers:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if n >= len(f.results) {
-		return nil
-	}
-	return f.results[n]
 }
 
 func TestRenewLoop(t *testing.T) {
 	t.Parallel()
+	const limit = 20 * time.Second
 	errIO := errors.New("input/output error")
 	lost := fmt.Errorf("renew: %w", lock.ErrLost)
-	const limit = 50 * time.Second
-	tests := []struct {
-		name    string
-		results []error
-		tick    time.Duration // each renewal advances the fake clock by this
-		cancel  int           // cancel the context during this call; -1 never
-		wantErr error
-		want    string
-		calls   int
-	}{
-		{name: "renews until cancelled", results: []error{nil, nil, nil}, tick: 10 * time.Second, cancel: 3, calls: 3},
-		{name: "lost stops at once", results: []error{nil, lost}, tick: 10 * time.Second, cancel: -1, wantErr: lock.ErrLost, calls: 2},
-		{name: "a short outage is retried", results: []error{errIO, errIO, nil, errIO, nil}, tick: 10 * time.Second, cancel: 5, calls: 5},
-		{name: "a success restarts the clock", results: []error{errIO, errIO, errIO, errIO, nil, errIO, errIO, errIO, errIO}, tick: 10 * time.Second, cancel: 9, calls: 9},
-		{name: "an outage longer than the limit ends it", results: []error{errIO, errIO, errIO, errIO, errIO, errIO}, tick: 10 * time.Second, cancel: -1, wantErr: errIO, want: "could not be renewed for 1m0s", calls: 6},
-		{name: "an error caused by cancellation is not a failure", results: []error{context.Canceled}, tick: time.Hour, cancel: 1, calls: 1},
+
+	type harness struct {
+		ctx    context.Context
+		cancel context.CancelFunc
+		ticks  chan time.Time
+		exp    *fakeExpiry
+		r      *scriptedRenewer
+		result chan error
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			clock := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-			ticks := make(chan time.Time)
-			r := &fakeRenewer{results: tt.results}
-			r.onCall = func(n int) {
-				// The loop's own goroutine runs this, so it is the only one
-				// that touches the clock.
-				clock = clock.Add(tt.tick)
-				if n+1 == tt.cancel {
-					cancel()
-				}
-			}
-			errc := make(chan error, 1)
-			go func() { errc <- renewLoop(ctx, r, ticks, func() time.Time { return clock }, limit) }()
-			for {
-				select {
-				case err := <-errc:
-					if tt.wantErr == nil && err != nil || tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
-						t.Errorf("error = %v, want %v", err, tt.wantErr)
-					}
-					if tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)) {
-						t.Errorf("error = %v, want it to contain %q", err, tt.want)
-					}
-					if r.calls != tt.calls {
-						t.Errorf("Renew called %d times, want %d", r.calls, tt.calls)
-					}
-					return
-				case ticks <- time.Time{}:
-				}
-			}
-		})
+	start := func(t *testing.T) *harness {
+		t.Helper()
+		h := &harness{ticks: make(chan time.Time), exp: newFakeExpiry(), r: newScriptedRenewer(), result: make(chan error, 1)}
+		h.ctx, h.cancel = context.WithCancel(context.Background())
+		t.Cleanup(h.cancel)
+		go func() { h.result <- renewLoop(h.ctx, h.r, h.ticks, h.exp, limit) }()
+		return h
 	}
+	// tick makes the loop start a renewal and returns its context.
+	tick := func(h *harness) context.Context {
+		h.ticks <- time.Time{}
+		return <-h.r.calls
+	}
+
+	t.Run("the timer is armed at the start and after every success", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		tick(h)
+		h.r.answers <- nil
+		tick(h)
+		h.r.answers <- nil
+		tick(h) // the loop has handled the second success before it takes this tick
+		h.cancel()
+		if err := <-h.result; err != nil {
+			t.Errorf("error = %v, want nil after cancellation", err)
+		}
+		if got := h.exp.resetCount(); got != 3 {
+			t.Errorf("timer reset %d times, want 3 (start and two successes)", got)
+		}
+		if h.exp.resets[0] != limit {
+			t.Errorf("timer armed for %s, want %s", h.exp.resets[0], limit)
+		}
+	})
+	t.Run("lost stops at once", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		tick(h)
+		h.r.answers <- lost
+		if err := <-h.result; !errors.Is(err, lock.ErrLost) {
+			t.Errorf("error = %v, want ErrLost", err)
+		}
+	})
+	t.Run("a failure is retried and a success restarts the timer", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		tick(h)
+		h.r.answers <- errIO
+		tick(h)
+		h.r.answers <- nil
+		tick(h)
+		if got := h.exp.resetCount(); got != 2 {
+			t.Errorf("timer reset %d times, want 2 (start and the success, not the failure)", got)
+		}
+		h.cancel()
+		if err := <-h.result; err != nil {
+			t.Errorf("error = %v, want nil", err)
+		}
+	})
+	t.Run("the timer ends it while waiting for a tick, whatever the tick phase", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		h.exp.fire() // no tick has come: the limit does not wait for one
+		err := <-h.result
+		if err == nil || !strings.Contains(err.Error(), "could not be renewed for 20s") {
+			t.Errorf("error = %v, want the limit", err)
+		}
+	})
+	t.Run("the error that preceded the limit is reported", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		tick(h)
+		h.r.answers <- errIO
+		tick(h) // the loop has recorded the failure before it takes this tick
+		h.exp.fire()
+		err := <-h.result
+		if err == nil || !errors.Is(err, errIO) || !strings.Contains(err.Error(), "could not be renewed for 20s") {
+			t.Errorf("error = %v, want the limit and the last error", err)
+		}
+	})
+	t.Run("the timer ends it and interrupts a renewal that is in flight", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		rctx := tick(h) // the renewal now waits for an answer that never comes
+		h.exp.fire()
+		err := <-h.result
+		if err == nil || !strings.Contains(err.Error(), "could not be renewed for 20s") {
+			t.Errorf("error = %v, want the limit", err)
+		}
+		select {
+		case <-rctx.Done():
+		default:
+			t.Error("the renewal in flight was not cancelled")
+		}
+	})
+	t.Run("cancellation during a renewal is not a failure", func(t *testing.T) {
+		t.Parallel()
+		h := start(t)
+		tick(h)
+		h.cancel()
+		if err := <-h.result; err != nil {
+			t.Errorf("error = %v, want nil", err)
+		}
+	})
 }

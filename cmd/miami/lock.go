@@ -38,6 +38,17 @@ run       acquire, run the command with stdio inherited, renew while it runs,
           killed by signal n), 1 if the lock is held by another, and 2 on an
           error or if the lock was lost, in which case the command was
           terminated
+
+The command runs in a process group of its own, and a signal (SIGTERM,
+SIGINT, or the SIGTERM and SIGKILL of a lost lock) goes to the whole group.
+It is still best for a wrapper script to exec its command: a process that
+leaves the group, or a command that outlives the group's leader, is not
+reached, and the helper cannot stop what it cannot signal.
+
+--renew must be at most a third of --stale, and --renew plus twice --timeout
+must be less than --stale: after a failed renewal run stops the command at
+--stale minus twice --timeout, so that SIGTERM (up to --timeout) and the last
+stamp's own latency fit before another acquirer may break the lock.
 `
 
 // lockConfig is what the flags of `miami lock` set.
@@ -122,6 +133,8 @@ func (c lockConfig) validate(verb string, command []string) error {
 	// --renew means nothing to a single attempt.
 	case verb == "run" && c.renew <= 0:
 		return errors.New("--renew must be positive")
+	case verb == "run" && c.renew+2*c.timeout >= c.stale:
+		return fmt.Errorf("--renew %s plus twice --timeout %s must be less than --stale %s", c.renew, c.timeout, c.stale)
 	case verb == "run" && c.renew > c.stale/3:
 		return fmt.Errorf("--renew %s must be at most a third of --stale %s", c.renew, c.stale)
 	case c.timeout <= 0:
@@ -171,30 +184,76 @@ type renewer interface {
 	Renew(ctx context.Context) error
 }
 
+// expiry is the timer that bounds how long renewals may keep failing.
+type expiry interface {
+	C() <-chan time.Time
+	// Reset restarts the timer: it fires d from now.
+	Reset(d time.Duration)
+	Stop()
+}
+
+type realExpiry struct{ t *time.Timer }
+
+func newRealExpiry() *realExpiry {
+	t := time.NewTimer(time.Hour)
+	t.Stop()
+	return &realExpiry{t}
+}
+
+func (r *realExpiry) C() <-chan time.Time   { return r.t.C }
+func (r *realExpiry) Reset(d time.Duration) { r.t.Reset(d) }
+func (r *realExpiry) Stop()                 { r.t.Stop() }
+
 // renewLoop renews on every tick until ctx is done. It returns nil then, and
-// an error when the lock is lost or when renewals have failed for longer than
-// limit, measured on the local monotonic clock from the last success: not a
-// staleness decision about anyone's lock, only how long this process can go
-// without knowing that its own may have been broken. Errors shorter than that
-// are retried at the next tick.
-func renewLoop(ctx context.Context, r renewer, ticks <-chan time.Time, now func() time.Time, limit time.Duration) error {
-	lastOK := now()
+// an error when the lock is lost or when no renewal has succeeded for limit.
+// The limit is a timer armed at the last success (the acquisition counts), so
+// it fires at that instant whatever the phase of the ticks, and it interrupts
+// a renewal that is still in flight. It measures how long this process can go
+// without knowing that its own lock may have been broken, on the local
+// monotonic clock; it is not a staleness decision about anyone's lock. Errors
+// shorter than that are retried at the next tick.
+func renewLoop(ctx context.Context, r renewer, ticks <-chan time.Time, exp expiry, limit time.Duration) error {
+	exp.Reset(limit)
+	defer exp.Stop()
+	var lastErr error
+	tooLong := func() error {
+		if lastErr != nil {
+			return fmt.Errorf("the lock could not be renewed for %s: %w", limit, lastErr)
+		}
+		return fmt.Errorf("the lock could not be renewed for %s", limit)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-exp.C():
+			return tooLong()
 		case <-ticks:
 		}
-		err := r.Renew(ctx)
+		rctx, cancel := context.WithCancel(ctx)
+		res := make(chan error, 1)
+		go func() { res <- r.Renew(rctx) }()
+		var err error
+		select {
+		case err = <-res:
+		case <-exp.C():
+			cancel()
+			return tooLong()
+		case <-ctx.Done():
+			cancel()
+			return nil
+		}
+		cancel()
 		switch {
 		case err == nil:
-			lastOK = now()
+			lastErr = nil
+			exp.Reset(limit)
 		case ctx.Err() != nil:
 			return nil
 		case errors.Is(err, lock.ErrLost):
 			return err
-		case now().Sub(lastOK) > limit:
-			return fmt.Errorf("the lock could not be renewed for %s: %w", now().Sub(lastOK).Round(time.Second), err)
+		default:
+			lastErr = err
 		}
 	}
 }
@@ -252,7 +311,7 @@ func lockRun(cfg lockConfig, argv []string, stdout, stderr io.Writer) int {
 	defer runtime.UnlockOSThread()
 	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // running the operator's command is the purpose
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL, Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		_, _ = fmt.Fprintf(stderr, "miami lock run: starting the command: %v\n", err)
 		return releaseAfter(l, exitError, stderr)
@@ -269,13 +328,13 @@ func lockRun(cfg lockConfig, argv []string, stdout, stderr io.Writer) int {
 	defer ticker.Stop()
 	renewed := make(chan error, 1)
 	go func() {
-		renewed <- renewLoop(rctx, l, ticker.C, time.Now, cfg.stale-cfg.renew)
+		renewed <- renewLoop(rctx, l, ticker.C, newRealExpiry(), cfg.stale-2*cfg.timeout)
 	}()
 
 	for {
 		select {
 		case s := <-sigs:
-			_ = cmd.Process.Signal(s)
+			signalGroup(cmd, s.(syscall.Signal))
 		case err := <-renewed:
 			// Not ours any more: stop the command, and release nothing.
 			_, _ = fmt.Fprintf(stderr, "miami lock run: %v; terminating the command\n", err)
@@ -307,7 +366,7 @@ func releaseAfter(l *lock.Lock, code int, stderr io.Writer) int {
 // terminate sends SIGTERM to the command, waits up to grace for it to exit
 // and then kills it.
 func terminate(cmd *exec.Cmd, exited <-chan struct{}, grace time.Duration, stderr io.Writer) {
-	_ = cmd.Process.Signal(syscall.SIGTERM)
+	signalGroup(cmd, syscall.SIGTERM)
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	select {
@@ -316,10 +375,16 @@ func terminate(cmd *exec.Cmd, exited <-chan struct{}, grace time.Duration, stder
 	case <-timer.C:
 	}
 	_, _ = fmt.Fprintf(stderr, "miami lock run: the command did not stop within %s; killing it\n", grace)
-	_ = cmd.Process.Kill()
+	signalGroup(cmd, syscall.SIGKILL)
 	select {
 	case <-exited:
 	case <-time.After(grace):
 		_, _ = fmt.Fprintln(stderr, "miami lock run: the command did not exit after SIGKILL")
 	}
+}
+
+// signalGroup sends sig to the command's process group, which the command
+// leads (Setpgid), so that what it started is signalled with it.
+func signalGroup(cmd *exec.Cmd, sig syscall.Signal) {
+	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
