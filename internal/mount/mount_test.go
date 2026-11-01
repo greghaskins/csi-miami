@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -53,6 +54,8 @@ type simKernel struct {
 	missing  map[string]bool
 	evalErr  error
 	lstatErr error
+	// noOpenat2 makes openDir fail with ENOSYS.
+	noOpenat2 bool
 	// evalErrAt fails evalSymlinks for that one path only.
 	evalErrAt string
 	// evalBlockAt makes evalSymlinks of that path hang until evalRelease is
@@ -61,6 +64,16 @@ type simKernel struct {
 	evalRelease chan struct{}
 	evalEntered chan struct{}
 
+	// Descriptors: openDir hands out numbers from nextFD, fds holds the open
+	// ones (number to the path it was opened on), opens records every openDir,
+	// closed every closeFd, and rawSources the source string of every mount
+	// call as the kernel received it.
+	nextFD     int
+	fds        map[int]string
+	opens      []openCall
+	closed     []int
+	rawSources []string
+
 	// block, when set to "mount", "unmount" or "statfs", makes that call wait
 	// until release is closed. entered is signalled when it starts waiting;
 	// exited when it has been released and has returned.
@@ -68,6 +81,13 @@ type simKernel struct {
 	release chan struct{}
 	entered chan struct{}
 	exited  chan struct{}
+}
+
+// openCall is one openDir the code under test made.
+type openCall struct {
+	root, rel string
+	resolve   uint64
+	fd        int // -1 when it failed
 }
 
 func newSim() *simKernel {
@@ -108,6 +128,16 @@ func (s *simKernel) wait(op string) {
 
 func (s *simKernel) mount(source, target, fstype string, flags uintptr, data string) error {
 	s.mu.Lock()
+	s.rawSources = append(s.rawSources, source)
+	if rest, ok := strings.CutPrefix(source, "/proc/self/fd/"); ok {
+		fd, _ := strconv.Atoi(rest)
+		p, open := s.fds[fd]
+		if !open {
+			s.mu.Unlock()
+			return fmt.Errorf("mount from %s: the descriptor is not open: %w", source, unix.ENOENT)
+		}
+		source = p
+	}
 	c := kcall{"mount", source, target, fstype, flags, data}
 	s.calls = append(s.calls, c)
 	fail := s.failMount
@@ -240,6 +270,76 @@ func (s *simKernel) isSymlink(p string) (bool, error) {
 	return ok, nil
 }
 
+// openDir simulates openat2(2) under the restrictions: a symlink at any
+// element is ELOOP, as RESOLVE_NO_SYMLINKS makes it, and a path that does not
+// exist is ENOENT. It blocks and fails on the same switches evalSymlinks does.
+func (s *simKernel) openDir(root, rel string, resolve uint64) (fd int, err error) {
+	p := filepath.Join(root, rel)
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.opens = append(s.opens, openCall{root, rel, resolve, fd})
+	}()
+	if s.evalBlockAt != "" && p == s.evalBlockAt {
+		s.evalEntered <- struct{}{}
+		<-s.evalRelease
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.evalErr != nil {
+		return -1, s.evalErr
+	}
+	if s.evalErrAt != "" && p == s.evalErrAt {
+		return -1, unix.EACCES
+	}
+	if s.noOpenat2 {
+		return -1, unix.ENOSYS
+	}
+	elems := []string{root}
+	if root == "/" {
+		elems = nil
+	}
+	cur := root
+	for _, e := range strings.Split(rel, "/") {
+		if e == "." || e == "" {
+			continue
+		}
+		cur = filepath.Join(cur, e)
+		elems = append(elems, cur)
+	}
+	for _, e := range elems {
+		if _, ok := s.links[e]; ok {
+			return -1, unix.ELOOP
+		}
+		if s.missing[e] {
+			return -1, fmt.Errorf("openat2 %s: %w", e, fs.ErrNotExist)
+		}
+	}
+	s.nextFD++
+	if s.fds == nil {
+		s.fds = map[int]string{}
+	}
+	fd = 100 + s.nextFD
+	s.fds[fd] = p
+	return fd, nil
+}
+
+func (s *simKernel) bindPath(fd int) string { return "/proc/self/fd/" + strconv.Itoa(fd) }
+
+func (s *simKernel) closeFd(fd int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.fds, fd)
+	s.closed = append(s.closed, fd)
+}
+
+// openFDs is the number of descriptors still open.
+func (s *simKernel) openFDs() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.fds)
+}
+
 // add puts a mount into the simulated table.
 func (s *simKernel) add(m observe.Mount) {
 	if m.ParentID == 0 {
@@ -255,8 +355,8 @@ func TestPathsMustBeAbsoluteAndClean(t *testing.T) {
 	bad := []string{"", "rel/path", "/a/../b", "/a//b", "/a/", "/a/./b"}
 	ops := map[string]func(m Mounter, p string) error{
 		"Mount":           func(m Mounter, p string) error { return m.Mount(bg(), "tmpfs", p, "tmpfs", 0, "") },
-		"Bind source":     func(m Mounter, p string) error { return m.Bind(bg(), p, "/ok", false) },
-		"Bind target":     func(m Mounter, p string) error { return m.Bind(bg(), "/ok", p, false) },
+		"Bind source":     func(m Mounter, p string) error { return m.Bind(bg(), "", p, "/ok", false) },
+		"Bind target":     func(m Mounter, p string) error { return m.Bind(bg(), "", "/ok", p, false) },
 		"RemountReadOnly": func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) },
 		"Unmount":         func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) },
 		"Statfs":          func(m Mounter, p string) error { _, err := m.Statfs(bg(), p); return err },
@@ -397,7 +497,7 @@ func TestBind(t *testing.T) {
 	t.Run("read-write bind of a read-write source is one call", func(t *testing.T) {
 		t.Parallel()
 		k := newSim()
-		if err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", false); err != nil {
+		if err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", false); err != nil {
 			t.Fatal(err)
 		}
 		want := kcall{"mount", "/data/src", "/mnt/dst", "", unix.MS_BIND, ""}
@@ -409,7 +509,7 @@ func TestBind(t *testing.T) {
 	t.Run("read-only bind is a bind then a remount with the right flags", func(t *testing.T) {
 		t.Parallel()
 		k := newSim()
-		if err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", true); err != nil {
+		if err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", true); err != nil {
 			t.Fatal(err)
 		}
 		want := []kcall{
@@ -442,7 +542,7 @@ func TestBind(t *testing.T) {
 					})
 					m := newMounter(k, time.Second)
 					for try := 1; try <= 2; try++ {
-						if err := m.Bind(bg(), "/stage/dir", "/mnt/pub", wantRO); err != nil {
+						if err := m.Bind(bg(), "", "/stage/dir", "/mnt/pub", wantRO); err != nil {
 							t.Fatalf("try %d: %v", try, err)
 						}
 						tbl, _ := k.mounts()
@@ -479,7 +579,7 @@ func TestBind(t *testing.T) {
 		}
 		for i, s := range steps {
 			before := len(k.callsCopy())
-			if err := m.Bind(bg(), "/data/src", "/mnt/dst", s.readOnly); err != nil {
+			if err := m.Bind(bg(), "", "/data/src", "/mnt/dst", s.readOnly); err != nil {
 				t.Fatalf("step %d: %v", i, err)
 			}
 			if n := len(k.callsCopy()) - before; n != s.wantCalls {
@@ -496,10 +596,10 @@ func TestBind(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		m := newMounter(k, time.Second)
-		if err := m.Bind(bg(), "/data/src", "/mnt/dst", false); err != nil {
+		if err := m.Bind(bg(), "", "/data/src", "/mnt/dst", false); err != nil {
 			t.Fatal(err)
 		}
-		if err := m.Bind(bg(), "/data/other", "/mnt/dst", false); !errors.Is(err, ErrConflict) {
+		if err := m.Bind(bg(), "", "/data/other", "/mnt/dst", false); !errors.Is(err, ErrConflict) {
 			t.Errorf("got %v, want ErrConflict", err)
 		}
 		if n := len(k.callsCopy()); n != 1 {
@@ -515,10 +615,10 @@ func TestBind(t *testing.T) {
 		k.add(observe.Mount{ID: 91, ParentID: 1, Major: 8, Minor: 1, Root: "/data/a", MountPoint: "/mnt/dst", Options: []string{"rw"}})
 		k.add(observe.Mount{ID: 90, ParentID: 91, Major: 8, Minor: 1, Root: "/data/b", MountPoint: "/mnt/dst", Options: []string{"rw"}})
 		m := newMounter(k, time.Second)
-		if err := m.Bind(bg(), "/data/b", "/mnt/dst", false); err != nil {
+		if err := m.Bind(bg(), "", "/data/b", "/mnt/dst", false); err != nil {
 			t.Errorf("bind of what is on top: %v", err)
 		}
-		if err := m.Bind(bg(), "/data/a", "/mnt/dst", false); !errors.Is(err, ErrConflict) {
+		if err := m.Bind(bg(), "", "/data/a", "/mnt/dst", false); !errors.Is(err, ErrConflict) {
 			t.Errorf("bind of what is covered: got %v, want ErrConflict", err)
 		}
 		if n := len(k.callsCopy()); n != 0 {
@@ -530,7 +630,7 @@ func TestBind(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		k.failMount = func(kcall) error { return unix.ENOENT }
-		err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", true)
+		err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", true)
 		if !errors.Is(err, unix.ENOENT) {
 			t.Errorf("got %v, want ENOENT", err)
 		}
@@ -556,7 +656,7 @@ func TestBind(t *testing.T) {
 			if !ro {
 				src = "/stage/dir" // inherits read-only, so asking for read-write needs the remount
 			}
-			err := newMounter(k, time.Second).Bind(bg(), src, "/mnt/dst", ro)
+			err := newMounter(k, time.Second).Bind(bg(), "", src, "/mnt/dst", ro)
 			if !errors.Is(err, unix.EPERM) {
 				t.Fatalf("read-only=%t: got %v, want EPERM", ro, err)
 			}
@@ -580,7 +680,7 @@ func TestBind(t *testing.T) {
 			return nil
 		}
 		k.failUnmount = unix.EBUSY
-		err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", true)
+		err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", true)
 		if !errors.Is(err, unix.EPERM) || !errors.Is(err, unix.EBUSY) {
 			t.Errorf("got %v, want both EPERM and EBUSY", err)
 		}
@@ -590,7 +690,7 @@ func TestBind(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		k.table = observe.Table{{ID: 5, MountPoint: "/elsewhere", Root: "/"}, {ID: 6, MountPoint: "/mnt/dst", Root: "/x"}}
-		if err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", false); err == nil {
+		if err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", false); err == nil {
 			t.Error("want an error")
 		}
 	})
@@ -599,7 +699,7 @@ func TestBind(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		k.readErr = errors.New("read failed")
-		if err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", false); err == nil {
+		if err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", false); err == nil {
 			t.Error("want an error")
 		}
 	})
@@ -612,7 +712,7 @@ func TestRemountReadOnly(t *testing.T) {
 		t.Parallel()
 		k := newSim()
 		m := newMounter(k, time.Second)
-		if err := m.Bind(bg(), "/data/src", "/mnt/dst", false); err != nil {
+		if err := m.Bind(bg(), "", "/data/src", "/mnt/dst", false); err != nil {
 			t.Fatal(err)
 		}
 		k.mu.Lock()
@@ -801,7 +901,7 @@ func TestSymlinksAreRefused(t *testing.T) {
 		run  func(m Mounter, target string) error
 	}{
 		{"Mount", func(m Mounter, p string) error { return m.Mount(bg(), "tmpfs", p, "tmpfs", 0, "") }},
-		{"Bind", func(m Mounter, p string) error { return m.Bind(bg(), "/data/src", p, false) }},
+		{"Bind", func(m Mounter, p string) error { return m.Bind(bg(), "", "/data/src", p, false) }},
 		{"RemountReadOnly", func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) }},
 		{"Unmount", func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) }},
 	}
@@ -832,9 +932,9 @@ func TestSymlinksAreRefused(t *testing.T) {
 		t.Parallel()
 		for _, src := range []string{"/link", "/link/sub"} {
 			k := setup()
-			err := newMounter(k, time.Second).Bind(bg(), src, "/mnt/dst", false)
-			if !errors.Is(err, ErrNotResolved) || !strings.Contains(err.Error(), "/real") {
-				t.Errorf("source %s: got %v, want ErrNotResolved naming /real", src, err)
+			err := newMounter(k, time.Second).Bind(bg(), "", src, "/mnt/dst", false)
+			if !errors.Is(err, ErrNotResolved) || !strings.Contains(err.Error(), src) {
+				t.Errorf("source %s: got %v, want ErrNotResolved naming it", src, err)
 			}
 			if n := len(k.callsCopy()); n != 0 {
 				t.Errorf("source %s: %d kernel calls, want 0", src, n)
@@ -899,7 +999,7 @@ func TestSymlinksAreRefused(t *testing.T) {
 		t.Parallel()
 		k := setup()
 		k.missing = map[string]bool{"/data/src": true}
-		if err := newMounter(k, time.Second).Bind(bg(), "/data/src", "/mnt/dst", false); !errors.Is(err, fs.ErrNotExist) {
+		if err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", false); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("got %v, want not-exist", err)
 		}
 	})
@@ -917,8 +1017,8 @@ func TestDanglingSymlinksAreNotResolved(t *testing.T) {
 	}
 	run := map[string]func(m Mounter, p string) error{
 		"Mount":           func(m Mounter, p string) error { return m.Mount(bg(), "tmpfs", p, "tmpfs", 0, "") },
-		"Bind target":     func(m Mounter, p string) error { return m.Bind(bg(), "/data/src", p, false) },
-		"Bind source":     func(m Mounter, p string) error { return m.Bind(bg(), p, "/mnt/dst", false) },
+		"Bind target":     func(m Mounter, p string) error { return m.Bind(bg(), "", "/data/src", p, false) },
+		"Bind source":     func(m Mounter, p string) error { return m.Bind(bg(), "", p, "/mnt/dst", false) },
 		"RemountReadOnly": func(m Mounter, p string) error { return m.RemountReadOnly(bg(), p, true) },
 		"Unmount":         func(m Mounter, p string) error { return m.Unmount(bg(), p, 0) },
 	}
@@ -945,7 +1045,7 @@ func TestDanglingSymlinksAreNotResolved(t *testing.T) {
 		if !errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNotResolved) {
 			t.Errorf("got %v, want a plain not-exist error", err)
 		}
-		err = newMounter(k, time.Second).Bind(bg(), "/absent", "/mnt/dst", false)
+		err = newMounter(k, time.Second).Bind(bg(), "", "/absent", "/mnt/dst", false)
 		if !errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNotResolved) {
 			t.Errorf("source: got %v, want a plain not-exist error", err)
 		}
@@ -965,7 +1065,7 @@ func TestHungSourcePinsOnlyItself(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
 	defer cancel()
-	err := m.Bind(ctx, "/stage/dead", "/mnt/pub", false)
+	err := m.Bind(ctx, "", "/stage/dead", "/mnt/pub", false)
 	if !errors.Is(err, ErrTimeout) || !strings.Contains(err.Error(), "/stage/dead") {
 		t.Fatalf("got %v, want ErrTimeout naming the source", err)
 	}
@@ -977,7 +1077,7 @@ func TestHungSourcePinsOnlyItself(t *testing.T) {
 	if err := m.Mount(bg(), "tmpfs", "/mnt/pub", "tmpfs", 0, ""); err != nil {
 		t.Errorf("mount on the target while the source hangs: %v", err)
 	}
-	if err := m.Bind(bg(), "/stage/dead", "/mnt/pub2", false); !errors.Is(err, ErrBusy) || !strings.Contains(err.Error(), "/stage/dead") {
+	if err := m.Bind(bg(), "", "/stage/dead", "/mnt/pub2", false); !errors.Is(err, ErrBusy) || !strings.Contains(err.Error(), "/stage/dead") {
 		t.Errorf("a second bind of the hung source: got %v, want ErrBusy naming the source", err)
 	}
 	if n := k.countOps("mount"); n != 1 {
@@ -1049,7 +1149,7 @@ func TestDeadline(t *testing.T) {
 		},
 		{
 			name: "bind", block: "mount", target: "/mnt/dst",
-			run: func(ctx context.Context, m Mounter) error { return m.Bind(ctx, "/data/src", "/mnt/dst", true) },
+			run: func(ctx context.Context, m Mounter) error { return m.Bind(ctx, "", "/data/src", "/mnt/dst", true) },
 		},
 		{
 			name: "remount", block: "mount", target: "/mnt/dst",
@@ -1129,7 +1229,7 @@ func TestBusyWhileAPreviousCallIsStillRunning(t *testing.T) {
 	// without reaching the kernel.
 	for name, run := range map[string]func() error{
 		"Mount":           func() error { return m.Mount(bg(), "tmpfs", "/mnt/t", "tmpfs", 0, "") },
-		"Bind":            func() error { return m.Bind(bg(), "/data/src", "/mnt/t", false) },
+		"Bind":            func() error { return m.Bind(bg(), "", "/data/src", "/mnt/t", false) },
 		"RemountReadOnly": func() error { return m.RemountReadOnly(bg(), "/mnt/t", true) },
 		"Unmount":         func() error { return m.Unmount(bg(), "/mnt/t", 0) },
 	} {
@@ -1351,7 +1451,7 @@ func TestReal(t *testing.T) {
 	})
 	t.Run("bind onto a missing directory fails", func(t *testing.T) {
 		t.Parallel()
-		if err := newReal(t).Bind(bg(), "/", missing, false); !errors.Is(err, fs.ErrNotExist) {
+		if err := newReal(t).Bind(bg(), "", "/", missing, false); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("got %v, want not-exist", err)
 		}
 	})
@@ -1377,13 +1477,13 @@ func TestReal(t *testing.T) {
 		for name, err := range map[string]error{
 			"mount onto a symlink":        m.Mount(bg(), "tmpfs", link, "tmpfs", 0, ""),
 			"mount under a symlink":       m.Mount(bg(), "tmpfs", filepath.Join(link, "sub"), "tmpfs", 0, ""),
-			"bind from a symlink":         m.Bind(bg(), link, filepath.Join(realDir, "t"), false),
+			"bind from a symlink":         m.Bind(bg(), "", link, filepath.Join(realDir, "t"), false),
 			"unmount of a symlink":        m.Unmount(bg(), link, 0),
 			"remount of a symlink":        m.RemountReadOnly(bg(), link, true),
-			"bind onto a symlinked above": m.Bind(bg(), realDir, filepath.Join(link, "t"), false),
+			"bind onto a symlinked above": m.Bind(bg(), "", realDir, filepath.Join(link, "t"), false),
 			"mount onto a dangling link":  m.Mount(bg(), "tmpfs", dangling, "tmpfs", 0, ""),
 			"mount under a dangling link": m.Mount(bg(), "tmpfs", filepath.Join(dangling, "sub"), "tmpfs", 0, ""),
-			"bind from a dangling link":   m.Bind(bg(), dangling, filepath.Join(realDir, "t"), false),
+			"bind from a dangling link":   m.Bind(bg(), "", dangling, filepath.Join(realDir, "t"), false),
 			"unmount of a dangling link":  m.Unmount(bg(), dangling, 0),
 		} {
 			if !errors.Is(err, ErrNotResolved) {
@@ -1391,4 +1491,266 @@ func TestReal(t *testing.T) {
 			}
 		}
 	})
+}
+
+// bindRoot is the transport root of the tests below.
+const bindRoot = "/transports/t1"
+
+// The source is opened once, beneath the root, and the mount is made from the
+// descriptor, which is still open when mount(2) is called and closed after.
+func TestBindMountsFromADescriptorOpenedBeneathTheRoot(t *testing.T) {
+	t.Parallel()
+	k := newSim()
+	k.add(observe.Mount{ID: 50, Major: 0, Minor: 50, Root: "/", MountPoint: bindRoot, FSType: "nfs", Source: "srv:/x",
+		Options: []string{"rw"}, SuperOptions: []string{"rw"}})
+	src := bindRoot + "/sub/vol"
+	if err := newMounter(k, time.Second).Bind(bg(), bindRoot, src, "/mnt/dst", false); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.opens) != 1 {
+		t.Fatalf("%d opens, want 1: %+v", len(k.opens), k.opens)
+	}
+	o := k.opens[0]
+	const want = uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV | unix.RESOLVE_NO_MAGICLINKS)
+	if o.root != bindRoot || o.rel != "sub/vol" || o.resolve != want || o.fd < 0 {
+		t.Errorf("open = %+v, want root %s, rel sub/vol, resolve %#x", o, bindRoot, want)
+	}
+	if len(k.rawSources) == 0 || k.rawSources[0] != "/proc/self/fd/"+strconv.Itoa(o.fd) {
+		t.Errorf("mount sources = %v, want the first to be /proc/self/fd/%d", k.rawSources, o.fd)
+	}
+	for _, s := range k.rawSources {
+		if s == src {
+			t.Errorf("mount(2) was given the path %s", s)
+		}
+	}
+	// The mount (a bind with the fd path) resolved the descriptor to the
+	// directory opened, so the table shows that directory as the root.
+	if m, ok := k.table.At("/mnt/dst"); !ok || m.Root != "/sub/vol" {
+		t.Errorf("mount at /mnt/dst = %+v, %v", m, ok)
+	}
+	if n := k.openFDs(); n != 0 || len(k.closed) != 1 || k.closed[0] != o.fd {
+		t.Errorf("descriptors still open %d, closed %v; want the one descriptor closed after the mount", n, k.closed)
+	}
+}
+
+func TestBindHostPathIsOpenedFromSlashWithoutBeneath(t *testing.T) {
+	t.Parallel()
+	k := newSim()
+	if err := newMounter(k, time.Second).Bind(bg(), "", "/data/src", "/mnt/dst", false); err != nil {
+		t.Fatal(err)
+	}
+	o := k.opens[0]
+	const want = uint64(unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS)
+	if o.root != "/" || o.rel != "data/src" || o.resolve != want {
+		t.Errorf("open = %+v, want root /, rel data/src, resolve %#x", o, want)
+	}
+}
+
+func TestBindRefusesWhatIsNotBeneathTheRoot(t *testing.T) {
+	t.Parallel()
+	for _, src := range []string{"/elsewhere/vol", "/transports/t10/vol", "/transports"} {
+		k := newSim()
+		err := newMounter(k, time.Second).Bind(bg(), bindRoot, src, "/mnt/dst", false)
+		if !errors.Is(err, ErrNotResolved) {
+			t.Errorf("source %s: got %v, want ErrNotResolved", src, err)
+		}
+		if len(k.opens) != 0 || len(k.callsCopy()) != 0 {
+			t.Errorf("source %s: reached the kernel", src)
+		}
+	}
+	if err := newMounter(newSim(), time.Second).Bind(bg(), "transports/t1", bindRoot+"/v", "/mnt/dst", false); err == nil {
+		t.Error("a relative root was accepted")
+	}
+}
+
+// A symlink at the source, or at any element between the root and it, is
+// refused by the open and nothing is mounted; so is one at the root itself.
+func TestBindRefusesASymlinkAnywhereUnderTheRoot(t *testing.T) {
+	t.Parallel()
+	for name, link := range map[string]string{
+		"the item directory itself": bindRoot + "/sub/vol",
+		"a subdir element":          bindRoot + "/sub",
+		"the root":                  bindRoot,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			k := newSim()
+			k.links = map[string]string{link: "/var/lib/kubelet"}
+			err := newMounter(k, time.Second).Bind(bg(), bindRoot, bindRoot+"/sub/vol", "/mnt/dst", false)
+			if !errors.Is(err, ErrNotResolved) || !strings.Contains(err.Error(), "symlink") {
+				t.Fatalf("got %v, want ErrNotResolved naming a symlink", err)
+			}
+			if n := len(k.callsCopy()); n != 0 {
+				t.Errorf("%d kernel calls, want 0", n)
+			}
+			if n := k.openFDs(); n != 0 {
+				t.Errorf("%d descriptors left open", n)
+			}
+		})
+	}
+}
+
+func TestBindFailsClosedWithoutOpenat2(t *testing.T) {
+	t.Parallel()
+	k := newSim()
+	k.noOpenat2 = true
+	err := newMounter(k, time.Second).Bind(bg(), bindRoot, bindRoot+"/vol", "/mnt/dst", false)
+	if !errors.Is(err, ErrNoOpenat2) {
+		t.Fatalf("got %v, want ErrNoOpenat2", err)
+	}
+	if n := len(k.callsCopy()); n != 0 {
+		t.Errorf("%d kernel calls, want 0 (no fallback to a path)", n)
+	}
+}
+
+func TestBindErrorsMapToTheirClass(t *testing.T) {
+	t.Parallel()
+	m := newMounter(newSim(), time.Second)
+	for _, tt := range []struct {
+		errno error
+		want  error
+	}{
+		{unix.EXDEV, ErrNotResolved}, {unix.ENOTDIR, ErrNotResolved}, {unix.ELOOP, ErrNotResolved},
+		{unix.ENOSYS, ErrNoOpenat2}, {unix.ENOENT, fs.ErrNotExist}, {unix.ESTALE, unix.ESTALE},
+	} {
+		if err := m.openFailure("/x", tt.errno); !errors.Is(err, tt.want) {
+			t.Errorf("%v: got %v, want %v", tt.errno, err, tt.want)
+		}
+	}
+}
+
+// The descriptor is closed on every way out: a bind that fails, an existing
+// target that is left alone, a conflict.
+func TestBindClosesTheDescriptorOnEveryPath(t *testing.T) {
+	t.Parallel()
+	src := "/data/src"
+	t.Run("mount fails", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		k.failMount = func(kcall) error { return unix.EPERM }
+		_ = newMounter(k, time.Second).Bind(bg(), "", src, "/mnt/dst", false)
+		if n := k.openFDs(); n != 0 {
+			t.Errorf("%d descriptors left open", n)
+		}
+	})
+	t.Run("existing target is remounted, not mounted", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		m := newMounter(k, time.Second)
+		if err := m.Bind(bg(), "", src, "/mnt/dst", false); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Bind(bg(), "", src, "/mnt/dst", true); err != nil {
+			t.Fatal(err)
+		}
+		if n := k.openFDs(); n != 0 || len(k.opens) != 2 || len(k.closed) != 2 {
+			t.Errorf("open %d, opens %d, closed %v", n, len(k.opens), k.closed)
+		}
+		if got := k.rawSources[len(k.rawSources)-1]; got != "" {
+			t.Errorf("the remount was given source %q, want none", got)
+		}
+	})
+	t.Run("conflict", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		m := newMounter(k, time.Second)
+		if err := m.Bind(bg(), "", src, "/mnt/dst", false); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Bind(bg(), "", "/data/other", "/mnt/dst", false); !errors.Is(err, ErrConflict) {
+			t.Fatalf("got %v, want ErrConflict", err)
+		}
+		if n := k.openFDs(); n != 0 {
+			t.Errorf("%d descriptors left open", n)
+		}
+	})
+	t.Run("busy target never starts the mount", func(t *testing.T) {
+		t.Parallel()
+		k := newSim()
+		m := newMounter(k, time.Second)
+		m.busy.acquire(mutKey("/mnt/dst"))
+		if err := m.Bind(bg(), "", src, "/mnt/dst", false); !errors.Is(err, ErrBusy) {
+			t.Fatalf("got %v, want ErrBusy", err)
+		}
+		if n := k.openFDs(); n != 0 {
+			t.Errorf("%d descriptors left open", n)
+		}
+	})
+}
+
+// The real openat2: a symlink anywhere on the way is refused, a plain
+// directory is opened, and the descriptor names the directory that was opened
+// even after the path is swapped for a symlink.
+func TestRealOpenDir(t *testing.T) {
+	t.Parallel()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dir, "outside")
+	root := filepath.Join(dir, "root")
+	for _, d := range []string{outside, filepath.Join(root, "sub", "vol")} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var k sysKernel
+	open := func(root, rel string) (int, error) { return k.openDir(root, rel, resolveBeneath) }
+
+	fd, err := open(root, "sub/vol")
+	if err != nil {
+		if errors.Is(err, unix.ENOSYS) {
+			t.Skip("no openat2 in this kernel")
+		}
+		t.Fatal(err)
+	}
+	defer k.closeFd(fd)
+
+	// Swap the opened directory for a symlink to somewhere else: the
+	// descriptor still names the directory that was checked.
+	if err := os.Rename(filepath.Join(root, "sub", "vol"), filepath.Join(root, "sub", "vol.moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "sub", "vol")); err != nil {
+		t.Fatal(err)
+	}
+	var held, moved unix.Stat_t
+	if err := unix.Stat(k.bindPath(fd), &held); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Stat(filepath.Join(root, "sub", "vol.moved"), &moved); err != nil {
+		t.Fatal(err)
+	}
+	if held.Ino != moved.Ino || held.Dev != moved.Dev {
+		t.Errorf("%s is not the directory that was opened", k.bindPath(fd))
+	}
+
+	// Now the same open is refused, for the swapped leaf, for a symlinked
+	// element above it, for an escape, and for a symlinked root.
+	if err := os.Rename(filepath.Join(root, "sub"), filepath.Join(root, "sub.moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	rootLink := filepath.Join(dir, "rootlink")
+	if err := os.Symlink(root, rootLink); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]struct{ root, rel string }{
+		"swapped leaf":      {root, "sub.moved/vol"},
+		"symlinked element": {root, "sub/vol"},
+		"escape":            {root, "../outside"},
+		"symlinked root":    {rootLink, "sub.moved"},
+	} {
+		fd, err := open(c.root, c.rel)
+		if err == nil {
+			k.closeFd(fd)
+			t.Errorf("%s: opened", name)
+			continue
+		}
+		if !errors.Is(err, unix.ELOOP) && !errors.Is(err, unix.EXDEV) && !errors.Is(err, unix.ENOTDIR) {
+			t.Errorf("%s: got %v, want ELOOP, EXDEV or ENOTDIR", name, err)
+		}
+	}
 }
