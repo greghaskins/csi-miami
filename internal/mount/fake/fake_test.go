@@ -27,7 +27,7 @@ func TestRecordsCalls(t *testing.T) {
 	if err := f.RemountReadOnly(ctx, "/mnt/stage", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Unmount(ctx, "/mnt/stage", unix.MNT_DETACH); err != nil {
+	if err := f.Unmount(ctx, "/mnt/stage", unix.MNT_DETACH, mount.AnyID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.Statfs(ctx, "/mnt/nfs"); err != nil {
@@ -80,17 +80,17 @@ func TestValidatesLikeTheRealOne(t *testing.T) {
 		if err := f.RemountReadOnly(ctx, p, true); err == nil {
 			t.Errorf("RemountReadOnly(%q): want an error", p)
 		}
-		if err := f.Unmount(ctx, p, 0); err == nil {
+		if err := f.Unmount(ctx, p, 0, mount.AnyID); err == nil {
 			t.Errorf("Unmount(%q): want an error", p)
 		}
 		if _, err := f.Statfs(ctx, p); err == nil {
 			t.Errorf("Statfs(%q): want an error", p)
 		}
 	}
-	if err := f.Unmount(ctx, "/", 0); err == nil || !strings.Contains(err.Error(), "refusing") {
+	if err := f.Unmount(ctx, "/", 0, mount.AnyID); err == nil || !strings.Contains(err.Error(), "refusing") {
 		t.Errorf("Unmount(/): got %v, want a refusal", err)
 	}
-	if err := f.Unmount(ctx, "/mnt/t", unix.MNT_FORCE); err == nil {
+	if err := f.Unmount(ctx, "/mnt/t", unix.MNT_FORCE, mount.AnyID); err == nil {
 		t.Error("Unmount with MNT_FORCE: want an error")
 	}
 	if n := len(f.Calls()); n != 0 {
@@ -107,13 +107,13 @@ func TestConfiguredErrors(t *testing.T) {
 	f.FailOn("/mnt/a", errAny)
 	f.FailOp(OpBind, "/mnt/a", errBind)
 
-	if err := f.Unmount(ctx, "/mnt/a", 0); err != errAny {
+	if err := f.Unmount(ctx, "/mnt/a", 0, mount.AnyID); err != errAny {
 		t.Errorf("Unmount: got %v, want the per-target error", err)
 	}
 	if err := f.Bind(ctx, "", "/x", "/mnt/a", false); err != errBind {
 		t.Errorf("Bind: got %v, want the per-operation error, which takes precedence", err)
 	}
-	if err := f.Unmount(ctx, "/mnt/b", 0); err != nil {
+	if err := f.Unmount(ctx, "/mnt/b", 0, mount.AnyID); err != nil {
 		t.Errorf("another target: got %v, want nil", err)
 	}
 	if _, err := f.Statfs(ctx, "/mnt/a"); err != errAny {
@@ -187,7 +187,7 @@ func TestBlockHangsUntilTheContextIsDone(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	err := f.Unmount(ctx, "/mnt/dead", 0)
+	err := f.Unmount(ctx, "/mnt/dead", 0, mount.AnyID)
 	if !errors.Is(err, mount.ErrTimeout) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("got %v, want mount.ErrTimeout wrapping DeadlineExceeded", err)
 	}
@@ -196,7 +196,7 @@ func TestBlockHangsUntilTheContextIsDone(t *testing.T) {
 	}
 
 	// Other targets are unaffected.
-	if err := f.Unmount(context.Background(), "/mnt/alive", 0); err != nil {
+	if err := f.Unmount(context.Background(), "/mnt/alive", 0, mount.AnyID); err != nil {
 		t.Errorf("unblocked target: %v", err)
 	}
 }
@@ -213,11 +213,11 @@ func TestBlockCoversEverythingBelowAndBindsFromIt(t *testing.T) {
 		hung bool
 	}{
 		{"statfs below the dead transport", func() error { _, err := f.Statfs(context.Background(), "/mnt/dead/vols/a"); return err }, true},
-		{"unmount of the transport itself", func() error { return f.Unmount(context.Background(), "/mnt/dead", 0) }, true},
+		{"unmount of the transport itself", func() error { return f.Unmount(context.Background(), "/mnt/dead", 0, mount.AnyID) }, true},
 		{"bind from the dead transport", func() error { return f.Bind(context.Background(), "", "/mnt/dead/vols/a", "/mnt/stage", false) }, true},
 		{"mount below it", func() error { return f.Mount(context.Background(), "x", "/mnt/dead/sub", "tmpfs", 0, "") }, true},
-		{"a name that only shares a string prefix", func() error { return f.Unmount(context.Background(), "/mnt/deadly", 0) }, false},
-		{"the parent directory", func() error { return f.Unmount(context.Background(), "/mnt", 0) }, false},
+		{"a name that only shares a string prefix", func() error { return f.Unmount(context.Background(), "/mnt/deadly", 0, mount.AnyID) }, false},
+		{"the parent directory", func() error { return f.Unmount(context.Background(), "/mnt", 0, mount.AnyID) }, false},
 		{"a bind to elsewhere from a live path", func() error { return f.Bind(context.Background(), "", "/mnt/live/a", "/mnt/stage2", false) }, false},
 	}
 	for _, tt := range tests {
@@ -231,7 +231,7 @@ func TestBlockCoversEverythingBelowAndBindsFromIt(t *testing.T) {
 	}
 
 	f.Block("/")
-	if err := f.Unmount(context.Background(), "/anywhere", 0); !errors.Is(err, mount.ErrTimeout) && !errors.Is(err, mount.ErrBusy) {
+	if err := f.Unmount(context.Background(), "/anywhere", 0, mount.AnyID); !errors.Is(err, mount.ErrTimeout) && !errors.Is(err, mount.ErrBusy) {
 		t.Errorf("blocking / blocks everything: got %v", err)
 	}
 	// Reading the table is not a call on a mount, so it is never blocked.
@@ -245,7 +245,7 @@ func TestDefaultDeadlineApplies(t *testing.T) {
 	f := Mounter{DefaultTimeout: 20 * time.Millisecond}
 	f.Block("/mnt/dead")
 	// No deadline on the context: the call must still end, like the real one.
-	err := f.Unmount(context.Background(), "/mnt/dead", 0)
+	err := f.Unmount(context.Background(), "/mnt/dead", 0, mount.AnyID)
 	if !errors.Is(err, mount.ErrTimeout) {
 		t.Errorf("got %v, want ErrTimeout from the default deadline", err)
 	}
@@ -258,7 +258,7 @@ func TestUnsetDefaultIsTheRealDefault(t *testing.T) {
 	// An expired context fails before anything starts, whatever the default.
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	err := f.Unmount(ctx, "/mnt/dead", 0)
+	err := f.Unmount(ctx, "/mnt/dead", 0, mount.AnyID)
 	if !errors.Is(err, mount.ErrTimeout) || strings.Contains(err.Error(), "abandoned") {
 		t.Errorf("got %v, want ErrTimeout and no abandoned call", err)
 	}
@@ -274,7 +274,7 @@ func TestCancellationIsNotATimeout(t *testing.T) {
 
 	pre, precancel := context.WithCancel(context.Background())
 	precancel()
-	if err := f.Unmount(pre, "/mnt/dead", 0); !errors.Is(err, context.Canceled) || errors.Is(err, mount.ErrTimeout) {
+	if err := f.Unmount(pre, "/mnt/dead", 0, mount.AnyID); !errors.Is(err, context.Canceled) || errors.Is(err, mount.ErrTimeout) {
 		t.Errorf("already cancelled: got %v, want context.Canceled and not ErrTimeout", err)
 	}
 
@@ -285,7 +285,7 @@ func TestCancellationIsNotATimeout(t *testing.T) {
 		<-started
 		cancel()
 	}()
-	if err := f.Unmount(ctx, "/mnt/dead", 0); !errors.Is(err, context.Canceled) || errors.Is(err, mount.ErrTimeout) {
+	if err := f.Unmount(ctx, "/mnt/dead", 0, mount.AnyID); !errors.Is(err, context.Canceled) || errors.Is(err, mount.ErrTimeout) {
 		t.Errorf("cancelled while hung: got %v, want context.Canceled and not ErrTimeout", err)
 	}
 }
@@ -303,7 +303,7 @@ func TestTimedOutCallLeavesThePathBusyUntilUnblock(t *testing.T) {
 		t.Fatalf("%d calls recorded, want 1", n)
 	}
 	// The same path is busy; the real Mounter would not have started another.
-	err := f.Unmount(ctx, "/mnt/dead/sub", 0)
+	err := f.Unmount(ctx, "/mnt/dead/sub", 0, mount.AnyID)
 	if !errors.Is(err, mount.ErrBusy) || errors.Is(err, mount.ErrTimeout) {
 		t.Errorf("second call: got %v, want ErrBusy", err)
 	}
@@ -319,7 +319,7 @@ func TestTimedOutCallLeavesThePathBusyUntilUnblock(t *testing.T) {
 	}
 
 	f.Unblock("/mnt/dead")
-	if err := f.Unmount(ctx, "/mnt/dead/sub", 0); err != nil {
+	if err := f.Unmount(ctx, "/mnt/dead/sub", 0, mount.AnyID); err != nil {
 		t.Errorf("after Unblock: %v", err)
 	}
 	if _, err := f.Statfs(ctx, "/mnt/dead/sub"); err != nil {
@@ -335,7 +335,7 @@ func TestUnblockReleasesTheCall(t *testing.T) {
 	f.Block("/mnt/dead") // blocking twice is the same as once
 
 	done := make(chan error, 1)
-	go func() { done <- f.Unmount(context.Background(), "/mnt/dead", 0) }()
+	go func() { done <- f.Unmount(context.Background(), "/mnt/dead", 0, mount.AnyID) }()
 
 	if c := <-started; c.Op != OpUnmount || c.Target != "/mnt/dead" {
 		t.Fatalf("OnCall saw %+v", c)
@@ -346,7 +346,7 @@ func TestUnblockReleasesTheCall(t *testing.T) {
 	}
 	// Unblocking a path that is not blocked is harmless, and it no longer hangs.
 	f.Unblock("/mnt/dead")
-	if err := f.Unmount(context.Background(), "/mnt/dead", 0); err != nil {
+	if err := f.Unmount(context.Background(), "/mnt/dead", 0, mount.AnyID); err != nil {
 		t.Errorf("after Unblock the path no longer hangs: %v", err)
 	}
 	<-started
@@ -367,7 +367,7 @@ func TestUnblockFreesABindFromADeadSource(t *testing.T) {
 	if !errors.Is(err, mount.ErrBusy) || !strings.Contains(err.Error(), "/nfs/vol") {
 		t.Errorf("a second bind of the dead source: got %v, want ErrBusy naming the source", err)
 	}
-	if err := f.Unmount(ctx, "/pub/x", 0); err != nil {
+	if err := f.Unmount(ctx, "/pub/x", 0, mount.AnyID); err != nil {
 		t.Errorf("unmount of the target while the source hangs: %v", err)
 	}
 
@@ -389,17 +389,36 @@ func TestUnblockClearsWhatItCaused(t *testing.T) {
 	f.Block("/nfs")
 	f.Block("/other")
 
-	if err := f.Unmount(ctx, "/nfs/a", 0); !errors.Is(err, mount.ErrTimeout) {
+	if err := f.Unmount(ctx, "/nfs/a", 0, mount.AnyID); !errors.Is(err, mount.ErrTimeout) {
 		t.Fatalf("got %v, want ErrTimeout", err)
 	}
-	if err := f.Unmount(ctx, "/other/b", 0); !errors.Is(err, mount.ErrTimeout) {
+	if err := f.Unmount(ctx, "/other/b", 0, mount.AnyID); !errors.Is(err, mount.ErrTimeout) {
 		t.Fatalf("got %v, want ErrTimeout", err)
 	}
 	f.Unblock("/nfs")
-	if err := f.Unmount(ctx, "/nfs/a", 0); err != nil {
+	if err := f.Unmount(ctx, "/nfs/a", 0, mount.AnyID); err != nil {
 		t.Errorf("/nfs/a after Unblock(/nfs): %v", err)
 	}
-	if err := f.Unmount(ctx, "/other/b", 0); !errors.Is(err, mount.ErrBusy) {
+	if err := f.Unmount(ctx, "/other/b", 0, mount.AnyID); !errors.Is(err, mount.ErrBusy) {
 		t.Errorf("/other/b is still held by its own block: got %v, want ErrBusy", err)
+	}
+}
+
+func TestUnmountHonoursTheExpectedMountID(t *testing.T) {
+	t.Parallel()
+	f := &Mounter{}
+	f.SetTable(observe.Table{{ID: 7, MountPoint: "/mnt/a", Root: "/", FSType: "tmpfs", Source: "t"}})
+	ctx := context.Background()
+	if err := f.Unmount(ctx, "/mnt/a", 0, 8); !errors.Is(err, mount.ErrChanged) {
+		t.Errorf("a different ID: got %v, want ErrConflict", err)
+	}
+	if err := f.Unmount(ctx, "/mnt/a", 0, 7); err != nil {
+		t.Errorf("the visible ID: %v", err)
+	}
+	if err := f.Unmount(ctx, "/mnt/a", 0, mount.AnyID); err != nil {
+		t.Errorf("AnyID: %v", err)
+	}
+	if err := f.Unmount(ctx, "/mnt/none", 0, 8); err != nil {
+		t.Errorf("nothing mounted: %v", err)
 	}
 }

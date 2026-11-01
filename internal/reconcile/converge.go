@@ -289,16 +289,17 @@ func (p *pass) clearEnsureItem(volumeID string) {
 var errNoChange = errors.New("no change")
 
 // prune removes a publish from the volume's record because its target's
-// parent directory is gone. The check is repeated inside the store's
-// read-modify-write: a Publish for the same target that made the directory
-// again and recorded it after this pass loaded the record is kept.
+// parent directory is gone. The directory is looked at before the store's
+// lock is taken, since a stat can hang on a dead mount and the lock is held
+// by every request; only the cheap condition (the record still has the
+// publish) is checked again inside the read-modify-write.
 func (p *pass) prune(in intent.Intent, target string) {
 	r := p.r
+	if _, err := os.Stat(filepath.Dir(target)); !errors.Is(err, fs.ErrNotExist) {
+		return
+	}
 	err := r.store.Update(in.VolumeID, func(rec *intent.Intent) error {
 		if !hasPublish(*rec, target) {
-			return errNoChange
-		}
-		if _, err := os.Stat(filepath.Dir(target)); !errors.Is(err, fs.ErrNotExist) {
 			return errNoChange
 		}
 		kept := rec.Publishes[:0]
@@ -512,14 +513,20 @@ func (res *volumeResult) problem() (string, error) {
 // observed or mounted. The answer is computed once per transport per pass and
 // shared by the volumes on it.
 func (p *pass) ensureTransport(in intent.Intent, dir string) error {
-	if res, ok := p.trs[dir]; ok {
-		return res.err
-	}
-	res := &trResult{}
-	p.trs[dir] = res
-	r := p.r
 	spec := in.Transport
 	canonical := spec.Canonical()
+	if res, ok := p.trs[dir]; ok {
+		if res.canonical != canonical {
+			// The controller refuses a pair of transports whose 48-bit IDs
+			// collide; the node must not share one mount, and one result, between
+			// them either.
+			return fmt.Errorf("%w: %s is the mount point of %s, and %s has the same transport ID", ErrTransportConflict, dir, res.canonical, canonical)
+		}
+		return res.err
+	}
+	res := &trResult{canonical: canonical}
+	p.trs[dir] = res
+	r := p.r
 
 	tr, err := r.transportFor(spec)
 	if err != nil {
@@ -605,7 +612,9 @@ func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) 
 			return fmt.Errorf("volume %s: %w: %s is mounted as %s from %q, which is not a bind of the volume's source %s",
 				in.VolumeID, ErrPublishConflict, target, top.FSType, top.Source, source)
 		}
-		if top.ReadOnly() == pub.ReadOnly {
+		// A bind without nosuid and nodev (made by an earlier build) falls
+		// through to Bind, whose remount step adds them and keeps the rest.
+		if top.ReadOnly() == pub.ReadOnly && top.NoSuidNoDev() {
 			return nil
 		}
 	} else {

@@ -11,7 +11,26 @@ case "$tool" in
   mcp__github__*) ;;
   Bash)
     cmd=$(jq -r '.tool_input.command // ""' <<<"$input")
-    grep -q -E '(^|[;&| ])gh +(pr|issue|release|api|repo) ' <<<"$cmd" || exit 0 ;;
+    grep -q -E '(^|[;&| ])gh +(pr|issue|release|api|repo) ' <<<"$cmd" || exit 0
+    # The private detector list guards what this repository publishes. A call
+    # that names another repository with --repo (or -R) publishes elsewhere
+    # and is not scanned; a call with no --repo publishes to the repository of
+    # the directory it runs in (gh resolves it from the remote), so one that
+    # changes into another checkout first is not scanned either.
+    if grep -q -E -- '(^|[[:space:]])(--repo|-R)[= ]+[^[:space:]]+' <<<"$cmd"; then
+      target=$(grep -o -E -- '(--repo|-R)[= ]+[^[:space:]]+' <<<"$cmd" | head -1 | sed -E 's/^(--repo|-R)[= ]+//')
+      case "$target" in
+        *csi-miami*) ;;
+        *) exit 0 ;;
+      esac
+    elif grep -q -E '(^|[;&|] *)cd +[^[:space:];&|]+' <<<"$cmd"; then
+      dir=$(grep -o -E '(^|[;&|] *)cd +[^[:space:];&|]+' <<<"$cmd" | head -1 | sed -E 's/^.*cd +//')
+      remote=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
+      case "$remote" in
+        *csi-miami*) ;;
+        *) exit 0 ;;
+      esac
+    fi ;;
   *) exit 0 ;;
 esac
 # Only now, for a GitHub-publishing call: a missing config blocks the call.

@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
+	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 )
 
@@ -406,11 +408,54 @@ type lyingMounter struct {
 	lie string
 }
 
-func (l *lyingMounter) Unmount(_ context.Context, target string, _ int) error {
+func (l *lyingMounter) Unmount(_ context.Context, target string, _ int, id int) error {
 	if target == l.lie {
 		return nil
 	}
-	return l.sim.Unmount(context.Background(), target, 0)
+	return l.sim.Unmount(context.Background(), target, 0, id)
+}
+
+// coveringMounter mounts something over the path just before its first
+// unmount, as another process would between the table read and the unmount.
+type coveringMounter struct {
+	*sim
+	mu    sync.Mutex
+	once  bool
+	first error
+}
+
+func (c *coveringMounter) Unmount(ctx context.Context, target string, fl int, id int) error {
+	c.mu.Lock()
+	cover := !c.once
+	c.once = true
+	c.mu.Unlock()
+	if cover {
+		c.addMount(target, "tmpfs", "cover")
+	}
+	err := c.sim.Unmount(ctx, target, fl, id)
+	if cover {
+		c.mu.Lock()
+		c.first = err
+		c.mu.Unlock()
+	}
+	return err
+}
+
+func TestAStrayReplacedBetweenJudgementAndUnmountIsNotUnmountedByTheOldJudgement(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	stray := filepath.Join(e.sRoot, "x")
+	e.sim.addMount(stray, "tmpfs", "t")
+	cm := &coveringMounter{sim: e.sim}
+	e.r.m = cm
+
+	e.pass()
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if !errors.Is(cm.first, mount.ErrChanged) {
+		t.Errorf("the first unmount answered %v, want mount.ErrChanged", cm.first)
+	}
 }
 
 // ---- the directory item through the reconciler ----

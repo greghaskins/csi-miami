@@ -30,6 +30,22 @@
 #             - spec.template.spec.containers.[name=miami].volumeMounts.[name=kubelet-dir].mountPath
 #             - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path
 #
+# Both workloads carry a required node affinity that keeps them off nodes
+# labelled node-role.kubernetes.io/control-plane or node-role.kubernetes.io/master
+# (decision 35); the node DaemonSet still tolerates every taint, so custom
+# taints on worker nodes do not keep the driver off. A cluster that wants the
+# driver on control planes removes the affinity in its overlay:
+#
+#   patches:
+#     - target: {kind: DaemonSet, name: miami-node}
+#       patch: |-
+#         - op: remove
+#           path: /spec/template/spec/affinity
+#     - target: {kind: Deployment, name: miami-controller}
+#       patch: |-
+#         - op: remove
+#           path: /spec/template/spec/affinity
+#
 # Known roots: k0s /var/lib/k0s/kubelet, k3s /var/lib/rancher/k3s/agent/kubelet,
 # microk8s /var/snap/microk8s/common/var/lib/kubelet.
 #

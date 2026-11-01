@@ -222,6 +222,15 @@ spec:
         app.kubernetes.io/component: controller
         app.kubernetes.io/name: miami
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: DoesNotExist
+              - key: node-role.kubernetes.io/master
+                operator: DoesNotExist
       automountServiceAccountToken: true
       containers:
       - args:
@@ -386,6 +395,15 @@ spec:
         app.kubernetes.io/component: node
         app.kubernetes.io/name: miami
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: DoesNotExist
+              - key: node-role.kubernetes.io/master
+                operator: DoesNotExist
       automountServiceAccountToken: true
       containers:
       - args:

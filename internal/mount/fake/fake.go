@@ -45,6 +45,8 @@ type Call struct {
 	Data   string
 	// ReadOnly is the requested state for Bind and RemountReadOnly.
 	ReadOnly bool
+	// ID is the expected mount ID of an Unmount.
+	ID int
 }
 
 // Mounter implements mount.Mounter. The zero value is ready to use and safe
@@ -316,11 +318,22 @@ func (f *Mounter) RemountReadOnly(ctx context.Context, target string, readOnly b
 
 // Unmount validates its arguments as the real Mounter does (including its flags
 // and its refusal of "/"), then records the call.
-func (f *Mounter) Unmount(ctx context.Context, target string, flags int) error {
+func (f *Mounter) Unmount(ctx context.Context, target string, flags int, id int) error {
 	if err := mount.CheckUnmount(target, flags); err != nil {
 		return err
 	}
-	return f.enter(ctx, Call{Op: OpUnmount, Target: target, Flags: uintptr(flags)})
+	if err := f.enter(ctx, Call{Op: OpUnmount, Target: target, Flags: uintptr(flags), ID: id}); err != nil {
+		return err
+	}
+	// Like the real Mounter, compare the expected ID with the visible top of
+	// the configured table at the moment of the call.
+	f.mu.Lock()
+	top, ok := f.table.At(target)
+	f.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return mount.CheckUnmountID(top, id)
 }
 
 // Statfs validates its path as the real Mounter does, records the call and

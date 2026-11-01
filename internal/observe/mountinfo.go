@@ -49,6 +49,12 @@ func (m Mount) ReadOnly() bool { return hasOption(m.Options, "ro") }
 // even when ReadOnly is false.
 func (m Mount) SuperReadOnly() bool { return hasOption(m.SuperOptions, "ro") }
 
+// NoSuidNoDev reports whether the mount carries both nosuid and nodev, as
+// every bind the driver makes does.
+func (m Mount) NoSuidNoDev() bool {
+	return hasOption(m.Options, "nosuid") && hasOption(m.Options, "nodev")
+}
+
 func hasOption(opts []string, want string) bool {
 	for _, o := range opts {
 		if o == want {

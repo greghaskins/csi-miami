@@ -26,6 +26,13 @@ spec:
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: miami-controller
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+                  - {key: node-role.kubernetes.io/master, operator: DoesNotExist}
       automountServiceAccountToken: true
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

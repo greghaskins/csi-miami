@@ -157,7 +157,7 @@ func TestAStageBindFromAnEarlierBuildIsRemovedAndThePublishAdopted(t *testing.T)
 			// What the previous build left: the item directory bound at the
 			// stage path, and the publish a bind of that.
 			mustNil(t, "old stage", e.sim.Bind(bg, "", e.srcOf(in), in.StagePath, false))
-			mustNil(t, "drop publish", e.sim.Unmount(bg, target, 0))
+			mustNil(t, "drop publish", e.sim.Unmount(bg, target, 0, mount.AnyID))
 			mustNil(t, "old publish", e.sim.Bind(bg, "", in.StagePath, target, false))
 			if deleted {
 				e.sim.markDeleted(in.StagePath, target)

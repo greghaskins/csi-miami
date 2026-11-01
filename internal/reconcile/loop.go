@@ -43,8 +43,11 @@ type pass struct {
 
 // trResult is what one pass found out about one transport.
 type trResult struct {
-	err     error
-	mounted bool
+	// canonical is the transport the result was computed for. Two transports
+	// whose IDs collide share a mount point; the second to ask is refused.
+	canonical string
+	err       error
+	mounted   bool
 }
 
 // runPass runs one pass over every intent and then collects garbage, and
@@ -70,7 +73,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 		r.ends.Add(1)
 	}()
 
-	loaded, err := r.store.Load()
+	loaded, err := r.load()
 	if err != nil {
 		r.metrics.IncReconcileError("load")
 		r.log.Error("reading the intent store failed; converging and collecting nothing", "error", err)

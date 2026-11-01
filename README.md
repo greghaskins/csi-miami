@@ -50,7 +50,7 @@ projects run off the shelf.
                      └─────────────────────┘
 ```
 
-The `miami node` DaemonSet runs on every node and does all the mounting. A
+The `miami node` DaemonSet runs on every worker node and does all the mounting. A
 small `miami controller` Deployment creates and deletes volumes on the NAS.
 Details: [architecture brief](docs/design/2026-10-30-architecture-brief.md).
 
@@ -114,6 +114,8 @@ replacements:
           - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path
 ```
 
+**Control planes.** The driver runs on worker nodes by default: a required node affinity on the node DaemonSet and the controller Deployment excludes nodes labelled `node-role.kubernetes.io/control-plane` or `node-role.kubernetes.io/master`. The DaemonSet tolerates every taint, so custom taints on workers do not keep it off. To run the driver on control planes, remove the affinity in your overlay with a JSON patch (the base kustomization.yaml has the snippet).
+
 **Local transport.** A `local` transport requires its host directory mounted into the node container. Add a volumeMount to the miami container with `mountPropagation: HostToContainer` and a hostPath volume to the pod spec.
 
 **Host watchdogs.** Host NFS watchdogs or scanners must exclude the driver's transports and stage roots. In `<kubelet-dir>/plugins/miami.csi.greghaskins.com/` exclude `transports` (the mounts) and `intents` (the intent records). Also exclude `<kubelet-dir>/plugins/kubernetes.io/csi/miami.csi.greghaskins.com` (the stage root). In the controller's `/var/lib/miami` (an emptyDir mount inside the container) exclude `transports`.
@@ -125,9 +127,11 @@ kubectl apply -k deploy/kustomize/base
 kubectl apply -k deploy/kustomize/examples
 ```
 
-Edit `deploy/kustomize/examples/miami-nfs3.yaml` and `miami-local.yaml` first: set `transport.server` and `transport.export` for nfs3, and `transport.path` for local.
+Edit `deploy/kustomize/examples/miami-dir-remote-rwx.yaml` and `miami-dir-local-rwo.yaml` first: set `transport.server` and `transport.export` for nfs3, and `transport.path` for local.
 
 ## StorageClass parameters
+
+**Naming.** A class is named `miami-<type>-<location>-<sharing>`, with a `-<crypt>` suffix when it is encrypted. `type` is `dir` (a directory item; `img` for image items later), `location` is `local` (the node's disk) or `remote` (a network server, NFSv3 today), and `sharing` is `rwo` (one node) or `rwx` (many nodes). The crypt token is defined with encryption in M2. The examples are `miami-dir-remote-rwx` (a directory on NFSv3, many nodes) and `miami-dir-local-rwo` (a directory on the node's disk, one node).
 
 | Parameter | Values | Required | Meaning |
 |---|---|---|---|
@@ -181,6 +185,7 @@ The helper runs the command in its own process group. SIGTERM or SIGINT sent to 
 - **ESTALE on server restart.** During the restart, directories answer `ESTALE` and recover when the server returns. A file held open across the window may not. The driver reports the condition (`miami_transport_up`, `miami_volume_condition`, `TransportUnavailable` event) and does not remediate in M1.
 - **Directory items only.** M1 does not support filesystem images, opaque blobs, encryption, fencing, expansion or exclusivity.
 - **Transport options are fixed in code.** The NFSv3 profile (`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30`) and the `local` bind are not configurable per StorageClass.
+- **Mount-point checks and old profiles.** A `local` transport does not require its path to be a mount point, so a directory meant to be a separate disk is bound from whatever is there when the disk is not mounted; and a transport mounted by an older option profile is reported as a conflict until it is unmounted by hand.
 - **Local volumes are not deleted by the controller.** When a `local` volume is deleted, the controller succeeds and logs a warning. The directory remains on the node's disk and is not removed (the node-local tier handles removal in M4).
 
 ## Development

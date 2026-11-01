@@ -8,7 +8,7 @@
 #
 #   --image       the driver image: name:tag or name@sha256:<digest>
 #   --nfs-server  an IPv4 address (decision 21); replaces transport.server of
-#                 StorageClass miami-nfs3. Omitted: the placeholder stays.
+#                 StorageClass miami-dir-remote-rwx. Omitted: the placeholder stays.
 #   --out         an existing, empty directory to write kustomization.yaml in
 #
 # The deploy check (hack/kind.sh) and the end-to-end tests both use it.
@@ -70,7 +70,7 @@ fi
     echo "patches:"
     echo "  - target:"
     echo "      kind: StorageClass"
-    echo "      name: miami-nfs3"
+    echo "      name: miami-dir-remote-rwx"
     echo "    patch: |-"
     echo "      - op: replace"
     echo "        path: /parameters/transport.server"

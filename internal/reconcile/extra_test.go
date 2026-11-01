@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -155,5 +156,131 @@ func TestStageKeepsTheRecordsEnsureItem(t *testing.T) {
 	mustNil(t, "second Stage", e.r.Stage(bg, in)) // a caller with a stale read
 	if got, _ = e.intentOf(in.VolumeID); got.EnsureItem {
 		t.Error("a Stage gave the permission back")
+	}
+}
+
+// A retried Stage racing the loop's clearing of EnsureItem cannot give the
+// permission back: its merge with the record is one read-modify-write in the
+// store. A watcher sees the flag go false once and never true again.
+func TestARetriedStageRacingTheClearOfEnsureItemDoesNotRestoreIt(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", pvc1)
+	in.EnsureItem = true
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	restored := make(chan string, 1)
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		cleared := false
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			got, ok := e.intentOf(in.VolumeID)
+			switch {
+			case !ok:
+			case !got.EnsureItem:
+				cleared = true
+			case cleared:
+				select {
+				case restored <- "EnsureItem went true after it was cleared":
+				default:
+				}
+				return
+			}
+		}
+	}()
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 15 {
+				if err := e.r.Stage(bg, in); err != nil {
+					t.Errorf("Stage: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	<-watched
+	select {
+	case msg := <-restored:
+		t.Error(msg)
+	default:
+	}
+}
+
+// Two transports whose IDs collide would share one mount point. The controller
+// refuses such a pair; the reconciler must not give the second the first's
+// mount, or its result, either. The collision is built by hand: the same mount
+// point asked for two different transports in one pass.
+func TestTwoTransportsSharingAMountPointAreAConflict(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	a := e.vol("a", pvc1)
+	b := e.vol("b", pvc2)
+	dir := e.tdir("a")
+	p := &pass{r: e.r, ctx: bg, trs: map[string]*trResult{}, hung: map[string]error{}}
+
+	if err := p.ensureTransport(a, dir); err != nil {
+		t.Fatalf("the first transport: %v", err)
+	}
+	err := p.ensureTransport(b, dir)
+	if !errors.Is(err, ErrTransportConflict) {
+		t.Fatalf("the second transport at the same mount point: %v, want ErrTransportConflict", err)
+	}
+	// The same transport asked again shares the result, as before.
+	if err := p.ensureTransport(a, dir); err != nil {
+		t.Errorf("the first transport asked again: %v", err)
+	}
+	for _, c := range e.sim.mutating() {
+		if c.Op == fake.OpBind && c.Source == e.host("b") {
+			t.Errorf("the second transport was mounted: %+v", c)
+		}
+	}
+}
+
+// A publish bind made by an earlier build lacks nosuid and nodev. The pass
+// does not adopt it as it is: Bind is called, and its remount step adds them,
+// keeping the read-only state.
+func TestAnExistingPublishWithoutNosuidAndNodevIsRepaired(t *testing.T) {
+	t.Parallel()
+	for _, ro := range []bool{false, true} {
+		e := newEnv(t)
+		e.start()
+		in := e.vol("a", pvc1)
+		target := e.stageAndPublish(in, "pod1", ro)
+		e.stop()
+
+		tbl := e.sim.table()
+		for i := range tbl {
+			if tbl[i].MountPoint == target {
+				tbl[i].Options = []string{map[bool]string{false: "rw", true: "ro"}[ro], "relatime"}
+			}
+		}
+		e.sim.set(tbl)
+		before := len(e.sim.mutating())
+
+		e.pass()
+
+		top, ok := e.visible(target)
+		if !ok || !top.NoSuidNoDev() || top.ReadOnly() != ro {
+			t.Errorf("ro=%t: publish after the pass = %v, %+v; want nosuid, nodev and the same read-only state", ro, ok, top.Options)
+		}
+		if n := len(e.sim.mutating()) - before; n != 1 {
+			t.Errorf("ro=%t: %d calls that change mounts, want the one Bind", ro, n)
+		}
+		e.pass()
+		if n := len(e.sim.mutating()) - before; n != 1 {
+			t.Errorf("ro=%t: a second pass changed mounts again", ro)
+		}
 	}
 }

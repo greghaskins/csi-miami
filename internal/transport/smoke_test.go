@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -45,6 +46,9 @@ func TestSmokeLocalTransport(t *testing.T) {
 	}
 	requireBind(t, tr.Dir(), src, true)
 	requireBind(t, tr.Dir(), other, false)
+	if top, ok := currentTable(t).At(tr.Dir()); !ok || !slices.Contains(top.Options, "nosuid") || !slices.Contains(top.Options, "nodev") {
+		t.Errorf("the local transport is not nosuid,nodev: %v", top.Options)
+	}
 	if got, err := os.ReadFile(filepath.Join(tr.Dir(), "marker")); err != nil || string(got) != "data" {
 		t.Fatalf("reading through the transport: %q, %v", got, err)
 	}

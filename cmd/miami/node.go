@@ -164,6 +164,7 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	if err != nil {
 		return err
 	}
+	defer func() { _ = store.Close() }()
 
 	reg := metrics.New(metrics.WithReconciler())
 	opts := reconcile.Options{

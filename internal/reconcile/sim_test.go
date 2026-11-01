@@ -91,9 +91,9 @@ func (s *sim) removeLocked(path string) bool {
 
 func rwOptions(ro bool) []string {
 	if ro {
-		return []string{"ro", "relatime"}
+		return []string{"ro", "nosuid", "nodev", "relatime"}
 	}
-	return []string{"rw", "relatime"}
+	return []string{"rw", "nosuid", "nodev", "relatime"}
 }
 
 func (s *sim) setReadOnly(id int, ro bool) {
@@ -147,8 +147,8 @@ func (s *sim) Bind(ctx context.Context, root, source, target string, readOnly bo
 
 // Unmount removes the top mount at target, or fails with EBUSY if another
 // mount lies inside it. Unmounting what is not mounted is a no-op.
-func (s *sim) Unmount(ctx context.Context, target string, flags int) error {
-	if err := s.Mounter.Unmount(ctx, target, flags); err != nil {
+func (s *sim) Unmount(ctx context.Context, target string, flags int, id int) error {
+	if err := s.Mounter.Unmount(ctx, target, flags, id); err != nil {
 		return err
 	}
 	s.mu.Lock()

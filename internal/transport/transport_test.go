@@ -32,8 +32,8 @@ func TestNFS3DataIsPinned(t *testing.T) {
 	if got := nfs3Data("192.0.2.10"); got != want {
 		t.Errorf("nfs3Data = %q, want %q", got, want)
 	}
-	if nfs3Flags != unix.MS_NOATIME {
-		t.Errorf("nfs3Flags = %#x, want MS_NOATIME %#x", uintptr(nfs3Flags), uintptr(unix.MS_NOATIME))
+	if want := uintptr(unix.MS_NOATIME | unix.MS_NOSUID | unix.MS_NODEV); nfs3Flags != want {
+		t.Errorf("nfs3Flags = %#x, want MS_NOATIME|MS_NOSUID|MS_NODEV %#x", uintptr(nfs3Flags), want)
 	}
 	if nfs3FSType != "nfs" {
 		t.Errorf("nfs3FSType = %q, want nfs", nfs3FSType)
@@ -298,7 +298,7 @@ func TestNFS3MountSendsTheProfile(t *testing.T) {
 		Source: nfsSource,
 		Target: tr.Dir(),
 		FSType: "nfs",
-		Flags:  unix.MS_NOATIME,
+		Flags:  unix.MS_NOATIME | unix.MS_NOSUID | unix.MS_NODEV,
 		Data:   "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10",
 	}
 	if got := kernelCalls(f); len(got) != 1 || got[0] != want {
@@ -647,14 +647,14 @@ func TestUnmount(t *testing.T) {
 		want []fake.Call
 	}{
 		{"nfs3 mounted", nfsSpec, table(rootMount(), kernelNFS3(t, nfsDir)),
-			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0}}},
+			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0, ID: 100}}},
 		{"nfs3 absent", nfsSpec, table(rootMount()), nil},
 		{"local absent", localSpec, table(rootMount()), nil},
 		{"local mounted", localSpec, table(rootMount(), observe.Mount{ID: 100, ParentID: 1, Major: 8, Minor: 1, Root: "/export/data", MountPoint: localDir, FSType: "ext4", Source: "/dev/sda1"}),
-			[]fake.Call{{Op: fake.OpUnmount, Target: localDir, Flags: 0}}},
+			[]fake.Call{{Op: fake.OpUnmount, Target: localDir, Flags: 0, ID: 100}}},
 		{"nfs3 mount made by an older profile is unmounted too", nfsSpec,
 			table(rootMount(), observe.Mount{ID: 100, ParentID: 1, Root: "/", MountPoint: nfsDir, FSType: "nfs", Source: nfsSource, SuperOptions: []string{"rw", "vers=3", "hard"}}),
-			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0}}},
+			[]fake.Call{{Op: fake.OpUnmount, Target: nfsDir, Flags: 0, ID: 100}}},
 		{"hidden under a cover: nothing is visible", nfsSpec,
 			table(rootMount(), kernelNFS3(t, nfsDir),
 				observe.Mount{ID: 101, ParentID: 1, Root: "/", MountPoint: filepath.Join(root, "transports"), FSType: "tmpfs", Source: "cover"}),

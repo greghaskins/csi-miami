@@ -155,9 +155,9 @@ func (c *countingMounter) RemountReadOnly(ctx context.Context, t string, ro bool
 	return c.Mounter.RemountReadOnly(ctx, t, ro)
 }
 
-func (c *countingMounter) Unmount(ctx context.Context, t string, fl int) error {
+func (c *countingMounter) Unmount(ctx context.Context, t string, fl int, id int) error {
 	c.changes.Add(1)
-	return c.Mounter.Unmount(ctx, t, fl)
+	return c.Mounter.Unmount(ctx, t, fl, id)
 }
 
 // run starts a Reconciler, a new process as far as the kernel can tell, and
@@ -301,6 +301,8 @@ func TestSmokeRebootRestoresTheNode(t *testing.T) {
 	n.requireAll(pvc1, target)
 	if m, ok := currentTable(t).At(target); !ok || !m.ReadOnly() {
 		t.Errorf("the read-only flag of the publish did not come back: %+v", m)
+	} else if !strings.Contains(strings.Join(m.Options, ","), "nosuid,nodev") {
+		t.Errorf("the publish is not nosuid,nodev: %v", m.Options)
 	}
 }
 

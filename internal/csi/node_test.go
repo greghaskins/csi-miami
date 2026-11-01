@@ -459,6 +459,23 @@ func TestNodePublish(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a reader-only access mode is published read-only whatever the request says", func(t *testing.T) {
+		t.Parallel()
+		for _, mode := range []csi.VolumeCapability_AccessMode_Mode{
+			csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
+			csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+		} {
+			rec := &fakeRec{record: stagedRecord()}
+			rec.record.AccessMode = mode.String()
+			req := publishReq() // readonly=false
+			if _, err := newTestNode(t, rec, nil).NodePublishVolume(ctx, req); err != nil {
+				t.Fatalf("%v: %v", mode, err)
+			}
+			if len(rec.published) != 1 || !rec.published[0].ReadOnly {
+				t.Errorf("%v: published %+v, want read-only", mode, rec.published)
+			}
+		}
+	})
 	t.Run("the reconciler's errors are mapped", func(t *testing.T) {
 		t.Parallel()
 		rec := &fakeRec{record: stagedRecord(), err: reconcile.ErrPublishConflict}

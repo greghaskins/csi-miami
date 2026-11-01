@@ -259,3 +259,105 @@ func TestTheLogLineForAnUnreadableRecordWarnsAboutRemovingIt(t *testing.T) {
 		t.Errorf("%d lines for one unreadable record over two passes, want 1", n)
 	}
 }
+
+// A record edited by hand, or written by another build, is held to the rules a
+// request is held to. One that breaks them is treated like an unreadable
+// record: counted, nothing mounted for it, collection suspended, and one log
+// line for it however many passes see it.
+func TestARecordBreakingTheRequestRulesIsTreatedAsUnreadable(t *testing.T) {
+	t.Parallel()
+	tests := map[string]func(e *env, in *intent.Intent){
+		"a stage path outside the stage root": func(_ *env, in *intent.Intent) {
+			in.StagePath = "/elsewhere/stage"
+		},
+		"the stage root itself": func(e *env, in *intent.Intent) {
+			in.StagePath = e.sRoot
+		},
+		"a publish target inside the stage root": func(e *env, in *intent.Intent) {
+			in.Publishes = []intent.Publish{{TargetPath: filepath.Join(e.sRoot, "other", "mount")}}
+		},
+		"a publish target inside the transports root": func(e *env, in *intent.Intent) {
+			in.Publishes = []intent.Publish{{TargetPath: filepath.Join(e.tRoot, "abc", "mount")}}
+		},
+		"a publish target above the stage root": func(e *env, in *intent.Intent) {
+			in.Publishes = []intent.Publish{{TargetPath: filepath.Dir(e.sRoot)}}
+		},
+	}
+	for name, edit := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			lg, buf := logger()
+			e := newEnv(t, func(o *Options) { o.Logger = lg })
+			bad := e.vol("a", pvc1)
+			edit(e, &bad)
+			mustNil(t, "save", e.store.Save(bad))
+			stray := filepath.Join(e.sRoot, "stray")
+			e.sim.addMount(stray, "tmpfs", "tmpfs")
+
+			e.pass()
+			e.pass()
+
+			if e.metrics.loadFailures != 1 {
+				t.Errorf("load failures = %d, want 1", e.metrics.loadFailures)
+			}
+			if got := e.sim.mutating(); len(got) != 0 {
+				t.Errorf("calls that change mounts: %+v, want none (nothing mounted, nothing collected)", got)
+			}
+			if _, ok := e.visible(stray); !ok {
+				t.Error("collection ran while a record failed the request rules")
+			}
+			if n := strings.Count(buf.String(), "could not be loaded"); n != 1 {
+				t.Errorf("%d log lines over two passes, want 1", n)
+			}
+		})
+	}
+}
+
+// The way out of a record that breaks the request rules: a fresh Stage
+// overwrites a bad stage path and keeps the record's publishes; an Unstage is
+// ErrIntentsUnknown while it stands; a bad publish target survives a Stage and
+// cannot be unpublished (the request rule refuses the path), so that record is
+// for a person to repair or remove.
+func TestTheWayOutOfARecordBreakingTheRequestRules(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", pvc1)
+	target := e.stageAndPublish(in, "pod1", false)
+
+	// A bad stage path: the volume's record is dormant, then repaired by Stage.
+	bad, _ := e.intentOf(in.VolumeID)
+	bad.StagePath = "/elsewhere/stage"
+	mustNil(t, "save", e.store.Save(bad))
+	e.freshPass(e.r.nudge)
+	if e.metrics.loadFailures != 1 {
+		t.Fatalf("load failures = %d, want 1", e.metrics.loadFailures)
+	}
+	if err := e.r.Unstage(bg, in.VolumeID); !errors.Is(err, ErrIntentsUnknown) {
+		t.Errorf("Unstage of a violating record = %v, want ErrIntentsUnknown", err)
+	}
+	mustNil(t, "Stage", e.r.Stage(bg, in))
+	got, _ := e.intentOf(in.VolumeID)
+	if got.StagePath != in.StagePath || len(got.Publishes) != 1 || got.Publishes[0].TargetPath != target {
+		t.Errorf("record after Stage = %+v, want the good stage path and the publish kept", got)
+	}
+	e.freshPass(e.r.nudge)
+	if e.metrics.loadFailures != 0 {
+		t.Errorf("load failures = %d after the repair, want 0", e.metrics.loadFailures)
+	}
+
+	// A bad publish target survives a Stage, and cannot be unpublished.
+	badPub := filepath.Join(e.sRoot, "elsewhere", "mount")
+	got.Publishes = append(got.Publishes, intent.Publish{TargetPath: badPub})
+	mustNil(t, "save", e.store.Save(got))
+	if err := e.r.Stage(bg, in); !errors.Is(err, ErrIntentsUnknown) {
+		t.Errorf("Stage over a record with a bad publish = %v, want ErrIntentsUnknown (the record is still dormant)", err)
+	}
+	if err := e.r.Unpublish(bg, in.VolumeID, badPub); !errors.Is(err, ErrTargetOutsideScope) {
+		t.Errorf("Unpublish of the bad target = %v, want ErrTargetOutsideScope", err)
+	}
+	e.freshPass(e.r.nudge)
+	if e.metrics.loadFailures != 1 {
+		t.Errorf("load failures = %d, want the record still dormant", e.metrics.loadFailures)
+	}
+}

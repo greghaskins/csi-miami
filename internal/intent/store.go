@@ -12,9 +12,15 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
+	// lockName is the file Open holds an exclusive lock on. It is not a record
+	// (it has no .json suffix) and Load ignores it.
+	lockName = ".lock"
+
 	recordSuffix = ".json"
 	tempInfix    = recordSuffix + ".tmp-"
 	dirPerm      = 0o700
@@ -29,9 +35,15 @@ const (
 //
 // Use one Store per directory per process and share the instance: the mutex
 // that makes writes and Load safe against each other lives in the Store, so
-// two Stores on one directory give no such guarantee.
+// two Stores on one directory give no such guarantee. Open enforces it with an
+// exclusive lock on the directory, held until the process ends or Close.
 type Store struct {
 	dir string
+
+	// lock holds the flock that keeps a second process off the directory. It
+	// is kept for the store's life: closing it, which the garbage collector
+	// would do once the file is unreachable, releases the lock.
+	lock *os.File
 
 	// mu serialises Save, Update, Delete, Get and Load, so that Load's
 	// removal of stale temp files can never delete the temp file of a Save
@@ -104,11 +116,35 @@ func Open(dir string) (*Store, error) {
 			return nil, fmt.Errorf("intent store: %w", err)
 		}
 	}
-	return &Store{dir: dir}, nil
+	// A second driver instance on the node (a force-deleted pod's container
+	// still running beside its replacement) would race on the records. The
+	// lock is on a descriptor of its own, so it conflicts with another Open
+	// in the same process too.
+	lock, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE|unix.O_CLOEXEC, filePerm) // #nosec G304 -- a file in the store directory
+	if err != nil {
+		return nil, fmt.Errorf("intent store: %w", err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lock.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, fmt.Errorf("intent store: %s is in use by another process; is a second instance of the driver running on this node?", dir)
+		}
+		return nil, fmt.Errorf("intent store: locking %s: %w", dir, err)
+	}
+	return &Store{dir: dir, lock: lock}, nil
 }
+
+// Close releases the lock Open took. The Store must not be used afterwards. A
+// process that ends releases it without calling Close.
+func (s *Store) Close() error { return s.lock.Close() }
 
 // Dir returns the directory the Store keeps its records in.
 func (s *Store) Dir() string { return s.dir }
+
+// Path returns the file that holds the record of a volume.
+func (s *Store) Path(volumeID string) string {
+	return filepath.Join(s.dir, s.fileName(volumeID))
+}
 
 func (s *Store) fileName(volumeID string) string {
 	return Escape(volumeID) + recordSuffix
