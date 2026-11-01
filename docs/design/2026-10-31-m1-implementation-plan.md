@@ -26,8 +26,9 @@ real cluster by hand:
    remains on its node (decision 23); the e2e for `local` asserts exactly
    that, and does not expect the directory to be gone.
 4. Restarting the node plugin pod while pods are running changes nothing:
-   the transport stays mounted on the host, bind mounts survive, and the
-   next stage and unstage on that node succeed.
+   the stage and publish bind mounts survive (the same mounts), the new
+   plugin has the transport mounted again, and the next stage and unstage on
+   that node succeed.
 5. A node reboot: pods come back, the transport is remounted on first use,
    nothing is leaked.
 6. `kubectl get --raw /metrics` on the node plugin shows the metrics in
@@ -327,7 +328,8 @@ not supported" usually means a missing `vers=3`), and whether `softerr`
 mounts on every node kernel. Either outcome changes the profile by a code
 change, with a version bump.
 
-**Adoption.** After a restart the transport is still on the host table, and
+**Adoption.** After a restart of the process the transport is still in the mount
+namespace (a new pod finds none and mounts it again), and
 `Mounted` answers true only for a mount that is exactly this transport: file
 system type `nfs`, the source `<server>:<export>`, per-mount `noatime`, and
 these super options among those the kernel reports: `rw`, `vers=3`,
@@ -351,11 +353,15 @@ reported and never stacked over.
 that every transport looks the same to the item and observer code. It
 must exist and be a directory; the driver never creates it.
 
-**Mount point on the host table.** The DaemonSet mounts a `hostPath`
-directory (`--transports-root`, default `/var/lib/miami`) with
-`mountPropagation: Bidirectional`. A transport mounted under it is visible
-to the host and to the next plugin pod. On start the reconciler reads
-mountinfo and adopts what is there; it never assumes.
+**Mount point.** The DaemonSet mounts a `hostPath` directory
+(`--transports-root`, default `/var/lib/miami`) with no mount propagation
+(brief decision 26): a transport mounted under it is private to the plugin's
+mount namespace, so the kubelet never sees it as a reference to the stage
+binds of an NFS volume. The stage and publish binds are under the kubelet
+directory, which is `Bidirectional`, so they are on the host and the next
+plugin pod finds them. On start the reconciler reads mountinfo, mounts the
+transports its intents need and adopts the binds that are there; it never
+assumes.
 
 **Deadlines.** Every `stat`, `statfs`, mount and unmount runs in its own
 goroutine with a deadline (default 10s, flag) because a hung NFS mount
@@ -469,8 +475,8 @@ node: PV get, events get, create and patch: the recorder reads an event before i
 count); the controller Deployment
 (provisioner with `--extra-create-metadata --feature-gates=Topology=true`,
 attacher, resizer kept out until M2, livenessprobe); the node DaemonSet
-(registrar, livenessprobe, `Bidirectional` kubelet dir and transports
-root, host `/dev` not needed in M1); an example StorageClass per transport.
+(registrar, livenessprobe, `Bidirectional` kubelet dir, transports
+root without propagation, host `/dev` not needed in M1); an example StorageClass per transport.
 Sidecars pinned by digest. Resource requests and limits on every container.
 `deploy/policy_test.go` asserts the RBAC rule set is exactly the list above.
 The sidecars are csi-provisioner v6.4.0, csi-attacher v4.13.0,
@@ -562,11 +568,13 @@ T2 and T4, T9 after T7 and T8, T10 after T9, T11 and T12 last.
 - **`mount(2)` NFSv3 without a helper, and `softerr`** on the target
   kernels: retired by the `nfs3` e2e variant in T4, before any node-agent
   code depends on it, and by the first real-cluster mount.
-- **`Bidirectional` propagation and adoption across a plugin restart**: the
-  reason the transports root is a hostPath; adoption across a process
-  restart is retired by the T4 smoke (one private mount namespace, so it
-  does not exercise propagation); propagation is proven by the e2e on a real
-  cluster in T10 and by exit criterion 4.
+- **Propagation and adoption across a plugin restart**: adoption across a
+  process restart is retired by the T4 smoke (one private mount namespace, so
+  it does not exercise propagation); propagation of the stage and publish
+  binds through the `Bidirectional` kubelet directory is proven by the e2e on
+  a real cluster in T10 and by exit criterion 4. The T10 e2e also showed that
+  a transport on the host table makes an NFS volume impossible to unstage
+  (brief decision 26), so the transports root has no propagation.
 - **Kubelet path differences across distributions**: one replacement in
   the kustomize base, checked by a render test in T9.
 - **A hung NFS mount blocking the reconciler**: every observation has a

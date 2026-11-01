@@ -8,6 +8,15 @@
 # `Bidirectional` mount propagation only to privileged containers. It sets
 # seccompProfile RuntimeDefault anyway; a runtime ignores the profile for a
 # privileged container, and the API server accepts the combination.
+#
+# The transports root has no propagation (private to the plugin's mount
+# namespace), on purpose: a transport mounted on the host table is, for NFS,
+# a "reference" to every stage bind of the same export (the NFS client reports
+# "/" as the root of all of them), and the kubelet then refuses to unstage the
+# volume ("still mounted by other references"). The stage and publish binds are
+# made under the kubelet directory, which does propagate, so they are on the
+# host and survive a plugin restart; the transport is mounted again by the next
+# plugin. Brief decision 26.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -77,7 +86,7 @@ spec:
               mountPropagation: Bidirectional
             - name: transports
               mountPath: /var/lib/miami
-              mountPropagation: Bidirectional
+              mountPropagation: None
             - name: plugin-dir
               mountPath: /csi
         - name: csi-node-driver-registrar
@@ -133,8 +142,9 @@ spec:
           hostPath:
             path: /var/lib/kubelet
             type: Directory
-        # Transport mounts live on the host mount table, so they survive a
-        # plugin restart.
+        # Where the plugin mounts its transports, private to its mount
+        # namespace (see the top of this file). The directory itself is on the
+        # host, so the mount points persist.
         - name: transports
           hostPath:
             path: /var/lib/miami
