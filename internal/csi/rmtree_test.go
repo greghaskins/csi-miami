@@ -365,7 +365,7 @@ func TestEnsureBeneathNeverCreatesOutsideTheTransport(t *testing.T) {
 					tt.swap(t, tr)
 				}
 			}}
-			created, err := ensureItemDirWith(r, tr.mount, filepath.Join(tr.mount, "teams", nameB))
+			created, err := ensureItemDirWith(r, tr.mount, filepath.Join(tr.mount, "teams", nameB), 0o755)
 			if codeOf(err) != tt.code || created {
 				t.Fatalf("created = %v, error = %v; want %v", created, err, tt.code)
 			}
@@ -379,7 +379,7 @@ func TestEnsureBeneathCreatesTheMissingElementsAndSetsTheMode(t *testing.T) {
 	t.Parallel()
 	tr := newTree(t)
 	dir := filepath.Join(tr.mount, "a", "b", nameB)
-	created, err := ensureItemDirWith(&treeRemover{}, tr.mount, dir)
+	created, err := ensureItemDirWith(&treeRemover{}, tr.mount, dir, 0o755)
 	if err != nil || !created {
 		t.Fatalf("created = %v, error = %v", created, err)
 	}
@@ -390,7 +390,7 @@ func TestEnsureBeneathCreatesTheMissingElementsAndSetsTheMode(t *testing.T) {
 		}
 	}
 	// Again: adopted, not created.
-	created, err = ensureItemDirWith(&treeRemover{}, tr.mount, dir)
+	created, err = ensureItemDirWith(&treeRemover{}, tr.mount, dir, 0o755)
 	if err != nil || created {
 		t.Errorf("again: created = %v, error = %v; want adopted", created, err)
 	}
@@ -401,7 +401,7 @@ func TestEnsureBeneathWithoutOpenat2CreatesNothing(t *testing.T) {
 	t.Parallel()
 	tr := newTree(t)
 	r := &treeRemover{open: func(int, string, *unix.OpenHow) (int, error) { return -1, unix.ENOSYS }}
-	created, err := ensureItemDirWith(r, tr.mount, filepath.Join(tr.mount, "x", nameB))
+	created, err := ensureItemDirWith(r, tr.mount, filepath.Join(tr.mount, "x", nameB), 0o755)
 	if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "Linux 5.6") || created {
 		t.Fatalf("created = %v, error = %v", created, err)
 	}
@@ -425,10 +425,30 @@ func TestEnsureBeneathRefusesWhatIsNotADirectory(t *testing.T) {
 		{[]string{"alink", nameB}, codes.FailedPrecondition},
 	}
 	for _, tt := range tests {
-		_, err := (&treeRemover{}).ensureBeneath(tr.mount, tt.elems)
+		_, err := (&treeRemover{}).ensureBeneath(tr.mount, tt.elems, 0o755)
 		if codeOf(err) != tt.code {
 			t.Errorf("%v: code = %v (%v), want %v", tt.elems, codeOf(err), err, tt.code)
 		}
 	}
 	mustNotExist(t, filepath.Join(tr.outside, nameB))
+}
+
+// The last element takes the mode given, whatever the umask, and the elements
+// above it 0755. It sets the process umask, so it is not parallel.
+func TestEnsureBeneathLastElementTakesTheMode(t *testing.T) {
+	old := unix.Umask(0o077)
+	defer unix.Umask(old)
+	tr := newTree(t)
+	dir := filepath.Join(tr.mount, "a", nameB)
+	created, err := ensureItemDirWith(&treeRemover{}, tr.mount, dir, 0o2775)
+	if err != nil || !created {
+		t.Fatalf("created = %v, error = %v", created, err)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil || fi.Mode()&(os.ModePerm|os.ModeSetgid) != 0o775|os.ModeSetgid {
+		t.Errorf("last element: %v, %v; want 2775", fi, err)
+	}
+	if fi, err := os.Lstat(filepath.Join(tr.mount, "a")); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Errorf("parent: %v, %v; want 755", fi, err)
+	}
 }

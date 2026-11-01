@@ -14,3 +14,9 @@ parameters:
   transport.export: /export
   # Optional: a prefix under the export, one directory per namespace and claim.
   subdir: ${pvc.namespace}/${pvc.name}
+  # Optional: the mode of the volume's directory when the driver creates it, as
+  # up to four octal digits (default 0755). 0777 lets any user write, which is
+  # what a pod needs on an export that squashes root to an unprivileged owner;
+  # 2775 adds the setgid bit so new files take the directory's group. An
+  # existing directory is adopted as it is and never chmod'ed.
+  # mode: "0777"

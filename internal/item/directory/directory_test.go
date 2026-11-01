@@ -126,6 +126,7 @@ type fixture struct {
 	// lists the (mountDir, dir) pairs it was called with.
 	ensure  func(mountDir, dir string) error
 	ensured [][2]string
+	modes   []uint32 // the mode each creation was asked for
 }
 
 func newFixture(t *testing.T, table ...observe.Mount) *fixture {
@@ -143,7 +144,10 @@ func newFixture(t *testing.T, table ...observe.Mount) *fixture {
 			fx.mu.Unlock()
 			return fn(p)
 		},
-		Ensure: func(mountDir, dir string) error {
+		Ensure: func(mountDir, dir string, mode uint32) error {
+			fx.mu.Lock()
+			fx.modes = append(fx.modes, mode)
+			fx.mu.Unlock()
 			fx.mu.Lock()
 			fx.ensured = append(fx.ensured, [2]string{mountDir, dir})
 			fn := fx.ensure
@@ -625,7 +629,7 @@ func TestEnsureBeneath(t *testing.T) {
 		t.Parallel()
 		base := mk(t)
 		dir := filepath.Join(base, "ns", "claim", pvc1)
-		if err := ensureBeneath(base, dir); err != nil {
+		if err := ensureBeneath(base, dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		for _, p := range []string{filepath.Join(base, "ns"), dir} {
@@ -642,7 +646,7 @@ func TestEnsureBeneath(t *testing.T) {
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := ensureBeneath(base, dir); err != nil {
+		if err := ensureBeneath(base, dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
@@ -656,7 +660,7 @@ func TestEnsureBeneath(t *testing.T) {
 		if err := os.WriteFile(dir, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := ensureBeneath(base, dir); !errors.Is(err, item.ErrItemNotDirectory) {
+		if err := ensureBeneath(base, dir, 0o755); !errors.Is(err, item.ErrItemNotDirectory) {
 			t.Fatalf("got %v, want ErrItemNotDirectory", err)
 		}
 	})
@@ -666,7 +670,7 @@ func TestEnsureBeneath(t *testing.T) {
 		if err := os.Symlink(outside, filepath.Join(base, "ns")); err != nil {
 			t.Fatal(err)
 		}
-		if err := ensureBeneath(base, filepath.Join(base, "ns", pvc1)); !errors.Is(err, item.ErrItemNotDirectory) {
+		if err := ensureBeneath(base, filepath.Join(base, "ns", pvc1), 0o755); !errors.Is(err, item.ErrItemNotDirectory) {
 			t.Fatalf("got %v, want ErrItemNotDirectory", err)
 		}
 		if ents, _ := os.ReadDir(outside); len(ents) != 0 {
@@ -677,7 +681,7 @@ func TestEnsureBeneath(t *testing.T) {
 		t.Parallel()
 		base := mk(t)
 		for _, dir := range []string{base, filepath.Dir(base), filepath.Join(filepath.Dir(base), "x")} {
-			if err := ensureBeneath(base, dir); err == nil {
+			if err := ensureBeneath(base, dir, 0o755); err == nil {
 				t.Errorf("%s accepted", dir)
 			}
 		}
@@ -691,8 +695,104 @@ func TestEnsureBeneath(t *testing.T) {
 	t.Run("fails if the mount directory is missing", func(t *testing.T) {
 		t.Parallel()
 		base := mk(t)
-		if err := ensureBeneath(filepath.Join(base, "gone"), filepath.Join(base, "gone", pvc1)); err == nil {
+		if err := ensureBeneath(filepath.Join(base, "gone"), filepath.Join(base, "gone", pvc1), 0o755); err == nil {
 			t.Fatal("no error")
+		}
+	})
+}
+
+// The creation is asked for the volume's mode, and for 0755 when the record
+// has none (every record from before the field).
+func TestConvergeCreatesWithTheVolumesMode(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		mode string
+		want uint32
+	}{
+		{"no mode is the default", "", 0o755},
+		{"world writable", "0777", 0o777},
+		{"setgid", "2775", 0o2775},
+		{"private", "0700", 0o700},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newFixture(t, rootMount(), transportMount())
+			made := false
+			fx.statFn = func(string) (fs.FileInfo, error) {
+				if !made {
+					return nil, fs.ErrNotExist
+				}
+				return dirInfo{dir: true}, nil
+			}
+			fx.ensure = func(string, string) error { made = true; return nil }
+			in := firstStage()
+			in.Mode = tt.mode
+			if err := fx.converge(in); err != nil {
+				t.Fatal(err)
+			}
+			if len(fx.modes) != 1 || fx.modes[0] != tt.want {
+				t.Errorf("creation asked for modes %o, want [%o]", fx.modes, tt.want)
+			}
+		})
+	}
+}
+
+// The mode is applied with fchmod, so the umask does not decide it, and only to
+// the volume's own directory: the elements above it keep 0755, and a directory
+// that exists is adopted with the mode it has. It sets the process umask, so
+// it is not parallel.
+func TestEnsureBeneathAppliesTheModeUnderAnyUmask(t *testing.T) {
+	old := unix.Umask(0o077)
+	defer unix.Umask(old)
+	mk := func(t *testing.T) string {
+		t.Helper()
+		d, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	tests := []struct {
+		name string
+		mode uint32
+		want fs.FileMode
+	}{
+		{"default", 0o755, 0o755},
+		{"world writable", 0o777, 0o777},
+		{"group writable", 0o775, 0o775},
+		{"setgid", 0o2775, 0o775 | fs.ModeSetgid},
+		{"sticky", 0o1777, 0o777 | fs.ModeSticky},
+		{"private", 0o700, 0o700},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := mk(t)
+			dir := filepath.Join(base, "ns", pvc1)
+			if err := ensureBeneath(base, dir, tt.mode); err != nil {
+				t.Fatal(err)
+			}
+			fi, err := os.Stat(dir)
+			if err != nil || !fi.IsDir() || fi.Mode()&(fs.ModePerm|fs.ModeSetgid|fs.ModeSetuid|fs.ModeSticky) != tt.want {
+				t.Errorf("item directory: %v, %v; want mode %v", fi, err, tt.want)
+			}
+			if fi, err := os.Stat(filepath.Join(base, "ns")); err != nil || fi.Mode().Perm() != 0o755 {
+				t.Errorf("parent: %v, %v; want 0755", fi, err)
+			}
+		})
+	}
+	t.Run("an existing directory keeps its mode", func(t *testing.T) {
+		base := mk(t)
+		dir := filepath.Join(base, pvc1)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureBeneath(base, dir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+			t.Errorf("mode of an adopted directory changed to %v", fi.Mode().Perm())
 		}
 	})
 }

@@ -19,6 +19,7 @@ const (
 	keyTransportExport = contextPrefix + "transport.export"
 	keyTransportPath   = contextPrefix + "transport.path"
 	keySubdir          = contextPrefix + "subdir"
+	keyMode            = contextPrefix + "mode"
 )
 
 // Context is the volume context set by CreateVolume, stored on the PV and
@@ -30,7 +31,18 @@ type Context struct {
 	Kind      Kind
 	Transport transport.Spec
 	Subdir    string // optional prefix, relative and cleaned; empty means none
+
+	// Mode is the mode of the item directory when the driver creates it, as
+	// four octal digits (0755); empty means DefaultMode. It applies to the
+	// directory of the volume only, not to the subdir elements above it, and
+	// only to a directory the driver makes: one that exists is adopted as it
+	// is. DirMode gives it as a number.
+	Mode string
 }
+
+// DirMode returns the mode of the item directory as a number: DefaultMode
+// when Mode is empty.
+func (c Context) DirMode() uint32 { return ModeBits(c.Mode) }
 
 // Validate reports whether the Context is complete and exactly in the form
 // NewContext produces. The error carries the gRPC code InvalidArgument.
@@ -39,6 +51,9 @@ func (c Context) Validate() error {
 		return invalid("volume context " + keyKind + " must be directory")
 	}
 	if err := c.Transport.Validate(); err != nil {
+		return err
+	}
+	if err := CheckMode(c.Mode); err != nil {
 		return err
 	}
 	if c.Subdir != "" {
@@ -94,14 +109,15 @@ func (c Context) Encode() map[string]string {
 	set(keyTransportExport, c.Transport.Export)
 	set(keyTransportPath, c.Transport.Path)
 	set(keySubdir, c.Subdir)
+	set(keyMode, c.Mode)
 	return m
 }
 
 // DecodeContext reads a volume context. It returns InvalidArgument for a
 // missing or malformed key, for any unknown key that starts with "miami/",
 // and for anything NewContext would not have produced (it never cleans or
-// repairs a value); keys without that prefix are ignored. The subdir key may
-// be absent.
+// repairs a value); keys without that prefix are ignored. The subdir and mode
+// keys may be absent (an absent mode is DefaultMode).
 func DecodeContext(m map[string]string) (Context, error) {
 	var unknown []string
 	for k := range m {
@@ -109,7 +125,7 @@ func DecodeContext(m map[string]string) (Context, error) {
 			continue
 		}
 		switch k {
-		case keyKind, keyTransportKind, keyTransportServer, keyTransportExport, keyTransportPath, keySubdir:
+		case keyKind, keyTransportKind, keyTransportServer, keyTransportExport, keyTransportPath, keySubdir, keyMode:
 		default:
 			unknown = append(unknown, k)
 		}
@@ -134,6 +150,7 @@ func DecodeContext(m map[string]string) (Context, error) {
 			Path:   m[keyTransportPath],
 		},
 		Subdir: m[keySubdir],
+		Mode:   m[keyMode],
 	}
 	if err := c.Validate(); err != nil {
 		return Context{}, err
@@ -152,7 +169,7 @@ func NewContext(params map[string]string) (Context, error) {
 	if err != nil {
 		return Context{}, err
 	}
-	c := Context{Kind: p.Kind, Transport: p.Transport, Subdir: subdir}
+	c := Context{Kind: p.Kind, Transport: p.Transport, Subdir: subdir, Mode: p.Mode}
 	if err := c.Validate(); err != nil {
 		return Context{}, err
 	}

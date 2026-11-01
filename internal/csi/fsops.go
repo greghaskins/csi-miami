@@ -10,9 +10,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// dirMode is the mode of a directory the controller creates on a transport.
-// Group ownership and the rest are the business of the kubelet, through the
-// CSIDriver's fsGroupPolicy.
+// dirMode is the mode of a directory the controller creates on a transport
+// below the volume's own: the subdir elements. The volume's directory takes
+// the StorageClass's mode (volume.Context.DirMode). Group ownership and the
+// rest are the business of the kubelet, through the CSIDriver's
+// fsGroupPolicy.
 const dirMode = 0o755
 
 // fsStatus maps an error from the file system of a transport to a gRPC
@@ -48,17 +50,18 @@ func relativeTo(base, path string) ([]string, bool) {
 // the share, or swapped in while this runs, cannot send the new directory
 // somewhere else. A final element that exists and is a directory is adopted
 // (that is what makes CreateVolume idempotent); one that exists and is anything
-// else is AlreadyExists. A directory the controller makes is set to dirMode
-// whatever the umask.
-func ensureItemDir(mountDir, dir string) (created bool, err error) {
-	return ensureItemDirWith(&treeRemover{}, mountDir, dir)
+// else is AlreadyExists. A directory the controller makes on the way is set to
+// dirMode, and dir itself to mode (permission, setuid, setgid and sticky bits),
+// whatever the umask; an existing dir keeps its mode.
+func ensureItemDir(mountDir, dir string, mode uint32) (created bool, err error) {
+	return ensureItemDirWith(&treeRemover{}, mountDir, dir, mode)
 }
 
 // ensureItemDirWith is ensureItemDir with the remover given, for tests.
-func ensureItemDirWith(r *treeRemover, mountDir, dir string) (bool, error) {
+func ensureItemDirWith(r *treeRemover, mountDir, dir string, mode uint32) (bool, error) {
 	elems, ok := relativeTo(mountDir, dir)
 	if !ok {
 		return false, status.Errorf(codes.Internal, "volume directory is not below the transport mount")
 	}
-	return r.ensureBeneath(mountDir, elems)
+	return r.ensureBeneath(mountDir, elems, mode)
 }

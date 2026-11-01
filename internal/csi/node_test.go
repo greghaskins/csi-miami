@@ -273,6 +273,32 @@ func TestNodeStageRepeats(t *testing.T) {
 			t.Errorf("code = %v, staged %d", codeOf(err), len(rec.staged))
 		}
 	})
+	t.Run("a mode in the context reaches the record", func(t *testing.T) {
+		t.Parallel()
+		rec := &fakeRec{}
+		req := stageReq()
+		vc := localCtx
+		vc.Mode = "2775"
+		req.VolumeContext = vc.Encode()
+		if _, err := newTestNode(t, rec, nil).NodeStageVolume(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		if len(rec.staged) != 1 || rec.staged[0].Mode != "2775" {
+			t.Errorf("staged %+v, want the mode 2775", rec.staged)
+		}
+	})
+	t.Run("another mode is AlreadyExists", func(t *testing.T) {
+		t.Parallel()
+		rec := &fakeRec{record: stagedRecord()}
+		req := stageReq()
+		vc := localCtx
+		vc.Mode = "0777"
+		req.VolumeContext = vc.Encode()
+		_, err := newTestNode(t, rec, nil).NodeStageVolume(context.Background(), req)
+		if codeOf(err) != codes.AlreadyExists || len(rec.staged) != 0 {
+			t.Errorf("code = %v, staged %d", codeOf(err), len(rec.staged))
+		}
+	})
 	t.Run("an unreadable record is Unavailable", func(t *testing.T) {
 		t.Parallel()
 		rec := &fakeRec{getErr: errors.New("input/output error")}

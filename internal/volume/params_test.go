@@ -198,7 +198,7 @@ func TestNewContext(t *testing.T) {
 		},
 		{
 			name:    "unknown parameter",
-			params:  nfsParams(map[string]string{"mode": "0777"}),
+			params:  nfsParams(map[string]string{"owner": "root"}),
 			wantErr: "unknown parameter",
 		},
 	}
