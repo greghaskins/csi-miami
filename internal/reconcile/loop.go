@@ -43,7 +43,10 @@ type pass struct {
 
 // trResult is what one pass found out about one transport.
 type trResult struct {
-	err     error
+	// canonical is the transport the result was computed for. Two transports
+	// whose IDs collide share a mount point; the second to ask is refused.
+	canonical string
+	err       error
 	mounted bool
 }
 

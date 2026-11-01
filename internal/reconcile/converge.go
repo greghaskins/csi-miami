@@ -513,14 +513,20 @@ func (res *volumeResult) problem() (string, error) {
 // observed or mounted. The answer is computed once per transport per pass and
 // shared by the volumes on it.
 func (p *pass) ensureTransport(in intent.Intent, dir string) error {
-	if res, ok := p.trs[dir]; ok {
-		return res.err
-	}
-	res := &trResult{}
-	p.trs[dir] = res
-	r := p.r
 	spec := in.Transport
 	canonical := spec.Canonical()
+	if res, ok := p.trs[dir]; ok {
+		if res.canonical != canonical {
+			// The controller refuses a pair of transports whose 48-bit IDs
+			// collide; the node must not share one mount, and one result, between
+			// them either.
+			return fmt.Errorf("%w: %s is the mount point of %s, and %s has the same transport ID", ErrTransportConflict, dir, res.canonical, canonical)
+		}
+		return res.err
+	}
+	res := &trResult{canonical: canonical}
+	p.trs[dir] = res
+	r := p.r
 
 	tr, err := r.transportFor(spec)
 	if err != nil {

@@ -217,3 +217,33 @@ func TestARetriedStageRacingTheClearOfEnsureItemDoesNotRestoreIt(t *testing.T) {
 	default:
 	}
 }
+
+// Two transports whose IDs collide would share one mount point. The controller
+// refuses such a pair; the reconciler must not give the second the first's
+// mount, or its result, either. The collision is built by hand: the same mount
+// point asked for two different transports in one pass.
+func TestTwoTransportsSharingAMountPointAreAConflict(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	a := e.vol("a", pvc1)
+	b := e.vol("b", pvc2)
+	dir := e.tdir("a")
+	p := &pass{r: e.r, ctx: bg, trs: map[string]*trResult{}, hung: map[string]error{}}
+
+	if err := p.ensureTransport(a, dir); err != nil {
+		t.Fatalf("the first transport: %v", err)
+	}
+	err := p.ensureTransport(b, dir)
+	if !errors.Is(err, ErrTransportConflict) {
+		t.Fatalf("the second transport at the same mount point: %v, want ErrTransportConflict", err)
+	}
+	// The same transport asked again shares the result, as before.
+	if err := p.ensureTransport(a, dir); err != nil {
+		t.Errorf("the first transport asked again: %v", err)
+	}
+	for _, c := range e.sim.mutating() {
+		if c.Op == fake.OpBind && c.Source == e.host("b") {
+			t.Errorf("the second transport was mounted: %+v", c)
+		}
+	}
+}
