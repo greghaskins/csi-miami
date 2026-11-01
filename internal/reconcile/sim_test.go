@@ -109,8 +109,8 @@ func (s *sim) setReadOnly(id int, ro bool) {
 // Bind follows the real Mounter's contract: it adopts a bind of source, sets
 // its read-only state, refuses a different mount at target with ErrConflict,
 // and otherwise makes the mount.
-func (s *sim) Bind(ctx context.Context, source, target string, readOnly bool) error {
-	if err := s.Mounter.Bind(ctx, source, target, readOnly); err != nil {
+func (s *sim) Bind(ctx context.Context, root, source, target string, readOnly bool) error {
+	if err := s.Mounter.Bind(ctx, root, source, target, readOnly); err != nil {
 		return err
 	}
 	s.mu.Lock()

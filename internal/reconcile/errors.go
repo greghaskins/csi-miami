@@ -203,7 +203,9 @@ var (
 	ErrInvalidRequest = errors.New("the request is not valid")
 
 	// ErrNoOpenat2 is returned when the kernel has no openat2(2), which the
-	// creation of a local volume's directory needs. It is item.ErrNoOpenat2.
+	// creation of a local volume's directory needs, and so does every bind of
+	// a volume's directory (a publish, and the local transport's own). It is
+	// item.ErrNoOpenat2.
 	ErrNoOpenat2 = item.ErrNoOpenat2
 
 	// ErrObserve is returned when the mount table cannot be read (it is

@@ -24,7 +24,7 @@ func TestAnythingAtTheStagePathIsAConflictAndIsNeverUnmounted(t *testing.T) {
 		{"a bind of another volume's directory", func(e *env, in intent.Intent) {
 			other := e.vol("a", pvc2)
 			mustNil(t, "Stage other", e.r.Stage(bg, other)) // brings the transport up
-			mustNil(t, "bind", e.sim.Bind(bg, e.srcOf(other), in.StagePath, false))
+			mustNil(t, "bind", e.sim.Bind(bg, "", e.srcOf(other), in.StagePath, false))
 		}},
 	}
 	for _, tt := range tests {
@@ -156,9 +156,9 @@ func TestAStageBindFromAnEarlierBuildIsRemovedAndThePublishAdopted(t *testing.T)
 
 			// What the previous build left: the item directory bound at the
 			// stage path, and the publish a bind of that.
-			mustNil(t, "old stage", e.sim.Bind(bg, e.srcOf(in), in.StagePath, false))
+			mustNil(t, "old stage", e.sim.Bind(bg, "", e.srcOf(in), in.StagePath, false))
 			mustNil(t, "drop publish", e.sim.Unmount(bg, target, 0))
-			mustNil(t, "old publish", e.sim.Bind(bg, in.StagePath, target, false))
+			mustNil(t, "old publish", e.sim.Bind(bg, "", in.StagePath, target, false))
 			if deleted {
 				e.sim.markDeleted(in.StagePath, target)
 			}

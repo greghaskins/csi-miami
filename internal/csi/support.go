@@ -96,7 +96,7 @@ func reason(err error) string {
 	case errors.Is(err, mount.ErrConflict):
 		return "something else is mounted at its mount point"
 	case errors.Is(err, mount.ErrNotResolved):
-		return "its path goes through a symlink"
+		return "the path is not a plain directory under the transport"
 	case errors.As(err, &errno):
 		return errno.Error()
 	default:

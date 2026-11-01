@@ -83,5 +83,5 @@ func (l *local) Mount(ctx context.Context) error {
 	if err := l.makeMountPoint(ctx); err != nil {
 		return err
 	}
-	return l.m.Bind(ctx, resolved, l.dir, false)
+	return l.m.Bind(ctx, "", resolved, l.dir, false)
 }
