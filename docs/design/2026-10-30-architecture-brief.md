@@ -742,7 +742,8 @@ Recorded:
     mounted at a directory volume's stage path is `ErrStageConflict`, reported
     and left, since the driver cannot show it made it. The transport model
     (one host-visible mount per server, adoption, deadlines, garbage rules)
-    is unchanged.
+    is unchanged. A stage bind from before this decision is recognised as
+    the driver's own and removed on the first pass.
 
 Pending: none that block M1.
 
