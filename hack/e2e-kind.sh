@@ -139,11 +139,11 @@ export MIAMI_E2E_TRANSPORT="$transport"
 export MIAMI_E2E_KIND_CLUSTER="$cluster"
 export MIAMI_E2E_ARTIFACT_DIR="$artifacts"
 if [ "$transport" = nfs3 ]; then
-  export MIAMI_E2E_STORAGE_CLASS="miami-nfs3"
+  export MIAMI_E2E_STORAGE_CLASS="miami-dir-remote-rwx"
   export MIAMI_E2E_NFS_SERVER="$server"
   export MIAMI_E2E_NFS_CONTAINER="$NFS_SERVER_NAME"
 else
-  export MIAMI_E2E_STORAGE_CLASS="miami-local"
+  export MIAMI_E2E_STORAGE_CLASS="miami-dir-local-rwo"
 fi
 
 "$kind_work/e2e.test" -test.v -test.count=1 -test.failfast -test.timeout=40m 2>&1 | tee "$log"

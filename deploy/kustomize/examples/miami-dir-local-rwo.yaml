@@ -1,9 +1,11 @@
-# A directory on the node's own disk. The path is on the node the pod runs on,
-# so the class waits for a consumer to learn which node that is.
+# Named miami-TYPE-LOCATION-SHARING[-CRYPT]: dir is a directory item, local is
+# the node's own disk, rwo is one node. The crypt suffix is for M2. The path is
+# on the node the pod runs on, so the class waits for a consumer to learn which
+# node that is.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: miami-local
+  name: miami-dir-local-rwo
 provisioner: miami.csi.greghaskins.com
 volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete

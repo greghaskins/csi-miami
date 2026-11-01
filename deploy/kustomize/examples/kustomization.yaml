@@ -1,6 +1,7 @@
-# Example StorageClasses, one per transport. Not part of the base.
+# Example StorageClasses, one per transport, named miami-TYPE-LOCATION-SHARING
+# [-CRYPT] (see the README). Not part of the base.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - miami-local.yaml
-  - miami-nfs3.yaml
+  - miami-dir-local-rwo.yaml
+  - miami-dir-remote-rwx.yaml
