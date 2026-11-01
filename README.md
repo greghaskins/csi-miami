@@ -4,13 +4,12 @@
 Kubernetes CSI driver that turns a NAS that only speaks NFSv3, or a node's
 own disk, into volumes that behave like local storage.
 
-> *INT. CLUSTER — NIGHT. A pod has been in `ContainerCreating` for an hour.*
+> *INT. CLUSTER — NIGHT. The pod is stuck in `ContainerCreating`.*
 >
-> **TECH:** Sir, the pod is falling behind and can not process case files!
+> **TECH:** We ran `kubectl describe`. The events... they just keep coming.
 >
-> *(Sunglasses go on.)*
->
-> **LIEUTENANT:** Looks like the evidence is... *mounting.*
+> **LIEUTENANT:** *(removes sunglasses)* Of course they do. *(puts them back
+> on)* The evidence is *mounting.*
 >
 > **YEEEAAAH**
 
