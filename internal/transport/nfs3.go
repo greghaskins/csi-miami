@@ -29,8 +29,10 @@ const nfs3Flags = unix.MS_NOATIME
 //	vers=3,proto=tcp      the protocol the target servers speak; tcp so that a
 //	                      socket reset is a real fence
 //	softerr,timeo=100,retrans=3
-//	                      bounded failure: about 100s major timeout, and
-//	                      ETIMEDOUT instead of EIO (needs Linux 5.3)
+//	                      bounded failure: a 40s major timeout, timeo x
+//	                      (retrans+1) (TCP backs off linearly and the major
+//	                      timeout is capped there), and ETIMEDOUT instead of
+//	                      EIO (needs Linux 5.3)
 //	nolock                locks are node-local; no NLM, no lockd state to hang
 //	lookupcache=positive  never cache a negative lookup
 //	actimeo=30            attribute cache of 30s; close-to-open still holds

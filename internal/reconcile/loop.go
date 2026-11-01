@@ -99,6 +99,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 	p.teardown(batch)
 	p.convergeAll()
 	p.reportIntents()
+	p.reportConditions()
 	p.collectGarbage(batch, len(loaded.Failures) == 0)
 	p.answer(batch)
 }

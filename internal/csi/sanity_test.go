@@ -573,7 +573,7 @@ func TestSanityCreateRefusesAMountPointOnTheWay(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = unix.Unmount(teams, 0) })
 
-	created, err := ensureItemDir(tr.mount, filepath.Join(teams, nameB))
+	created, err := ensureItemDir(tr.mount, filepath.Join(teams, nameB), 0o755)
 	if codeOf(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "mount point") || created {
 		t.Fatalf("created = %v, error = %v; want FailedPrecondition naming a mount point", created, err)
 	}

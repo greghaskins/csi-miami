@@ -44,7 +44,8 @@ import (
 //	 6. ErrSuperseded                             ClassAborted           Aborted
 //	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
 //	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
-//	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, ErrStopped, EBUSY
+//	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, ErrStopped, EBUSY,
+//	    ESTALE (a stale NFS handle: the server restarted)
 //	 9. anything else                             ClassInternal          Internal
 //
 // Consequences worth knowing. A mount.ErrTimeout wraps context.DeadlineExceeded
@@ -54,8 +55,12 @@ import (
 // Unavailable. A transport that does not answer and then reports "busy" on the
 // passes after is Unavailable, which is the retry-later answer it is. EBUSY,
 // from an unmount of a mount something still has open, is retryable and so is
-// Unavailable. Errors from the Mounter that are none of these, such as an
-// unexpected errno, are Internal.
+// Unavailable. A stat of a volume's item directory that
+// returns ESTALE, times out or is busy is ErrTransportUnavailable: the
+// transport has restarted or is not answering, never Internal. ESTALE and
+// busy are Unavailable; a timeout stays DeadlineExceeded, by 7. Errors from
+// the Mounter that are none of these, such as an unexpected errno, are
+// Internal.
 
 // Class is the kind of an error of this package, in the terms the CSI layer
 // maps to status codes. See the mapping above.
@@ -116,7 +121,7 @@ func Classify(err error) Class {
 	case errors.Is(err, mount.ErrTimeout):
 		return ClassDeadlineExceeded
 	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy),
-		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY):
+		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY), errors.Is(err, syscall.ESTALE):
 		return ClassUnavailable
 	default:
 		return ClassInternal
@@ -133,10 +138,13 @@ var (
 
 	// ErrTransportUnavailable is returned when the transport could not be
 	// observed or mounted: the server did not answer, the name did not
-	// resolve, the host path is gone, the mount table could not be read. The
-	// error it wraps (often mount.ErrTimeout or mount.ErrBusy) says which.
-	// It is retryable, and the next pass retries it.
-	ErrTransportUnavailable = errors.New("the transport is unavailable")
+	// resolve, the host path is gone, the mount table could not be read; or
+	// when it is mounted but does not answer or has restarted, which the stat
+	// of a volume's item directory shows as ESTALE, a timeout or busy (it is
+	// item.ErrTransportUnavailable). The error it wraps (often mount.ErrTimeout
+	// or mount.ErrBusy, or ESTALE) says which. It is retryable, nothing is
+	// unmounted or mounted on account of it, and the next pass retries.
+	ErrTransportUnavailable = item.ErrTransportUnavailable
 
 	// ErrStageConflict is returned when the stage path holds a mount that is
 	// not the volume's: for a directory volume any mount, since the driver

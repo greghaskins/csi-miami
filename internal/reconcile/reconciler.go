@@ -101,6 +101,7 @@ type Reconciler struct {
 	idleSince   map[string]time.Time  // unreferenced transport dir → first pass that saw it
 	lastErr     map[string]string     // volume → text of its last error, for dedup
 	reported    map[string]string     // transport dir → kind, for the metrics seam
+	up          map[string]bool       // transport dir → whether it answered its last probe, to log changes
 	kinds       map[string]struct{}   // intent kinds reported, so a kind that empties reads 0
 	failedLoad  map[string]struct{}   // load-failure paths already logged
 	warned      map[string]string     // path → kind of the failure last logged at warn level
@@ -182,6 +183,7 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		idleSince:   map[string]time.Time{},
 		lastErr:     map[string]string{},
 		reported:    map[string]string{},
+		up:          map[string]bool{},
 		kinds:       map[string]struct{}{},
 		failedLoad:  map[string]struct{}{},
 		warned:      map[string]string{},

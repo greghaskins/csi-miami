@@ -102,7 +102,7 @@ kind_wait
 
 go test -c -tags e2e -o "$kind_work/e2e.test" ./test/e2e
 
-# The tests every transport runs a variant of, and the one only nfs3 runs.
+# The tests every transport runs a variant of, and the ones only nfs3 runs.
 # A listing that lacks one means a rename or a build tag would pass by running
 # nothing.
 if [ "$transport" = nfs3 ]; then
@@ -112,6 +112,7 @@ if [ "$transport" = nfs3 ]; then
     TestNodePluginRestartChangesNothing
     TestNodeReboot
     TestMetrics
+    TestNFSServerRestart
   )
 else
   expected=(

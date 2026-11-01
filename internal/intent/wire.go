@@ -9,15 +9,18 @@ import (
 // golden file under testdata/ pins it. Change it only under the rules in the
 // documentation of Version.
 type wireIntent struct {
-	Version    int             `json:"version"`
-	VolumeID   string          `json:"volumeID"`
-	Kind       string          `json:"kind"`
-	Transport  transportRecord `json:"transport"`
-	Subdir     string          `json:"subdir"`
-	StagePath  string          `json:"stagePath"`
-	Publishes  []Publish       `json:"publishes,omitempty"`
-	MountFlags []string        `json:"mountFlags,omitempty"`
-	AccessMode string          `json:"accessMode"`
+	Version   int             `json:"version"`
+	VolumeID  string          `json:"volumeID"`
+	Kind      string          `json:"kind"`
+	Transport transportRecord `json:"transport"`
+	Subdir    string          `json:"subdir"`
+	// Mode is informational for a version 1 reader, which ignores it; a
+	// record without it reads as empty, the default mode.
+	Mode       string    `json:"mode,omitempty"`
+	StagePath  string    `json:"stagePath"`
+	Publishes  []Publish `json:"publishes,omitempty"`
+	MountFlags []string  `json:"mountFlags,omitempty"`
+	AccessMode string    `json:"accessMode"`
 	// EnsureItem is informational for a version 1 reader, which ignores it
 	// (and then never creates a directory); a record without it reads false.
 	EnsureItem bool `json:"ensureItem,omitempty"`
@@ -48,6 +51,7 @@ func toWire(in Intent) wireIntent {
 			Path:   in.Transport.Path,
 		},
 		Subdir:     in.Subdir,
+		Mode:       in.Mode,
 		StagePath:  in.StagePath,
 		Publishes:  in.Publishes,
 		MountFlags: in.MountFlags,
@@ -69,6 +73,7 @@ func fromWire(w wireIntent) Intent {
 			Path:   w.Transport.Path,
 		},
 		Subdir:     w.Subdir,
+		Mode:       w.Mode,
 		StagePath:  w.StagePath,
 		Publishes:  w.Publishes,
 		MountFlags: w.MountFlags,

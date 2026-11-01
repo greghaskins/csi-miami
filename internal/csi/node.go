@@ -241,6 +241,7 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 		Kind:       vc.Kind,
 		Transport:  vc.Transport,
 		Subdir:     vc.Subdir,
+		Mode:       vc.Mode,
 		StagePath:  req.GetStagingTargetPath(),
 		AccessMode: capability.GetAccessMode().GetMode().String(),
 		MountFlags: capability.GetMount().GetMountFlags(),

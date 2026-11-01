@@ -75,6 +75,14 @@ var (
 	// is something else.
 	ErrItemNotDirectory = errors.New("the volume's item path in its transport is not a directory")
 
+	// ErrTransportUnavailable is returned when the item cannot be looked at
+	// because the transport is not answering or has restarted: a stat of the
+	// item directory returned ESTALE, timed out (mount.ErrTimeout) or is held
+	// busy by an earlier call that has not returned (mount.ErrBusy). It is
+	// retryable and nothing is unmounted or mounted on account of it; the next
+	// pass looks again. The error it wraps says which.
+	ErrTransportUnavailable = errors.New("the transport is unavailable")
+
 	// ErrStageConflict is returned when the stage path holds a mount that is
 	// not this volume's: for a directory volume, any mount at all, since the
 	// driver makes none there, and kubelet's reference check would see it.
