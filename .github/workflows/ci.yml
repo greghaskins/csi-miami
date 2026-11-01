@@ -3,6 +3,12 @@
 # required check: it fails if any job failed, was cancelled, or was skipped
 # when it should have run.
 #
+# The `changes` job decides whether the pull request touches anything but
+# documentation (docs/, Markdown files, LICENSE). If it does not, the heavy
+# jobs (envtest, sanity, smoke, e2e, e2e-kind, build, manifest, deploy) are
+# skipped, and `ci-ok` accepts exactly those jobs as skipped; on any other
+# change, and on every push to main, they must all have succeeded.
+#
 # Images are content-addressed: they are tagged by hack/content-hash.sh, a
 # hash of the build inputs (including hack/image-build.sh, which holds the
 # build command), not by commit. A commit whose inputs are unchanged rebuilds
@@ -23,6 +29,49 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  # Whether the change is more than documentation. Pull requests only: the
+  # files the pull request changes (renames count both names) are listed from
+  # the API, and the change is documentation only when every one is under
+  # docs/, is a Markdown file or is LICENSE. A push to main, an empty list, or
+  # a list the API may have cut short is "code", so the filter can only ever
+  # run more, never less.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "not a pull request: everything runs"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files="$(gh api --paginate "repos/${REPO}/pulls/${PR}/files" --jq '.[] | .filename, (.previous_filename // empty)')"
+          count="$(gh api "repos/${REPO}/pulls/${PR}" --jq '.changed_files')"
+          code=false
+          if [ -z "$files" ] || [ "$count" -ge 3000 ]; then
+            code=true
+          fi
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              docs/*|*.md|LICENSE) echo "documentation: $f" ;;
+              *) echo "code: $f"; code=true ;;
+            esac
+          done <<<"$files"
+          echo "code=${code}"
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+
   static:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -73,6 +122,8 @@ jobs:
   # the version mise.toml pins; the Kubernetes version of the binaries it
   # downloads is pinned in the Makefile.
   envtest:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -97,11 +148,22 @@ jobs:
   # and node services on a local transport, with real bind mounts for the node
   # half, and the delete-path tests that mount real file systems and race
   # renames and mounts against the removal, as root under `unshare --mount
-  # --propagation private` (hack/sanity.sh). The output is uploaded when it
-  # fails.
+  # --propagation private` (hack/sanity.sh), natively on each architecture. The
+  # output is uploaded when it fails.
   sanity:
-    runs-on: ubuntu-24.04
+    name: sanity (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -124,7 +186,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
-          name: sanity-log
+          name: sanity-log-${{ matrix.arch }}
           path: ${{ runner.temp }}/sanity.log
           if-no-files-found: ignore
 
@@ -135,6 +197,8 @@ jobs:
   # run uploads the mountinfo lines for the test's own temporary paths.
   smoke:
     name: smoke (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
@@ -173,6 +237,8 @@ jobs:
   # there is no user-space fallback. A failing run uploads the mountinfo lines
   # for the test's own paths and the server container's output.
   e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: e2e (${{ matrix.transport }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -208,6 +274,8 @@ jobs:
   # or not this run built it. It records the digest of the image it ran, and
   # the index is created from exactly those digests.
   build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: build (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -292,7 +360,8 @@ jobs:
   # Creates the multi-arch index x-<hash> from exactly the two digests the
   # build legs ran, and verifies that it lists those and nothing else.
   manifest:
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -367,7 +436,8 @@ jobs:
   # node's mountinfo. kind is built, and kubectl downloaded and checked against its
   # published checksum, at the versions mise.toml pins.
   deploy:
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -382,17 +452,8 @@ jobs:
           go-version-file: go.mod
           cache: false
       - name: Install kind and kubectl at the versions mise.toml pins
-        env:
-          GOTOOLCHAIN: local
         run: |
-          kind="$(sed -n 's/^kind = "\(.*\)"$/\1/p' mise.toml)"
-          kubectl="$(sed -n 's/^kubectl = "\(.*\)"$/\1/p' mise.toml)"
-          test -n "$kind" && test -n "$kubectl"
-          GOBIN="${RUNNER_TEMP}/bin" go install "sigs.k8s.io/kind@v${kind}"
-          url="https://dl.k8s.io/release/v${kubectl}/bin/linux/amd64/kubectl"
-          curl -fsSL --retry 0 -o "${RUNNER_TEMP}/bin/kubectl" "$url"
-          printf '%s  %s\n' "$(curl -fsSL "${url}.sha256")" "${RUNNER_TEMP}/bin/kubectl" | sha256sum --check -
-          chmod +x "${RUNNER_TEMP}/bin/kubectl"
+          hack/install-kind-tools.sh "${RUNNER_TEMP}/bin"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
       - name: Pull the image the build job pushed
         id: image
@@ -420,6 +481,82 @@ jobs:
         with:
           name: deploy
           path: ${{ runner.temp }}/deploy/
+          if-no-files-found: ignore
+
+  # The driver on kind, end to end (hack/e2e-kind.sh, test/e2e): a cluster of
+  # one control plane and two workers, the image the build job pushed for this
+  # architecture (the content tag, pulled and loaded into the nodes, never
+  # pulled by them), and exit criteria 1 to 6 of the plan as Go tests driven
+  # through the API: two pods on two nodes share an nfs3 volume, a local volume
+  # lives on one node, delete removes (nfs3) or leaves (local) the directory,
+  # also across a controller restart, a node plugin restart changes nothing, a
+  # node reboot (docker restart of a worker) loses nothing and leaks nothing,
+  # and the metrics are served. For nfs3 the kernel NFSv3 server of
+  # hack/nfs-server runs on the docker network of the kind nodes. A failing
+  # run uploads what the tests dumped (driver logs, YAML, events, mountinfo),
+  # the test output, kind's logs and the NFS server's output.
+  e2e-kind:
+    name: e2e-kind (${{ matrix.transport }}, ${{ matrix.arch }})
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transport: local
+            arch: amd64
+            runner: ubuntu-24.04
+          - transport: nfs3
+            arch: amd64
+            runner: ubuntu-24.04
+          - transport: nfs3
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install kind and kubectl at the versions mise.toml pins
+        run: |
+          hack/install-kind-tools.sh "${RUNNER_TEMP}/bin"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+      - name: Pull the image the build job pushed
+        id: image
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          hash="$(hack/content-hash.sh)"
+          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
+            echo "::error::unexpected content hash: '${hash}'"
+            exit 1
+          fi
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]'):x-${hash}-${ARCH}"
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker pull "$image"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+      - name: Run the kind end-to-end tests
+        env:
+          E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-kind
+          TRANSPORT: ${{ matrix.transport }}
+          E2E_IMAGE: ${{ steps.image.outputs.image }}
+        run: sudo -E env "PATH=$PATH" make e2e E2E_MODE=kind E2E_TRANSPORT="$TRANSPORT" E2E_IMAGE="$E2E_IMAGE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-kind-${{ matrix.transport }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/e2e-kind/
           if-no-files-found: ignore
 
   # On main only: add the commit sha as an alias of the index that this run's
@@ -452,21 +589,39 @@ jobs:
           image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
           docker buildx imagetools create -t "${image}:${SHA}" "${image}@${INDEX}"
 
+  # The single required check. It runs even when a job it needs failed, was
+  # cancelled or was skipped (if: always()), and passes only if:
+  #
+  #   - `changes` succeeded and said "true" or "false" (anything else, including
+  #     a failure to decide, fails);
+  #   - static and unit succeeded (they run on every change);
+  #   - each filtered job (envtest, sanity, smoke, e2e, e2e-kind, build,
+  #     manifest, deploy) succeeded when `changes` said "true" (code), so a job
+  #     that was skipped, cancelled or failed on a code change fails here; and,
+  #     when it said "false" (documentation only), is either skipped, which is
+  #     what the filter does, or succeeded, but never failed or cancelled;
+  #   - publish succeeded on a push to main and was skipped everywhere else.
+  #
+  # A filtered job therefore cannot stand in for a pass, and a pass cannot be
+  # skipped on a code change.
   ci-ok:
     if: always()
-    needs: [static, unit, envtest, sanity, smoke, e2e, build, manifest, deploy, publish]
+    needs: [changes, static, unit, envtest, sanity, smoke, e2e, e2e-kind, build, manifest, deploy, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Require every job to have succeeded
+      - name: Require every job to have succeeded, or to have been filtered out
         env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
           STATIC: ${{ needs.static.result }}
           UNIT: ${{ needs.unit.result }}
           ENVTEST: ${{ needs.envtest.result }}
           SANITY: ${{ needs.sanity.result }}
           SMOKE: ${{ needs.smoke.result }}
           E2E: ${{ needs.e2e.result }}
+          E2E_KIND: ${{ needs.e2e-kind.result }}
           BUILD: ${{ needs.build.result }}
           MANIFEST: ${{ needs.manifest.result }}
           DEPLOY: ${{ needs.deploy.result }}
@@ -474,11 +629,34 @@ jobs:
           PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           fail=0
-          for pair in "static=$STATIC" "unit=$UNIT" "envtest=$ENVTEST" "sanity=$SANITY" "smoke=$SMOKE" "e2e=$E2E" "build=$BUILD" "manifest=$MANIFEST" "deploy=$DEPLOY"; do
+          if [ "$CHANGES" != "success" ]; then
+            echo "::error::changes was $CHANGES, expected success"
+            fail=1
+          fi
+          if [ "$CODE" != "true" ] && [ "$CODE" != "false" ]; then
+            echo "::error::the change filter said '$CODE', expected true or false"
+            fail=1
+          fi
+          # Jobs that run on every change.
+          for pair in "static=$STATIC" "unit=$UNIT"; do
             if [ "${pair#*=}" != "success" ]; then
               echo "::error::${pair%%=*} was ${pair#*=}, expected success"
               fail=1
             fi
+          done
+          # Jobs the filter may skip. On a code change (CODE is not "false", so
+          # an undecided filter is a code change here) only success will do.
+          for pair in "envtest=$ENVTEST" "sanity=$SANITY" "smoke=$SMOKE" "e2e=$E2E" "e2e-kind=$E2E_KIND" "build=$BUILD" "manifest=$MANIFEST" "deploy=$DEPLOY"; do
+            result="${pair#*=}"
+            if [ "$result" = "success" ]; then
+              continue
+            fi
+            if [ "$CODE" = "false" ] && [ "$result" = "skipped" ]; then
+              echo "${pair%%=*} was skipped: documentation-only change"
+              continue
+            fi
+            echo "::error::${pair%%=*} was $result, expected success (the change filter said '$CODE')"
+            fail=1
           done
           # publish only runs when publishing from main; skipped is expected
           # everywhere else, and a failure to run it on main is a failure.
