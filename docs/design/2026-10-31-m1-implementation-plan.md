@@ -321,7 +321,7 @@ string of `mount(2)` is
 vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,addr=<ip>
 ```
 
-and `noatime` is the generic mount flag `MS_NOATIME`, not a data option.
+and `noatime`, `nosuid` and `nodev` are the generic mount flags `MS_NOATIME`, `MS_NOSUID` and `MS_NODEV`, not data options (nosuid and nodev: architecture brief, decision 34).
 
 | option | reason |
 |---|---|
@@ -345,7 +345,7 @@ change, with a version bump.
 
 **Adoption.** After a restart the transport is still on the host table, and
 `Mounted` answers true only for a mount that is exactly this transport: file
-system type `nfs`, the source `<server>:<export>`, per-mount `noatime`, and
+system type `nfs`, the source `<server>:<export>`, per-mount `nosuid`, `nodev` and `noatime`, and
 these super options among those the kernel reports: `rw`, `vers=3`,
 `proto=tcp`, `softerr`, `timeo=100`, `retrans=17`, `nolock`, `local_lock=all`,
 `lookupcache=pos`, `acregmin=30`, `acregmax=30`, `acdirmax=30`. The kernel
@@ -358,9 +358,9 @@ its meaning, not a byte-exact comparison (`rsize` and `wsize` are
 negotiated, newer kernels add tokens, the MOUNT request adds `mount*`): a
 mount that also has `nocto`, `nosharecache`, `noresvport`, `soft`, `hard`,
 `ro`, an `acdirmin`, `sec`, `lookupcache` or `local_lock` with another
-value, or any per-mount option beyond `rw` and `noatime`, is not adopted.
+value, or any per-mount option beyond `rw`, `nosuid`, `nodev` and `noatime`, is not adopted.
 That includes a mount made with an earlier profile (`retrans=3`): it is
-reported as a transport conflict and left alone (decision 30).
+reported as a transport conflict and left alone (decisions 30 and 34, which adds the same for a mount without `nosuid` and `nodev`).
 The source must match exactly, which is why a server is named one way across
 StorageClasses (section 5). Anything else at the mount point is a conflict,
 reported and never stacked over.

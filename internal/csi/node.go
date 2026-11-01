@@ -320,11 +320,21 @@ func (n *Node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolume
 	if rec.StagePath != req.GetStagingTargetPath() {
 		return nil, status.Errorf(codes.FailedPrecondition, "volume %s is staged at a different path than staging_target_path", id)
 	}
-	err = n.rec.Publish(ctx, id.String(), intent.Publish{TargetPath: req.GetTargetPath(), ReadOnly: req.GetReadonly()})
+	// A reader-only volume is never published read-write, whatever the CO
+	// sends: the access mode the volume was staged with decides.
+	readOnly := req.GetReadonly() || readerOnly(rec.AccessMode)
+	err = n.rec.Publish(ctx, id.String(), intent.Publish{TargetPath: req.GetTargetPath(), ReadOnly: readOnly})
 	if err != nil {
 		return nil, nodeStatus(err)
 	}
 	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// readerOnly says whether a recorded access mode (the name of a
+// csi.VolumeCapability_AccessMode_Mode) allows reading only.
+func readerOnly(mode string) bool {
+	return mode == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY.String() ||
+		mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY.String()
 }
 
 // NodeUnpublishVolume unmounts the target path and then removes the directory

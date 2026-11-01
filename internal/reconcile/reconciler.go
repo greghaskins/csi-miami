@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -291,19 +292,26 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 	}
 	defer unlock()
 
-	in.Publishes = nil
-	prev, ok, err := r.store.Get(in.VolumeID)
+	// One read-modify-write in the store: the loop updates the record too
+	// (it clears EnsureItem, it prunes publishes), and a Get followed by a Save
+	// could write back what the loop had just changed.
+	err = r.store.Update(in.VolumeID, func(rec *intent.Intent) error {
+		merged := in
+		merged.Publishes = nil
+		if rec.VolumeID != "" {
+			merged.Publishes = rec.Publishes
+			// The record is the truth about whether the item has converged: a
+			// caller that read it earlier must not give the permission back
+			// after the loop took it.
+			merged.EnsureItem = rec.EnsureItem
+		}
+		*rec = merged
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, in.VolumeID, err)
-	}
-	if ok {
-		in.Publishes = prev.Publishes
-		// Under the volume's lock the record is the truth about whether the
-		// item has converged: a caller that read it earlier must not give the
-		// permission back after the loop took it.
-		in.EnsureItem = prev.EnsureItem
-	}
-	if err := r.store.Save(in); err != nil {
+		if _, _, gerr := r.store.Get(in.VolumeID); gerr != nil {
+			return fmt.Errorf("%w: reading the record of %s: %w", ErrIntentsUnknown, in.VolumeID, gerr)
+		}
 		return fmt.Errorf("recording the intent of %s: %w", in.VolumeID, err)
 	}
 	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID})
@@ -485,6 +493,41 @@ func (r *Reconciler) checkTargetPath(what, target string) error {
 	return nil
 }
 
+// load reads the intent store and holds every record to the rules a request is
+// held to when it is made: the stage path strictly below the staging root and
+// each publish target acceptable to checkTargetPath. A record written by hand
+// or by another build may break them, and the reconciler would mount where the
+// driver never lets a request mount. Such a record is treated exactly like an
+// unreadable one: it is reported in Failures, so it is counted, collection is
+// suspended, nothing is mounted for it and the log says so once per change.
+func (r *Reconciler) load() (intent.Loaded, error) {
+	loaded, err := r.store.Load()
+	if err != nil {
+		return loaded, err
+	}
+	for id, in := range loaded.Intents {
+		if err := r.checkRecord(in); err != nil {
+			delete(loaded.Intents, id)
+			loaded.Failures = append(loaded.Failures, intent.LoadFailure{Path: r.store.Path(id), VolumeID: id, Err: err})
+		}
+	}
+	slices.SortFunc(loaded.Failures, func(a, b intent.LoadFailure) int { return strings.Compare(a.Path, b.Path) })
+	return loaded, nil
+}
+
+// checkRecord applies the request-time rules of Stage and Publish to a record.
+func (r *Reconciler) checkRecord(in intent.Intent) error {
+	if !strictlyBelow(r.opts.StageRoot, in.StagePath) {
+		return fmt.Errorf("%w: %s", ErrStagePathOutsideRoot, in.StagePath)
+	}
+	for _, p := range in.Publishes {
+		if err := r.checkTargetPath("publish", p.TargetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkTargetScope reads the intents and refuses a target that is, is inside,
 // or contains some intent's stage path (ErrTargetOutsideScope: another
 // volume's stage would otherwise be an unpublish away from unmounted, or
@@ -492,10 +535,11 @@ func (r *Reconciler) checkTargetPath(what, target string) error {
 // another volume's record claims as its publish target (ErrPublishConflict,
 // naming the claimant): two volumes cannot be bound at one path, and an
 // unpublish for one must not unmount the other's. A store that cannot be read
-// is ErrIntentsUnknown. Records that fail to load cannot be consulted; their
-// stage paths are below the staging root, which checkTargetPath refuses.
+// is ErrIntentsUnknown. Records that fail to load, or that break the request rules (load), cannot be consulted
+// and are left out: a new publish can claim a target that such a record names,
+// and that becomes a conflict only once the record is repaired.
 func (r *Reconciler) checkTargetScope(volumeID, target string) error {
-	loaded, err := r.store.Load()
+	loaded, err := r.load()
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrIntentsUnknown, err)
 	}

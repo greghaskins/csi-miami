@@ -283,7 +283,7 @@ idempotent against the file; a size mismatch is `AlreadyExists`.
 The simplification is in **who decides fenceability**. **Decision 8:
 the driver owns mount options.** The driver mounts NFSv3 with one fixed option set
 (`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,
-actimeo=30,noatime`; the reasons are in the M1 plan, section 8), so the NFS
+actimeo=30,noatime`, with `nosuid` and `nodev` as flags; the reasons are in the M1 plan, section 8), so the NFS
 major timeout `S` (180 seconds; decision 30) is a constant, the takeover
 timeout `T` is one driver flag validated against it at startup, and `FenceAfter = T - S - margin` and
 `ResetAfter = T - margin` are derived once. No per-StorageClass option
@@ -471,6 +471,10 @@ can be installed side by side during the window; nothing forces a flag day.
   (decision 33).
 - Every API write the node agent can perform is enumerated in RBAC and
   mirrored by a VAP.
+- Every mount the driver makes is `nosuid` and `nodev`, a record read back
+  from disk is held to the rules a request is, and a node has one driver
+  instance at a time (decision 34). The limits that were accepted rather than
+  closed are listed there too.
 - Image and supply chain: section 7.
 
 ## 5. Storage tiers
@@ -1120,6 +1124,83 @@ Recorded:
       the write-access trust boundary. Deploy by digest (the manifest job's
       `index_digest`) rather than by tag; signing is planned for the release
       pipeline.
+
+34. **The mount lifecycle's remaining review findings (M1, T20)**: seven
+    fixes and six accepted limits, each the smallest change that closes the
+    finding, and no new mechanism.
+
+    *Fixed.* (M-4) `Mounter.Unmount` takes the mount ID the caller judged and
+    refuses with `mount.ErrChanged`, unmounting nothing, when the mount visible
+    at the path in its own, fresh read of the table is another one (a race the
+    next pass looks at again, so it is `Unavailable` to CSI, not a conflict): the judgement
+    and the unmount used to be made on two tables. `item.UnmountIf`, the
+    stray and idle-transport garbage rules and the transport's own `Unmount`
+    pass the ID of the mount they judged; `mount.AnyID` (0, never a real ID)
+    skips the comparison and is for tests only. Nothing mounted at the path is
+    still a no-op. (M-5) The nfs3 profile mounts with `MS_NOSUID|MS_NODEV` and
+    adoption requires `nosuid` and `nodev` among the mount's own options, so
+    a pod that writes a shared volume cannot plant a setuid or device file
+    for the others. `Mounter.Bind` sets both on its remount step beside the
+    read-only handling, which covers the publish bind and the local
+    transport's bind. The reconciler does not adopt an existing publish bind
+    that lacks them: it calls `Bind`, whose remount step adds them and keeps
+    the read-only state and `noatime`, so a bind of an older build is repaired
+    on the next pass. *Upgrade*: as with decision 30, a transport mounted by the previous profile lacks
+    them, is not adopted, and is reported as `ErrTransportConflict` for every
+    volume on it until it is unmounted, by draining the node or by hand; the
+    driver does not remount it. A `local` transport is adopted without a
+    remount, but the publish binds made from it are repaired on the next
+    pass, and those are what a pod sees. (M-7) `NodePublishVolume` publishes read-only
+    when the request says so or the record's access mode is
+    `SINGLE_NODE_READER_ONLY` or `MULTI_NODE_READER_ONLY`. (M-8) The
+    reconciler applies the request-time rules to every record it loads (the
+    stage path strictly below the stage root, each publish target acceptable
+    to the publish rule) and treats a violator exactly like an unreadable
+    record: the load-failure gauge, collection suspended, nothing mounted for
+    it, one log line per change. The rules are the reconciler's, not the
+    intent package's, because the roots are its options; the publish rule is
+    the one it has, which keeps targets out of the driver's own directories
+    and does not know the kubelet's pod directories. (M-9) `Stage` merges
+    into the record in one `store.Update` (creating it if absent) instead of
+    a `Get` and a `Save`, so a retried NodeStage cannot restore an
+    `EnsureItem` the loop cleared or a publish it pruned; `prune` stats the
+    parent directory before taking the store's lock and checks only that the
+    record still has the publish inside it. The narrow race this leaves, a
+    publish that recreates the directory between the stat and the lock, ends
+    with the publish pruned and the pod's next NodePublish restoring it.
+    (M-10) `intent.Open` takes an exclusive non-blocking `flock` on
+    `.lock` in the state directory and fails, saying the directory is in use
+    by another process, when it is held; the lock lives as long as the store
+    (until `Close` or the process ends). A rolling update of the DaemonSet
+    makes the new pod fail and restart until the old one has exited, which is
+    the intent. (M-14) `ensureTransport` compares the cached result's
+    transport with the request's and answers `ErrTransportConflict` for a
+    second transport at the same mount point, as the controller already
+    refuses the pair.
+
+    *Accepted, and why.* (M-7 upgrade) A reader-only volume already published
+    read-write before the upgrade stays read-write until it is republished:
+    the access-mode rule applies when a NodePublish arrives. (M-1) Garbage rules (a) and (c) unmount strays below
+    the stage root and idle transports without a proof of ownership. That is
+    acceptable while no M1 item mounts at a stage path and nothing else
+    belongs there; revisit it when image items do (M2). (M-2) A foreign
+    direct NFS mount of the volume directory at exactly a publish target, on
+    the driver's own superblock, is indistinguishable in mountinfo from the
+    driver's bind, and an Unpublish would unmount it. (M-6) Publish targets
+    join the transport mount's peer group, so a privileged pod with
+    bidirectional propagation could mount into its volume and have the mount
+    appear in the transport. (M-11) An Unpublish or Unstage while the
+    transport is absent from the table and its server is down fails as
+    `Unavailable` until the transport is back, because the bind cannot be
+    judged without it: the deliberate fail-closed trade. (M-15) A `local`
+    transport does not require its path to be a mount point, so a directory
+    meant to be a separate disk is bound from whatever is there if the disk
+    is not mounted. (N-2) A transport mounted by an older option profile
+    (decisions 30 and 34) is reported as a conflict for as long as it stays
+    mounted and must be unmounted by hand: `umount` its directory under the
+    transports root after the pods using it are gone, then let the next pass
+    mount it. The README's Limitations carries a sentence for N-2 and M-15.
+
 
 Pending: none that block M1.
 

@@ -39,6 +39,11 @@ func TestNFS3AdoptionForbidsWhatChangesTheProfile(t *testing.T) {
 			m.SuperOptions[i] = to
 		}
 	}
+	without := func(tok string) func(*observe.Mount) {
+		return func(m *observe.Mount) {
+			m.Options = slices.DeleteFunc(slices.Clone(m.Options), func(o string) bool { return o == tok })
+		}
+	}
 	mountWith := func(tokens ...string) func(*observe.Mount) {
 		return func(m *observe.Mount) { m.Options = append(slices.Clone(m.Options), tokens...) }
 	}
@@ -71,13 +76,15 @@ func TestNFS3AdoptionForbidsWhatChangesTheProfile(t *testing.T) {
 		{"another lookupcache", superReplace("lookupcache=pos", "lookupcache=none"), false, "it has lookupcache=none"},
 		{"another local_lock", superReplace("local_lock=all", "local_lock=flock"), false, "it has local_lock=flock"},
 
-		// Per-mount options: exactly rw and noatime.
-		{"nosuid", mountWith("nosuid"), false, "it has the mount option nosuid"},
-		{"nodev", mountWith("nodev"), false, "it has the mount option nodev"},
+		// Per-mount options: exactly rw, nosuid, nodev and noatime. A mount of
+		// an earlier profile lacks nosuid and nodev and is not adopted.
+		{"no nosuid", without("nosuid"), false, "it lacks the mount option nosuid"},
+		{"no nodev", without("nodev"), false, "it lacks the mount option nodev"},
+		{"the earlier profile: rw,noatime", func(m *observe.Mount) { m.Options = []string{"rw", "noatime"} }, false, "it lacks the mount option nosuid, it lacks the mount option nodev"},
 		{"noexec", mountWith("noexec"), false, "it has the mount option noexec"},
 		{"relatime", mountWith("relatime"), false, "it has the mount option relatime"},
-		{"ro mount", func(m *observe.Mount) { m.Options = []string{"ro", "noatime"} }, false, "it lacks the mount option rw"},
-		{"no noatime", func(m *observe.Mount) { m.Options = []string{"rw"} }, false, "it lacks the mount option noatime"},
+		{"ro mount", func(m *observe.Mount) { m.Options = []string{"ro", "nosuid", "nodev", "noatime"} }, false, "it lacks the mount option rw"},
+		{"no noatime", func(m *observe.Mount) { m.Options = []string{"rw", "nosuid", "nodev"} }, false, "it lacks the mount option noatime"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -181,6 +181,7 @@ The helper runs the command in its own process group. SIGTERM or SIGINT sent to 
 - **ESTALE on server restart.** During the restart, directories answer `ESTALE` and recover when the server returns. A file held open across the window may not. The driver reports the condition (`miami_transport_up`, `miami_volume_condition`, `TransportUnavailable` event) and does not remediate in M1.
 - **Directory items only.** M1 does not support filesystem images, opaque blobs, encryption, fencing, expansion or exclusivity.
 - **Transport options are fixed in code.** The NFSv3 profile (`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30`) and the `local` bind are not configurable per StorageClass.
+- **Mount-point checks and old profiles.** A `local` transport does not require its path to be a mount point, so a directory meant to be a separate disk is bound from whatever is there when the disk is not mounted; and a transport mounted by an older option profile is reported as a conflict until it is unmounted by hand.
 - **Local volumes are not deleted by the controller.** When a `local` volume is deleted, the controller succeeds and logs a warning. The directory remains on the node's disk and is not removed (the node-local tier handles removal in M4).
 
 ## Development

@@ -44,7 +44,8 @@ import (
 //	 6. ErrSuperseded                             ClassAborted           Aborted
 //	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
 //	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
-//	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, ErrStopped, EBUSY,
+//	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, mount.ErrChanged
+//	    (a mount replaced between judgement and unmount), ErrStopped, EBUSY,
 //	    ESTALE (a stale NFS handle: the server restarted)
 //	 9. anything else                             ClassInternal          Internal
 //
@@ -120,7 +121,7 @@ func Classify(err error) Class {
 		return ClassAborted
 	case errors.Is(err, mount.ErrTimeout):
 		return ClassDeadlineExceeded
-	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy),
+	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy), errors.Is(err, mount.ErrChanged),
 		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY), errors.Is(err, syscall.ESTALE):
 		return ClassUnavailable
 	default:

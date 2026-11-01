@@ -32,7 +32,13 @@
 // A record that cannot be read makes its volume's intent unknown, not absent:
 // a pass in which the store or any record could not be read collects nothing
 // (an explicit Unpublish excepted), and a request that would have to read or
-// rewrite that record fails as ErrIntentsUnknown and changes nothing. The
+// rewrite that record fails as ErrIntentsUnknown and changes nothing. A record
+// that breaks the request rules (a stage path outside the staging root, a
+// publish target in the driver's own directories) is treated the same way,
+// with one way out: a fresh Stage overwrites its stage path and keeps its
+// publishes, so a bad stage path is repaired by the next NodeStage, while a
+// bad publish target survives it and, since Unpublish refuses such a path, is
+// for a person to repair or remove. The
 // driver unmounts only what the mount table shows to be a bind of what it
 // should be a bind of, so a foreign mount at a stage path or a publish target
 // is reported and left. Every stat and

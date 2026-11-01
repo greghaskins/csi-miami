@@ -139,7 +139,9 @@ func UnmountBind(ctx context.Context, m mount.Mounter, mountPoint, source string
 //     the reconciler's ErrPublishConflict for a publish target). what says
 //     what it should have been, for the message.
 //   - The unmount is once and without MNT_DETACH, so a busy mount is an error
-//     and stays.
+//     and stays. It names the mount ID that was judged, so a mount that
+//     replaced or covered it since the table was read is mount.ErrConflict
+//     and is left in place.
 //
 // The caller chooses the test. The reconciler uses two, for publish targets.
 // The usual one is BindOf the volume's directory in its transport: used for
@@ -170,7 +172,7 @@ func UnmountIf(ctx context.Context, m mount.Mounter, mountPoint string, owned Ow
 	if !ours {
 		return fmt.Errorf("%w: %s is mounted as %s from %q, which is not %s, and is left in place", conflict, mountPoint, top.FSType, top.Source, what)
 	}
-	if err := m.Unmount(ctx, mountPoint, 0); err != nil {
+	if err := m.Unmount(ctx, mountPoint, 0, top.ID); err != nil {
 		return err
 	}
 	t, err = m.Mounts(ctx)

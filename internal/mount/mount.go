@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,12 @@ var (
 	// than the one requested. Stacking a second mount over it would hide the
 	// first and leak it, so the caller decides what to do.
 	ErrConflict = errors.New("mount: target is already mounted from something else")
+
+	// ErrChanged is returned by Unmount when the mount visible at the target
+	// is not the one the caller judged: it was replaced or covered between the
+	// judgement and the call. It is a race, not a lasting conflict, and wraps
+	// nothing conflict-like: the caller looks again.
+	ErrChanged = errors.New("mount: the mount at the path changed since it was judged")
 
 	// ErrNotMounted is returned by RemountReadOnly when nothing is mounted at
 	// the target.
@@ -134,7 +141,13 @@ type Mounter interface {
 	// symlink, and refuses "/". It is a no-op when nothing is mounted at
 	// target. It removes the kernel's top mount at that path only, so a
 	// caller clearing a stack calls it again.
-	Unmount(ctx context.Context, target string, flags int) error
+	//
+	// id is the mount ID of the mount the caller judged, read from the table
+	// it judged it in. The call reads the table again, and when the mount
+	// visible at target is not id (it was replaced or covered between the
+	// judgement and now) it unmounts nothing and returns ErrChanged. AnyID
+	// skips the comparison, for callers that made no judgement.
+	Unmount(ctx context.Context, target string, flags int, id int) error
 
 	// Statfs reports filesystem statistics for path.
 	Statfs(ctx context.Context, path string) (unix.Statfs_t, error)
@@ -143,6 +156,11 @@ type Mounter interface {
 	// mounted. It does not touch any mounted filesystem.
 	Mounts(ctx context.Context) (observe.Table, error)
 }
+
+// AnyID is the id argument of Unmount that accepts whatever mount is visible
+// at the target. Mount IDs are positive, so it can never name a mount. Code
+// that has judged a mount before unmounting it passes that mount's ID instead.
+const AnyID = 0
 
 // CheckPath rejects a path that is not absolute and clean. what names the
 // argument in the error. The real Mounter calls it before any system call, and
@@ -165,6 +183,16 @@ func CheckUnmount(target string, flags int) error {
 	}
 	if flags != 0 && flags != unix.MNT_DETACH {
 		return fmt.Errorf("unmount: flags %#x: only 0 and MNT_DETACH are accepted", flags)
+	}
+	return nil
+}
+
+// CheckUnmountID is the comparison Unmount makes: nil when id is AnyID or
+// names top, ErrChanged when the visible mount is another. The fake calls it
+// too.
+func CheckUnmountID(top observe.Mount, id int) error {
+	if id != AnyID && top.ID != id {
+		return fmt.Errorf("unmount %s: the mount there is %d, not the %d that was judged: %w", top.MountPoint, top.ID, id, ErrChanged)
 	}
 	return nil
 }
@@ -523,9 +551,9 @@ func (m *mounter) RemountReadOnly(ctx context.Context, target string, readOnly b
 	return err
 }
 
-// remount flips read-only on the bind mount at target, preserving the other
-// per-mount flags: a remount that does not repeat nosuid, noatime and the
-// rest would silently reset them. It reads the table afresh.
+// remount makes the bind mount at target nosuid and nodev and read-only as
+// asked, preserving its other per-mount flags: a remount that does not repeat
+// noatime and the rest would silently reset them. It reads the table afresh.
 func (m *mounter) remount(target string, readOnly bool) error {
 	t, err := m.k.mounts()
 	if err != nil {
@@ -535,17 +563,19 @@ func (m *mounter) remount(target string, readOnly bool) error {
 	if !ok {
 		return ErrNotMounted
 	}
-	if cur.ReadOnly() == readOnly {
+	if cur.ReadOnly() == readOnly && hasAll(cur.Options, "nosuid", "nodev") {
 		return nil
 	}
-	flags := uintptr(unix.MS_REMOUNT|unix.MS_BIND) | perMountFlags(cur.Options)
+	// Every bind this driver makes is nosuid and nodev, whatever the mount it
+	// was made from has.
+	flags := uintptr(unix.MS_REMOUNT|unix.MS_BIND|unix.MS_NOSUID|unix.MS_NODEV) | perMountFlags(cur.Options)
 	if readOnly {
 		flags |= unix.MS_RDONLY
 	}
 	return m.k.mount("", target, "", flags, "")
 }
 
-func (m *mounter) Unmount(ctx context.Context, target string, flags int) error {
+func (m *mounter) Unmount(ctx context.Context, target string, flags int, id int) error {
 	const op = "unmount"
 	if err := CheckUnmount(target, flags); err != nil {
 		return err
@@ -561,8 +591,12 @@ func (m *mounter) Unmount(ctx context.Context, target string, flags int) error {
 			}
 			return struct{}{}, err
 		}
-		if _, ok := t.At(target); !ok {
+		top, ok := t.At(target)
+		if !ok {
 			return struct{}{}, nil
+		}
+		if err := CheckUnmountID(top, id); err != nil {
+			return struct{}{}, err
 		}
 		return struct{}{}, m.k.unmount(target, flags|unix.UMOUNT_NOFOLLOW)
 	})
@@ -644,6 +678,15 @@ func (m *mounter) resolveFailure(path string, err error) error {
 
 func notResolved(path, resolved string) error {
 	return fmt.Errorf("%w: %q resolves to %q; pass the resolved path", ErrNotResolved, path, resolved)
+}
+
+func hasAll(opts []string, want ...string) bool {
+	for _, w := range want {
+		if !slices.Contains(opts, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // perMountFlags translates the per-mount options mountinfo shows back into

@@ -48,6 +48,7 @@ func TestClassifyEverySentinel(t *testing.T) {
 		{ErrIntentsUnknown, ClassUnavailable},
 		{ErrTransportUnavailable, ClassUnavailable},
 		{mount.ErrBusy, ClassUnavailable},
+		{mount.ErrChanged, ClassUnavailable},
 		{ErrStopped, ClassUnavailable},
 		{unix.EBUSY, ClassUnavailable},
 		{unix.ESTALE, ClassUnavailable}, // the NFS server restarted: never Internal
