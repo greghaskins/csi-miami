@@ -72,6 +72,7 @@ func TestGet(t *testing.T) {
 func TestGetWithMissingDirectoryIsAnError(t *testing.T) {
 	t.Parallel()
 	s, dir := openStore(t)
+	_ = os.Remove(filepath.Join(dir, lockName)) // the missing-directory case needs an empty one
 	if err := os.Remove(dir); err != nil {
 		t.Fatal(err)
 	}

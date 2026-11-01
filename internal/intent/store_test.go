@@ -38,7 +38,7 @@ func mustLoad(t *testing.T, s *Store) Loaded {
 	return l
 }
 
-// names lists the entries of dir, sorted.
+// names lists the entries of dir, sorted, except the lock file Open holds.
 func names(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -47,6 +47,9 @@ func names(t *testing.T, dir string) []string {
 	}
 	var out []string
 	for _, e := range entries {
+		if e.Name() == lockName {
+			continue
+		}
 		out = append(out, e.Name())
 	}
 	sort.Strings(out)
@@ -91,6 +94,31 @@ func TestOpen(t *testing.T) {
 		t.Parallel()
 		if _, err := Open(t.TempDir()); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	t.Run("a second Open of a held directory fails, and succeeds after Close", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		first, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Open(dir)
+		if err == nil || !strings.Contains(err.Error(), "in use by another process") {
+			t.Fatalf("second Open = %v, want an error saying the directory is in use", err)
+		}
+		// The failed Open must not have disturbed the first store.
+		mustSave(t, first, sample("pvc-1"))
+		if err := first.Close(); err != nil {
+			t.Fatal(err)
+		}
+		again, err := Open(dir)
+		if err != nil {
+			t.Fatalf("Open after Close: %v", err)
+		}
+		if got := mustLoad(t, again); len(got.Intents) != 1 || len(got.Failures) != 0 {
+			t.Errorf("Load = %+v, want the one record and no failure (the lock file is not a record)", got)
 		}
 	})
 
@@ -232,6 +260,7 @@ func TestSaveRejectsInvalid(t *testing.T) {
 func TestSaveMissingDirectory(t *testing.T) {
 	t.Parallel()
 	s, dir := openStore(t)
+	_ = os.Remove(filepath.Join(dir, lockName)) // the missing-directory case needs an empty one
 	if err := os.Remove(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -420,6 +449,7 @@ func TestDeleteDoesNotEscapeDirectory(t *testing.T) {
 func TestLoadMissingDirectory(t *testing.T) {
 	t.Parallel()
 	s, dir := openStore(t)
+	_ = os.Remove(filepath.Join(dir, lockName)) // the missing-directory case needs an empty one
 	if err := os.Remove(dir); err != nil {
 		t.Fatal(err)
 	}
