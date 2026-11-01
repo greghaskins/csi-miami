@@ -259,3 +259,56 @@ func TestTheLogLineForAnUnreadableRecordWarnsAboutRemovingIt(t *testing.T) {
 		t.Errorf("%d lines for one unreadable record over two passes, want 1", n)
 	}
 }
+
+// A record edited by hand, or written by another build, is held to the rules a
+// request is held to. One that breaks them is treated like an unreadable
+// record: counted, nothing mounted for it, collection suspended, and one log
+// line for it however many passes see it.
+func TestARecordBreakingTheRequestRulesIsTreatedAsUnreadable(t *testing.T) {
+	t.Parallel()
+	tests := map[string]func(e *env, in *intent.Intent){
+		"a stage path outside the stage root": func(e *env, in *intent.Intent) {
+			in.StagePath = "/elsewhere/stage"
+		},
+		"the stage root itself": func(e *env, in *intent.Intent) {
+			in.StagePath = e.sRoot
+		},
+		"a publish target inside the stage root": func(e *env, in *intent.Intent) {
+			in.Publishes = []intent.Publish{{TargetPath: filepath.Join(e.sRoot, "other", "mount")}}
+		},
+		"a publish target inside the transports root": func(e *env, in *intent.Intent) {
+			in.Publishes = []intent.Publish{{TargetPath: filepath.Join(e.tRoot, "abc", "mount")}}
+		},
+		"a publish target above the stage root": func(e *env, in *intent.Intent) {
+			in.Publishes = []intent.Publish{{TargetPath: filepath.Dir(e.sRoot)}}
+		},
+	}
+	for name, edit := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			lg, buf := logger()
+			e := newEnv(t, func(o *Options) { o.Logger = lg })
+			bad := e.vol("a", pvc1)
+			edit(e, &bad)
+			mustNil(t, "save", e.store.Save(bad))
+			stray := filepath.Join(e.sRoot, "stray")
+			e.sim.addMount(stray, "tmpfs", "tmpfs")
+
+			e.pass()
+			e.pass()
+
+			if e.metrics.loadFailures != 1 {
+				t.Errorf("load failures = %d, want 1", e.metrics.loadFailures)
+			}
+			if got := e.sim.mutating(); len(got) != 0 {
+				t.Errorf("calls that change mounts: %+v, want none (nothing mounted, nothing collected)", got)
+			}
+			if _, ok := e.visible(stray); !ok {
+				t.Error("collection ran while a record failed the request rules")
+			}
+			if n := strings.Count(buf.String(), "could not be loaded"); n != 1 {
+				t.Errorf("%d log lines over two passes, want 1", n)
+			}
+		})
+	}
+}

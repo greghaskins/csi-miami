@@ -110,6 +110,11 @@ func Open(dir string) (*Store, error) {
 // Dir returns the directory the Store keeps its records in.
 func (s *Store) Dir() string { return s.dir }
 
+// Path returns the file that holds the record of a volume.
+func (s *Store) Path(volumeID string) string {
+	return filepath.Join(s.dir, s.fileName(volumeID))
+}
+
 func (s *Store) fileName(volumeID string) string {
 	return Escape(volumeID) + recordSuffix
 }

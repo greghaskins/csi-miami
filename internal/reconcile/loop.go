@@ -70,7 +70,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 		r.ends.Add(1)
 	}()
 
-	loaded, err := r.store.Load()
+	loaded, err := r.load()
 	if err != nil {
 		r.metrics.IncReconcileError("load")
 		r.log.Error("reading the intent store failed; converging and collecting nothing", "error", err)
