@@ -37,6 +37,7 @@ const (
 // zero.
 type Call struct {
 	Op     string
+	Root   string // Bind: the directory the source lives under
 	Source string
 	Target string // Statfs records its path here
 	FSType string
@@ -294,14 +295,14 @@ func (f *Mounter) Mount(ctx context.Context, source, target, fstype string, flag
 }
 
 // Bind validates its arguments as the real Mounter does, then records the call.
-func (f *Mounter) Bind(ctx context.Context, source, target string, readOnly bool) error {
-	if err := mount.CheckPath("bind", "source", source); err != nil {
+func (f *Mounter) Bind(ctx context.Context, root, source, target string, readOnly bool) error {
+	if err := mount.CheckBind(root, source); err != nil {
 		return err
 	}
 	if err := mount.CheckPath("bind", "target", target); err != nil {
 		return err
 	}
-	return f.enter(ctx, Call{Op: OpBind, Source: source, Target: target, ReadOnly: readOnly})
+	return f.enter(ctx, Call{Op: OpBind, Root: root, Source: source, Target: target, ReadOnly: readOnly})
 }
 
 // RemountReadOnly validates its arguments as the real Mounter does, then

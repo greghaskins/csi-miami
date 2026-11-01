@@ -184,7 +184,6 @@ func TestRBACRuleSets(t *testing.T) {
 			{"", "nodes", []string{"get", "list", "watch"}},
 			{"storage.k8s.io", "csinodes", []string{"get", "list", "watch"}},
 			{"", "events", []string{"list", "watch", "create", "update", "patch"}},
-			{"coordination.k8s.io", "leases", []string{"get", "create", "update", "delete"}},
 		}},
 		{"miami-node", []rule{
 			{"", "persistentvolumes", []string{"get"}},
@@ -232,6 +231,59 @@ func TestRBACRuleSets(t *testing.T) {
 			var sa corev1.ServiceAccount
 			r.get(t, "ServiceAccount", tc.role, &sa)
 		})
+	}
+}
+
+// TestControllerLeaseRole: leader election needs Leases in the driver's own
+// namespace and nowhere else, so the grant is a namespaced Role and no
+// ClusterRole carries a lease rule.
+func TestControllerLeaseRole(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var role rbacv1.Role
+	r.get(t, "Role", "miami-controller", &role)
+	if role.Namespace != "miami-system" {
+		t.Errorf("role namespace = %q, want miami-system", role.Namespace)
+	}
+	want := map[string]bool{}
+	for _, v := range []string{"get", "create", "update", "delete"} {
+		want["coordination.k8s.io/leases:"+v] = true
+	}
+	if got := ruleSet(role.Rules); !reflect.DeepEqual(got, want) {
+		t.Errorf("role grants %v, want %v", got, want)
+	}
+	for _, ru := range role.Rules {
+		if len(ru.ResourceNames) > 0 || len(ru.NonResourceURLs) > 0 {
+			t.Errorf("unexpected resourceNames or nonResourceURLs in %+v", ru)
+		}
+	}
+
+	var rb rbacv1.RoleBinding
+	r.get(t, "RoleBinding", "miami-controller", &rb)
+	if rb.Namespace != "miami-system" {
+		t.Errorf("binding namespace = %q, want miami-system", rb.Namespace)
+	}
+	if rb.RoleRef.Kind != "Role" || rb.RoleRef.Name != "miami-controller" {
+		t.Errorf("binding refers to %v", rb.RoleRef)
+	}
+	wantSubject := rbacv1.Subject{Kind: "ServiceAccount", Name: "miami-controller", Namespace: "miami-system"}
+	if len(rb.Subjects) != 1 || rb.Subjects[0] != wantSubject {
+		t.Errorf("binding subjects = %v, want [%v]", rb.Subjects, wantSubject)
+	}
+
+	for _, o := range r.objects {
+		if o.kind != "ClusterRole" {
+			continue
+		}
+		var cr rbacv1.ClusterRole
+		r.get(t, "ClusterRole", o.name, &cr)
+		for _, ru := range cr.Rules {
+			for _, res := range ru.Resources {
+				if res == "leases" {
+					t.Errorf("ClusterRole %s grants leases cluster-wide", o.name)
+				}
+			}
+		}
 	}
 }
 
@@ -331,6 +383,38 @@ func TestNodeDaemonSet(t *testing.T) {
 		}
 		if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 			t.Errorf("%s: seccompProfile must be RuntimeDefault", c.Name)
+		}
+		if sc.RunAsUser == nil || *sc.RunAsUser != 0 {
+			t.Errorf("%s: runAsUser must be 0", c.Name)
+		}
+		if c.Name == "miami" {
+			// Privileged already implies every capability and no AppArmor
+			// confinement (the container runtime runs it unconfined), and the
+			// API rejects allowPrivilegeEscalation: false beside it. So the
+			// manifest sets none of the three, and none may appear.
+			if sc.Capabilities != nil {
+				t.Errorf("miami: capabilities = %+v, want none (it is privileged)", sc.Capabilities)
+			}
+			if sc.AllowPrivilegeEscalation != nil && !*sc.AllowPrivilegeEscalation {
+				t.Error("miami: allowPrivilegeEscalation false is invalid beside privileged")
+			}
+			if sc.AppArmorProfile != nil && sc.AppArmorProfile.Type != corev1.AppArmorProfileTypeUnconfined {
+				t.Errorf("miami: appArmorProfile = %+v, want unset or Unconfined", sc.AppArmorProfile)
+			}
+			continue
+		}
+		// The sidecars share the pod with a privileged container and a
+		// root-owned kubelet subPath; they get nothing.
+		if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Errorf("%s: allowPrivilegeEscalation must be false", c.Name)
+		}
+		if sc.AppArmorProfile != nil {
+			t.Errorf("%s: appArmorProfile = %+v, want the runtime default", c.Name, sc.AppArmorProfile)
+		}
+		if sc.Capabilities == nil || !reflect.DeepEqual(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+			t.Errorf("%s: capabilities must drop ALL", c.Name)
+		} else if len(sc.Capabilities.Add) != 0 {
+			t.Errorf("%s: capabilities add = %v, want none", c.Name, sc.Capabilities.Add)
 		}
 	}
 	names := []string{}

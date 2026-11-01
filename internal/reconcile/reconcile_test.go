@@ -760,7 +760,7 @@ func TestIdleTransportThatIsStillInUseStays(t *testing.T) {
 	// Something outside the staging root still holds a bind of the volume.
 	other := filepath.Join(e.base, "other")
 	mustNil(t, "mkdir", os.MkdirAll(other, 0o750))
-	mustNil(t, "bind", e.sim.Bind(bg, e.itemDir("a", pvc1), other, false))
+	mustNil(t, "bind", e.sim.Bind(bg, "", e.itemDir("a", pvc1), other, false))
 
 	e.pass()
 	e.clock.Advance(time.Hour)
@@ -1229,5 +1229,27 @@ func TestNewValidation(t *testing.T) {
 	mustNil(t, "New", err)
 	if r.opts.Interval != DefaultInterval || r.opts.StatTimeout != DefaultStatTimeout {
 		t.Errorf("defaults: %+v", r.opts)
+	}
+}
+
+// A publish binds the item directory beneath the transport's mount point, so
+// that the Mounter opens it with openat2 relative to that directory.
+func TestPublishBindsBeneathTheTransportMountPoint(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.start()
+	in := e.vol("a", pvc1)
+	target := e.stageAndPublish(in, "pod1", false)
+	found := false
+	for _, c := range e.sim.Calls() {
+		if c.Op == fake.OpBind && c.Target == target {
+			found = true
+			if c.Root != e.tdir("a") || c.Source != e.srcOf(in) {
+				t.Errorf("publish bind = %+v, want root %s and source %s", c, e.tdir("a"), e.srcOf(in))
+			}
+		}
+	}
+	if !found {
+		t.Error("no publish bind was made")
 	}
 }

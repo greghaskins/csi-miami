@@ -119,7 +119,7 @@ func TestSmoke(t *testing.T) {
 	}
 
 	// Bind a subdirectory; the stage is a bind of src and not of its sibling.
-	if err := m.Bind(dctx, src, stage, false); err != nil {
+	if err := m.Bind(dctx, "", src, stage, false); err != nil {
 		t.Fatalf("bind %s on %s: %v", src, stage, err)
 	}
 	requireBind(t, stage, src, true)
@@ -128,13 +128,13 @@ func TestSmoke(t *testing.T) {
 	// The publish targets are binds of the stage, one of them read-only from
 	// the start. A bind of a bind is a bind of the original directory.
 	mkdir(t, publish, publishRO)
-	if err := m.Bind(dctx, stage, publish, false); err != nil {
+	if err := m.Bind(dctx, "", stage, publish, false); err != nil {
 		t.Fatalf("bind %s on %s: %v", stage, publish, err)
 	}
-	if err := m.Bind(dctx, stage, publishRO, true); err != nil {
+	if err := m.Bind(dctx, "", stage, publishRO, true); err != nil {
 		t.Fatalf("read-only bind %s on %s: %v", stage, publishRO, err)
 	}
-	if err := m.Bind(dctx, stage, publishRO, true); err != nil {
+	if err := m.Bind(dctx, "", stage, publishRO, true); err != nil {
 		t.Fatalf("repeating the read-only bind: %v", err)
 	}
 	for _, target := range []string{publish, publishRO} {
@@ -142,7 +142,7 @@ func TestSmoke(t *testing.T) {
 		requireBind(t, target, src, true)
 		requireBind(t, target, sibling, false)
 	}
-	if err := m.Bind(dctx, sibling, publish, false); !errors.Is(err, mount.ErrConflict) {
+	if err := m.Bind(dctx, "", sibling, publish, false); !errors.Is(err, mount.ErrConflict) {
 		t.Errorf("binding another directory over a bind: got %v, want ErrConflict", err)
 	}
 
@@ -224,10 +224,10 @@ func TestSmokeOvermountIsTheTop(t *testing.T) {
 
 	// Two binds of dirA, then free the first one's ID, then cover the second
 	// with a bind of dirB: the cover is made later but may get the lower ID.
-	if err := m.Bind(ctx, dirA, p1, false); err != nil {
+	if err := m.Bind(ctx, "", dirA, p1, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Bind(ctx, dirA, p2, false); err != nil {
+	if err := m.Bind(ctx, "", dirA, p2, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Unmount(ctx, p1, 0); err != nil {
@@ -252,10 +252,10 @@ func TestSmokeOvermountIsTheTop(t *testing.T) {
 
 	requireBind(t, p2, dirB, true)
 	requireBind(t, p2, dirA, false)
-	if err := m.Bind(ctx, dirA, p2, false); !errors.Is(err, mount.ErrConflict) {
+	if err := m.Bind(ctx, "", dirA, p2, false); !errors.Is(err, mount.ErrConflict) {
 		t.Errorf("binding what is covered: got %v, want ErrConflict", err)
 	}
-	if err := m.Bind(ctx, dirB, p2, false); err != nil {
+	if err := m.Bind(ctx, "", dirB, p2, false); err != nil {
 		t.Errorf("binding what is on top: %v", err)
 	}
 
@@ -293,7 +293,7 @@ func TestSmokeCoveredMountPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	mkdir(t, sub)
-	if err := m.Bind(ctx, other, sub, false); err != nil {
+	if err := m.Bind(ctx, "", other, sub, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.Mount("cover", hid, "tmpfs", 0, ""); err != nil {
@@ -383,7 +383,7 @@ func TestSmokeHiddenBySiblingCover(t *testing.T) {
 	// Make the directory inside the cover and bind there: the new mount is the
 	// cover's child and is what the table shows at the path.
 	mkdir(t, hidden)
-	if err := m.Bind(ctx, src, hidden, false); err != nil {
+	if err := m.Bind(ctx, "", src, hidden, false); err != nil {
 		t.Fatalf("bind in the cover: %v", err)
 	}
 	tbl = currentTable(t)
@@ -413,7 +413,7 @@ func TestSmokeSuperblockReadOnly(t *testing.T) {
 	if err := m.Mount(ctx, "tmpfs", vol, "tmpfs", unix.MS_RDONLY, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Bind(ctx, vol, pub, false); err != nil {
+	if err := m.Bind(ctx, "", vol, pub, false); err != nil {
 		t.Fatalf("bind of a read-only filesystem, read-write requested: %v", err)
 	}
 	cur, ok := currentTable(t).At(pub)
@@ -440,10 +440,10 @@ func TestSmokeReadOnlyIsWhatWasAskedFor(t *testing.T) {
 		t.Fatal(err)
 	}
 	mkdir(t, data, roStage, rwStage)
-	if err := m.Bind(ctx, data, roStage, true); err != nil {
+	if err := m.Bind(ctx, "", data, roStage, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Bind(ctx, data, rwStage, false); err != nil {
+	if err := m.Bind(ctx, "", data, rwStage, false); err != nil {
 		t.Fatal(err)
 	}
 	requireReadOnly(t, roStage)
@@ -462,7 +462,7 @@ func TestSmokeReadOnlyIsWhatWasAskedFor(t *testing.T) {
 		pub := filepath.Join(vol, strings.ReplaceAll(tt.name, " ", "-"))
 		mkdir(t, pub)
 		for try := 1; try <= 2; try++ {
-			if err := m.Bind(ctx, tt.stage, pub, tt.readOnly); err != nil {
+			if err := m.Bind(ctx, "", tt.stage, pub, tt.readOnly); err != nil {
 				t.Fatalf("%s, try %d: %v", tt.name, try, err)
 			}
 			if tt.readOnly {
@@ -497,14 +497,14 @@ func TestSmokeSymlinksAreRefused(t *testing.T) {
 	for name, err := range map[string]error{
 		"mount onto a symlink":       m.Mount(ctx, "tmpfs", link, "tmpfs", 0, ""),
 		"mount under a symlink":      m.Mount(ctx, "tmpfs", filepath.Join(link, "sub"), "tmpfs", 0, ""),
-		"bind from a symlink":        m.Bind(ctx, link, filepath.Join(realDir, "sub"), false),
-		"bind onto a symlink":        m.Bind(ctx, realDir, link, false),
+		"bind from a symlink":        m.Bind(ctx, "", link, filepath.Join(realDir, "sub"), false),
+		"bind onto a symlink":        m.Bind(ctx, "", realDir, link, false),
 		"remount through a symlink":  m.RemountReadOnly(ctx, link, true),
 		"unmount through a symlink":  m.Unmount(ctx, filepath.Join(link, "sub"), 0),
 		"unmount of a symlink":       m.Unmount(ctx, link, 0),
-		"bind under a symlinked dir": m.Bind(ctx, realDir, filepath.Join(link, "sub"), false),
+		"bind under a symlinked dir": m.Bind(ctx, "", realDir, filepath.Join(link, "sub"), false),
 		"mount onto a dangling link": m.Mount(ctx, "tmpfs", dangling, "tmpfs", 0, ""),
-		"bind from a dangling link":  m.Bind(ctx, dangling, filepath.Join(realDir, "sub"), false),
+		"bind from a dangling link":  m.Bind(ctx, "", dangling, filepath.Join(realDir, "sub"), false),
 		"unmount a dangling link":    m.Unmount(ctx, dangling, 0),
 	} {
 		if !errors.Is(err, mount.ErrNotResolved) || errors.Is(err, fs.ErrNotExist) {
@@ -639,4 +639,136 @@ func saveMountinfo(t *testing.T, base string) {
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Join(keep, "\n")+"\n"), 0o644); err != nil {
 		t.Logf("saving mountinfo: %v", err)
 	}
+}
+
+// A bind source is opened beneath a root and bound by descriptor: the item
+// directory is bound, and the same path turned into a symlink (or reached
+// through one) is refused and nothing is mounted, so a writer on the transport
+// cannot point a publish at another directory of the node.
+func TestSmokeBindBeneathARoot(t *testing.T) {
+	base, m := smokeEnv(t)
+	ctx := context.Background()
+
+	root := filepath.Join(base, "root")
+	vol := filepath.Join(root, "sub", "vol")
+	outside := filepath.Join(base, "outside")
+	pub := filepath.Join(base, "pub")
+	pub2 := filepath.Join(base, "pub2")
+	mkdir(t, vol, outside, pub, pub2)
+
+	fdsBefore := openFds(t)
+	if err := m.Bind(ctx, root, vol, pub, false); err != nil {
+		t.Fatalf("bind %s beneath %s: %v", vol, root, err)
+	}
+	requireBind(t, pub, vol, true)
+	if after := openFds(t); after != fdsBefore {
+		t.Errorf("descriptors after a bind: %d, before %d", after, fdsBefore)
+	}
+	// Retrying the bind of an existing target is still a no-op.
+	if err := m.Bind(ctx, root, vol, pub, true); err != nil {
+		t.Fatalf("second bind: %v", err)
+	}
+
+	moved := filepath.Join(root, "sub", "vol.moved")
+	if err := os.Rename(vol, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, vol); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Bind(ctx, root, vol, pub2, false); !errors.Is(err, mount.ErrNotResolved) {
+		t.Errorf("bind of a swapped-in symlink: got %v, want ErrNotResolved", err)
+	}
+	sub := filepath.Join(root, "sub")
+	if err := os.Rename(sub, filepath.Join(root, "sub.moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Bind(ctx, root, vol, pub2, false); !errors.Is(err, mount.ErrNotResolved) {
+		t.Errorf("bind through a symlinked element: got %v, want ErrNotResolved", err)
+	}
+	if _, ok := currentTable(t).At(pub2); ok {
+		t.Errorf("%s is mounted after a refused bind", pub2)
+	}
+	if after := openFds(t); after != fdsBefore {
+		t.Errorf("descriptors after the refused binds: %d, before %d", after, fdsBefore)
+	}
+}
+
+// On a tmpfs transport: the bind succeeds by descriptor and leaves none open,
+// a mount point on the way (or as the source) is refused as RESOLVE_NO_XDEV
+// says, and a refused bind mounts nothing and leaks no descriptor.
+func TestSmokeBindOnATransportMount(t *testing.T) {
+	base, m := smokeEnv(t)
+	ctx := context.Background()
+
+	root := filepath.Join(base, "transport")
+	mkdir(t, root)
+	if err := m.Mount(ctx, "tmpfs", root, "tmpfs", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	vol := filepath.Join(root, "sub", "vol")
+	inner := filepath.Join(root, "sub", "inner")
+	outside := filepath.Join(base, "outside")
+	pub, pubX, pubY, pubZ := filepath.Join(base, "pub"), filepath.Join(base, "pubx"), filepath.Join(base, "puby"), filepath.Join(base, "pubz")
+	mkdir(t, vol, inner, outside, pub, pubX, pubY, pubZ)
+	if err := m.Mount(ctx, "tmpfs", inner, "tmpfs", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	mkdir(t, filepath.Join(inner, "deep"))
+
+	before := openFds(t)
+	if err := m.Bind(ctx, root, vol, pub, false); err != nil {
+		t.Fatalf("bind on a tmpfs transport: %v", err)
+	}
+	requireBind(t, pub, vol, true)
+	if after := openFds(t); after != before {
+		t.Errorf("descriptors after a bind: %d, before %d", after, before)
+	}
+	// Writing through the target lands in the source directory.
+	if err := os.WriteFile(filepath.Join(pub, "probe"), []byte("through"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(vol, "probe")); err != nil || string(got) != "through" {
+		t.Errorf("read back from the source: %q, %v", got, err)
+	}
+
+	// A mount point as the source, and one on the way.
+	if err := m.Bind(ctx, root, inner, pubX, false); !errors.Is(err, mount.ErrNotResolved) {
+		t.Errorf("bind of a mount point: got %v, want ErrNotResolved", err)
+	}
+	if err := m.Bind(ctx, root, filepath.Join(inner, "deep"), pubY, false); !errors.Is(err, mount.ErrNotResolved) {
+		t.Errorf("bind through a mount point: got %v, want ErrNotResolved", err)
+	}
+	// A symlink as the source.
+	link := filepath.Join(root, "sub", "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Bind(ctx, root, link, pubZ, false); !errors.Is(err, mount.ErrNotResolved) {
+		t.Errorf("bind of a symlink: got %v, want ErrNotResolved", err)
+	}
+	// A source outside the root fails before any mount.
+	if err := m.Bind(ctx, root, outside, pubZ, false); !errors.Is(err, mount.ErrNotResolved) {
+		t.Errorf("bind of a source outside the root: got %v, want ErrNotResolved", err)
+	}
+	for _, p := range []string{pubX, pubY, pubZ} {
+		if _, ok := currentTable(t).At(p); ok {
+			t.Errorf("%s is mounted after a refused bind", p)
+		}
+	}
+	if after := openFds(t); after != before {
+		t.Errorf("descriptors after refused binds: %d, before %d", after, before)
+	}
+}
+
+func openFds(t *testing.T) int {
+	t.Helper()
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(ents)
 }

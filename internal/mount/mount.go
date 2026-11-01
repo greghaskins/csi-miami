@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,12 @@ var (
 	// under, a symlink. mountinfo shows resolved paths, so a mount made
 	// through a symlink could never be recognised as already mounted.
 	ErrNotResolved = errors.New("mount: path is not resolved")
+
+	// ErrNoOpenat2 is returned when the kernel has no openat2(2) (before Linux
+	// 5.6), which Bind needs to open its source without following a symlink or
+	// leaving the transport. There is no fallback to a path-based bind. The
+	// item package re-exports it as item.ErrNoOpenat2, so that both agree.
+	ErrNoOpenat2 = errors.New("the node needs openat2(2), which this kernel does not have (Linux 5.6 or newer is required), so nothing is changed")
 )
 
 // Mounter performs mount operations under deadlines and reports the node's
@@ -54,7 +61,9 @@ var (
 // Targets and bind sources must be absolute, cleaned and resolved: no symlink
 // in them (mountinfo only shows resolved paths, so a symlinked path would
 // stack a new mount on every retry), else the call fails with ErrNotResolved,
-// or before any system call for a path that is not absolute and clean. A
+// or before any system call for a path that is not absolute and clean. A bind
+// source is held to more than that: it is opened once, beneath a root, and
+// bound by descriptor (see Bind). A
 // caller holding a host path that may contain symlinks, such as the local
 // transport, resolves it first.
 //
@@ -90,7 +99,27 @@ type Mounter interface {
 	//
 	// The source is resolved in a call of its own, so a source that hangs
 	// (a dead stage) holds only itself busy, never the target.
-	Bind(ctx context.Context, source, target string, readOnly bool) error
+	//
+	// The source is not bound by its path. A path checked and then mounted is
+	// resolved twice, and whoever can rename entries on the transport (a
+	// network file system's other writers) can swap the directory for a
+	// symlink between the two, so that the kernel follows it to anywhere on
+	// the node. Bind opens source once with openat2(2) relative to a
+	// descriptor of root, with RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS,
+	// RESOLVE_NO_XDEV and RESOLVE_NO_MAGICLINKS, and mounts from
+	// /proc/self/fd/N with the descriptor open until mount(2) has returned. A
+	// symlink anywhere between root and source (the last element included), a
+	// mount point there, or a source that is not under root is ErrNotResolved.
+	// A kernel without openat2(2) is ErrNoOpenat2.
+	//
+	// root is the directory the source lives under, normally the transport's
+	// mount point. The empty root says that source is a resolved host path with
+	// no such directory above it (the local transport's disk): it is opened
+	// from "/" with the symlink and magic-link restrictions only, since the
+	// path crosses mounts by nature. A non-empty root must be absolute and
+	// cleaned, and source must be root or lie under it. An existing mount at
+	// target is compared with source by its path (Table.IsBindOf) as before.
+	Bind(ctx context.Context, root, source, target string, readOnly bool) error
 
 	// RemountReadOnly sets or clears read-only on the existing mount at
 	// target, keeping its other per-mount options. It is a no-op when the
@@ -150,6 +179,13 @@ type kernel interface {
 	mounts() (observe.Table, error)
 	evalSymlinks(path string) (string, error)
 	isSymlink(path string) (bool, error)
+	// openDir opens rel, relative to the directory root, as a directory with
+	// openat2(2) under the RESOLVE_ flags in resolve, and returns the
+	// descriptor. A kernel without openat2 is unix.ENOSYS.
+	openDir(root, rel string, resolve uint64) (int, error)
+	// bindPath is the path through which mount(2) reaches the descriptor fd.
+	bindPath(fd int) string
+	closeFd(fd int)
 }
 
 type sysKernel struct{}
@@ -176,6 +212,40 @@ func (sysKernel) isSymlink(path string) (bool, error) {
 	}
 	return fi.Mode()&fs.ModeSymlink != 0, nil
 }
+
+// resolveBeneath and resolveHost are the openat2 restrictions of a bind source
+// under a root and of a resolved host path. The first agrees with the
+// directory and csi packages.
+const (
+	resolveBeneath = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV | unix.RESOLVE_NO_MAGICLINKS
+	resolveHost    = unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS
+)
+
+// openDir opens the directory root (not following a symlink) and then rel
+// below it. The descriptor is O_PATH: it names the directory for mount(2) and
+// for nothing else, so it needs no read access and no read of a hung server's
+// data, and the kernel's path walk of /proc/self/fd/N lands on the very dentry
+// and mount that openat2 resolved, the way runc binds its sources. O_RDONLY
+// would work as well but would open the directory on the file system.
+func (sysKernel) openDir(root, rel string, resolve uint64) (int, error) {
+	rfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	defer func() { _ = unix.Close(rfd) }()
+	how := &unix.OpenHow{Flags: unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: resolve}
+	for {
+		fd, err := unix.Openat2(rfd, rel, how)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return fd, err
+	}
+}
+
+func (sysKernel) bindPath(fd int) string { return "/proc/self/fd/" + strconv.Itoa(fd) }
+
+func (sysKernel) closeFd(fd int) { _ = unix.Close(fd) }
 
 // inflight is the set of paths with a call that has not returned.
 type inflight struct {
@@ -260,7 +330,7 @@ func (m *mounter) Mount(ctx context.Context, source, target, fstype string, flag
 	return err
 }
 
-func (m *mounter) Bind(ctx context.Context, source, target string, readOnly bool) error {
+func (m *mounter) Bind(ctx context.Context, root, source, target string, readOnly bool) error {
 	const op = "bind"
 	if err := CheckPath(op, "source", source); err != nil {
 		return err
@@ -268,22 +338,45 @@ func (m *mounter) Bind(ctx context.Context, source, target string, readOnly bool
 	if err := CheckPath(op, "target", target); err != nil {
 		return err
 	}
+	dir, rel, resolve, err := bindSource(root, source)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", op, source, err)
+	}
 	// One deadline covers both calls below.
 	ctx, cancel := withDeadline(ctx, m.timeout)
 	defer cancel()
+
+	// The descriptor passes from the resolving call to the mounting call and
+	// is closed by whichever goroutine ends up owning it (see fdHolder).
+	h := &fdHolder{k: m.k}
+	defer h.release()
 
 	// The source may live on a dead transport, where resolving it hangs. Do it
 	// on a key of its own so that only the source is held busy, not the target:
 	// otherwise unmounting a target with nothing mounted on it would be refused
 	// for as long as the source hangs.
-	_, err := call(ctx, m.timeout, &m.busy, resolveKey(source), "resolve", source, func() (struct{}, error) {
-		return struct{}{}, m.checkSource(source)
+	_, err = call(ctx, m.timeout, &m.busy, resolveKey(source), "resolve", source, func() (struct{}, error) {
+		fd, err := m.k.openDir(dir, rel, resolve)
+		if err != nil {
+			return struct{}{}, m.openFailure(source, err)
+		}
+		if !h.put(fd) {
+			return struct{}{}, errors.New("the call was abandoned before the source was opened")
+		}
+		return struct{}{}, nil
 	})
 	if err != nil {
 		return err
 	}
 
 	_, err = call(ctx, m.timeout, &m.busy, mutKey(target), op, target, func() (struct{}, error) {
+		fd, ok := h.take()
+		if !ok {
+			return struct{}{}, errors.New("the call was abandoned before the source could be bound")
+		}
+		// Held open until mount(2) has returned, and no longer: this goroutine
+		// owns the descriptor, even if the caller has stopped waiting.
+		defer m.k.closeFd(fd)
 		t, err := m.k.mounts()
 		if err != nil {
 			return struct{}{}, err
@@ -301,7 +394,7 @@ func (m *mounter) Bind(ctx context.Context, source, target string, readOnly bool
 			}
 			return struct{}{}, m.remount(target, readOnly)
 		}
-		if err := m.k.mount(source, target, "", unix.MS_BIND, ""); err != nil {
+		if err := m.k.mount(m.k.bindPath(fd), target, "", unix.MS_BIND, ""); err != nil {
 			return struct{}{}, err
 		}
 		// The new mount inherited its read-only flag from the mount its source
@@ -318,17 +411,98 @@ func (m *mounter) Bind(ctx context.Context, source, target string, readOnly bool
 	return err
 }
 
-// checkSource fails with ErrNotResolved when the bind source is, or lies
-// under, a symlink.
-func (m *mounter) checkSource(source string) error {
-	resolved, err := m.k.evalSymlinks(source)
-	if err != nil {
-		return m.resolveFailure(source, err)
+// CheckBind validates the root and source arguments of Bind: the same checks
+// the real Mounter makes before any system call. The fake calls it too.
+func CheckBind(root, source string) error {
+	if err := CheckPath("bind", "source", source); err != nil {
+		return err
 	}
-	if resolved != source {
-		return notResolved(source, resolved)
+	_, _, _, err := bindSource(root, source)
+	if err != nil {
+		return fmt.Errorf("bind %s: %w", source, err)
 	}
 	return nil
+}
+
+// bindSource splits a bind source into the directory to open from, the path
+// below it and the openat2 restrictions. See Mounter.Bind for root.
+func bindSource(root, source string) (dir, rel string, resolve uint64, err error) {
+	if root == "" {
+		return "/", strings.TrimPrefix(source, "/"), resolveHost, nil
+	}
+	if err := CheckPath("bind", "root", root); err != nil {
+		return "", "", 0, err
+	}
+	rel, rerr := filepath.Rel(root, source)
+	if rerr != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", "", 0, fmt.Errorf("%w: %q is not under the root %q", ErrNotResolved, source, root)
+	}
+	return root, rel, resolveBeneath, nil
+}
+
+// openFailure explains an error from opening a bind source. A symlink on the
+// way (ELOOP), a mount point on the way (EXDEV, RESOLVE_NO_XDEV) and an escape
+// (also EXDEV, RESOLVE_BENEATH) are ErrNotResolved: the path is not a plain
+// directory in the transport. A kernel without openat2 is ErrNoOpenat2. A
+// missing source stays an error wrapping fs.ErrNotExist.
+func (m *mounter) openFailure(source string, err error) error {
+	switch {
+	case errors.Is(err, unix.ENOSYS):
+		return ErrNoOpenat2
+	case errors.Is(err, unix.ELOOP):
+		return fmt.Errorf("%w: %q is, or lies under, a symlink", ErrNotResolved, source)
+	case errors.Is(err, unix.EXDEV):
+		return fmt.Errorf("%w: %q crosses a mount point or leaves its root", ErrNotResolved, source)
+	case errors.Is(err, unix.ENOTDIR):
+		return fmt.Errorf("%w: %q is not a directory", ErrNotResolved, source)
+	}
+	return err
+}
+
+// fdHolder hands one descriptor from the call that opens it to the call that
+// mounts from it, and makes sure that exactly one party closes it. A call that
+// timed out is abandoned, not stopped, so either goroutine can run after Bind
+// has returned: closing the descriptor from Bind then would free its number
+// for reuse while mount(2) is about to resolve /proc/self/fd/N. So the
+// goroutine that mounts takes the descriptor and closes it itself; release
+// closes one nobody took, or one that arrives after Bind has given up.
+type fdHolder struct {
+	k    kernel
+	mu   sync.Mutex
+	fd   int
+	have bool
+	done bool
+}
+
+func (h *fdHolder) put(fd int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done {
+		h.k.closeFd(fd)
+		return false
+	}
+	h.fd, h.have = fd, true
+	return true
+}
+
+func (h *fdHolder) take() (int, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done || !h.have {
+		return -1, false
+	}
+	h.have, h.done = false, true
+	return h.fd, true
+}
+
+func (h *fdHolder) release() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.have {
+		h.k.closeFd(h.fd)
+		h.have = false
+	}
+	h.done = true
 }
 
 func (m *mounter) RemountReadOnly(ctx context.Context, target string, readOnly bool) error {
