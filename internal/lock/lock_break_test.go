@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -38,13 +39,13 @@ func TestBreakerThatLosesTheRenameReportsContended(t *testing.T) {
 	t.Parallel()
 	dir, f := staleLock(t)
 	lockDir := filepath.Join(dir, "web"+Suffix)
-	f.rename = func(oldpath, newpath string) error {
+	f.rename = func(oldpath, _ string) error {
 		// The other breaker wins: it moves the lock away, removes it and takes
 		// the name.
 		if err := os.RemoveAll(oldpath); err != nil {
 			return err
 		}
-		if err := os.Mkdir(oldpath, 0o755); err != nil {
+		if err := os.Mkdir(oldpath, 0o750); err != nil {
 			return err
 		}
 		if err := os.WriteFile(filepath.Join(oldpath, "holder"), []byte("winner"), 0o600); err != nil {
@@ -120,7 +121,7 @@ func TestBreakerPutsBackALockThatChangedBeforeTheRename(t *testing.T) {
 	if got := read(t, filepath.Join(lockDir, "holder")); got != "new holder" {
 		t.Errorf("holder = %q, want the live holder's, put back", got)
 	}
-	if got := names(t, dir); !equalStrings(got, []string{"web" + Suffix}) {
+	if got := names(t, dir); !slices.Equal(got, []string{"web" + Suffix}) {
 		t.Errorf("directory holds %v, want the lock only", got)
 	}
 }
@@ -157,13 +158,13 @@ func TestBreakRemoveFailureIsAnError(t *testing.T) {
 		if err := os.Rename(oldpath, newpath); err != nil {
 			return err
 		}
-		return os.Chmod(newpath, 0o500)
+		return os.Chmod(newpath, 0o500) //nolint:gosec // a directory that cannot be written
 	}
 	_, err := acquire(context.Background(), f, dir, "web", opts("breaker"))
 	// Let the temporary directory be removed.
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
-		_ = os.Chmod(filepath.Join(dir, e.Name()), 0o700)
+		_ = os.Chmod(filepath.Join(dir, e.Name()), 0o700) //nolint:gosec // let the temporary directory be removed
 	}
 	if err == nil || errors.Is(err, ErrContended) {
 		t.Fatalf("acquire = %v, want the removal error", err)
@@ -197,7 +198,7 @@ func TestReleaseAndRenewAfterLossTouchNothing(t *testing.T) {
 	if err := old.Release(ctx); !errors.Is(err, ErrLost) {
 		t.Errorf("second Release = %v, want ErrLost", err)
 	}
-	if got := names(t, lockDir); !equalStrings(got, before) || read(t, filepath.Join(lockDir, "holder")) != "new" {
+	if got := names(t, lockDir); !slices.Equal(got, before) || read(t, filepath.Join(lockDir, "holder")) != "new" {
 		t.Errorf("the new holder's lock changed: %v (was %v), holder %q", got, before, read(t, filepath.Join(lockDir, "holder")))
 	}
 }

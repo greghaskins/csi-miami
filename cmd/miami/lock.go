@@ -282,7 +282,11 @@ func lockRun(cfg lockConfig, argv []string, stdout, stderr io.Writer) int {
 			return exitError
 		case <-exited:
 			stopRenewing()
-			<-renewed
+			// A loss found as the command exited is reported; the release below
+			// finds the lock lost too.
+			if err := <-renewed; err != nil {
+				_, _ = fmt.Fprintf(stderr, "miami lock run: %v\n", err)
+			}
 			return releaseAfter(l, exitStatus(cmd.ProcessState), stderr)
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,19 +22,19 @@ func TestOSFSWriteAtomicLeavesNoTemporaryFile(t *testing.T) {
 	if err := o.WriteAtomic(dir, "holder", []byte("h2")); err != nil {
 		t.Fatal(err)
 	}
-	if got := names(t, dir); !equalStrings(got, []string{"holder"}) || read(t, filepath.Join(dir, "holder")) != "h2" {
+	if got := names(t, dir); !slices.Equal(got, []string{"holder"}) || read(t, filepath.Join(dir, "holder")) != "h2" {
 		t.Errorf("directory holds %v, holder %q", got, read(t, filepath.Join(dir, "holder")))
 	}
 
 	// The rename fails (the target is a directory with something in it): the
 	// temporary file does not stay.
-	if err := os.MkdirAll(filepath.Join(dir, "since", "x"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "since", "x"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.WriteAtomic(dir, "since", nil); err == nil {
 		t.Error("WriteAtomic over a non-empty directory succeeded")
 	}
-	if got := names(t, dir); !equalStrings(got, []string{"holder", "since"}) {
+	if got := names(t, dir); !slices.Equal(got, []string{"holder", "since"}) {
 		t.Errorf("directory holds %v after a failed write", got)
 	}
 
@@ -95,7 +96,7 @@ func TestCleanDropsThePathButKeepsTheCause(t *testing.T) {
 		err  error
 		want error
 	}{
-		{"path error", os.Mkdir(filepath.Join(dir, "a", "b"), 0o755), fs.ErrNotExist},
+		{"path error", os.Mkdir(filepath.Join(dir, "a", "b"), 0o750), fs.ErrNotExist},
 		{"link error", os.Rename(filepath.Join(dir, "a"), filepath.Join(dir, "b")), fs.ErrNotExist},
 		{"other", fs.ErrPermission, fs.ErrPermission},
 	}

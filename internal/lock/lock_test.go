@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -149,21 +150,9 @@ func names(t *testing.T, dir string) []string {
 	return out
 }
 
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func read(t *testing.T, path string) string {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // a test reads its own temporary files
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +172,7 @@ func TestAcquireWritesTheLockAndReleaseRemovesIt(t *testing.T) {
 		t.Errorf("Name, Holder = %q, %q", l.Name(), l.Holder())
 	}
 	lockDir := filepath.Join(dir, "web"+Suffix)
-	if got := names(t, lockDir); !equalStrings(got, []string{"holder", "since"}) {
+	if got := names(t, lockDir); !slices.Equal(got, []string{"holder", "since"}) {
 		t.Fatalf("lock directory holds %v, want holder and since only (no temporary files)", got)
 	}
 	if got := read(t, filepath.Join(lockDir, "holder")); got != "node-a:1" {
@@ -196,7 +185,7 @@ func TestAcquireWritesTheLockAndReleaseRemovesIt(t *testing.T) {
 	if err := l.Renew(ctx); err != nil {
 		t.Errorf("Renew: %v", err)
 	}
-	if got := names(t, lockDir); !equalStrings(got, []string{"holder", "since"}) {
+	if got := names(t, lockDir); !slices.Equal(got, []string{"holder", "since"}) {
 		t.Errorf("after Renew the lock directory holds %v", got)
 	}
 
@@ -237,7 +226,7 @@ func TestAcquireContended(t *testing.T) {
 	if got := read(t, filepath.Join(dir, "web"+Suffix, "holder")); got != "a" {
 		t.Errorf("holder = %q after a contended attempt, want a", got)
 	}
-	if got := names(t, dir); !equalStrings(got, []string{"web" + Suffix}) {
+	if got := names(t, dir); !slices.Equal(got, []string{"web" + Suffix}) {
 		t.Errorf("directory holds %v after a contended attempt", got)
 	}
 	// A different name is a different lock.
@@ -271,7 +260,7 @@ func TestOnlyOneConcurrentAcquirerWins(t *testing.T) {
 	if wins.Load() != 1 || contended.Load() != n-1 {
 		t.Errorf("%d won and %d were contended, want 1 and %d", wins.Load(), contended.Load(), n-1)
 	}
-	if got := names(t, dir); !equalStrings(got, []string{"web" + Suffix}) {
+	if got := names(t, dir); !slices.Equal(got, []string{"web" + Suffix}) {
 		t.Errorf("directory holds %v, want the lock only", got)
 	}
 }
@@ -364,7 +353,7 @@ func TestAcquireBreaksOnlyAStaleLock(t *testing.T) {
 					t.Error("a lock that is not stale was renamed")
 				}
 			}
-			if got := names(t, dir); !equalStrings(got, []string{"web" + Suffix}) {
+			if got := names(t, dir); !slices.Equal(got, []string{"web" + Suffix}) {
 				t.Errorf("directory holds %v, want only the lock (no probe, no broken directory)", got)
 			}
 		})

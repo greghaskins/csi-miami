@@ -28,7 +28,7 @@ const helperMarker = "lock-helper"
 // TestLockHelperProcess is not a test: it is the command that `lock run`
 // starts in the tests below. It does nothing unless the marker is among its
 // arguments.
-func TestLockHelperProcess(t *testing.T) {
+func TestLockHelperProcess(_ *testing.T) {
 	var mode string
 	for i, a := range os.Args {
 		if a == helperMarker && i+1 < len(os.Args) {
@@ -223,7 +223,7 @@ func TestLockRunWhileTheLockIsHeld(t *testing.T) {
 	if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "held by another holder") {
 		t.Errorf("exit %d, stdout %q, stderr %q; want exit 1 without running the command", code, stdout.String(), stderr.String())
 	}
-	if h, err := os.ReadFile(filepath.Join(dir, "web.lock", "holder")); err != nil || string(h) != "other" {
+	if h, err := os.ReadFile(filepath.Join(dir, "web.lock", "holder")); err != nil || string(h) != "other" { //nolint:gosec // a test reads its own temporary files
 		t.Errorf("holder = %q, %v; the contender must leave the lock alone", h, err)
 	}
 }
@@ -289,7 +289,7 @@ func TestLockRunTerminatesTheCommandWhenTheLockIsLost(t *testing.T) {
 				t.Errorf("killed = %v, want %v (stderr %q)", killed, tt.wantKill, msg)
 			}
 			// Nothing of the new holder's was touched.
-			if got, err := os.ReadFile(holder); err != nil || string(got) != "other" {
+			if got, err := os.ReadFile(holder); err != nil || string(got) != "other" { //nolint:gosec // a test reads its own temporary files
 				t.Errorf("holder = %q, %v; the lost lock must not be released", got, err)
 			}
 		})

@@ -46,7 +46,7 @@ func (osFS) Mkdir(path string) error { return os.Mkdir(path, 0o755) } //nolint:g
 
 func (osFS) Rename(oldpath, newpath string) error { return os.Rename(oldpath, newpath) }
 
-func (osFS) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
+func (osFS) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) } //nolint:gosec // the path is built from a validated lock name
 
 func (osFS) RemoveAll(path string) error { return os.RemoveAll(path) }
 
@@ -91,7 +91,7 @@ func (osFS) ModTime(path string) (time.Time, error) {
 
 func (osFS) Probe(dir, name string) (time.Time, error) {
 	tmp := filepath.Join(dir, "."+name+".probe-"+randomSuffix())
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // the path is built from a validated lock name
 	if err != nil {
 		return time.Time{}, err
 	}
