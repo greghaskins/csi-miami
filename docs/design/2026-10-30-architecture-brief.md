@@ -710,8 +710,9 @@ Recorded:
     `readOnlyRootFilesystem: true` and `seccompProfile: RuntimeDefault` (the
     API server accepts it; the runtime ignores the profile for a privileged
     container). The sidecars run as root so they can open the socket the driver
-    creates. Whether an nfs3 mount works with `allowPrivilegeEscalation: false`
-    on the controller is unverified until the nfs3 e2e. The namespace carries
+    creates. An nfs3 mount works with `allowPrivilegeEscalation: false` on the
+    controller (verified by the T10 e2e: CreateVolume and DeleteVolume make and
+    remove the directory on a kernel NFS export through it). The namespace carries
     the `privileged` Pod Security level. The deploy check runs on kind with a
     control plane and two workers (the shape the end-to-end tests need), from a
     node image pinned by digest; the DaemonSet tolerates every taint, so it
