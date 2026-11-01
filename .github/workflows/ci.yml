@@ -430,8 +430,8 @@ jobs:
   # The deploy check (hack/kind.sh): the e2e overlay on a kind cluster of one
   # control plane and two workers, with the amd64 image the build job pushed
   # (the content tag, pulled and loaded into the nodes, never pulled by them).
-  # Passes when both pods are Ready on every node, the driver is registered in
-  # every CSINode and /healthz and /metrics answer through the API server. A
+  # Passes when the node pod is Ready on each of the two workers and not on the
+  # control plane, the driver is registered in every worker's CSINode and /healthz and /metrics answer through the API server. A
   # failing run uploads kind's logs, the pods' logs and descriptions and each
   # node's mountinfo. kind is built, and kubectl downloaded and checked against its
   # published checksum, at the versions mise.toml pins.

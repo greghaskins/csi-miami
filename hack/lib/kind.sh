@@ -61,8 +61,14 @@ YAML
 
   echo "kind: creating cluster $kind_cluster"
   kind create cluster --name "$kind_cluster" --config "$kind_work/kind.yaml" --wait "$kind_timeout"
-  kind_nodes="$(kubectl get nodes -o name | wc -l)"
-  echo "kind: $kind_nodes nodes"
+  # kind labels the control plane node-role.kubernetes.io/control-plane, which
+  # the driver's node affinity excludes (decision 35): workers only.
+  kind_workers="$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name | wc -l)"
+  echo "kind: $kind_workers workers"
+  if [ "$kind_workers" != 2 ]; then
+    echo "kind: want 2 workers, have $kind_workers" >&2
+    return 1
+  fi
 }
 
 kind_apply() {
@@ -80,19 +86,27 @@ kind_apply() {
 }
 
 kind_wait() {
-  local desired ready node
+  local desired ready node on_cp
   kubectl -n "$kind_ns" wait --for=condition=Available --timeout="$kind_timeout" deployment/miami-controller
-  kubectl -n "$kind_ns" wait --for=jsonpath='{.status.desiredNumberScheduled}'="$kind_nodes" --timeout="$kind_timeout" daemonset/miami-node
-  kubectl -n "$kind_ns" wait --for=jsonpath='{.status.numberReady}'="$kind_nodes" --timeout="$kind_timeout" daemonset/miami-node
+  kubectl -n "$kind_ns" wait --for=jsonpath='{.status.desiredNumberScheduled}'="$kind_workers" --timeout="$kind_timeout" daemonset/miami-node
+  kubectl -n "$kind_ns" wait --for=jsonpath='{.status.numberReady}'="$kind_workers" --timeout="$kind_timeout" daemonset/miami-node
   desired="$(kubectl -n "$kind_ns" get daemonset miami-node -o jsonpath='{.status.desiredNumberScheduled}')"
   ready="$(kubectl -n "$kind_ns" get daemonset miami-node -o jsonpath='{.status.numberReady}')"
   echo "kind: DaemonSet miami-node desired=$desired ready=$ready; Deployment miami-controller available"
   test "$desired" = "$ready"
 
-  for node in $(kubectl get nodes -o name); do
+  for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name); do
     kubectl wait --for=jsonpath='{.spec.drivers[*].name}'="$kind_driver" --timeout="$kind_timeout" "csinode/${node#node/}"
     echo "kind: CSINode ${node#node/} lists $kind_driver"
   done
+
+  # No plugin on the control plane: its node affinity excludes it.
+  on_cp="$(kubectl -n "$kind_ns" get pods -l app.kubernetes.io/component=node -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | grep -c -- control-plane || true)"
+  if [ "$on_cp" != 0 ]; then
+    echo "kind: $on_cp node plugin pods on the control plane, want none" >&2
+    return 1
+  fi
+  echo "kind: no node plugin on the control plane"
 }
 
 kind_collect() {

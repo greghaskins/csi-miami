@@ -1201,6 +1201,29 @@ Recorded:
     transports root after the pods using it are gone, then let the next pass
     mount it. The README's Limitations carries a sentence for N-2 and M-15.
 
+35. **Control-plane exclusion and StorageClass names (M1, T21; amends 24)**:
+    two owner decisions.
+    - The node DaemonSet and the controller Deployment carry a required node
+      affinity (`requiredDuringSchedulingIgnoredDuringExecution`, one term)
+      whose expressions require `node-role.kubernetes.io/control-plane` and
+      `node-role.kubernetes.io/master` to not exist, so the driver runs on
+      worker nodes by default. The DaemonSet keeps its tolerate-all
+      toleration (the usual CSI shape), so custom taints on workers do not
+      keep it off. This supersedes decision 24's sentence that the DaemonSet
+      "tolerates every taint, so it runs on all three nodes": on the deploy
+      check's kind cluster it runs on the two workers only, and the check
+      asserts the desired count equals the worker count and no plugin runs on
+      the control plane. A cluster that wants the driver on control planes
+      removes the affinity with a JSON patch in its overlay (the snippet is in
+      the base kustomization).
+    - StorageClass names follow `miami-<type>-<location>-<sharing>[-<crypt>]`:
+      type `dir` (a directory item; `img` for image items later), location
+      `local` (the node's disk) or `remote` (a network server, NFSv3 today),
+      sharing `rwo` (one node) or `rwx` (many nodes), and an optional crypt
+      suffix when encrypted, whose token is defined with M2's encryption. The
+      example classes are `miami-dir-remote-rwx` and `miami-dir-local-rwo`.
+      Names carry no meaning to the driver: parameters, code and the volume
+      context are unchanged.
 
 Pending: none that block M1.
 
