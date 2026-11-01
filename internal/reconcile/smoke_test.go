@@ -301,6 +301,8 @@ func TestSmokeRebootRestoresTheNode(t *testing.T) {
 	n.requireAll(pvc1, target)
 	if m, ok := currentTable(t).At(target); !ok || !m.ReadOnly() {
 		t.Errorf("the read-only flag of the publish did not come back: %+v", m)
+	} else if !strings.Contains(strings.Join(m.Options, ","), "nosuid,nodev") {
+		t.Errorf("the publish is not nosuid,nodev: %v", m.Options)
 	}
 }
 

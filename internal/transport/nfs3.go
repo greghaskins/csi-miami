@@ -20,8 +20,10 @@ import (
 const nfs3FSType = "nfs"
 
 // nfs3Flags are the generic mount flags of the profile. noatime is a flag of
-// the mount, not an NFS data option.
-const nfs3Flags = unix.MS_NOATIME
+// the mount, not an NFS data option. nosuid and nodev are inherited by every
+// bind of the transport: a pod that can write the volume must not be able to
+// plant a setuid or device file for the other pods that share it.
+const nfs3Flags = unix.MS_NOATIME | unix.MS_NOSUID | unix.MS_NODEV
 
 // nfs3Profile is the one option set nfs3 mounts with. It is code, not
 // configuration, and changing it is a code change with a version bump.
@@ -111,10 +113,11 @@ var nfs3Pinned = map[string]string{
 }
 
 // nfs3MountOptions are the only tokens the mount's own options (not the super
-// block's) may have, and both must be present: the mount is read-write and
-// noatime, and nosuid, nodev, noexec, ro or any other flag means someone
-// else's mount.
-var nfs3MountOptions = []string{"rw", "noatime"}
+// block's) may have, and all must be present: the mount is read-write,
+// nosuid, nodev and noatime, and noexec, ro or any other flag means someone
+// else's mount. A transport mounted by an earlier profile lacks nosuid and
+// nodev and is therefore not adopted.
+var nfs3MountOptions = []string{"rw", "nosuid", "nodev", "noatime"}
 
 // nfs3 is an NFSv3 export mounted with mount(2) at Dir.
 type nfs3 struct {

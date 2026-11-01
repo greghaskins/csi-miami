@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -79,6 +80,14 @@ func TestE2ENFS3(t *testing.T) {
 	for _, tr := range []transport.Transport{a, b} {
 		if ok, err := tr.Mounted(ctx); err != nil || !ok {
 			t.Fatalf("Mounted after Mount = %v, %v at %s; want true (see the mountinfo lines above)", ok, err, tr.Dir())
+		}
+	}
+	// The profile's per-mount flags: nosuid and nodev are inherited by every
+	// bind of the transport, and an adoption requires them.
+	for _, tr := range []transport.Transport{a, b} {
+		mm, _ := currentTable(t).At(tr.Dir())
+		if !slices.Contains(mm.Options, "nosuid") || !slices.Contains(mm.Options, "nodev") {
+			t.Errorf("%s is mounted without nosuid,nodev: %v", tr.Dir(), mm.Options)
 		}
 	}
 	ma, _ := currentTable(t).At(a.Dir())

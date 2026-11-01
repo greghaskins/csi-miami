@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -556,10 +557,21 @@ func requireBind(t *testing.T, mountPoint, dir string, want bool) {
 	}
 }
 
+// requireNoSuidNoDev checks that mountinfo shows the mount nosuid and nodev,
+// as every bind the Mounter makes must be.
+func requireNoSuidNoDev(t *testing.T, mountPoint string) {
+	t.Helper()
+	cur, ok := currentTable(t).At(mountPoint)
+	if !ok || !slices.Contains(cur.Options, "nosuid") || !slices.Contains(cur.Options, "nodev") {
+		t.Errorf("mountinfo does not show %s nosuid,nodev: %+v, %v", mountPoint, cur.Options, ok)
+	}
+}
+
 // requireReadOnly checks that mountinfo says the mount is read-only and that
 // the kernel refuses a write there with EROFS.
 func requireReadOnly(t *testing.T, mountPoint string) {
 	t.Helper()
+	requireNoSuidNoDev(t, mountPoint)
 	if cur, ok := currentTable(t).At(mountPoint); !ok || !cur.ReadOnly() {
 		t.Errorf("mountinfo does not show %s read-only: %+v, %v", mountPoint, cur, ok)
 	}
@@ -571,6 +583,7 @@ func requireReadOnly(t *testing.T, mountPoint string) {
 
 func requireWritable(t *testing.T, mountPoint string) {
 	t.Helper()
+	requireNoSuidNoDev(t, mountPoint)
 	if cur, ok := currentTable(t).At(mountPoint); ok && cur.ReadOnly() {
 		t.Errorf("mountinfo shows %s read-only", mountPoint)
 	}

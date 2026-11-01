@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -544,9 +545,9 @@ func (m *mounter) RemountReadOnly(ctx context.Context, target string, readOnly b
 	return err
 }
 
-// remount flips read-only on the bind mount at target, preserving the other
-// per-mount flags: a remount that does not repeat nosuid, noatime and the
-// rest would silently reset them. It reads the table afresh.
+// remount makes the bind mount at target nosuid and nodev and read-only as
+// asked, preserving its other per-mount flags: a remount that does not repeat
+// noatime and the rest would silently reset them. It reads the table afresh.
 func (m *mounter) remount(target string, readOnly bool) error {
 	t, err := m.k.mounts()
 	if err != nil {
@@ -556,10 +557,12 @@ func (m *mounter) remount(target string, readOnly bool) error {
 	if !ok {
 		return ErrNotMounted
 	}
-	if cur.ReadOnly() == readOnly {
+	if cur.ReadOnly() == readOnly && hasAll(cur.Options, "nosuid", "nodev") {
 		return nil
 	}
-	flags := uintptr(unix.MS_REMOUNT|unix.MS_BIND) | perMountFlags(cur.Options)
+	// Every bind this driver makes is nosuid and nodev, whatever the mount it
+	// was made from has.
+	flags := uintptr(unix.MS_REMOUNT|unix.MS_BIND|unix.MS_NOSUID|unix.MS_NODEV) | perMountFlags(cur.Options)
 	if readOnly {
 		flags |= unix.MS_RDONLY
 	}
@@ -669,6 +672,15 @@ func (m *mounter) resolveFailure(path string, err error) error {
 
 func notResolved(path, resolved string) error {
 	return fmt.Errorf("%w: %q resolves to %q; pass the resolved path", ErrNotResolved, path, resolved)
+}
+
+func hasAll(opts []string, want ...string) bool {
+	for _, w := range want {
+		if !slices.Contains(opts, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // perMountFlags translates the per-mount options mountinfo shows back into

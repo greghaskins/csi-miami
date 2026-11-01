@@ -32,8 +32,8 @@ func TestNFS3DataIsPinned(t *testing.T) {
 	if got := nfs3Data("192.0.2.10"); got != want {
 		t.Errorf("nfs3Data = %q, want %q", got, want)
 	}
-	if nfs3Flags != unix.MS_NOATIME {
-		t.Errorf("nfs3Flags = %#x, want MS_NOATIME %#x", uintptr(nfs3Flags), uintptr(unix.MS_NOATIME))
+	if want := uintptr(unix.MS_NOATIME | unix.MS_NOSUID | unix.MS_NODEV); nfs3Flags != want {
+		t.Errorf("nfs3Flags = %#x, want MS_NOATIME|MS_NOSUID|MS_NODEV %#x", uintptr(nfs3Flags), want)
 	}
 	if nfs3FSType != "nfs" {
 		t.Errorf("nfs3FSType = %q, want nfs", nfs3FSType)
@@ -298,7 +298,7 @@ func TestNFS3MountSendsTheProfile(t *testing.T) {
 		Source: nfsSource,
 		Target: tr.Dir(),
 		FSType: "nfs",
-		Flags:  unix.MS_NOATIME,
+		Flags:  unix.MS_NOATIME | unix.MS_NOSUID | unix.MS_NODEV,
 		Data:   "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10",
 	}
 	if got := kernelCalls(f); len(got) != 1 || got[0] != want {

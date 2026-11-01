@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,9 +165,15 @@ func (s *simKernel) mount(source, target, fstype string, flags uintptr, data str
 					opts = []string{"ro"}
 				}
 				for _, o := range s.table[i].Options {
-					if o != "rw" && o != "ro" {
+					if o != "rw" && o != "ro" && o != "nosuid" && o != "nodev" {
 						opts = append(opts, o)
 					}
+				}
+				if flags&unix.MS_NOSUID != 0 {
+					opts = append(opts, "nosuid")
+				}
+				if flags&unix.MS_NODEV != 0 {
+					opts = append(opts, "nodev")
 				}
 				s.table[i].Options = opts
 			}
@@ -532,9 +539,9 @@ func TestBind(t *testing.T) {
 				t.Run(fmt.Sprintf("source ro=%t, requested ro=%t", srcRO, wantRO), func(t *testing.T) {
 					t.Parallel()
 					k := newSim()
-					opts := []string{"rw", "noatime"}
+					opts := []string{"rw", "nosuid", "nodev", "noatime"}
 					if srcRO {
-						opts = []string{"ro", "noatime"}
+						opts = []string{"ro", "nosuid", "nodev", "noatime"}
 					}
 					k.add(observe.Mount{
 						ID: 50, Major: 0, Minor: 50, Root: "/", MountPoint: "/stage", Options: opts,
@@ -558,6 +565,33 @@ func TestBind(t *testing.T) {
 						t.Errorf("%d kernel calls over two tries, want %d (the retry is a no-op)", n, wantCalls)
 					}
 				})
+			}
+		}
+	})
+
+	// A source mount without nosuid and nodev (an NFS transport of an earlier
+	// profile, a local disk) must not let its binds be setuid or device capable.
+	t.Run("a bind is nosuid and nodev whatever its source mount allows", func(t *testing.T) {
+		t.Parallel()
+		for _, ro := range []bool{false, true} {
+			k := newSim()
+			k.add(observe.Mount{
+				ID: 50, Major: 0, Minor: 50, Root: "/", MountPoint: "/stage", Options: []string{"rw", "noatime"},
+				FSType: "tmpfs", Source: "tmpfs", SuperOptions: []string{"rw"},
+			})
+			m := newMounter(k, time.Second)
+			for try := 1; try <= 2; try++ {
+				if err := m.Bind(bg(), "", "/stage/dir", "/mnt/pub", ro); err != nil {
+					t.Fatalf("ro=%t try %d: %v", ro, try, err)
+				}
+			}
+			tbl, _ := k.mounts()
+			cur, _ := tbl.At("/mnt/pub")
+			if !slices.Contains(cur.Options, "nosuid") || !slices.Contains(cur.Options, "nodev") || cur.ReadOnly() != ro {
+				t.Errorf("ro=%t: options = %v, want nosuid and nodev", ro, cur.Options)
+			}
+			if n := len(k.callsCopy()); n != 2 {
+				t.Errorf("ro=%t: %d kernel calls over two tries, want the bind and one remount", ro, n)
 			}
 		}
 	})
@@ -612,8 +646,8 @@ func TestBind(t *testing.T) {
 		k := newSim()
 		// Mount 90 is a bind of /data/b made over mount 91, a bind of /data/a,
 		// and has the lower ID, as when the kernel reuses an ID.
-		k.add(observe.Mount{ID: 91, ParentID: 1, Major: 8, Minor: 1, Root: "/data/a", MountPoint: "/mnt/dst", Options: []string{"rw"}})
-		k.add(observe.Mount{ID: 90, ParentID: 91, Major: 8, Minor: 1, Root: "/data/b", MountPoint: "/mnt/dst", Options: []string{"rw"}})
+		k.add(observe.Mount{ID: 91, ParentID: 1, Major: 8, Minor: 1, Root: "/data/a", MountPoint: "/mnt/dst", Options: []string{"rw", "nosuid", "nodev"}})
+		k.add(observe.Mount{ID: 90, ParentID: 91, Major: 8, Minor: 1, Root: "/data/b", MountPoint: "/mnt/dst", Options: []string{"rw", "nosuid", "nodev"}})
 		m := newMounter(k, time.Second)
 		if err := m.Bind(bg(), "", "/data/b", "/mnt/dst", false); err != nil {
 			t.Errorf("bind of what is on top: %v", err)
@@ -751,7 +785,7 @@ func TestRemountReadOnly(t *testing.T) {
 		if err := newMounter(k, time.Second).RemountReadOnly(bg(), "/mnt/s", true); err != nil {
 			t.Fatal(err)
 		}
-		want := uintptr(unix.MS_REMOUNT | unix.MS_BIND | unix.MS_RDONLY | unix.MS_STRICTATIME)
+		want := uintptr(unix.MS_REMOUNT | unix.MS_BIND | unix.MS_RDONLY | unix.MS_STRICTATIME | unix.MS_NOSUID | unix.MS_NODEV)
 		if got := k.callsCopy(); len(got) != 1 || got[0].flags != want {
 			t.Errorf("kernel calls = %v, want one remount with flags %#x", got, want)
 		}
