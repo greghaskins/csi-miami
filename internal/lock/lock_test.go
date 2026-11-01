@@ -382,9 +382,10 @@ func TestAcquireBreaksOnlyAStaleLock(t *testing.T) {
 				if got := read(t, filepath.Join(lockDir, "holder")); got != "breaker" {
 					t.Errorf("holder = %q, want breaker", got)
 				}
-				// One probe to judge, one more under the breakers' directory.
-				if f.called("Probe") != 2 {
-					t.Errorf("probes = %d, want 2", f.called("Probe"))
+				// Two probes to judge (before and after the stamp is read), two
+				// more to judge again under the breakers' directory.
+				if f.called("Probe") != 4 {
+					t.Errorf("probes = %d, want 4", f.called("Probe"))
 				}
 				if l.Broke() == "" {
 					t.Error("Broke is empty after a break")

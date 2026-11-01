@@ -41,7 +41,10 @@ func TestBreakerThatLosesTheRenameReportsContended(t *testing.T) {
 	t.Parallel()
 	dir, f := staleLock(t)
 	lockDir := filepath.Join(dir, "web"+Suffix)
-	f.rename = func(oldpath, _ string) error {
+	f.rename = func(oldpath, newpath string) error {
+		if filepath.Base(oldpath) != "web"+Suffix {
+			return os.Rename(oldpath, newpath) // the breakers' directory
+		}
 		// The other breaker wins: it moves the lock away, removes it and takes
 		// the name.
 		if err := os.RemoveAll(oldpath); err != nil {
@@ -74,7 +77,10 @@ func TestBreakerThatLosesTheRenameReportsContended(t *testing.T) {
 func TestBreakerThatLosesTheRenameTakesAFreeLock(t *testing.T) {
 	t.Parallel()
 	dir, f := staleLock(t)
-	f.rename = func(oldpath, _ string) error {
+	f.rename = func(oldpath, newpath string) error {
+		if filepath.Base(oldpath) != "web"+Suffix {
+			return os.Rename(oldpath, newpath) // the breakers' directory
+		}
 		if err := os.RemoveAll(oldpath); err != nil {
 			return err
 		}

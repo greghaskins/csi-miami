@@ -34,9 +34,9 @@ type fsys interface {
 	// Lstat returns the mode of the entry at path without following a
 	// symbolic link.
 	Lstat(path string) (fs.FileMode, error)
-	// ReadDir lists a directory, opening it first so that the client
-	// revalidates its cache.
-	ReadDir(path string) ([]fs.DirEntry, error)
+	// ReadDir lists up to n entries of a directory, opening it first so that
+	// the client revalidates its cache.
+	ReadDir(path string, n int) ([]fs.DirEntry, error)
 	// RemoveAll removes a directory and what is in it.
 	RemoveAll(path string) error
 	// OpenDir opens the directory at path and pins it: the handle keeps
@@ -79,7 +79,18 @@ func (osFS) Lstat(path string) (fs.FileMode, error) {
 	return st.Mode(), nil
 }
 
-func (osFS) ReadDir(path string) ([]fs.DirEntry, error) { return os.ReadDir(path) }
+func (osFS) ReadDir(path string, n int) ([]fs.DirEntry, error) {
+	d, err := os.Open(path) //nolint:gosec // the path is built from a validated lock name
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = d.Close() }()
+	ents, err := d.ReadDir(n)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	return ents, err
+}
 
 func (osFS) RemoveAll(path string) error { return os.RemoveAll(path) }
 

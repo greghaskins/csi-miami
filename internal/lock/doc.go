@@ -44,7 +44,8 @@
 // probe by more than Options.Stale. No local time enters the decision, so
 // clock skew between nodes cannot break a live lock or keep a dead one.
 //
-// A stamp more than 30 seconds ahead of the probe is stale too, with the
+// A stamp more than 30 seconds ahead of a probe taken after the stamp was read
+// is stale too, with the
 // reason recorded (Lock.Broke): a tenant can set a stamp into the future, and
 // a server clock stepped backwards leaves every earlier stamp ahead of it, and
 // either would keep the lock unbreakable for as long as the lie. A live holder
@@ -55,8 +56,10 @@
 //
 // Only a lock-shaped directory is ever broken: a directory (not a symbolic
 // link) holding nothing but regular files named holder, since, or the
-// temporary names .holder.tmp-* and .since.tmp-* (16 hex digits). An empty one
-// counts. Anything else at the lock's path, a regular file, a symbolic link,
+// temporary names .holder.tmp-* and .since.tmp-* (16 hex digits), or the
+// silly-renamed files .nfs<hex> that NFSv3 leaves for a moment when a file is
+// renamed over while another client has it open; at most 9 entries. An empty
+// one counts. Anything else at the lock's path, a regular file, a symbolic link,
 // or a directory with other contents, may be somebody's data: Acquire returns
 // ErrNotALock naming what it found, and moves and removes nothing. That error
 // is not ErrContended, and the miami command gives it exit code 3.
@@ -82,12 +85,19 @@
 // broken all the same: the attempt goes on and takes the lock, and the hidden
 // .NAME.broken-* directory is left behind. It is harmless; delete it by hand.
 //
-// NFSv3 has no conditional rename, so this does not close every window. A
-// holder whose lock was moved in that instant, while it was being put back
-// after another acquirer already took the name, learns it at its next
-// renewal: two holders may overlap for up to one renewal interval plus the
-// grace the command is given to stop. The lock is a lease without fencing, and
-// the work it protects must tolerate that overlap.
+// NFSv3 has no conditional rename, so this does not close every window. The
+// breaker holds the breakers' directory between its second judgement and the
+// rename, so the window needs a breaker that stalls there for longer than
+// Stale: another breaker then reclaims the directory, judges the lock stale
+// (it is not renewed any more, or is), breaks it and takes it, and the first
+// breaker wakes and renames the new lock away. It is checked and put back, but
+// if a third acquirer took the name meanwhile the restore fails (a rename does
+// not replace a directory), the error is returned, and the moved lock is left
+// under a hidden name; its holder learns at its next renewal. Two holders may
+// overlap for up to one renewal interval plus the grace the command is given to
+// stop. The lock is a lease without fencing, and the work it protects must
+// tolerate that overlap. A call abandoned at its deadline that completes late
+// can also still move a lock without these checks.
 //
 // # The floor on Stale
 //
@@ -123,7 +133,10 @@
 // .NAME.broken-*, .NAME.removed-*, .NAME.breaking or
 // .NAME.breaking-dead-*, and temporary files inside a lock
 // directory. They are harmless to the lock (nothing reads them, and a lock
-// directory holding one is removed with it) and can be deleted by hand.
+// directory holding one is removed with it) and can be deleted by hand. The
+// steps that put things right after a call (restore, leaving the breakers'
+// directory) run under a deadline key of their own, so a hung look at a moved
+// lock does not refuse the restore.
 //
 // Errors other than ErrContended and ErrLost are *Error values carrying the
 // operation and the lock name, never a path.
