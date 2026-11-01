@@ -388,7 +388,7 @@ spec:
           mountPropagation: Bidirectional
           name: kubelet-dir
         - mountPath: /var/lib/miami
-          mountPropagation: None
+          mountPropagation: Bidirectional
           name: transports
         - mountPath: /csi
           name: plugin-dir

@@ -190,17 +190,12 @@ volume stay serialized.
   already privileged on every node, so the alternative (an unprivileged
   controller delegating delete and expand to a node agent through a PV
   annotation handshake) buys little and adds a cross-component protocol.
-- **Transport mounts are private to the node agent** (decision 26): the agent
-  mounts into a `hostPath` directory with no mount propagation, so a
-  transport is not on the host mount table; the stage and publish binds are
-  made under the kubelet directory, which is `Bidirectional`, so they are on
-  the host and survive a plugin restart, and the next agent mounts the
-  transport again. The transport mount is a convenience for finding items,
-  not state. (Earlier drafts had the transport on the host table so it
-  persisted across restarts and host-side watchdogs could see it; see
-  decision 26 for why it cannot be for NFS.) Transports are reference-counted
-  by intent and unmounted when idle for a configurable period (default:
-  never).
+- **Transport mounts on the host mount table**: the agent mounts into a
+  `hostPath` directory with `mountPropagation: Bidirectional`, so the mount
+  persists across plugin restarts, loop back-files always show the host
+  path, and host-side watchdogs can see them. Transports are
+  reference-counted by intent and unmounted when idle for a configurable
+  period (default: never).
 
 ### 4.4 Self-describing volumes
 
@@ -750,34 +745,32 @@ Recorded:
     exactly those as skipped; on code, a skipped, cancelled or failed job
     fails `ci-ok`.
 
-26. **Transports are private to the node agent (found by the T10 e2e)**: with
-    the transport mounted on the host table, an `nfs3` volume can never be
-    unstaged. The NFS client reports `/` as the root of every mount of an
-    export, a bind of a subdirectory included, and puts the directory in the
-    source (`server:/export/dir`). The kubelet, before it calls
-    `NodeUnstageVolume`, lists the other mounts with the same device and root
-    as the staging path and refuses while any exists ("the device mount path
-    ... is still mounted by other references"); the transport is one. The
-    pod's publish is removed, the stage stays, the VolumeAttachment is not
-    detached and the PV delete hangs. `local` is not affected (its roots
-    differ). The transports root is therefore mounted without propagation: the
-    transport lives in the node agent's mount namespace; stage and publish
-    binds propagate to the host through the kubelet directory, and the next
-    agent mounts the transport again on start and adopts the binds as before.
-    Cost: a transport is no longer visible on the host table and is not the
-    same mount after a plugin restart (exit criterion 4 asserts the stage and
-    publish binds are, and that the transport is mounted again). The
-    alternatives (a stage that is its own NFS mount with `nosharecache`; no
-    stage bind) change the reconciler's model and were not taken in T10.
-    `observe.IsBindOf` also learned this NFS shape: for two NFS mounts of one
-    device with different sources it compares the sources.
+Pending, and it blocks the `nfs3` exit criteria of M1 (found by the T10 e2e on
+a kind cluster; `local` passes all six):
 
-Pending: none that block M1.
+- **An NFS volume cannot be unstaged.** The NFS client reports `/` as the root
+  of every mount of an export, a bind of a subdirectory included, and puts the
+  directory in the source (`server:/export/dir`). Before it calls
+  `NodeUnstageVolume` the kubelet lists the other mounts with the same device
+  and root as the staging path and refuses while any exists ("the device mount
+  path ... is still mounted by other references"). Two kinds of mount match: the
+  transport mount (when it is on the host table), and the stage bind of every
+  other volume of the same export on the node. The pod's publish is removed,
+  the stage stays, the VolumeAttachment is not detached and the PV delete
+  hangs. Taking the transport off the host table (no propagation on the
+  transports root) fixes one volume per node and was tried in T10; two volumes
+  of one export on a node still block each other. `local` is not affected: its
+  roots are the volume paths. A stage that does not share a superblock with
+  any other host-visible mount is needed, for example a stage that is its own
+  NFS mount with `nosharecache`, or no stage mount for a directory item (the
+  publish binds the item directory from the transport). Either changes the
+  reconciler's model (stage as a bind of the item), so it is for the
+  architect to choose.
 
 ## 10. Milestones
 
 1. **M1, directory items on NFSv3 and local**: the binary, controller and
-   DaemonSet; transports private to the node agent (decision 26) with driver-owned
+   DaemonSet; transports on the host mount table with driver-owned
    profiles via `mount(2)`; intent store and reconciler; opaque IDs with PV
    lookup; metrics; the `miami lock` helper; the image build and the full CI shape
    of 7.3 with the `local` and `nfs3` e2e variants.

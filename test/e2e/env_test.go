@@ -173,6 +173,11 @@ func poll(timeout time.Duration, check func(ctx context.Context) (seen string, d
 	}
 	for {
 		seen, done, err := check(ctx)
+		if ctx.Err() != nil {
+			// What a check saw as the deadline passed (typically its own
+			// timed-out call) is not news; report the last state before it.
+			return report(), false
+		}
 		if err == nil {
 			// An observation made while the deadline passed is not news.
 			lastSeen, lastErr = seen, ""

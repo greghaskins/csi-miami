@@ -143,7 +143,7 @@ else
   export MIAMI_E2E_STORAGE_CLASS="miami-local"
 fi
 
-"$kind_work/e2e.test" -test.v -test.count=1 -test.timeout=40m 2>&1 | tee "$log"
+"$kind_work/e2e.test" -test.v -test.count=1 -test.failfast -test.timeout=40m 2>&1 | tee "$log"
 
 # Every test above ran the variant for this transport and passed; a test that
 # found nothing to run for it would also exit 0.

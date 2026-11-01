@@ -371,7 +371,7 @@ func TestNodeDaemonSet(t *testing.T) {
 	}
 	want := map[string]mount{
 		kubeletDir:                            {kubeletDir, corev1.HostPathDirectory, kubeletDir, corev1.MountPropagationBidirectional},
-		"/var/lib/miami":                      {"/var/lib/miami", corev1.HostPathDirectoryOrCreate, "/var/lib/miami", corev1.MountPropagationNone},
+		"/var/lib/miami":                      {"/var/lib/miami", corev1.HostPathDirectoryOrCreate, "/var/lib/miami", corev1.MountPropagationBidirectional},
 		kubeletDir + "/plugins/" + driverName: {kubeletDir + "/plugins/" + driverName, corev1.HostPathDirectoryOrCreate, "/csi", corev1.MountPropagationNone},
 	}
 	if !reflect.DeepEqual(got, want) {
