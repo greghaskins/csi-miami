@@ -515,10 +515,10 @@ future or a server clock stepped back cannot keep a lock unbreakable. Breakers
 take turns through a `.NAME.breaking` directory and judge the lock again once
 they hold it, so a stalled breaker finds the lock another one took and leaves
 it. The overlap that remains is accepted: NFSv3 has no conditional rename, so
-a breaker stalled for longer than `--stale` inside the breakers' directory is
-reclaimed by another, and on waking it moves the live lock the other took; if a
-third acquirer took the name before it is put back, the lock's holder learns it
-at its next renewal. Two holders may then overlap for up to one
+a holder renewing at the wrong moment, or a breaker stalled for longer than
+`--stale` inside the breakers' directory, can have its live lock moved; if an
+acquirer took the name before it is put back, the lock's holder learns it at
+its next renewal. Two holders may then overlap for up to one
 renewal interval (`--renew`, 30s by default) plus the stop grace
 (`--timeout`, 10s). The lock is a lease without fencing; the work it protects
 must tolerate that.

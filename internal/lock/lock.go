@@ -217,6 +217,9 @@ func (e *env) cleanupStep(ctx context.Context, what string, fn func() error) err
 	return err
 }
 
+// lookKey is the deadline key of the looks that decide a cleanup.
+func (e *env) lookKey() string { return e.dir + "\x00look" }
+
 // stepValue is step for a call that returns a value.
 func stepValue[T any](ctx context.Context, e *env, what string, fn func() (T, error)) (T, error) {
 	return stepKeyed(ctx, e, e.dir, what, fn)
@@ -543,7 +546,11 @@ func (e *env) breakIfStale(ctx context.Context) (retry bool, reason string, err 
 	if err != nil || !ok {
 		return false, "", err // not ok: another breaker is at work, the lock is contended
 	}
-	defer unlock()
+	defer func() {
+		if uerr := unlock(); uerr != nil {
+			err = errors.Join(err, fmt.Errorf("leaving the breakers' directory: %w", uerr))
+		}
+	}()
 	if v, err = e.judge(ctx); err != nil {
 		return false, "", err
 	}
@@ -631,7 +638,7 @@ func (e *env) checkMoved(ctx context.Context, broken string, judged observation)
 // unlock removes the directory only if it is still the one this breaker made:
 // a breaker stalled for more than Stale and reclaimed must not remove the
 // directory of the one that took its place.
-func (e *env) enterBreakers(ctx context.Context) (unlock func(), ok bool, err error) {
+func (e *env) enterBreakers(ctx context.Context) (unlock func() error, ok bool, err error) {
 	mutex := filepath.Join(e.dir, "."+e.name+".breaking")
 	created, err := e.mkdirAt(ctx, mutex)
 	if err != nil {
@@ -653,9 +660,13 @@ func (e *env) enterBreakers(ctx context.Context) (unlock func(), ok bool, err er
 		}
 		return nil, false, err
 	}
-	unlock = func() {
-		_ = e.removeAt(context.WithoutCancel(ctx), h, mutex, ".breaking-dead-", true, nil)
+	unlock = func() error {
+		err := e.removeAt(context.WithoutCancel(ctx), h, mutex, ".breaking-dead-", true, nil)
 		e.closeDir(h)
+		if errors.Is(err, ErrLost) {
+			err = nil // not ours any more: reclaimed while we stalled
+		}
+		return err
 	}
 	return unlock, true, nil
 }
@@ -684,16 +695,16 @@ func (e *env) reclaimBreakers(ctx context.Context, mutex string) (bool, error) {
 	// What was moved may not be what was judged: a breaker that finished and
 	// another that made the directory anew, between the stat and the rename.
 	ctx = context.WithoutCancel(ctx)
-	stamp, err = stepKeyed(ctx, e, e.dir+"\x00cleanup", "stat breakers", func() (time.Time, error) { return e.fs.ModTime(junk) })
+	// The looks run under a key of their own and only the steps that put
+	// things right under the cleanup key: a look that hangs leaves its key
+	// busy, and the restore must not wait behind it.
+	stamp, err = stepKeyed(ctx, e, e.lookKey(), "stat breakers", func() (time.Time, error) { return e.fs.ModTime(junk) })
 	if err == nil {
-		now, err = stepKeyed(ctx, e, e.dir+"\x00cleanup", "probe", func() (time.Time, error) { return e.fs.Probe(e.dir, e.name) })
+		now, err = stepKeyed(ctx, e, e.lookKey(), "probe", func() (time.Time, error) { return e.fs.Probe(e.dir, e.name) })
 	}
 	if stale, _ := staleness(now, stamp, e.stale); err != nil || !stale {
 		back := e.cleanupStep(ctx, "restore breakers", func() error { return e.fs.Rename(junk, mutex) })
-		if err == nil {
-			err = back
-		}
-		return false, err
+		return false, errors.Join(err, back)
 	}
 	if err = e.cleanupStep(ctx, "remove dead breakers", func() error { return e.fs.RemoveAll(junk) }); err != nil {
 		return false, err
@@ -881,13 +892,14 @@ func (e *env) removeAt(ctx context.Context, h dirHandle, path, tag string, clean
 		}
 		return err
 	}
-	var same bool
-	var err error
+	// The look never shares a key with the restore that follows it, so that a
+	// look that hangs cannot refuse it. Cleanup's look has a key of its own, so
+	// that an earlier hung call does not refuse it either.
+	key := e.dir
 	if cleanup {
-		same, err = stepKeyed(ctx, e, e.dir+"\x00cleanup", "check lock", func() (bool, error) { return h.Same(junk) })
-	} else {
-		same, err = stepValue(ctx, e, "check lock", func() (bool, error) { return h.Same(junk) })
+		key = e.lookKey()
 	}
+	same, err := stepKeyed(ctx, e, key, "check lock", func() (bool, error) { return h.Same(junk) })
 	if err == nil && same && verify != nil {
 		if verr := verify(ctx, junk); verr != nil {
 			if !errors.Is(verr, ErrNotALock) {

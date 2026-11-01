@@ -85,19 +85,32 @@
 // broken all the same: the attempt goes on and takes the lock, and the hidden
 // .NAME.broken-* directory is left behind. It is harmless; delete it by hand.
 //
-// NFSv3 has no conditional rename, so this does not close every window. The
-// breaker holds the breakers' directory between its second judgement and the
-// rename, so the window needs a breaker that stalls there for longer than
-// Stale: another breaker then reclaims the directory, judges the lock stale
-// (it is not renewed any more, or is), breaks it and takes it, and the first
-// breaker wakes and renames the new lock away. It is checked and put back, but
-// if a third acquirer took the name meanwhile the restore fails (a rename does
-// not replace a directory), the error is returned, and the moved lock is left
-// under a hidden name; its holder learns at its next renewal. Two holders may
-// overlap for up to one renewal interval plus the grace the command is given to
-// stop. The lock is a lease without fencing, and the work it protects must
-// tolerate that overlap. A call abandoned at its deadline that completes late
-// can also still move a lock without these checks.
+// NFSv3 has no conditional rename, so this does not close every window. It
+// opens in two ways. A holder renews, or a breaker stalls, between the second
+// judgement and the rename: if the holder renews there, the check of the moved
+// directory finds it alive and puts it back, and if any acquirer's mkdir
+// landed in that gap the restore fails (a rename does not replace a
+// directory), the error is returned, and the live lock is stranded under a
+// hidden .NAME.broken-* name. That takes one round trip of bad luck. Or a
+// breaker stalls there for longer than Stale: another breaker then reclaims
+// the breakers' directory, judges the lock stale, breaks it and takes it, and
+// the first breaker wakes and renames the new lock away, with the same
+// restore and the same failure. The holder of a stranded lock learns at its
+// next renewal. Two holders may overlap for up to one renewal interval plus
+// the grace the command is given to stop. The lock is a lease without
+// fencing, and the work it protects must tolerate that overlap. A call
+// abandoned at its deadline that completes late can also still move a lock
+// without these checks.
+//
+// That a restore does not replace an empty directory is Go's os.Rename, which
+// looks at the target with an Lstat before it calls rename(2); the raw system
+// call replaces an empty directory. It has a tiny window of its own between
+// the Lstat and the rename, and lookupcache=positive keeps the Lstat from
+// answering from a cached negative entry. Leaving the breakers' directory
+// moves it away and checks it is the one this breaker made; one that was
+// replaced is put back, and for the two round trips in between a mkdir lands
+// on the free name and strands it the same way (harmless: the next breaker
+// reclaims it after Stale).
 //
 // # The floor on Stale
 //

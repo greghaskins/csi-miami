@@ -157,7 +157,7 @@ Exit codes of `run`: the command's status (0–255; 128+n if killed by signal n)
 
 Only a lock-shaped directory is ever broken: a real directory (not a symbolic link) holding at most nine regular files, named `holder`, `since`, their temporary names, or the `.nfs<hex>` files NFSv3 leaves for a moment when a file is renamed over while open. A regular file, a symbolic link or a directory with other contents at `<dir>/<lock>.lock` may be someone's data: it is reported (exit 3) and never moved or removed. Breakers take turns through a `.<lock>.breaking` directory. A killed process can leave hidden entries beside the lock (`.<lock>.breaking`, `.<lock>.breaking-dead-*`, `.<lock>.broken-*`, `.<lock>.removed-*`, `.<lock>.probe-*`, `.<lock>.tmp-*`); they are harmless and can be deleted by hand.
 
-The lock is a lease without fencing. NFSv3 has no conditional rename, so a breaker that stalls for longer than `--stale` at the wrong moment can leave two holders overlapping for up to one renew interval (`--renew`, 30 seconds by default) plus the stop grace (`--timeout`, 10 seconds by default). The work a lock protects must tolerate that.
+The lock is a lease without fencing. NFSv3 has no conditional rename, so a holder that renews at the wrong moment while a breaker acts (one round trip of bad luck), or a breaker that stalls for longer than `--stale`, can leave a live lock stranded under a hidden name and two holders overlapping for up to one renew interval (`--renew`, 30 seconds by default) plus the stop grace (`--timeout`, 10 seconds by default). The work a lock protects must tolerate that.
 
 Example wrapper with retry on contention:
 

@@ -61,6 +61,11 @@ func TestStampWrittenBetweenTheProbesIsNotAhead(t *testing.T) {
 	if got := read(t, filepath.Join(dir, "web"+Suffix, "holder")); got != "dead" {
 		t.Errorf("holder = %q, want the live lock untouched", got)
 	}
+	// The first verdict is the one that decides: the re-judge under the
+	// breakers' directory must never be reached.
+	if f.called("Rename") != 0 || f.called("Mkdir") != 1 {
+		t.Errorf("Rename %d, Mkdir %d: the first judgement called a live stamp stale", f.called("Rename"), f.called("Mkdir"))
+	}
 }
 
 func TestStalenessWithTwoProbes(t *testing.T) {
@@ -337,5 +342,30 @@ func TestReleaseDoesNotRemoveADirectoryThatIsNotLockShaped(t *testing.T) {
 	mustExist(t, filepath.Join(lockDir, "mine.txt"))
 	if got := read(t, filepath.Join(lockDir, "holder")); got != "a" {
 		t.Errorf("holder = %q, want the directory put back", got)
+	}
+}
+
+// The same for the reclaim of a dead breaker's directory: a look at the moved
+// directory that hangs leaves its key busy, and the directory is put back all
+// the same.
+func TestRestoreAfterAHungLookDuringAReclaim(t *testing.T) {
+	t.Parallel()
+	dir, f := staleLock(t)
+	if err := os.Mkdir(filepath.Join(dir, ".web.breaking"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f.dirStamp = serverNow.Add(-time.Hour)
+	// ModTime calls: the lock's since, the breakers' directory, then the look
+	// at the directory after it was moved.
+	f.block = func(method string, n int) bool { return method == "ModTime" && n == 3 }
+	_, err := acquire(context.Background(), f, dir, "web", Options{Holder: "b", Stale: testStale, Timeout: 100 * time.Millisecond})
+	if !errors.Is(err, mount.ErrTimeout) {
+		t.Fatalf("acquire = %v, want the timeout", err)
+	}
+	if errors.Is(err, mount.ErrBusy) {
+		t.Errorf("acquire = %v: the restore was refused as busy", err)
+	}
+	if got := names(t, dir); !slices.Equal(got, []string{".web.breaking", "web" + Suffix}) {
+		t.Errorf("directory holds %v, want the breakers' directory put back", got)
 	}
 }
