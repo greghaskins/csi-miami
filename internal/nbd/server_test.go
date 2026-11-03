@@ -349,6 +349,28 @@ func TestDiscEndsServe(t *testing.T) {
 	}
 }
 
+// The kernel sends NBD_CMD_DISC and shuts the socket down at once, without
+// waiting for the replies still owed; a reply that then cannot be written is
+// not a failure of the server.
+func TestDiscWithARequestInFlightEndsServeCleanly(t *testing.T) {
+	t.Parallel()
+	b := &blockingBackend{memBackend: newMem(testSize), release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	s := negotiated(t, b, defaultOpts)
+	s.send(t, cmdRead, 0, 1, 0, 4096, nil)
+	<-b.entered
+	s.send(t, cmdDisc, 0, 2, 0, 0, nil) // net.Pipe: returns once Serve has read it
+	_ = s.c.Close()
+	close(b.release)
+	select {
+	case <-s.done:
+		if s.err != nil {
+			t.Fatalf("Serve after DISC with a request in flight: %v", s.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+}
+
 func TestBackendErrorMapsToEIO(t *testing.T) {
 	t.Parallel()
 	m := newMem(testSize)
