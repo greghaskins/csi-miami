@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/mdlayher/genetlink"
@@ -93,16 +95,23 @@ func Connect(ctx context.Context, sock *os.File, o ConnectOptions) (int, error) 
 
 // Reconfigure sets the size of a connected device (NBD_CMD_RECONFIGURE with
 // NBD_ATTR_SIZE_BYTES). It passes no sockets: the kernel takes them on
-// reconfigure only to replace a dead connection.
+// reconfigure only to replace a dead connection. A device connected with a
+// backend identifier can be reconfigured only by naming it again, so the
+// identifier is read back from /sys/block/nbdN/backend and sent along.
 func Reconfigure(ctx context.Context, index int, size int64) error {
+	return reconfigure(ctx, "/sys", index, size)
+}
+
+func reconfigure(ctx context.Context, sysfs string, index int, size int64) error {
 	if index < 0 || size <= 0 {
 		return fmt.Errorf("nbd: reconfigure: index %d, size %d", index, size)
 	}
-	_, err := bounded(ctx, func(ctx context.Context) (struct{}, error) {
-		ae := netlink.NewAttributeEncoder()
-		ae.Uint32(attrIndex, uint32(index))    //nolint:gosec // checked non-negative; device indexes are small
-		ae.Uint64(attrSizeBytes, uint64(size)) //nolint:gosec // checked positive
-		attrs, err := ae.Encode()
+	backend, _, err := readAttr(filepath.Join(sysfs, "block", "nbd"+strconv.Itoa(index)), "backend")
+	if err != nil {
+		return fmt.Errorf("nbd: reconfigure nbd%d: %w", index, err)
+	}
+	_, err = bounded(ctx, func(ctx context.Context) (struct{}, error) {
+		attrs, err := reconfigureAttrs(index, size, backend)
 		if err != nil {
 			return struct{}{}, err
 		}
@@ -113,6 +122,17 @@ func Reconfigure(ctx context.Context, index int, size int64) error {
 		return fmt.Errorf("nbd: reconfigure nbd%d: %w", index, err)
 	}
 	return nil
+}
+
+// reconfigureAttrs encodes NBD_CMD_RECONFIGURE's attributes.
+func reconfigureAttrs(index int, size int64, backend string) ([]byte, error) {
+	ae := netlink.NewAttributeEncoder()
+	ae.Uint32(attrIndex, uint32(index))    //nolint:gosec // checked non-negative; device indexes are small
+	ae.Uint64(attrSizeBytes, uint64(size)) //nolint:gosec // checked positive
+	if backend != "" {
+		ae.String(attrBackendIdentifier, backend)
+	}
+	return ae.Encode()
 }
 
 // Disconnect asks the kernel to disconnect a device (NBD_CMD_DISCONNECT): it

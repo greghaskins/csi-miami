@@ -182,6 +182,38 @@ func TestNetlinkArgumentChecks(t *testing.T) {
 	}
 }
 
+func TestReconfigureAttrsNameTheBackend(t *testing.T) {
+	t.Parallel()
+	for _, backend := range []string{"", "pvc-00000000-0000-0000-0000-000000000001"} {
+		b, err := reconfigureAttrs(4, 8192, backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ad, err := netlink.NewAttributeDecoder(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var index uint32
+		var size uint64
+		got := ""
+		for ad.Next() {
+			switch ad.Type() {
+			case attrIndex:
+				index = ad.Uint32()
+			case attrSizeBytes:
+				size = ad.Uint64()
+			case attrBackendIdentifier:
+				got = ad.String()
+			default:
+				t.Errorf("unexpected attribute %d", ad.Type())
+			}
+		}
+		if index != 4 || size != 8192 || got != backend {
+			t.Errorf("index %d, size %d, backend %q; want 4, 8192, %q", index, size, got, backend)
+		}
+	}
+}
+
 func TestSeconds(t *testing.T) {
 	t.Parallel()
 	for d, want := range map[time.Duration]uint64{0: 0, -time.Second: 0, time.Nanosecond: 1, time.Second: 1, 61 * time.Second / 2: 31} {

@@ -99,7 +99,7 @@ func (kernel) Available() error             { return Available() }
 func (kernel) Connect(ctx context.Context, sock *os.File, o ConnectOptions) (int, error) {
 	return Connect(ctx, sock, o)
 }
-func (kernel) Reconfigure(ctx context.Context, index int, size int64) error {
-	return Reconfigure(ctx, index, size)
+func (k kernel) Reconfigure(ctx context.Context, index int, size int64) error {
+	return reconfigure(ctx, k.sysfs, index, size)
 }
 func (kernel) Disconnect(ctx context.Context, index int) error { return Disconnect(ctx, index) }

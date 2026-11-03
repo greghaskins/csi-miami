@@ -35,6 +35,21 @@ func smokeEnv(t *testing.T) {
 	if err := Available(); err != nil {
 		t.Fatalf("Available: %v", err)
 	}
+	// The kernel says why it refused a netlink request only in its log.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		out, _ := exec.Command("dmesg").CombinedOutput()
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		var nbd []string
+		for _, l := range lines {
+			if strings.Contains(l, "nbd") {
+				nbd = append(nbd, l)
+			}
+		}
+		t.Logf("kernel log, nbd lines:\n%s", strings.Join(nbd[max(0, len(nbd)-20):], "\n"))
+	})
 }
 
 // device serves b on a socketpair and connects a device to it. stop kills
