@@ -102,12 +102,19 @@ type bus interface {
 	StopUnitContext(ctx context.Context, name, mode string, ch chan<- string) (int, error)
 	ResetFailedUnitContext(ctx context.Context, name string) error
 	GetUnitPropertiesContext(ctx context.Context, unit string) (map[string]any, error)
+	GetServiceProperties(ctx context.Context, unit string) (map[string]any, error)
 	GetServiceExecStart(ctx context.Context, unit string) ([][]string, error)
 	Close()
 }
 
 // realBus adapts *sdbus.Conn.
 type realBus struct{ *sdbus.Conn }
+
+// GetServiceProperties returns the properties of the unit's Service
+// interface; MainPID lives there, not on the Unit interface.
+func (b realBus) GetServiceProperties(ctx context.Context, unit string) (map[string]any, error) {
+	return b.GetUnitTypePropertiesContext(ctx, unit, "Service")
+}
 
 // GetServiceExecStart returns the argv of each ExecStart entry of a service.
 func (b realBus) GetServiceExecStart(ctx context.Context, unit string) ([][]string, error) {
@@ -322,8 +329,15 @@ func (m *manager) State(ctx context.Context, name string) (State, error) {
 		return State{}, fmt.Errorf("systemd: properties of %s carry no ActiveState", name)
 	}
 	sub, _ := props["SubState"].(string)
+	svc, err := m.bus.GetServiceProperties(ctx, name)
+	if err != nil {
+		if isDBusError(err, errNoSuchUnit) {
+			return State{}, nil
+		}
+		return State{}, fmt.Errorf("systemd: service properties of %s: %w", name, err)
+	}
 	var pid int
-	if v, ok := props["MainPID"].(uint32); ok {
+	if v, ok := svc["MainPID"].(uint32); ok {
 		pid = int(v)
 	}
 	return State{Active: active, Sub: sub, MainPID: pid, Present: true}, nil

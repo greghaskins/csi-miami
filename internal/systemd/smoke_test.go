@@ -80,13 +80,16 @@ func TestSmokeFailedUnitIsReset(t *testing.T) {
 	if err := m.Start(ctx, Unit{Name: name, ExecStart: []string{"/bin/false"}}); err != nil {
 		t.Fatal(err)
 	}
+	// CollectMode=inactive-or-failed lets systemd forget a failed unit as soon
+	// as it fails, so the unit goes from active straight to absent; accept a
+	// moment spent as "failed" too, in case the collection is not yet done.
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		st, err := m.State(ctx, name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st.Present && st.Active == "failed" {
+		if !st.Present || st.Active == "failed" {
 			break
 		}
 		if time.Now().After(deadline) {

@@ -60,7 +60,7 @@ func TestPropertiesAreExactlyTheDesignedSet(t *testing.T) {
 type stubBus struct {
 	startErr, stopErr, resetErr, propsErr error
 	result                                string // job result sent on the channel; "" sends none
-	props                                 map[string]any
+	props, svcProps                       map[string]any
 	exec                                  [][]string
 	execErr                               error
 	calls                                 []string
@@ -97,6 +97,10 @@ func (b *stubBus) ResetFailedUnitContext(_ context.Context, name string) error {
 
 func (b *stubBus) GetUnitPropertiesContext(context.Context, string) (map[string]any, error) {
 	return b.props, b.propsErr
+}
+
+func (b *stubBus) GetServiceProperties(context.Context, string) (map[string]any, error) {
+	return b.svcProps, b.propsErr
 }
 
 func (b *stubBus) GetServiceExecStart(context.Context, string) ([][]string, error) {
@@ -193,7 +197,10 @@ func TestStopResetsFailedAndToleratesAbsence(t *testing.T) {
 }
 
 func TestStateReadsThePropertiesAndMapsAbsence(t *testing.T) {
-	b := &stubBus{props: map[string]any{"LoadState": "loaded", "ActiveState": "active", "SubState": "running", "MainPID": uint32(99)}}
+	b := &stubBus{
+		props:    map[string]any{"LoadState": "loaded", "ActiveState": "active", "SubState": "running"},
+		svcProps: map[string]any{"MainPID": uint32(99)},
+	}
 	got, err := (&manager{b}).State(context.Background(), testUnit.Name)
 	if want := (State{Active: "active", Sub: "running", MainPID: 99, Present: true}); err != nil || got != want {
 		t.Fatalf("State = %+v, %v", got, err)
