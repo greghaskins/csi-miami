@@ -8,9 +8,10 @@
 # The smoke tests live in internal/mount, which they exercise together with
 # internal/observe, in internal/transport, which they exercise on top of both,
 # in internal/reconcile, which runs the node reconciler on a real local
-# transport, and in cmd/miami, which runs the node command and drives it over
-# its CSI socket. Each package is built as its own test binary and run in its
-# own namespace.
+# transport, in internal/nbd, which serves a device through the kernel's nbd
+# module (loaded below) and drives it with dd and blkdiscard, and in
+# cmd/miami, which runs the node command and drives it over its CSI socket.
+# Each package is built as its own test binary and run in its own namespace.
 #
 # A last step, `tools`, builds the image that would ship (hack/image-build.sh
 # --load, for this machine's architecture) and runs the tools it carries:
@@ -41,6 +42,12 @@ if ! command -v unshare >/dev/null 2>&1; then
   exit 1
 fi
 
+# The nbd smoke tests create devices through the module's netlink family.
+if ! modprobe nbd; then
+  echo "smoke: cannot load the nbd module" >&2
+  exit 1
+fi
+
 if [ -n "${SMOKE_ARTIFACT_DIR:-}" ]; then
   mkdir -p "$SMOKE_ARTIFACT_DIR"
 fi
@@ -48,7 +55,7 @@ fi
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-for path in internal/mount internal/transport internal/reconcile cmd/miami; do
+for path in internal/mount internal/transport internal/reconcile internal/nbd cmd/miami; do
   pkg="$(basename "$path")"
   go test -c -tags smoke -o "$dir/$pkg.test" "./$path"
 
