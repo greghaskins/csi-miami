@@ -21,7 +21,7 @@ shift
 copy() {
   p="$1"
   while :; do
-    [ -e "$dest$p" ] || [ -L "$dest$p" ] || cp -a --parents "$p" "$dest"
+    [ -e "$dest$p" ] || [ -L "$dest$p" ] || { mkdir -p "$dest$(dirname "$p")" && cp -a "$p" "$dest$p"; }
     [ -L "$p" ] || break
     t="$(readlink "$p")"
     case "$t" in
