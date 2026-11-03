@@ -1,6 +1,7 @@
 # Chunk-backed volumes: the design for M2 and the re-plan
 
-**Status:** Draft for owner approval
+**Status:** Approved by the owner on 2026-11-03; the plan is
+`2026-11-03-m2-implementation-plan.md`
 **Created:** 2026-11-03
 **Reads with:** `README.md`, `2026-10-30-architecture-brief.md` (decisions 1 to
 35 and, after this document, 36 to 50), `2026-11-01-goals-ahead-of-the-design.md`
@@ -728,12 +729,10 @@ A new session continues from here with no other context:
 1. Read `README.md`, the brief (its sections stand; decisions 36 to 50 win
    where they differ), `2026-10-31-working-mode.md`, then this document.
 2. Confirm the secret-scan config (`hack/secret-scan/require-config.sh`).
-3. If this document's status is still "Draft for owner approval", the next
-   step is the owner's review on its pull request; address review there.
-4. Once approved: write the M2 implementation plan in `docs/design/` as a
-   dated file on the same branch (the M1 plan is the template: work breakdown
-   with acceptance checks, waves, and the gates of section 7 as the first
-   tasks), then execute it with one subagent per task per the working-mode
-   document, on the same branch and pull request.
+3. The spec is approved. The plan is `2026-11-03-m2-implementation-plan.md`
+   on the same branch; its work breakdown says which tasks are merged (the
+   pull request's commits and `git log` are the truth). Execute the next
+   incomplete wave with one subagent per task per the working-mode document,
+   on the same branch and pull request.
 5. The migration of consumers is a deployment's own specification, written
    after the plan; nothing environment-specific belongs here.
