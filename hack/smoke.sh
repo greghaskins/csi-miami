@@ -14,7 +14,7 @@
 #
 # A last step, `tools`, builds the image that would ship (hack/image-build.sh
 # --load, for this machine's architecture) and runs the tools it carries:
-# cryptsetup --version and -V of mkfs.ext4, e2fsck and resize2fs, with the image's own entrypoint
+# cryptsetup --version and -V of mkfs.ext4 and e2fsck, and the resize2fs banner, with the image's own entrypoint
 # replaced. It needs docker; without it the step is skipped with a notice,
 # unless SMOKE_REQUIRE_TOOLS=1 (CI sets it), when a missing docker fails.
 #
@@ -90,4 +90,11 @@ fi
 docker run --rm --entrypoint /sbin/cryptsetup "$tag" --version
 docker run --rm --entrypoint /sbin/mkfs.ext4 "$tag" -V
 docker run --rm --entrypoint /sbin/e2fsck "$tag" -V
-docker run --rm --entrypoint /sbin/resize2fs "$tag" -V
+# resize2fs has no version flag: it prints its banner and then the usage
+# message with a failing status, so the banner is what is checked.
+out="$(docker run --rm --entrypoint /sbin/resize2fs "$tag" 2>&1 || true)"
+echo "$out"
+case "$out" in
+  "resize2fs "[0-9]*) ;;
+  *) echo "smoke: resize2fs did not start from the image" >&2; exit 1 ;;
+esac
