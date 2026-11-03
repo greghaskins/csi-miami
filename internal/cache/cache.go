@@ -73,9 +73,13 @@ type Cache struct {
 	lruMu    sync.Mutex // guards clean's order where readers hold only mu.RLock
 	scratch  []byte
 	unsynced map[uint32]struct{}
-	idxDirty bool
-	timer    *time.Timer
-	closed   bool
+	// pendingUnlink holds trimmed chunks whose c/<i> is removed once an index
+	// recording them as Zero is on disk; a Write cancels it.
+	pendingUnlink map[uint32]struct{}
+	indexWrites   int // index.json rewrites by flushLocked, for tests
+	idxDirty      bool
+	timer         *time.Timer
+	closed        bool
 }
 
 // AlignedBuffer returns a slice of n bytes whose first byte is 4096-aligned,
@@ -100,7 +104,7 @@ func newCache(dir string, idx Index, bound int64) *Cache {
 	return &Cache{
 		dir: dir, bound: bound, idx: idx,
 		dirty: map[uint32]struct{}{}, zero: map[uint32]struct{}{},
-		bcopy: map[uint32]struct{}{}, clean: newLRU(), unsynced: map[uint32]struct{}{},
+		bcopy: map[uint32]struct{}{}, clean: newLRU(), unsynced: map[uint32]struct{}{}, pendingUnlink: map[uint32]struct{}{},
 	}
 }
 
@@ -445,6 +449,7 @@ func (c *Cache) Write(i uint32, buf []byte) error {
 	}
 	c.clean.remove(i)
 	delete(c.zero, i)
+	delete(c.pendingUnlink, i)
 	c.dirty[i] = struct{}{}
 	c.unsynced[i] = struct{}{}
 	c.markIndexLocked()
@@ -643,24 +648,18 @@ func (c *Cache) MarkZero(i uint32) error {
 	if err := c.cowLocked(i); err != nil {
 		return err
 	}
-	// Record Zero durably before the file goes: a crash between the two
-	// would otherwise leave a dirty chunk with no file and no Zero flag.
-	_, wasDirty := c.dirty[i]
-	c.dirty[i] = struct{}{}
-	c.zero[i] = struct{}{}
-	c.idxDirty = true
-	if err := c.flushLocked(); err != nil {
-		delete(c.zero, i)
-		if !wasDirty {
-			delete(c.dirty, i)
-		}
-		return err
-	}
-	if err := os.Remove(c.cpath(i)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	// The file is unlinked only after an index recording Zero has been
+	// written (see flushLocked), so a crash in between never leaves a dirty
+	// chunk with no file and no Zero flag. A chunk with no file needs no
+	// unlink at all, which is the common case after mkfs discards a device.
+	if _, isDirty := c.dirty[i]; isDirty || c.clean.has(i) {
+		c.pendingUnlink[i] = struct{}{}
 	}
 	c.clean.remove(i)
 	delete(c.unsynced, i)
+	c.dirty[i] = struct{}{}
+	c.zero[i] = struct{}{}
+	c.markIndexLocked()
 	return nil
 }
 
@@ -723,6 +722,11 @@ func (c *Cache) flushLocked() error {
 		return err
 	}
 	c.idxDirty = false
+	c.indexWrites++
+	for i := range c.pendingUnlink {
+		_ = os.Remove(c.cpath(i)) // best effort: Open drops a file left for a Zero chunk
+		delete(c.pendingUnlink, i)
+	}
 	if c.timer != nil {
 		c.timer.Stop()
 		c.timer = nil

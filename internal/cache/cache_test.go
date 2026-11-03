@@ -296,6 +296,9 @@ func TestMarkZero(t *testing.T) {
 	if err := c.MarkZero(2); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.Sync(); err != nil { // the unlink follows the next index flush
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(filepath.Join(dir, "c", "2")); !os.IsNotExist(err) {
 		t.Fatal("zero chunk kept its file")
 	}
@@ -600,7 +603,7 @@ func TestCrashBeforeIndexFlushLosesWriteNotStaleClean(t *testing.T) {
 	}
 }
 
-func TestCrashAfterMarkZeroReopensAndReadsZeros(t *testing.T) {
+func TestCrashAfterMarkZeroReopens(t *testing.T) {
 	holdFlush(t)
 	c, dir := tmpCache(t, 1<<30)
 	mustWrite(t, c, 2, 2)
@@ -610,13 +613,85 @@ func TestCrashAfterMarkZeroReopensAndReadsZeros(t *testing.T) {
 	if err := c.MarkZero(2); err != nil {
 		t.Fatal(err)
 	}
+	// Crash before any flush: the trim is lost, but the cache must open.
 	d, err := Open(crashCopy(t, dir), 1<<30)
 	if err != nil {
 		t.Fatalf("Open after crash: %v", err)
 	}
+	_ = d.Close()
+}
+
+func TestCrashBetweenFlushAndDeferredUnlinkReadsZeros(t *testing.T) {
+	holdFlush(t)
+	c, dir := tmpCache(t, 1<<30)
+	mustWrite(t, c, 2, 2)
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.MarkZero(2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "c", "2")); err != nil {
+		t.Fatalf("unlink was not deferred: %v", err)
+	}
+	// The index recording Zero reaches disk; the process dies before the unlink.
+	c.mu.Lock()
+	err := writeIndex(dir, c.snapshot())
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(crashCopy(t, dir), 1<<30)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
 	defer func() { _ = d.Close() }()
 	if !bytes.Equal(mustRead(t, d, 2), make([]byte, testChunk)) {
 		t.Fatal("trimmed chunk not zero after crash")
+	}
+}
+
+func TestWriteCancelsPendingUnlink(t *testing.T) {
+	holdFlush(t)
+	c, dir := tmpCache(t, 1<<30)
+	mustWrite(t, c, 2, 2)
+	if err := c.MarkZero(2); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, c, 2, 5)
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "c", "2")); err != nil {
+		t.Fatalf("rewritten chunk was unlinked: %v", err)
+	}
+	if !bytes.Equal(mustRead(t, c, 2), fill(5)) {
+		t.Fatal("rewritten chunk lost")
+	}
+}
+
+func TestMarkZeroBatchesIndexWrites(t *testing.T) {
+	holdFlush(t)
+	const n = 10000
+	dir := filepath.Join(t.TempDir(), "cache")
+	c, err := Create(dir, Index{Volume: "v", Size: n * ioAlign, Chunk: ioAlign}, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	for i := uint32(0); i < n; i++ {
+		if err := c.MarkZero(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c.indexWrites != 0 {
+		t.Fatalf("index written %d times during %d trims, want 0", c.indexWrites, n)
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if c.indexWrites != 1 || len(c.Index().Zero) != n {
+		t.Fatalf("after Sync: %d index writes, %d zero chunks", c.indexWrites, len(c.Index().Zero))
 	}
 }
 
@@ -651,6 +726,9 @@ func TestCreateIgnoresLeftoverFiles(t *testing.T) {
 	c, err := Create(dir, Index{Volume: "v", Size: 16 * testChunk, Chunk: testChunk}, 1<<30)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "c", "5")); !os.IsNotExist(err) {
+		t.Fatalf("Create kept the leftover c/5: %v", err)
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
