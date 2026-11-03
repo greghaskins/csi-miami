@@ -14,7 +14,7 @@
 #
 # A last step, `tools`, builds the image that would ship (hack/image-build.sh
 # --load, for this machine's architecture) and runs the tools it carries:
-# cryptsetup --version and mkfs.ext4 -V, with the image's own entrypoint
+# cryptsetup --version and -V of mkfs.ext4, e2fsck and resize2fs, with the image's own entrypoint
 # replaced. It needs docker; without it the step is skipped with a notice,
 # unless SMOKE_REQUIRE_TOOLS=1 (CI sets it), when a missing docker fails.
 #
@@ -89,3 +89,5 @@ if ! docker image inspect "$tag" >/dev/null 2>&1; then
 fi
 docker run --rm --entrypoint /sbin/cryptsetup "$tag" --version
 docker run --rm --entrypoint /sbin/mkfs.ext4 "$tag" -V
+docker run --rm --entrypoint /sbin/e2fsck "$tag" -V
+docker run --rm --entrypoint /sbin/resize2fs "$tag" -V

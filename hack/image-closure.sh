@@ -31,17 +31,35 @@ copy() {
   done
 }
 
+libs="$(mktemp)"
+trap 'rm -f "$libs" "$libs.all"' EXIT
+
 for prog in "$@"; do
   [ -e "$prog" ] || { echo "image-closure: $prog not found" >&2; exit 1; }
   copy "$prog"
   real="$(readlink -f "$prog")"
+  # ldd output is captured first so its failure stops the build instead of
+  # vanishing into a pipe. A library it cannot resolve is a hard error.
+  out="$(ldd "$real" 2>&1)" || { echo "image-closure: ldd $real failed: $out" >&2; exit 1; }
+  case "$out" in
+    *"not found"*) echo "image-closure: $real has an unresolved library: $out" >&2; exit 1 ;;
+  esac
   # ldd prints "name => /path (addr)" for each library and "/path (addr)" for
   # the loader; every absolute path on a line is a file to carry.
-  ldd "$real" | tr -s ' \t()' '\n\n\n\n' | grep '^/' | sort -u | while read -r lib; do
-    [ "$lib" = "$real" ] || copy "$lib"
-  done
+  printf '%s\n' "$out" | tr -s ' \t()' '\n\n\n\n' | grep '^/' | sort -u > "$libs" || true
+  while read -r lib; do
+    [ "$lib" = "$real" ] && continue
+    copy "$lib"
+    echo "$lib" >> "$libs.all"
+  done < "$libs"
 done
 
 for prog in "$@"; do
   [ -e "$dest$prog" ] || { echo "image-closure: $prog missing from $dest" >&2; exit 1; }
 done
+if [ -f "$libs.all" ]; then
+  while read -r lib; do
+    [ -e "$dest$lib" ] || { echo "image-closure: library $lib missing from $dest" >&2; exit 1; }
+  done < "$libs.all"
+  rm -f "$libs.all"
+fi
