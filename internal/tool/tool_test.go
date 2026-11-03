@@ -2,6 +2,7 @@ package tool_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -82,8 +83,8 @@ func TestRealRunnerDeadlineKillsProcessGroup(t *testing.T) {
 	start := time.Now()
 	// The grandchild holds stdout open; only a group kill lets Run return.
 	_, _, _, err := tool.Real().Run(ctx, []string{"sh", "-c", "sleep 30 & sleep 30"}, nil)
-	if err == nil {
-		t.Fatal("want an error after the deadline")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
 	if d := time.Since(start); d > 10*time.Second {
 		t.Fatalf("Run took %v, the group was not killed", d)
@@ -121,5 +122,31 @@ func TestFakeRunnerRecordsArgv(t *testing.T) {
 	}
 	if got := strings.Join(calls[1].Argv, " "); got != "e2fsck -p /dev/x" || calls[1].Extra != 0 {
 		t.Fatalf("call 1 = %q extra %d", got, calls[1].Extra)
+	}
+}
+
+func TestFakeRunnerRecordsExtraFileContents(t *testing.T) {
+	t.Parallel()
+	pipe := func(s string) *os.File {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.WriteString(s)
+		_ = w.Close()
+		t.Cleanup(func() { _ = r.Close() })
+		return r
+	}
+	f3, f4 := pipe("old-key"), pipe("new-key")
+	f := &fake.Runner{}
+	if _, _, _, err := f.Run(context.Background(), []string{"cryptsetup", "luksChangeKey"}, []*os.File{f3, f4}); err != nil {
+		t.Fatal(err)
+	}
+	c := f.Calls()[0]
+	if len(c.Files) != 2 || c.Files[0] != f3 || c.Files[1] != f4 {
+		t.Fatalf("Files = %v, want the two files passed", c.Files)
+	}
+	if string(c.Data[0]) != "old-key" || string(c.Data[1]) != "new-key" {
+		t.Fatalf("Data = %q, want fd 3 old-key and fd 4 new-key", c.Data)
 	}
 }

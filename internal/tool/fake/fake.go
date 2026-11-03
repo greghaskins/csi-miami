@@ -4,6 +4,7 @@ package fake
 
 import (
 	"context"
+	"io"
 	"os"
 	"sync"
 )
@@ -16,9 +17,13 @@ type Reply struct {
 }
 
 // Call is one recorded call. Extra is the number of extra descriptors passed.
+// Files holds the extra files themselves, in order (Files[0] is fd 3), and
+// Data what each one held when the call was made, read at call time.
 type Call struct {
 	Argv  []string
 	Extra int
+	Files []*os.File
+	Data  [][]byte
 }
 
 // Runner answers Replies in order, then Func if set, then success with no
@@ -36,7 +41,12 @@ type Runner struct {
 // Run records the call and returns the next scripted answer.
 func (r *Runner) Run(_ context.Context, argv []string, extra []*os.File) ([]byte, []byte, int, error) {
 	r.mu.Lock()
-	r.calls = append(r.calls, Call{Argv: append([]string(nil), argv...), Extra: len(extra)})
+	r.calls = append(r.calls, Call{
+		Argv:  append([]string(nil), argv...),
+		Extra: len(extra),
+		Files: append([]*os.File(nil), extra...),
+		Data:  readAll(extra),
+	})
 	var rep Reply
 	switch {
 	case r.next < len(r.Replies):
@@ -54,4 +64,19 @@ func (r *Runner) Calls() []Call {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]Call(nil), r.calls...)
+}
+
+// readAll reads each file from its current offset to the end. A file that
+// cannot be read (a write end, a closed file) records nil.
+func readAll(files []*os.File) [][]byte {
+	out := make([][]byte, len(files))
+	for i, f := range files {
+		if f == nil {
+			continue
+		}
+		if b, err := io.ReadAll(f); err == nil {
+			out[i] = b
+		}
+	}
+	return out
 }

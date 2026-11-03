@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // Runner runs one program to completion.
@@ -51,6 +52,7 @@ func (host) Run(ctx context.Context, argv []string, extra []*os.File) ([]byte, [
 	cmd.ExtraFiles = extra
 	// Own process group, so a deadline takes the program's children with it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
