@@ -151,6 +151,59 @@ func TestConnectReturnsUnderDeadlineWhenServerIsSilent(t *testing.T) {
 	}
 }
 
+// earlyDeadline reports a deadline before the moment its Done channel
+// closes, as a context does in the instant between its deadline passing and
+// its timer firing; the socket deadline Connect sets from it fires first.
+type earlyDeadline struct {
+	context.Context
+	at time.Time
+}
+
+func (e earlyDeadline) Deadline() (time.Time, bool) { return e.at, true }
+
+func TestConnectReportsTheContextsDeadlineWhenTheSocketsFiresFirst(t *testing.T) {
+	t.Parallel()
+	_, cli := socketpair(t) // nothing serves the other end
+	inner, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ctx := earlyDeadline{Context: inner, at: time.Now().Add(50 * time.Millisecond)}
+	_, err := handshakeFile(ctx, cli)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("handshake: %v, want DeadlineExceeded", err)
+	}
+	if inner.Err() != nil {
+		t.Fatal("the test did not provoke the race: the context ended before the socket's deadline")
+	}
+}
+
+func TestCtxErrMapping(t *testing.T) {
+	t.Parallel()
+	other := errors.New("other")
+	live := context.Background()
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	past, cancel2 := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel2()
+	for _, c := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want error
+	}{
+		{"live, other error", live, other, other},
+		{"live, socket timeout", live, os.ErrDeadlineExceeded, os.ErrDeadlineExceeded},
+		{"cancelled, other error", done, other, context.Canceled},
+		{"cancelled, socket timeout", done, os.ErrDeadlineExceeded, context.Canceled},
+		{"deadline passed, socket timeout", past, os.ErrDeadlineExceeded, context.DeadlineExceeded},
+		{"deadline passed, success", past, nil, context.DeadlineExceeded},
+		{"live, success", live, nil, nil},
+	} {
+		if got := ctxErr(c.ctx, c.err); !errors.Is(got, c.want) || (c.want == nil && got != nil) {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestConnectRefusesAnExportSmallerThanTheDevice(t *testing.T) {
 	t.Parallel()
 	srv, cli := socketpair(t)

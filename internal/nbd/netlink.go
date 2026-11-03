@@ -168,7 +168,7 @@ func Available() error {
 		}
 		defer func() { _ = c.Close() }()
 		_, err = family(c)
-		return struct{}{}, err
+		return struct{}{}, ctxErr(ctx, err)
 	})
 	return err
 }
@@ -241,10 +241,10 @@ func handshakeFile(ctx context.Context, sock *os.File) (export, error) {
 	stop := context.AfterFunc(ctx, func() { _ = c.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 	e, err := clientHandshake(c)
-	if ctx.Err() != nil {
-		return export{}, ctx.Err()
+	if err = ctxErr(ctx, err); err != nil {
+		return export{}, err
 	}
-	return e, err
+	return e, nil
 }
 
 func dial(ctx context.Context) (*genetlink.Conn, error) {
@@ -282,17 +282,32 @@ func execute(ctx context.Context, cmd uint8, attrs []byte) ([]genetlink.Message,
 	stop := context.AfterFunc(ctx, func() { _ = c.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 	f, err := family(c)
-	if err != nil {
+	if err = ctxErr(ctx, err); err != nil {
 		return nil, err
 	}
 	msgs, err := c.Execute(genetlink.Message{
 		Header: genetlink.Header{Command: cmd, Version: f.Version},
 		Data:   attrs,
 	}, f.ID, netlink.Request|netlink.Acknowledge)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err = ctxErr(ctx, err); err != nil {
+		return nil, err
 	}
-	return msgs, err
+	return msgs, nil
+}
+
+// ctxErr maps the result of a socket call whose only deadlines come from
+// ctx. The socket's deadline is ctx's, and the two timers fire at the same
+// instant in no fixed order, so a socket timeout may be seen while ctx.Err
+// is still nil. Once ctx is done, or its deadline has passed, ctx's error is
+// the answer, whatever the socket reported; otherwise err stands.
+func ctxErr(ctx context.Context, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 // bounded runs fn in its own goroutine and returns its result, or ctx's error
