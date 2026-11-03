@@ -1227,6 +1227,95 @@ Recorded:
 
 Pending: none that block M1.
 
+Decisions 36 to 50 are the M2 design pass, recorded in full with their
+measurements in `2026-11-03-chunk-backed-volumes-design.md`; the one-line
+forms here are the log. Where they contradict a section above, the section's
+text is kept and the decision wins.
+
+36. **The `volume` kind replaces the image item (M2 design, 2026-11-03)**:
+    ext4 over dm-crypt over a chunk-backed nbd device whose live data is on
+    the node and whose point-in-time generations are on the transport. No
+    kernel filesystem is ever stacked over NFS: a loop's flush is an `fsync`
+    of its backing file that waits uninterruptibly on NFS writeback, which the
+    hung-task detector reports past 120 s on a soft mount and which wedges
+    until the server returns on a hard one. The image item of 4.1, 4.4 and
+    section 10 is not built; its one justification, metadata write throughput
+    (a directory on the NAS evaluated pays about 38 ms per file create, a
+    local filesystem does not), is served by the local store. Supersedes the
+    opening of section 1.
+37. **Encryption on by default for every `volume`**, LUKS2 with Adiantum,
+    keyslot rotation and the key over `/dev/fd` as in 4.7; the class-name
+    suffix flips to `-plain` for the exception, and decision 35's `-crypt`
+    token is withdrawn unused.
+38. **No FUSE layer and no second ciphertext format.** A FUSE crypt layer was
+    measured viable over NFS and rejected for a local store (five to fifteen
+    times on metadata-heavy phases); rclone's crypt format was rejected because
+    it cannot rewrite a block in place. Lesson 8's one inherent cost, daemon
+    lifetime across plugin restarts, is recorded with its mitigations (a
+    transient systemd service, or `hostPID`); FUSE is no longer rejected
+    wholesale, it has no use left here. Amends lesson 8 and decision 6's
+    reasoning, not its outcome.
+39. **Generations are the backup unit**: a freeze of milliseconds, a chunk-
+    level copy-on-write boundary in the server's cache, upload of the dirty
+    chunks under their SHA-256 names, a manifest, then `current` by rename;
+    retained by count on the transport. The NAS's file-level incremental mirror
+    then uploads only new chunks, and every restorable state is one the
+    workload could have crashed at. Supersedes 5.1's reasoning (a changing
+    image re-uploads whole) while confirming decision 12.
+40. **Restore needs coreutils and cryptsetup**: verify chunks by name,
+    concatenate in manifest order, `cryptsetup open`, mount. Nothing of the
+    driver's in the path.
+41. **The block server is a transient systemd service** started over the
+    host's private socket, executing a copy of the driver binary placed under
+    the kubelet plugin directory; its lifetime is the volume's stage, its
+    upgrade is the volume's next stage, and the plugin pod can restart freely.
+    No `hostPID`. A node without systemd cannot stage a `volume`.
+42. **nbd, in Go, in the one binary** (`miami blockd`), hot path without
+    allocations, gated by throughput against a loop device on a Pi (within
+    1.5× on every phase of the metadata benchmark); `ublk` with its Rust
+    library is the named fallback and is not built.
+43. **The local cache is deleted at unstage**, after the final generation;
+    returning to a node fetches again. Cache bound and chunk size are class
+    parameters; a cache smaller than the volume runs lazily, and when it fills
+    with unpublishable dirty chunks writes fail rather than block.
+44. **No era target**: the server is the write path and tracks the dirty set
+    itself, persisted in the cache so a restarted server resumes with
+    unpublished data intact.
+45. **Fencing is the holder epoch carried in every manifest** and re-checked
+    against the holder file before `current` is renamed. The ext4 shutdown
+    ioctl and the TCP reset of 4.5 and decision 8 are not built, because
+    nothing a stale holder writes reaches the shared store except through a
+    token-checked publish. The takeover timeout is no longer bound to the NFS
+    major timeout (decision 30's M2 note is moot) and defaults to 5 m. The
+    one-round-trip window of decision 32's kind remains and is documented.
+46. **`noacl` joins the nfs3 profile**: the NAS evaluated answers the NFSv3
+    ACL sideband with EPERM, which makes GNU coreutils `install -m`, `sed -i`
+    and `cp` fail on a directory item. Unlike decisions 30 and 34, a transport
+    mounted without it is adopted, not reported foreign, because its absence
+    breaks nothing the driver fences on; the drift is logged once.
+47. **Backup membership is the export** (decision 12 confirmed by the backup
+    trial): the backed-up export is selected whole, once, since the mirror
+    keeps only the selected folder's basename above it; a scratch export is
+    never selected; holder-file churn costs one small object per run and is
+    accepted.
+48. **Blobs are a layout on a `volume`, not a kind**; 5.3's S3 service is
+    dropped. The application owns the hash, the write-then-rename and the
+    integrity check, and is its namespace's credential gate.
+49. **SMB is closed**: the NAS evaluated offers SMB 3.1.1 without persistent
+    handles or the POSIX extensions; measured, its creates are five times
+    faster than NFSv3 but fsync-per-file is identical, SQLite fails on its
+    first statement, and exec bits, symlinks and FIFOs are lost. Section 8 of
+    the goals document is answered.
+50. **Milestones re-planned**: M2 `volume` RWO with generations, gated by
+    throughput and by an NAS outage e2e with no hung task; M3 RWX by re-export
+    (4.9 with `volume` in the image's place); M4 snapshots and clones from
+    manifests; node-local persistent with `miami move` (5.2) dropped since every
+    volume is mobile; read-only generation followers, encrypted shared
+    directories and lazy fetch outside the server unscheduled. Supersedes
+    section 10.
+
+Pending: none that block M2.
+
 ## 10. Milestones
 
 1. **M1, directory items on NFSv3 and local**: the binary, controller and
