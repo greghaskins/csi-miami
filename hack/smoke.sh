@@ -13,6 +13,12 @@
 # cmd/miami, which runs the node command and drives it over its CSI socket.
 # Each package is built as its own test binary and run in its own namespace.
 #
+# A last step, `tools`, builds the image that would ship (hack/image-build.sh
+# --load, for this machine's architecture) and runs the tools it carries:
+# cryptsetup --version and -V of mkfs.ext4 and e2fsck, and the resize2fs banner, with the image's own entrypoint
+# replaced. It needs docker; without it the step is skipped with a notice,
+# unless SMOKE_REQUIRE_TOOLS=1 (CI sets it), when a missing docker fails.
+#
 # If SMOKE_ARTIFACT_DIR is set, a failing test leaves mountinfo-<test>.txt
 # there: the lines of /proc/self/mountinfo for its own temporary paths, and
 # nothing else.
@@ -66,3 +72,36 @@ for path in internal/mount internal/transport internal/reconcile internal/nbd cm
   unshare --mount --propagation private \
     "$dir/$pkg.test" -test.run '^TestSmoke' -test.v -test.count=1
 done
+
+# The tools step: the image's cryptsetup and e2fsprogs start and report their
+# versions. The image has no shell, so each is the entrypoint of its own run.
+if ! command -v docker >/dev/null 2>&1; then
+  if [ "${SMOKE_REQUIRE_TOOLS:-}" = "1" ]; then
+    echo "smoke: tools step needs docker" >&2
+    exit 1
+  fi
+  echo "smoke: docker not found; skipping the tools step" >&2
+  exit 0
+fi
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+  *) echo "smoke: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+tag="csi-miami-smoke:tools"
+hack/image-build.sh --arch "$arch" --tag "$tag" --load
+# A build from a tree that differs from the index is tagged -dirty.
+if ! docker image inspect "$tag" >/dev/null 2>&1; then
+  tag="${tag}-dirty"
+fi
+docker run --rm --entrypoint /sbin/cryptsetup "$tag" --version
+docker run --rm --entrypoint /sbin/mkfs.ext4 "$tag" -V
+docker run --rm --entrypoint /sbin/e2fsck "$tag" -V
+# resize2fs has no version flag: it prints its banner and then the usage
+# message with a failing status, so the banner is what is checked.
+out="$(docker run --rm --entrypoint /sbin/resize2fs "$tag" 2>&1 || true)"
+echo "$out"
+case "$out" in
+  "resize2fs "[0-9]*) ;;
+  *) echo "smoke: resize2fs did not start from the image" >&2; exit 1 ;;
+esac

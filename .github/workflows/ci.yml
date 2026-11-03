@@ -193,7 +193,9 @@ jobs:
   # The mount, observe, transport, reconcile and node-command packages against the real kernel,
   # natively on each architecture: hack/smoke.sh builds each package's smoke
   # tests and runs them as root under `unshare --mount --propagation
-  # private`, so nothing they mount outlives or escapes them. sudo gets the pinned Go through PATH. A failing
+  # private`, so nothing they mount outlives or escapes them. Its last step
+  # builds the image for the runner's architecture and prints the versions of
+  # the cryptsetup and mkfs.ext4 it carries. sudo gets the pinned Go through PATH. A failing
   # run uploads the mountinfo lines for the test's own temporary paths.
   smoke:
     name: smoke (${{ matrix.arch }})
@@ -220,6 +222,7 @@ jobs:
       - name: Run the smoke tests as root
         env:
           SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/smoke
+          SMOKE_REQUIRE_TOOLS: "1"
         run: sudo -E env "PATH=$PATH" make smoke
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
