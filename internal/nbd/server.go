@@ -43,8 +43,8 @@ const discardChunk = 64 << 10
 // Serve speaks the fixed-newstyle handshake then transmission until
 // NBD_CMD_DISC or ctx ends. It owns conn and closes it when it returns.
 //
-// It returns nil after NBD_CMD_DISC (once the requests before it are
-// answered) or NBD_OPT_ABORT, ctx's error when ctx ends, and an error when
+// It returns nil after NBD_CMD_DISC (once the requests before it are done,
+// whether or not the client stayed to read their replies) or NBD_OPT_ABORT, ctx's error when ctx ends, and an error when
 // the peer breaks the protocol or the connection fails. When ctx ends it
 // closes conn and returns at once, even if the backend is stuck: a request
 // still in the backend is abandoned, and its reply goes nowhere.
@@ -91,6 +91,12 @@ func Serve(ctx context.Context, conn net.Conn, b Backend, o ServeOptions) error 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	// After NBD_CMD_DISC the client owes us nothing: the kernel shuts the
+	// socket down right after sending it, so a reply still in flight may
+	// fail to be written. That ends the session cleanly all the same.
+	if err == nil {
+		return nil
+	}
 	if ferr := s.failure(); ferr != nil {
 		return ferr
 	}
@@ -128,7 +134,10 @@ func (s *session) fail(err error) {
 		s.failed = fmt.Errorf("nbd: write reply: %w", err)
 	}
 	s.fmu.Unlock()
-	_ = s.conn.Close()
+	// The connection is left open: a reply fails because the peer has gone,
+	// which ends the reader's next read too, and a NBD_CMD_DISC the peer sent
+	// before going is still there to be read. The reader stops at the next
+	// request either way.
 }
 
 func (s *session) failure() error {
@@ -140,6 +149,9 @@ func (s *session) failure() error {
 // read is the request loop: one reader, requests handed to the workers.
 func (s *session) read(ctx context.Context) error {
 	for {
+		if ferr := s.failure(); ferr != nil {
+			return ferr
+		}
 		if _, err := io.ReadFull(s.conn, s.rhdr[:]); err != nil {
 			if errors.Is(err, io.EOF) {
 				return fmt.Errorf("nbd: connection closed without NBD_CMD_DISC: %w", io.ErrUnexpectedEOF)
