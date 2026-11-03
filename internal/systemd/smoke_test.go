@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ func smokeManager(t *testing.T) (Manager, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = m.(io.Closer).Close() })
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatal(err)

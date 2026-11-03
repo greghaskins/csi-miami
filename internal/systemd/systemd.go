@@ -16,11 +16,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
@@ -46,7 +50,7 @@ const unitPrefix = "miami-blockd-"
 var unitNameShape = regexp.MustCompile(`^` + unitPrefix + `[a-z0-9][a-z0-9-]*\.service$`)
 
 // dialTimeout bounds the dial in New; the socket is local, so it is long.
-const dialTimeout = 10 * time.Second
+var dialTimeout = 10 * time.Second
 
 // D-Bus error names of the two conditions this package treats as outcomes.
 const (
@@ -78,9 +82,16 @@ type Manager interface {
 	// any other existing unit is, and the error names it.
 	Start(ctx context.Context, u Unit) error
 	// Stop stops the unit and clears its failed state, so systemd forgets
-	// it. A unit systemd does not know is not an error.
+	// it. A unit systemd does not know is not an error. Because units are
+	// created with CollectMode=inactive-or-failed, a unit that crashed has
+	// already been collected, so clearing its failed state is almost always
+	// a no-op.
 	Stop(ctx context.Context, name string) error
-	// State reports the unit's ActiveState, SubState and MainPID.
+	// State reports the unit's ActiveState, SubState and MainPID. Because
+	// units are created with CollectMode=inactive-or-failed, systemd forgets
+	// a crashed unit at once: it reports Present=false, never "failed". A
+	// caller must treat a unit that is absent while its volume is staged as
+	// a crash.
 	State(ctx context.Context, name string) (State, error)
 }
 
@@ -145,66 +156,177 @@ func (b realBus) GetServiceExecStart(ctx context.Context, unit string) ([][]stri
 	return argvs, nil
 }
 
+// manager implements Manager over a bus that re-dials (see redialBus).
 type manager struct{ bus bus }
 
 // New connects to systemd's private socket (DefaultSocket when socket is
 // empty). It returns an error wrapping ErrNoSystemd when the dial fails.
+//
+// The connection is re-dialled once, transparently, when a call finds it
+// closed (a daemon-reexec or a restart of PID 1 drops every client of the
+// private socket). The returned Manager also implements io.Closer; a caller
+// that owns it for a bounded time type-asserts and closes it.
 func New(socket string) (Manager, error) {
 	if socket == "" {
 		socket = DefaultSocket
 	}
-	c, err := sdbus.NewConnection(func() (*godbus.Conn, error) { return dial(socket) })
-	if err != nil {
-		return nil, fmt.Errorf("%w at %s: %v", ErrNoSystemd, socket, err)
+	r := &redialBus{dial: func() (bus, error) {
+		c, err := sdbus.NewConnection(func() (*godbus.Conn, error) { return dial(socket) })
+		if err != nil {
+			return nil, fmt.Errorf("%w at %s: %v", ErrNoSystemd, socket, err)
+		}
+		return realBus{c}, nil
+	}}
+	if _, err := r.current(); err != nil {
+		return nil, err
 	}
-	return &manager{bus: realBus{c}}, nil
+	return &manager{bus: r}, nil
+}
+
+// Close closes the connection. Later calls fail; they do not re-dial.
+func (m *manager) Close() error {
+	m.bus.Close()
+	return nil
+}
+
+// redialBus is a bus over one connection at a time. A call that fails because
+// the connection is closed or its socket is gone replaces the connection with
+// a fresh one and is retried once; a second failure is returned.
+type redialBus struct {
+	dial   func() (bus, error)
+	mu     sync.Mutex
+	cur    bus
+	closed bool
+}
+
+var errManagerClosed = errors.New("systemd: manager closed")
+
+// current returns the live connection, dialling when there is none.
+func (r *redialBus) current() (bus, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, errManagerClosed
+	}
+	if r.cur == nil {
+		b, err := r.dial()
+		if err != nil {
+			return nil, err
+		}
+		r.cur = b
+	}
+	return r.cur, nil
+}
+
+// drop forgets and closes failed, unless another call already replaced it.
+func (r *redialBus) drop(failed bus) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cur == failed {
+		r.cur = nil
+		failed.Close()
+	}
+}
+
+// Close closes the connection and refuses further dials.
+func (r *redialBus) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
+	if r.cur != nil {
+		r.cur.Close()
+		r.cur = nil
+	}
+}
+
+// connLost reports whether err means the connection itself is gone, as
+// opposed to systemd having answered with an error.
+func connLost(err error) bool {
+	return errors.Is(err, godbus.ErrClosed) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
+}
+
+// redo runs f on the live connection and, if the connection was lost, once
+// more on a fresh one. A context that is done is not retried.
+func redo[T any](ctx context.Context, r *redialBus, f func(bus) (T, error)) (T, error) {
+	b, err := r.current()
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	v, err := f(b)
+	if err == nil || !connLost(err) || ctx.Err() != nil {
+		return v, err
+	}
+	r.drop(b)
+	if b, err = r.current(); err != nil {
+		var zero T
+		return zero, err
+	}
+	return f(b)
+}
+
+func (r *redialBus) StartTransientUnitContext(ctx context.Context, name, mode string, props []sdbus.Property, ch chan<- string) (int, error) {
+	return redo(ctx, r, func(b bus) (int, error) { return b.StartTransientUnitContext(ctx, name, mode, props, ch) })
+}
+
+func (r *redialBus) StopUnitContext(ctx context.Context, name, mode string, ch chan<- string) (int, error) {
+	return redo(ctx, r, func(b bus) (int, error) { return b.StopUnitContext(ctx, name, mode, ch) })
+}
+
+func (r *redialBus) ResetFailedUnitContext(ctx context.Context, name string) error {
+	_, err := redo(ctx, r, func(b bus) (struct{}, error) { return struct{}{}, b.ResetFailedUnitContext(ctx, name) })
+	return err
+}
+
+func (r *redialBus) GetUnitPropertiesContext(ctx context.Context, unit string) (map[string]any, error) {
+	return redo(ctx, r, func(b bus) (map[string]any, error) { return b.GetUnitPropertiesContext(ctx, unit) })
+}
+
+func (r *redialBus) GetServiceProperties(ctx context.Context, unit string) (map[string]any, error) {
+	return redo(ctx, r, func(b bus) (map[string]any, error) { return b.GetServiceProperties(ctx, unit) })
+}
+
+func (r *redialBus) GetServiceExecStart(ctx context.Context, unit string) ([][]string, error) {
+	return redo(ctx, r, func(b bus) ([][]string, error) { return b.GetServiceExecStart(ctx, unit) })
 }
 
 // dial opens one authenticated connection to the private socket. The
-// connection lives as long as the manager, so the context that bounds the
-// dial is not the connection's; the dial of a local socket does not hang, and
-// the handshake gets a deadline from the socket itself.
+// connection lives as long as the manager, so no context bounds it; the
+// dial and the handshake share one deadline on the socket itself, which is
+// cleared once the handshake is done, so a wedged PID 1 costs dialTimeout and
+// leaks nothing.
 func dial(socket string) (*godbus.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	type result struct {
-		c   *godbus.Conn
-		err error
+	nc, err := net.DialTimeout("unix", socket, dialTimeout)
+	if err != nil {
+		return nil, err
 	}
-	done := make(chan result, 1)
-	go func() {
-		c, err := godbus.Dial("unix:path=" + socket)
-		if err != nil {
-			done <- result{nil, err}
-			return
-		}
-		// EXTERNAL with the numeric uid: no user lookup. No Hello: PID 1
-		// serves this socket directly, with no bus daemon behind it.
-		if err := c.Auth([]godbus.Auth{godbus.AuthExternal(strconv.Itoa(os.Getuid()))}); err != nil {
-			_ = c.Close()
-			done <- result{nil, err}
-			return
-		}
-		done <- result{c, nil}
-	}()
-	select {
-	case r := <-done:
-		return r.c, r.err
-	case <-ctx.Done():
-		// The dial is abandoned, never joined; if it finishes later, the
-		// goroutine below closes what it produced.
-		go func() {
-			if r := <-done; r.c != nil {
-				_ = r.c.Close()
-			}
-		}()
-		return nil, fmt.Errorf("dial %s: %w", socket, ctx.Err())
+	if err := nc.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
+		_ = nc.Close()
+		return nil, err
 	}
+	c, err := godbus.NewConn(nc)
+	if err != nil {
+		_ = nc.Close()
+		return nil, err
+	}
+	// EXTERNAL with the numeric uid: no user lookup. No Hello: PID 1 serves
+	// this socket directly, with no bus daemon behind it.
+	if err := c.Auth([]godbus.Auth{godbus.AuthExternal(strconv.Itoa(os.Getuid()))}); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := nc.SetDeadline(time.Time{}); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
 }
 
-// properties are the transient unit's properties. ExecStart is not "unclean
-// is failure": a block server that is killed by the kernel's OOM handling is
-// restarted by the reconciler, which reads State.
+// properties are the transient unit's properties. The bool of PropExecStart
+// is systemd's ignore-failure flag: false means a non-zero exit counts as a
+// failure.
 func properties(u Unit) []sdbus.Property {
 	return []sdbus.Property{
 		sdbus.PropType("simple"),
