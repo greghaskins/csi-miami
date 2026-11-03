@@ -30,7 +30,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,7 +50,9 @@ var (
 	ErrBoundaryActive = errors.New("cache: a boundary is already active")
 )
 
-const flushDelay = 100 * time.Millisecond
+// flushDelay is how long index changes are batched; a variable so tests can
+// hold the timer back to simulate a crash inside the window.
+var flushDelay = 100 * time.Millisecond
 
 // Cache is a node-local chunk cache. See the package comment.
 type Cache struct {
@@ -128,6 +129,13 @@ func Create(dir string, idx Index, bound int64) (*Cache, error) {
 	if _, err := os.Stat(filepath.Join(dir, indexName)); err == nil {
 		return nil, fmt.Errorf("cache: %s already holds a cache: %w", dir, os.ErrExist)
 	}
+	// With no index, anything under c/ and b/ is a leftover (an interrupted
+	// Remove, say) and must not be adopted as chunks of this cache.
+	for _, d := range []string{"c", "b"} {
+		if err := os.RemoveAll(filepath.Join(dir, d)); err != nil {
+			return nil, err
+		}
+	}
 	for _, d := range []string{dir, filepath.Join(dir, "c"), filepath.Join(dir, "b")} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, err
@@ -189,11 +197,6 @@ func (c *Cache) scanChunks() error {
 	if err != nil {
 		return err
 	}
-	type resident struct {
-		i uint32
-		t time.Time
-	}
-	var clean []resident
 	n := chunkCount(c.idx.Size, c.idx.Chunk)
 	seen := map[uint32]struct{}{}
 	for _, e := range entries {
@@ -222,7 +225,10 @@ func (c *Cache) scanChunks() error {
 		case isDirty:
 			seen[i] = struct{}{}
 		default:
-			clean = append(clean, resident{i, fi.ModTime()})
+			// Not in the index: either a clean copy or a write whose index
+			// update a crash beat to disk. Only the index is trusted, so a
+			// resumed cache starts cold for clean data.
+			_ = os.Remove(path)
 		}
 	}
 	for v := range c.dirty {
@@ -232,10 +238,6 @@ func (c *Cache) scanChunks() error {
 		if _, ok := seen[v]; !ok {
 			return fmt.Errorf("%w: dirty chunk %d has no file", ErrCorrupt, v)
 		}
-	}
-	sort.Slice(clean, func(a, b int) bool { return clean[a].t.After(clean[b].t) })
-	for _, r := range clean {
-		c.clean.addOldest(r.i)
 	}
 	return nil
 }
@@ -610,7 +612,6 @@ func (c *Cache) ClearBoundary(published bool) {
 				continue
 			}
 			delete(c.dirty, i)
-			delete(c.unsynced, i)
 			if _, isZero := c.zero[i]; isZero {
 				delete(c.zero, i)
 				continue
@@ -642,14 +643,24 @@ func (c *Cache) MarkZero(i uint32) error {
 	if err := c.cowLocked(i); err != nil {
 		return err
 	}
+	// Record Zero durably before the file goes: a crash between the two
+	// would otherwise leave a dirty chunk with no file and no Zero flag.
+	_, wasDirty := c.dirty[i]
+	c.dirty[i] = struct{}{}
+	c.zero[i] = struct{}{}
+	c.idxDirty = true
+	if err := c.flushLocked(); err != nil {
+		delete(c.zero, i)
+		if !wasDirty {
+			delete(c.dirty, i)
+		}
+		return err
+	}
 	if err := os.Remove(c.cpath(i)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	c.clean.remove(i)
 	delete(c.unsynced, i)
-	c.dirty[i] = struct{}{}
-	c.zero[i] = struct{}{}
-	c.markIndexLocked()
 	return nil
 }
 

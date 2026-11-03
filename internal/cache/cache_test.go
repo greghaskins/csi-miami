@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 const testChunk = 8192
@@ -409,19 +410,14 @@ func TestResumeAfterCrash(t *testing.T) {
 	if !equalU32(d.Index().Dirty, []uint32{1, 2, 4}) || !equalU32(d.Index().Zero, []uint32{4}) {
 		t.Fatalf("index: %+v", d.Index())
 	}
-	if !bytes.Equal(mustRead(t, d, 2), fill(2)) || !d.Has(3) {
-		t.Fatal("chunks not resumed")
+	if !bytes.Equal(mustRead(t, d, 2), fill(2)) {
+		t.Fatal("dirty chunk not resumed")
+	}
+	if d.Has(3) {
+		t.Fatal("a resumed cache must start cold for clean data")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "c", ".9.tmp")); !os.IsNotExist(err) {
 		t.Fatal("temporary file survived Open")
-	}
-	// the resumed clean chunk is evictable
-	d.bound = 3 * testChunk
-	if err := d.Insert(6, fill(6)); err != nil {
-		t.Fatal(err)
-	}
-	if d.Has(3) {
-		t.Fatal("resumed clean chunk not evicted")
 	}
 }
 
@@ -436,7 +432,7 @@ func TestIndexFlushesWithoutSync(t *testing.T) {
 
 func TestDirectIOAlignment(t *testing.T) {
 	// A directory on the worktree's own filesystem; tmpfs refuses O_DIRECT.
-	dir, err := os.MkdirTemp(".", "direct-")
+	dir, err := os.MkdirTemp(".", "direct-") // ignored by .gitignore
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,5 +545,125 @@ func TestSetBase(t *testing.T) {
 	defer func() { _ = d.Close() }()
 	if i := d.Index(); i.Base != "1.2" || i.Epoch != 1 {
 		t.Fatalf("%+v", i)
+	}
+}
+
+// crashCopy snapshots dir as a crash would leave it: whatever is on disk now,
+// with no Close, Sync or pending timer applied.
+func crashCopy(t *testing.T, dir string) string {
+	t.Helper()
+	dst := filepath.Join(t.TempDir(), "crashed")
+	err := filepath.Walk(dir, func(p string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		if fi.IsDir() {
+			return os.MkdirAll(filepath.Join(dst, rel), 0o700)
+		}
+		b, err := os.ReadFile(p) //nolint:gosec // test path
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dst, rel), b, 0o600) //nolint:gosec // test path
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dst
+}
+
+func holdFlush(t *testing.T) {
+	t.Helper()
+	old := flushDelay
+	flushDelay = time.Hour
+	t.Cleanup(func() { flushDelay = old })
+}
+
+func TestCrashBeforeIndexFlushLosesWriteNotStaleClean(t *testing.T) {
+	holdFlush(t)
+	c, dir := tmpCache(t, 1<<30)
+	if err := c.Insert(3, fill(3)); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, c, 3, 9) // clean-resident chunk rewritten; index not yet flushed
+	d, err := Open(crashCopy(t, dir), 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	if d.Has(3) {
+		t.Fatal("unindexed chunk file adopted as clean")
+	}
+	if err := d.Read(3, AlignedBuffer(testChunk)); !errors.Is(err, ErrMiss) {
+		t.Fatalf("Read = %v, want ErrMiss", err)
+	}
+}
+
+func TestCrashAfterMarkZeroReopensAndReadsZeros(t *testing.T) {
+	holdFlush(t)
+	c, dir := tmpCache(t, 1<<30)
+	mustWrite(t, c, 2, 2)
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.MarkZero(2); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(crashCopy(t, dir), 1<<30)
+	if err != nil {
+		t.Fatalf("Open after crash: %v", err)
+	}
+	defer func() { _ = d.Close() }()
+	if !bytes.Equal(mustRead(t, d, 2), make([]byte, testChunk)) {
+		t.Fatal("trimmed chunk not zero after crash")
+	}
+}
+
+func TestPublishedChunkKeepsFsyncObligation(t *testing.T) {
+	c, _ := tmpCache(t, 1<<30)
+	mustWrite(t, c, 1, 1)
+	if _, err := c.SetBoundary(); err != nil {
+		t.Fatal(err)
+	}
+	c.ClearBoundary(true)
+	if _, ok := c.unsynced[1]; !ok {
+		t.Fatal("published chunk dropped from the unsynced set before its bytes were fsynced")
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.unsynced) != 0 {
+		t.Fatal("Sync left obligations")
+	}
+}
+
+func TestCreateIgnoresLeftoverFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cache")
+	for _, d := range []string{"c", "b"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, d, "5"), fill(7), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := Create(dir, Index{Volume: "v", Size: 16 * testChunk, Chunk: testChunk}, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Open(dir, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	if d.Has(5) {
+		t.Fatal("leftover chunk adopted")
+	}
+	if err := d.Read(5, AlignedBuffer(testChunk)); !errors.Is(err, ErrMiss) {
+		t.Fatalf("Read = %v", err)
 	}
 }

@@ -24,14 +24,6 @@ func (l *lru) touch(i uint32) {
 	l.where[i] = l.order.PushFront(i)
 }
 
-// addOldest adds i at the least recently used end (used when resuming, where
-// recency is unknown).
-func (l *lru) addOldest(i uint32) {
-	if _, ok := l.where[i]; !ok {
-		l.where[i] = l.order.PushBack(i)
-	}
-}
-
 func (l *lru) remove(i uint32) {
 	if e, ok := l.where[i]; ok {
 		l.order.Remove(e)

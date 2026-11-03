@@ -5,3 +5,6 @@
 /bin/
 coverage.out
 *.tar
+
+# Scratch directory made by the direct-I/O cache test.
+/internal/cache/direct-*/
