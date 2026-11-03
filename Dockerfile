@@ -16,10 +16,10 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /miami ./cmd/miami
 
-# alpine:3.24. Built for the target architecture, natively:
+# alpine:3.24, pinned by digest. Built for the target architecture, natively:
 # the tools are dynamically linked and are copied together with their
 # libraries, so they must be the ones this stage can run `ldd` on.
-FROM alpine:3.24 AS tools
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS tools
 RUN apk add --no-cache cryptsetup e2fsprogs
 COPY hack/image-closure.sh /image-closure.sh
 RUN /image-closure.sh /closure /sbin/cryptsetup /sbin/mkfs.ext4 /sbin/e2fsck /sbin/resize2fs
