@@ -36,9 +36,8 @@ implemented in-repo (the one maintained Go library lacks flush, trim and FUA).
 - Nothing environment-specific enters the repository (working mode section
   5): no hostnames, addresses, export paths, node names, backup targets,
   prior project names. Node names in tests are `kind-worker` and friends.
-- Commit messages: imperative subject, a body that says why, exactly one
-  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` line, never a
-  session link. PR text is scanned; it says what changed and what was verified.
+- Commit messages: imperative subject, a body that says why, no
+  co-author trailer and never a session link (secret scanning rejects both). PR text is scanned; it says what changed and what was verified.
 - One branch, one PR: every task is a branch `m2/tNN-<slug>` from `m2/design`
   (or from an unmerged predecessor when a wave needs it, said in the merge
   message), merged into `m2/design` with a merge commit by the orchestrator
@@ -375,7 +374,7 @@ at the first error, which maps to a condition:
 | 1 | prerequisites | `nbd.Available`, `/dev/mapper/control`, an AF_ALG bind of `adiantum(xchacha12,aes)` succeeds, systemd socket dials, cache dir writable | nothing; refuse | `prerequisite-missing` (`FailedPrecondition`) |
 | 2 | holder | `holder.Read` | `Acquire` with the reconciler's `Judgement`; renew on every pass | `holder-contended` (`Unavailable`) |
 | 3 | binary | `<bin-dir>/miami-<hash>` present and same size | copy `/proc/self/exe`, temp and rename, mode 0755 | internal |
-| 4 | unit and device | `systemd.State` active and `nbd.Devices` has one with `Backend == volume` and `Pid == MainPID` | start the unit with `blockd` args (3.4); wait for the device under the deadline | `server-down` (`Unavailable`) |
+| 4 | unit and device | `systemd.State` active, `nbd.Devices` has one with `Backend == volume`, and the control socket's `Status` names that device (decision 51: sysfs `pid` is not liveness) | start the unit with `blockd` args (3.4); blockd reconfigures an existing device or connects a new one; wait for `Status` under the deadline | `server-down` (`Unavailable`) |
 | 5 | LUKS mapping | `/sys/block/dm-*/dm/name == crypt.Name(volume)` | `IsLUKS` false and no `current`: `Format`; then `Open` with the request's key; `ErrBadKey` and a `previousKey` that opens: `Rotate(previous, key)` then `Open` (one chunk re-uploads at the next generation); no key in hand: `key-required` | `key-required` (`FailedPrecondition`), `bad-key` |
 | 6 | filesystem and mount | mountinfo at the stage path, source the mapper (or the nbd device when plain) | `Fsck`; `Mkfs` when the device has no superblock (first stage); mount `ext4` with `MountOptions`, `nosuid,nodev` | `failed` on fsck >= 4 |
 | 7 | size | `BLKGETSIZE64` of the mapper vs `in.Volume.Size` | `Client.Grow`, `crypt.Resize`, `ext4.Resize` | internal |

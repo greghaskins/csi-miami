@@ -651,6 +651,25 @@ Appended to the brief's log as 36 to 50; the brief's numbering continues.
     `miami move` dropped; read-only generation followers, encrypted shared
     directories and lazy fetch through anything but the server itself
     unscheduled.
+51. **A restarted block server re-points the same device** (supersedes the
+    recovery shape of 41). A new `miami blockd` for a volume whose nbd device
+    still exists (matched by backend identifier) does not connect a new
+    device: it sends `NBD_CMD_RECONFIGURE` with the new socket and the same
+    backend identifier, and no size attributes (a size change notifies a
+    uevent). The device, the dm-crypt mapping and the ext4 mount survive, so
+    a restart needs no pod deletion, no `e2fsck` and no key. Read from the
+    kernel source (v6.8 and v7.0, identical here): the kernel takes a socket
+    only into a slot already marked dead, which the receive thread does at
+    once on EOF; a reconfigure with no dead slot returns success and drops
+    the socket, so the server confirms the device is served by its own
+    socket (a read through the device reaching it) before it reports ready.
+    Requests arriving while the connection is dead wait up to the
+    dead-connection timeout (60 s by default) and then fail with EIO; the
+    unit restarts the server well inside it. The sysfs `pid` keeps the
+    connecting process's pid across a reconfigure, so it is not a liveness
+    signal: liveness is the unit's main process answering on the volume's
+    control socket. A server stopping on request (unstage) still disconnects
+    the device; a live binary upgrade is possible on this path and not built.
 
 ## 7. Milestones
 
