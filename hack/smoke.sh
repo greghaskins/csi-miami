@@ -10,6 +10,9 @@
 # in internal/reconcile, which runs the node reconciler on a real local
 # transport, in internal/nbd, which serves a device through the kernel's nbd
 # module (loaded below) and drives it with dd and blkdiscard, in
+# internal/blockd, which runs the block server as a child process over a real
+# nbd device, mkfs/mounts ext4 on it and kills and restarts it to prove
+# crash-resume, in
 # internal/systemd, which starts transient units on the host's systemd, and in
 # internal/crypt and internal/ext4, which run the LUKS2 and ext4 tools on loop
 # devices, and in cmd/miami, which runs the node command and drives it over
@@ -66,7 +69,7 @@ fi
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-for path in internal/prereq internal/mount internal/transport internal/reconcile internal/nbd internal/systemd internal/crypt internal/ext4 cmd/miami; do
+for path in internal/prereq internal/mount internal/transport internal/reconcile internal/nbd internal/blockd internal/systemd internal/crypt internal/ext4 cmd/miami; do
   pkg="$(basename "$path")"
   go test -c -tags smoke -o "$dir/$pkg.test" "./$path"
 

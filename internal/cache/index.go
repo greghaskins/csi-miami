@@ -42,6 +42,11 @@ const (
 // inconsistent.
 var ErrCorrupt = errors.New("cache: corrupt index")
 
+// ErrNotResident is returned by WriteAt for a sub-range write to a chunk that is
+// not resident and whose base was neither supplied nor declared zero: the cache
+// refuses to invent a zero base. The caller fetches the base and retries.
+var ErrNotResident = errors.New("cache: chunk is not resident; supply its base")
+
 func (i Index) clone() Index {
 	i.Dirty = cloneU32(i.Dirty)
 	i.Zero = cloneU32(i.Zero)
