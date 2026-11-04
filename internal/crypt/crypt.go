@@ -77,8 +77,13 @@ func Format(ctx context.Context, r tool.Runner, dev string, key []byte, p Params
 }
 
 // Open maps dev as name using key. A wrong key is ErrBadKey.
+//
+// The volume key is stored in the dm-crypt table rather than in the kernel
+// keyring (--disable-keyring). With a keyring key, cryptsetup resize asks for
+// a passphrase to reload it, and a node-side expand has none; with the key in
+// the table, resize reuses it, which is what Resize relies on.
 func Open(ctx context.Context, r tool.Runner, dev, name string, key []byte) error {
-	argv := []string{"cryptsetup", "open", "--type", "luks2", "--key-file", "/dev/fd/3", dev, name}
+	argv := []string{"cryptsetup", "open", "--type", "luks2", "--disable-keyring", "--key-file", "/dev/fd/3", dev, name}
 	return run(ctx, r, "open", argv, key)
 }
 
