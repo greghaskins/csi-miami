@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -22,6 +23,108 @@ const (
 	shutdownTimeout = 30 * time.Second
 )
 
+// confirmAttempt is how long a reconfigure is given to show a request on the
+// new socket before it is issued again, and confirmBudget the whole of it. The
+// budget stays well inside the device's dead-connection timeout (60 s by
+// default), after which requests held for the dead connection fail with EIO.
+// Variables so tests can shorten them.
+var (
+	confirmAttempt = 3 * time.Second
+	confirmBudget  = 15 * time.Second
+)
+
+// kernelAPI is the nbd kernel interface Run needs; the kernel in production, a
+// fake in tests.
+type kernelAPI interface {
+	devices() ([]nbd.Device, error)
+	// connect creates a device on sock (which has not been through the
+	// handshake) and returns its index.
+	connect(ctx context.Context, cfg Config, sock *os.File) (int, error)
+	// reconnect hands sock, already through the handshake, to the device.
+	reconnect(ctx context.Context, idx int, sock *os.File) error
+	disconnect(ctx context.Context, idx int) error
+	// touch sends one request through the device to offset 0 and returns
+	// once it completes. b is the backend that serves the device's socket;
+	// the kernel reaches it over the socket, a fake may call it directly.
+	touch(ctx context.Context, idx int, b nbd.Backend) error
+}
+
+// realKernel is the host's nbd.
+type realKernel struct{ sysfs string }
+
+func (r realKernel) devices() ([]nbd.Device, error) { return nbd.Devices(r.sysfs) }
+
+func (realKernel) connect(ctx context.Context, cfg Config, sock *os.File) (int, error) {
+	return nbd.Connect(ctx, sock, nbd.ConnectOptions{
+		Index:           -1,
+		Size:            cfg.Size,
+		BlockSize:       blockSize,
+		Timeout:         cfg.Timeout,
+		DeadConnTimeout: cfg.DeadConnTimeout,
+		ServerFlags:     serverFlags(cfg.ReadOnly),
+		Backend:         cfg.Volume,
+	})
+}
+
+func (realKernel) reconnect(ctx context.Context, idx int, sock *os.File) error {
+	return nbd.ReconnectSocket(ctx, idx, sock)
+}
+
+func (realKernel) disconnect(ctx context.Context, idx int) error { return nbd.Disconnect(ctx, idx) }
+
+// touch reads one block at offset 0 of /dev/nbdN with O_DIRECT, so the read
+// goes to the server rather than the page cache. The read blocks while the
+// connection is dead, and cannot be interrupted; ctx only stops it starting.
+func (realKernel) touch(ctx context.Context, idx int, _ nbd.Backend) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	fd, err := unix.Open(fmt.Sprintf("/dev/nbd%d", idx), unix.O_RDONLY|unix.O_DIRECT|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("blockd: open nbd%d: %w", idx, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	// O_DIRECT wants an aligned buffer; an anonymous mapping is page-aligned.
+	buf, err := unix.Mmap(-1, 0, blockSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	if err != nil {
+		return fmt.Errorf("blockd: map read buffer: %w", err)
+	}
+	defer func() { _ = unix.Munmap(buf) }()
+	if _, err := unix.Pread(fd, buf, 0); err != nil {
+		return fmt.Errorf("blockd: read nbd%d: %w", idx, err)
+	}
+	return nil
+}
+
+// notifyBackend marks the first request that reaches the serving side. A
+// reconfigure the kernel dropped sends nothing to the new socket, so a request
+// arriving on it is the proof that the device is served by this process.
+type notifyBackend struct {
+	nbd.Backend
+	served chan struct{}
+	once   sync.Once
+}
+
+func newNotifyBackend(b nbd.Backend) *notifyBackend {
+	return &notifyBackend{Backend: b, served: make(chan struct{})}
+}
+
+func (n *notifyBackend) mark() { n.once.Do(func() { close(n.served) }) }
+
+func (n *notifyBackend) ReadAt(p []byte, off int64) (int, error) {
+	n.mark()
+	return n.Backend.ReadAt(p, off)
+}
+
+func (n *notifyBackend) WriteAt(p []byte, off int64, fua bool) (int, error) {
+	n.mark()
+	return n.Backend.WriteAt(p, off, fua)
+}
+
+func (n *notifyBackend) Flush() error { n.mark(); return n.Backend.Flush() }
+
+func (n *notifyBackend) Trim(off, nn int64) error { n.mark(); return n.Backend.Trim(off, nn) }
+
 // kernelDevice is the real nbd device.
 type kernelDevice struct{ idx int }
 
@@ -32,11 +135,30 @@ func (k kernelDevice) reconfigure(ctx context.Context, size int64) error {
 func (k kernelDevice) disconnect(ctx context.Context) error { return nbd.Disconnect(ctx, k.idx) }
 
 // Run is the whole block-server program: open or create the cache (resuming
-// from its index after a crash, else building from current), connect an nbd
-// device backed by it, serve control RPCs, and prefetch the current manifest
-// when the whole volume fits the cache. It returns nil after a Stop RPC or a
-// cancelled ctx, having disconnected the device and synced the cache.
+// from its index after a crash, else building from current), put an nbd device
+// on it, serve control RPCs, and prefetch the current manifest when the whole
+// volume fits the cache. The device is a new one, unless a configured device
+// already carries this volume's name: a server that crashed left it, with its
+// mapping and mount, and this one re-points it at its own socket (decision 51).
+// It returns nil after a Stop RPC or a cancelled ctx, having disconnected the
+// device and synced the cache. A server that cannot take over a left device
+// returns an error and leaves the device alone.
 func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
+	return runOn(ctx, cfg, log, realKernel{sysfs: "/sys"})
+}
+
+func runOn(ctx context.Context, cfg Config, log *slog.Logger, k kernelAPI) error {
+	cfg = cfg.withDefaults()
+	left, err := leftDevice(k, cfg.Volume)
+	if err != nil {
+		return err
+	}
+	if left != nil {
+		// The device may have been grown after this unit's arguments were written.
+		if cfg, err = adoptDeviceSize(cfg, *left); err != nil {
+			return err
+		}
+	}
 	s, err := newServer(ctx, cfg, log)
 	if err != nil {
 		return err
@@ -53,33 +175,53 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 
 	srvConn, cliFile, err := socketpair()
 	if err != nil {
+		_ = lis.Close()
 		return err
+	}
+	var back nbd.Backend = s.back
+	var notify *notifyBackend
+	if left != nil {
+		notify = newNotifyBackend(s.back)
+		back = notify
 	}
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- nbd.Serve(runCtx, srvConn, s.back, nbd.ServeOptions{
+		serveErr <- nbd.Serve(runCtx, srvConn, back, nbd.ServeOptions{
 			ReadOnly: s.cfg.ReadOnly, BlockSize: blockSize, MaxRequest: maxRequest,
 		})
 	}()
 
-	idx, err := connectDevice(ctx, s.cfg, cliFile)
+	// The control service answers from here on, with Status.Index -1 until the
+	// device is known to be served by this process.
+	ctlErr := make(chan error, 1)
+	go func() { ctlErr <- s.serveControl(runCtx, lis) }()
+
+	var idx int
+	path := "connect"
+	if left == nil {
+		idx, err = connectDevice(ctx, k, s.cfg, cliFile)
+	} else {
+		path = "reconfigure"
+		idx = left.Index
+		err = reconfigureDevice(ctx, k, s.cfg, idx, cliFile, notify)
+	}
 	_ = cliFile.Close() // the kernel holds its own reference
 	if err != nil {
 		cancel()
 		if serr := <-serveErr; serr != nil {
 			log.Warn("serve ended", "volume", s.cfg.Volume, "err", serr)
 		}
+		if cerr := <-ctlErr; cerr != nil {
+			log.Warn("control ended", "volume", s.cfg.Volume, "err", cerr)
+		}
 		return err
 	}
 	s.setDevice(kernelDevice{idx: idx})
-	log.Info("blockd serving", "volume", s.cfg.Volume, "device", idx, "size", s.cfg.Size, "binaryHash", s.binaryHash)
+	log.Info("blockd serving", "volume", s.cfg.Volume, "path", path, "device", idx, "size", s.cfg.Size, "binaryHash", s.binaryHash)
 
 	if s.cfg.CacheBound >= s.cfg.Size {
 		go s.back.prefetch(runCtx)
 	}
-
-	ctlErr := make(chan error, 1)
-	go func() { ctlErr <- s.serveControl(runCtx, lis) }()
 
 	var serveDied error
 	select {
@@ -98,7 +240,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 
 	dctx, dcancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer dcancel()
-	if err := nbd.Disconnect(dctx, idx); err != nil {
+	if err := k.disconnect(dctx, idx); err != nil {
 		log.Warn("disconnect failed", "volume", s.cfg.Volume, "device", idx, "err", err)
 	}
 	if serveDied == nil {
@@ -127,31 +269,109 @@ func serverFlags(readOnly bool) uint64 {
 	return f
 }
 
-// connectDevice connects the device to the serving end of the socket pair. A
+// leftDevice finds the device a crashed server of this volume left: configured
+// (a nonzero pid) with the volume's name as its backend identifier. It returns
+// nil when there is none, and an error when there are several, which are not
+// ours to choose between.
+func leftDevice(k kernelAPI, volume string) (*nbd.Device, error) {
+	devs, err := k.devices()
+	if err != nil {
+		return nil, fmt.Errorf("blockd: list nbd devices: %w", err)
+	}
+	var found []nbd.Device
+	for _, d := range devs {
+		if d.Backend == volume && d.Pid != 0 {
+			found = append(found, d)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return nil, nil
+	case 1:
+		return &found[0], nil
+	}
+	idxs := make([]int, len(found))
+	for i, d := range found {
+		idxs[i] = d.Index
+	}
+	return nil, fmt.Errorf("blockd: volume %q is on several nbd devices %v; refusing to choose", volume, idxs)
+}
+
+// adoptDeviceSize returns cfg with the size of a device left by a previous
+// server. A device can have been grown after this unit's arguments were
+// written, so it may be larger than cfg.Size: then the larger size is served,
+// which a cache index that recorded the growth already says (the server grows
+// one that did not). A device smaller than cfg.Size cannot serve it, and a
+// size that is not whole chunks cannot be served at all: both are refused.
+func adoptDeviceSize(cfg Config, d nbd.Device) (Config, error) {
+	switch {
+	case d.Size < cfg.Size:
+		return cfg, fmt.Errorf("blockd: nbd%d is %d bytes, smaller than the configured %d", d.Index, d.Size, cfg.Size)
+	case cfg.Chunk <= 0 || d.Size%cfg.Chunk != 0:
+		return cfg, fmt.Errorf("blockd: nbd%d is %d bytes, not a whole number of %d byte chunks", d.Index, d.Size, cfg.Chunk)
+	}
+	cfg.Size = d.Size
+	return cfg, nil
+}
+
+// connectDevice connects a new device to the serving end of the socket pair. A
 // Connect cut off by its context may still have created the device, so on an
 // error it looks for a device THIS process created and disconnects it before
 // returning the error.
-func connectDevice(ctx context.Context, cfg Config, cliFile *os.File) (int, error) {
+func connectDevice(ctx context.Context, k kernelAPI, cfg Config, cliFile *os.File) (int, error) {
 	cctx, ccancel := context.WithTimeout(ctx, connectTimeout)
 	defer ccancel()
-	idx, err := nbd.Connect(cctx, cliFile, nbd.ConnectOptions{
-		Index:           -1,
-		Size:            cfg.Size,
-		BlockSize:       blockSize,
-		Timeout:         cfg.Timeout,
-		DeadConnTimeout: cfg.DeadConnTimeout,
-		ServerFlags:     serverFlags(cfg.ReadOnly),
-		Backend:         cfg.Volume,
-	})
+	idx, err := k.connect(cctx, cfg, cliFile)
 	if err != nil {
-		if d, ok := findOurDevice(cfg.Volume); ok {
+		if d, ok := findOurDevice(k, cfg.Volume); ok {
 			dctx, dcancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			defer dcancel()
-			_ = nbd.Disconnect(dctx, d.Index)
+			_ = k.disconnect(dctx, d.Index)
 		}
 		return -1, fmt.Errorf("blockd: connect device: %w", err)
 	}
 	return idx, nil
+}
+
+// reconfigureDevice re-points the left device at cliFile and confirms the
+// kernel took it. The kernel puts a new socket only into a connection slot
+// already marked dead, which the receive thread does the moment the old server
+// dies; with none it reports success and drops the socket. So after each
+// reconfigure it waits for a request to reach the served backend (a read
+// through the device, started once, is held by the dead connection and resent
+// on the new socket), and issues the reconfigure again if none does. It
+// returns an error when confirmBudget passes, never having disconnected: the
+// device carries a live mount, and the unit will start us again.
+func reconfigureDevice(ctx context.Context, k kernelAPI, cfg Config, idx int, cliFile *os.File, n *notifyBackend) error {
+	bctx, cancel := context.WithTimeout(ctx, confirmBudget)
+	defer cancel()
+	// The handshake runs once: the serve loop is past it after this.
+	if err := nbd.Handshake(bctx, cliFile, cfg.Size); err != nil {
+		return fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
+	}
+	probeCtx, stopProbe := context.WithCancel(bctx)
+	defer stopProbe()
+	go func() { _ = k.touch(probeCtx, idx, n) }()
+	for {
+		if err := k.reconnect(bctx, idx, cliFile); err != nil {
+			return fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
+		}
+		t := time.NewTimer(confirmAttempt)
+		select {
+		case <-n.served:
+			t.Stop()
+			return nil
+		case <-t.C:
+		case <-bctx.Done():
+			t.Stop()
+			select {
+			case <-n.served:
+				return nil
+			default:
+			}
+			return fmt.Errorf("blockd: reconfigure nbd%d: no request reached this server within %s; the device is left in place: %w", idx, confirmBudget, bctx.Err())
+		}
+	}
 }
 
 // findOurDevice finds a configured device this process created: the backend
@@ -159,8 +379,8 @@ func connectDevice(ctx context.Context, cfg Config, cliFile *os.File) (int, erro
 // After a crash the dead device keeps the same backend string, so matching the
 // name alone could pick another incarnation's corpse — still carrying its
 // dm-crypt mapping and mount — and disconnect it. The pid check (I3) avoids it.
-func findOurDevice(name string) (nbd.Device, bool) {
-	devs, err := nbd.Devices("/sys")
+func findOurDevice(k kernelAPI, name string) (nbd.Device, bool) {
+	devs, err := k.devices()
 	if err != nil {
 		return nbd.Device{}, false
 	}

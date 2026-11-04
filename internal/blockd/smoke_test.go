@@ -148,16 +148,29 @@ func dialWait(t *testing.T, control string) *Client {
 // tell a live device from a killed incarnation's dead-but-still-configured one.
 func deviceFor(t *testing.T, cli *Client) string {
 	t.Helper()
+	return fmt.Sprintf("/dev/nbd%d", deviceIndex(t, cli))
+}
+
+// deviceIndex waits for the server to report a served device (Status.Index is
+// -1 until the kernel is known to be using the server's socket) and returns it.
+func deviceIndex(t *testing.T, cli *Client) int {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	st, err := cli.Status(ctx)
-	if err != nil {
-		t.Fatalf("status: %v", err)
+	for {
+		st, err := cli.Status(ctx)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if st.Index >= 0 {
+			return st.Index
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("server reports no device: %+v", st)
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	if st.Index < 0 {
-		t.Fatalf("server reports no device: %+v", st)
-	}
-	return fmt.Sprintf("/dev/nbd%d", st.Index)
 }
 
 func TestSmokeBlockdServesAndResumes(t *testing.T) {
@@ -216,13 +229,14 @@ func TestSmokeBlockdServesAndResumes(t *testing.T) {
 	}
 	_ = cmd.Wait()
 
-	// Second incarnation: resume from the cache index, remount, data present. A
-	// kill -9 leaves the first device configured-but-dead until its dead-conn
-	// timeout, so the resume lands on a different index; Status names the live
-	// one, which a scan by backend name would not distinguish from the corpse.
+	// Second incarnation: resume from the cache index, remount, data present.
+	// A kill -9 leaves the first device configured but dead; the new server
+	// re-points that same device (decision 51) rather than connecting another.
 	startChild(t, store, cache, control, epoch)
 	cli = dialWait(t, control)
-	dev = deviceFor(t, cli)
+	if dev2 := deviceFor(t, cli); dev2 != dev {
+		t.Fatalf("restart moved the volume from %s to %s", dev, dev2)
+	}
 	mountExt4(t, dev, mnt)
 	readFiles(t, mnt, want)
 
@@ -396,3 +410,109 @@ func verifyStore(t *testing.T, storeDir string) {
 type blackHole struct{}
 
 func (blackHole) Write(p []byte) (int, error) { return len(p), nil }
+
+// A server killed with a filesystem mounted on its device is replaced by a new
+// one that re-points the same device: the mount stays, a write issued while no
+// server ran completes without EIO once the new one is up, and everything
+// written before the kill reads back from the device afterwards.
+func TestSmokeBlockdRestartKeepsDeviceAndMount(t *testing.T) {
+	smokeEnv(t)
+
+	base := t.TempDir()
+	store := filepath.Join(base, smokeVol)
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunk.Open(store); err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(t.TempDir(), "cache")
+	mnt := filepath.Join(t.TempDir(), "mnt")
+	if err := os.MkdirAll(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctlDir, err := os.MkdirTemp("/tmp", "bd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(ctlDir) })
+	control := filepath.Join(ctlDir, "c.sock")
+
+	actx, acancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer acancel()
+	h, err := holder.Acquire(actx, base, smokeVol, smokeNode, holder.Judgement{})
+	if err != nil {
+		t.Fatalf("acquire holder: %v", err)
+	}
+	epoch := h.Epoch()
+	t.Cleanup(func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer rcancel()
+		_ = h.Release(rctx)
+	})
+
+	cmd := startChild(t, store, cache, control, epoch)
+	cli := dialWait(t, control)
+	idx := deviceIndex(t, cli)
+	dev := fmt.Sprintf("/dev/nbd%d", idx)
+	run(t, "mkfs.ext4", "-F", "-q", dev)
+	mountExt4(t, dev, mnt)
+	want := writeFiles(t, mnt, 8)
+	_ = cli.Close()
+
+	// Kill the server with the filesystem still mounted: no disconnect.
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill child: %v", err)
+	}
+	_ = cmd.Wait()
+
+	// Write through the mount while no server runs: the request waits on the
+	// dead connection and must complete once the new server is up.
+	gap := make(chan error, 1)
+	go func() {
+		name := filepath.Join(mnt, "during-gap")
+		f, err := os.Create(name) //nolint:gosec // test file in a temp mount
+		if err != nil {
+			gap <- err
+			return
+		}
+		defer func() { _ = f.Close() }()
+		if _, err := f.Write(pattern(0x5a, 256<<10)); err != nil {
+			gap <- err
+			return
+		}
+		gap <- f.Sync()
+	}()
+	time.Sleep(500 * time.Millisecond)
+
+	startChild(t, store, cache, control, epoch)
+	cli = dialWait(t, control)
+	if got := deviceIndex(t, cli); got != idx {
+		t.Fatalf("restart moved the volume from nbd%d to nbd%d", idx, got)
+	}
+	select {
+	case err := <-gap:
+		if err != nil {
+			dumpNBD(t)
+			t.Fatalf("write during the gap: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("write during the gap did not complete")
+	}
+	want[filepath.Join(mnt, "during-gap")] = pattern(0x5a, 256<<10)
+
+	// Drop the page cache so the reads come from the device, through the new
+	// server, rather than from memory.
+	if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0o200); err != nil {
+		t.Fatalf("drop caches: %v", err)
+	}
+	readFiles(t, mnt, want)
+
+	unmount(t, mnt)
+	sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer scancel()
+	if err := cli.Stop(sctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	_ = cli.Close()
+}

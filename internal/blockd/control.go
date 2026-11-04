@@ -96,6 +96,9 @@ func (c *controlService) Stop(_ struct{}, _ *struct{}) error {
 // growTo raises the device to size (a whole number of chunks, never smaller
 // than the current size) in the cache and then in the kernel.
 func (s *server) growTo(ctx context.Context, size int64) error {
+	if s.device().index() < 0 {
+		return errors.New("blockd: the device is not served yet")
+	}
 	cur := s.back.Size()
 	switch {
 	case size == cur:

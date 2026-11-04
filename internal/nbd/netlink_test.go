@@ -287,3 +287,77 @@ func TestBoundedAbandonsAHungCall(t *testing.T) {
 		t.Fatalf("bounded: %v", err)
 	}
 }
+
+// A reconnect names the device, its backend and the new socket, and nothing
+// else: a size attribute that differs from the device's would notify a uevent.
+func TestReconnectAttrsCarrySocketAndBackendButNoSize(t *testing.T) {
+	t.Parallel()
+	for _, backend := range []string{"", "pvc-00000000-0000-0000-0000-000000000001"} {
+		b, err := reconnectAttrs(4, backend, 9)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ad, err := netlink.NewAttributeDecoder(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var index, fd uint32
+		got := ""
+		for ad.Next() {
+			switch ad.Type() {
+			case attrIndex:
+				index = ad.Uint32()
+			case attrBackendIdentifier:
+				got = ad.String()
+			case attrSockets:
+				ad.Nested(func(nad *netlink.AttributeDecoder) error {
+					for nad.Next() {
+						if nad.Type() != sockItem {
+							t.Errorf("socket list item type %d", nad.Type())
+						}
+						nad.Nested(func(sad *netlink.AttributeDecoder) error {
+							for sad.Next() {
+								if sad.Type() == sockFD {
+									fd = sad.Uint32()
+								}
+							}
+							return nil
+						})
+					}
+					return nil
+				})
+			default:
+				t.Errorf("unexpected attribute %d (a size or timeout must not be sent)", ad.Type())
+			}
+		}
+		if err := ad.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if index != 4 || fd != 9 || got != backend {
+			t.Errorf("index %d, fd %d, backend %q; want 4, 9, %q", index, fd, got, backend)
+		}
+	}
+}
+
+func TestReconnectSocketArgumentChecks(t *testing.T) {
+	t.Parallel()
+	if err := ReconnectSocket(context.Background(), -1, os.Stdin); err == nil {
+		t.Error("a negative index was accepted")
+	}
+	if err := ReconnectSocket(context.Background(), 0, nil); err == nil {
+		t.Error("a nil socket was accepted")
+	}
+}
+
+func TestHandshakeRefusesAnExportSmallerThanWanted(t *testing.T) {
+	t.Parallel()
+	srv, cli := socketpair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = Serve(ctx, srv, newMem(testSize), defaultOpts) }()
+	hctx, hcancel := context.WithTimeout(ctx, 5*time.Second)
+	defer hcancel()
+	if err := Handshake(hctx, cli, testSize+4096); err == nil {
+		t.Fatal("an export smaller than wanted was accepted")
+	}
+}
