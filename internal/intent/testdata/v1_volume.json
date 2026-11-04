@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "volumeID": "volume:pvc-0a1b2c3d-1111-2222-3333-444455556666",
+  "kind": "volume",
+  "transport": {
+    "kind": "nfs3",
+    "server": "nfs.example.com",
+    "export": "/export/data"
+  },
+  "subdir": "",
+  "stagePath": "/var/lib/kubelet/plugins/example/stage/pvc-0a1b2c3d-1111-2222-3333-444455556666",
+  "accessMode": "SINGLE_NODE_WRITER",
+  "generation": 1,
+  "volume": {
+    "chunkSize": 4194304,
+    "cacheSize": 1073741824,
+    "size": 1073741824,
+    "encryption": true,
+    "cipher": "xchacha12,aes-adiantum-plain64",
+    "keySize": 256,
+    "interval": 300000000000,
+    "maxAge": 3600000000000,
+    "keep": 3,
+    "dirtyWatermark": 536870912
+  },
+  "epoch": 3
+}

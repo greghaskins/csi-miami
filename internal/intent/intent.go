@@ -97,6 +97,15 @@ type Intent struct {
 	// written before the field existed reads as 0. It is not part of what
 	// the record says should be true.
 	Generation uint64
+
+	// Volume holds the parameters of a volume of kind volume, nil for a
+	// directory. A version 1 reader ignores it (it never learns of a volume
+	// kind), so adding it needs no Version bump; a directory record has none
+	// and its bytes are unchanged.
+	Volume *volume.VolumeParams
+	// Epoch is the holder epoch the node acquired the volume at, 0 for a
+	// record with none. Informational for a version 1 reader.
+	Epoch uint64
 }
 
 // ID returns the volume ID in the record, split into kind and name. It
@@ -114,7 +123,7 @@ func (in Intent) ID() (volume.ID, error) {
 // Context returns the volume context the record mirrors: its kind, transport
 // subdir and mode.
 func (in Intent) Context() volume.Context {
-	return volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir, Mode: in.Mode}
+	return volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir, Mode: in.Mode, Volume: in.Volume}
 }
 
 // Validate reports whether the Intent is a structurally sound record, which
@@ -149,6 +158,9 @@ func (in Intent) Validate() error {
 	}
 	if kind != in.Kind {
 		return errors.New("kind does not match the kind of volumeID")
+	}
+	if (in.Kind == volume.KindVolume) != (in.Volume != nil) {
+		return errors.New("volume parameters are required for kind volume and allowed for no other kind")
 	}
 	if len(Escape(in.VolumeID)) > maxEscapedIDLen {
 		return errors.New("volumeID is too long to be a file name")

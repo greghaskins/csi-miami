@@ -100,6 +100,9 @@ func NewController(o ControllerOptions) (*Controller, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	if o.Transport.Log == nil {
+		o.Transport.Log = log
+	}
 	deadline := o.Deadline
 	if deadline <= 0 {
 		deadline = DefaultListDeadline
@@ -117,7 +120,7 @@ func NewController(o ControllerOptions) (*Controller, error) {
 }
 
 // ControllerGetCapabilities reports CREATE_DELETE_VOLUME,
-// PUBLISH_UNPUBLISH_VOLUME and LIST_VOLUMES.
+// PUBLISH_UNPUBLISH_VOLUME, and LIST_VOLUMES.
 func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	rpc := func(t csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
 		return &csi.ControllerServiceCapability{Type: &csi.ControllerServiceCapability_Rpc{
@@ -174,6 +177,9 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 	if err != nil {
 		return nil, err
 	}
+	if err := checkCapabilitiesFor(vctx.Kind, req.GetVolumeCapabilities()); err != nil {
+		return nil, err
+	}
 	id, err := volume.NewID(vctx.Kind, req.GetName())
 	if err != nil {
 		return nil, err
@@ -181,6 +187,18 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 	capacity, err := requiredBytes(req.GetCapacityRange())
 	if err != nil {
 		return nil, err
+	}
+	if vctx.Kind == volume.KindVolume {
+		// The size is rounded up to whole chunks and recorded in the
+		// context; the volume's directory is all that is made here, and the
+		// first stage formats it.
+		if vctx, err = vctx.WithSize(capacity); err != nil {
+			return nil, err
+		}
+		capacity = vctx.Volume.Size
+		if limit := req.GetCapacityRange().GetLimitBytes(); limit > 0 && capacity > limit {
+			return nil, status.Errorf(codes.OutOfRange, "the size rounded up to whole %d byte chunks (%d) exceeds the limit", vctx.Volume.ChunkSize, capacity)
+		}
 	}
 	var topology []*csi.Topology
 	if vctx.Transport.Kind == transport.KindLocal {
@@ -283,11 +301,12 @@ func (c *Controller) ValidateVolumeCapabilities(_ context.Context, req *csi.Vali
 	if len(req.GetVolumeCapabilities()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
-	if _, err := parseVolumeID(req.GetVolumeId()); err != nil {
+	id, err := parseVolumeID(req.GetVolumeId())
+	if err != nil {
 		return nil, status.Error(codes.NotFound, "no such volume")
 	}
 	for _, vc := range req.GetVolumeCapabilities() {
-		if p := capabilityProblem(vc); p != "" {
+		if p := capabilityProblemFor(id.Kind, vc); p != "" {
 			return &csi.ValidateVolumeCapabilitiesResponse{Message: p}, nil
 		}
 	}
@@ -312,11 +331,12 @@ func (c *Controller) ControllerPublishVolume(_ context.Context, req *csi.Control
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
-	if p := capabilityProblem(req.GetVolumeCapability()); p != "" {
-		return nil, status.Error(codes.InvalidArgument, p)
-	}
-	if _, err := parseVolumeID(req.GetVolumeId()); err != nil {
+	id, err := parseVolumeID(req.GetVolumeId())
+	if err != nil {
 		return nil, status.Error(codes.NotFound, "no such volume")
+	}
+	if p := capabilityProblemFor(id.Kind, req.GetVolumeCapability()); p != "" {
+		return nil, status.Error(codes.InvalidArgument, p)
 	}
 	return &csi.ControllerPublishVolumeResponse{}, nil
 }
