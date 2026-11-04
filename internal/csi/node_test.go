@@ -1,6 +1,7 @@
 package csi
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -37,9 +38,11 @@ type fakeRec struct {
 	calls     []string
 	staged    []intent.Intent
 	published []intent.Publish
-	record    *intent.Intent
-	getErr    error
-	err       error // returned by every request
+	// The keys each request carried, copied before the handler wipes them.
+	stageKeys, publishKeys []fakeKeys
+	record                 *intent.Intent
+	getErr                 error
+	err                    error // returned by every request
 }
 
 func (f *fakeRec) note(s string) {
@@ -48,10 +51,11 @@ func (f *fakeRec) note(s string) {
 	f.calls = append(f.calls, s)
 }
 
-func (f *fakeRec) Stage(_ context.Context, in intent.Intent) error {
+func (f *fakeRec) StageWith(_ context.Context, in intent.Intent, keys reconcile.Keys) error {
 	f.note("stage")
 	f.mu.Lock()
 	f.staged = append(f.staged, in)
+	f.stageKeys = append(f.stageKeys, fakeKeys{bytes.Clone(keys.Key), bytes.Clone(keys.PreviousKey)})
 	f.mu.Unlock()
 	return f.err
 }
@@ -61,10 +65,11 @@ func (f *fakeRec) Unstage(_ context.Context, id string) error {
 	return f.err
 }
 
-func (f *fakeRec) Publish(_ context.Context, id string, p intent.Publish) error {
+func (f *fakeRec) PublishWith(_ context.Context, id string, p intent.Publish, keys reconcile.Keys) error {
 	f.note("publish " + id)
 	f.mu.Lock()
 	f.published = append(f.published, p)
+	f.publishKeys = append(f.publishKeys, fakeKeys{bytes.Clone(keys.Key), bytes.Clone(keys.PreviousKey)})
 	f.mu.Unlock()
 	return f.err
 }
@@ -680,3 +685,6 @@ func TestNodeStageEnsureItem(t *testing.T) {
 		})
 	}
 }
+
+// fakeKeys is a copy of the keys a request carried.
+type fakeKeys struct{ key, previous []byte }

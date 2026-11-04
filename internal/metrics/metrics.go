@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
 )
 
@@ -41,6 +43,7 @@ const (
 	NameObservationTimeouts = "miami_observation_timeouts_total"
 	NameGarbageUnmounts     = "miami_garbage_unmounts_total"
 	NameIntentLoadFailures  = "miami_intent_load_failures"
+	NameNodeCapability      = "miami_node_capability"
 	NameCSIRequests         = "miami_csi_requests_total"
 	NameCSIRequestDuration  = "miami_csi_request_duration_seconds"
 )
@@ -49,7 +52,7 @@ const (
 // two CSI request metrics.
 var NodeFamilies = []string{
 	NameIntents, NameTransports, NameTransportUp, NameVolumeCondition, NameReconcileDuration, NameReconcileErrors,
-	NameObservationTimeouts, NameGarbageUnmounts, NameIntentLoadFailures,
+	NameObservationTimeouts, NameGarbageUnmounts, NameIntentLoadFailures, NameNodeCapability,
 	NameCSIRequests, NameCSIRequestDuration,
 }
 
@@ -76,6 +79,7 @@ type Registry struct {
 	obsTimeouts     *prometheus.CounterVec
 	garbage         prometheus.Counter
 	loadFailures    prometheus.Gauge
+	capability      *prometheus.GaugeVec
 	requests        *prometheus.CounterVec
 	requestDuration *prometheus.HistogramVec
 }
@@ -132,6 +136,9 @@ func New(opts ...Option) *Registry {
 	r.loadFailures = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: NameIntentLoadFailures, Help: "Intent records that failed to load in the latest pass.",
 	})
+	r.capability = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameNodeCapability, Help: "Whether the node has what the volume kind needs, by feature: 1 present, 0 missing.",
+	}, []string{"feature"})
 	r.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: NameCSIRequests, Help: "Finished CSI calls, by method and gRPC code.",
 	}, []string{"method", "code"})
@@ -159,7 +166,7 @@ func New(opts ...Option) *Registry {
 	if o.reconciler {
 		r.reg.MustRegister(
 			r.intents, r.transports, r.transportUp, r.volumeCondition, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
-			r.garbage, r.loadFailures,
+			r.garbage, r.loadFailures, r.capability,
 		)
 	}
 	return r
@@ -210,6 +217,21 @@ func (r *Registry) IncObservationTimeout(op string) { r.obsTimeouts.WithLabelVal
 
 // IncGarbageUnmount implements reconcile.Metrics.
 func (r *Registry) IncGarbageUnmount() { r.garbage.Inc() }
+
+// SetCapability sets whether the node has a prerequisite feature (see
+// prereq.Features): 1 present, 0 missing. The label is the feature name and
+// nothing else, never a path or an address; a name that is not a feature is
+// dropped, so the label values are a fixed list.
+func (r *Registry) SetCapability(feature string, present bool) {
+	if !slices.Contains(prereq.Features, feature) {
+		return
+	}
+	v := 0.0
+	if present {
+		v = 1
+	}
+	r.capability.WithLabelValues(feature).Set(v)
+}
 
 // SetIntentLoadFailures implements reconcile.Metrics.
 func (r *Registry) SetIntentLoadFailures(n int) { r.loadFailures.Set(float64(n)) }

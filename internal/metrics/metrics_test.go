@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
 )
 
@@ -370,6 +371,7 @@ func TestFamilyListsMatchTheRegistry(t *testing.T) {
 	node.SetTransport("local", "abc", true)
 	node.SetTransportUp("local", "abc", true)
 	node.ObserveReconcile(time.Millisecond)
+	node.SetCapability(prereq.FeatureNBD, true)
 	node.requests.WithLabelValues("NodeStageVolume", "OK").Inc()
 	node.requestDuration.WithLabelValues("NodeStageVolume").Observe(0.001)
 	check("the node registry", served(node), NodeFamilies)
@@ -378,4 +380,31 @@ func TestFamilyListsMatchTheRegistry(t *testing.T) {
 	ctrl.requests.WithLabelValues("CreateVolume", "OK").Inc()
 	ctrl.requestDuration.WithLabelValues("CreateVolume").Observe(0.001)
 	check("the controller registry", served(ctrl), ControllerFamilies)
+}
+
+func TestCapabilityGauges(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	r.SetCapability(prereq.FeatureNBD, true)
+	r.SetCapability(prereq.FeatureAdiantum, false)
+	r.SetCapability("/run/systemd/private", false) // not a feature: dropped, never a label
+	if v := sample(t, r, NameNodeCapability, map[string]string{"feature": "nbd"}).GetGauge().GetValue(); v != 1 {
+		t.Errorf("nbd = %v, want 1", v)
+	}
+	if v := sample(t, r, NameNodeCapability, map[string]string{"feature": "adiantum"}).GetGauge().GetValue(); v != 0 {
+		t.Errorf("adiantum = %v, want 0", v)
+	}
+	f := family(t, r, NameNodeCapability)
+	if n := len(f.GetMetric()); n != 2 {
+		t.Errorf("%d series, want 2 (a non-feature name must be dropped)", n)
+	}
+	// A feature that comes back flips to 1.
+	r.SetCapability(prereq.FeatureAdiantum, true)
+	if v := sample(t, r, NameNodeCapability, map[string]string{"feature": "adiantum"}).GetGauge().GetValue(); v != 1 {
+		t.Errorf("adiantum after it came back = %v, want 1", v)
+	}
+	// Without the reconciler's family the gauge is not exposed.
+	if family(t, New(), NameNodeCapability) != nil {
+		t.Error("the controller registry serves the capability family")
+	}
 }
