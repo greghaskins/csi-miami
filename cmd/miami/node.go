@@ -11,6 +11,7 @@ import (
 	"net"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/metrics"
 	"github.com/greghaskins/csi-miami/internal/mount"
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
 )
 
@@ -39,6 +41,14 @@ type nodeConfig struct {
 	transportIdle  time.Duration
 	kubeconfig     string
 	noEvents       bool
+
+	// For the volume kind.
+	cacheDir        string
+	binDir          string
+	systemdSocket   string
+	takeoverTimeout time.Duration
+	holderRenew     time.Duration
+	remediate       bool
 }
 
 // withDefaults fills the paths that default to places under the kubelet
@@ -52,6 +62,9 @@ func (c nodeConfig) withDefaults() nodeConfig {
 	}
 	if c.stageRoot == "" {
 		c.stageRoot = filepath.Join(c.kubeletDir, "plugins", "kubernetes.io", "csi", csi.DriverName)
+	}
+	if c.binDir == "" {
+		c.binDir = filepath.Join(c.kubeletDir, "plugins", csi.DriverName, "bin")
 	}
 	return c
 }
@@ -83,6 +96,12 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&cfg.transportIdle, "transport-idle", 0, "unmount a transport that no volume uses after this long; 0 means never")
 	fs.StringVar(&cfg.kubeconfig, "kubeconfig", "", "kubeconfig file, for development outside a cluster; in a cluster the service account is used")
 	fs.BoolVar(&cfg.noEvents, "no-events", false, "do not record Kubernetes events (for tests, where there is no API server)")
+	fs.StringVar(&cfg.cacheDir, "cache-dir", "/var/lib/miami/cache", "directory the volume caches live under on the host; must be writable")
+	fs.StringVar(&cfg.binDir, "bin-dir", "", "directory the per-hash copies of the miami binary are kept in (default <kubelet-dir>/plugins/"+csi.DriverName+"/bin)")
+	fs.StringVar(&cfg.systemdSocket, "systemd-socket", "/run/systemd/private", "systemd's private socket, used to run each volume's block server as a unit")
+	fs.DurationVar(&cfg.takeoverTimeout, "takeover-timeout", 5*time.Minute, "how long a volume's holder must be silent before another node may take it over")
+	fs.DurationVar(&cfg.holderRenew, "holder-renew", 15*time.Second, "how often the node renews the holder file of each volume it serves")
+	fs.BoolVar(&cfg.remediate, "remediate", false, "let the reconciler repair what it finds wrong beyond converging intent (off until remediation ships)")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -105,6 +124,12 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		{"-reconcile-interval must be positive", cfg.interval <= 0},
 		{"-transport-idle must not be negative", cfg.transportIdle < 0},
 		{"-kubelet-dir must be an absolute path", !filepath.IsAbs(cfg.kubeletDir)},
+		{"-cache-dir must be an absolute path", !filepath.IsAbs(cfg.cacheDir)},
+		{"-bin-dir must be an absolute path", cfg.binDir != "" && !filepath.IsAbs(cfg.binDir)},
+		{"-systemd-socket must be an absolute path", !filepath.IsAbs(cfg.systemdSocket)},
+		{"-takeover-timeout must be positive", cfg.takeoverTimeout <= 0},
+		{"-holder-renew must be positive", cfg.holderRenew <= 0},
+		{"-holder-renew must be shorter than -takeover-timeout", cfg.holderRenew >= cfg.takeoverTimeout},
 	} {
 		if p.bad {
 			_, _ = fmt.Fprintf(stderr, "miami node: %s\n", p.name)
@@ -179,6 +204,13 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	if events != nil {
 		opts.Events = events
 	}
+	opts.CacheDir, opts.BinDir, opts.SystemdSocket = cfg.cacheDir, cfg.binDir, cfg.systemdSocket
+	opts.TakeoverTimeout, opts.HolderRenew, opts.Remediate = cfg.takeoverTimeout, cfg.holderRenew, cfg.remediate
+	// The prerequisites of the volume kind are probed now and on every pass;
+	// a node without them still serves directory volumes.
+	probe := newProber(prereq.Options{SystemdSocket: cfg.systemdSocket, CacheDir: cfg.cacheDir}, reg, log)
+	opts.Prereq = probe
+	probe(ctx)
 	rec, err := reconcile.New(store, m, opts)
 	if err != nil {
 		return err
@@ -264,6 +296,34 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		return serveErr
 	}
 	return fatal
+}
+
+// newProber returns the probe of the node's prerequisites: it runs
+// prereq.Probe, sets the capability gauges and logs when the set of missing
+// features changes (not on every pass). It is safe for concurrent use.
+func newProber(o prereq.Options, reg *metrics.Registry, log *slog.Logger) func(context.Context) prereq.Report {
+	var mu sync.Mutex
+	var last string
+	first := true
+	return func(ctx context.Context) prereq.Report {
+		rep := prereq.Probe(ctx, o)
+		for _, f := range rep.Features {
+			reg.SetCapability(f.Name, f.Err == nil)
+		}
+		missing := strings.Join(rep.Missing(), ",")
+		mu.Lock()
+		changed := first || missing != last
+		first, last = false, missing
+		mu.Unlock()
+		switch {
+		case !changed:
+		case missing == "":
+			log.Info("node prerequisites for volumes are all present")
+		default:
+			log.Warn("node prerequisites for volumes are missing; volume-kind volumes will not stage here", "missing", missing, "error", rep.Err())
+		}
+		return rep
+	}
 }
 
 // listenMetrics listens on addr for the metrics server, or returns nil if addr

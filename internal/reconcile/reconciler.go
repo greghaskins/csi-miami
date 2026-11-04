@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -45,7 +46,34 @@ type request struct {
 	kind   reqKind
 	volume string
 	target string // reqPublish and reqUnpublish: the publish target path
+	keys   Keys   // reqStage and reqPublish: a copy, wiped when the request is finished with
 	done   chan error
+}
+
+// Keys are the encryption keys that arrive with a stage or publish request, from
+// the node-stage Secret. They exist only in memory: they are never written to
+// an intent record, a log line, a unit's command line or an RPC reply. The
+// reconciler works from its own copy and wipes it when the request is
+// finished with (answered, refused or abandoned at shutdown); the caller wipes
+// the slices it passed.
+type Keys struct {
+	// Key opens the volume (and formats it at its first stage).
+	Key []byte
+	// PreviousKey, when set, is the key the volume was last opened with, for a
+	// rotation to Key.
+	PreviousKey []byte
+}
+
+// Wipe zeroes both keys and drops them.
+func (k *Keys) Wipe() {
+	clear(k.Key)
+	clear(k.PreviousKey)
+	k.Key, k.PreviousKey = nil, nil
+}
+
+// clone returns a copy that shares nothing with k.
+func (k Keys) clone() Keys {
+	return Keys{Key: bytes.Clone(k.Key), PreviousKey: bytes.Clone(k.PreviousKey)}
 }
 
 // Reconciler is the node agent's converge loop. Build one with New, start it
@@ -263,6 +291,12 @@ func strictlyBelow(dir, path string) bool { return path != dir && within(dir, pa
 // unmount them as targets no intent claims. A record that stays unreadable is
 // for a person to repair or remove; every pass says so (see garbage.go).
 func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
+	return r.StageWith(ctx, in, Keys{})
+}
+
+// StageWith is Stage for a request that carries encryption keys (see Keys). The
+// keys are not part of the intent and are not recorded.
+func (r *Reconciler) StageWith(ctx context.Context, in intent.Intent, keys Keys) error {
 	if in.Version == 0 {
 		in.Version = intent.Version
 	}
@@ -314,7 +348,7 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 		}
 		return fmt.Errorf("recording the intent of %s: %w", in.VolumeID, err)
 	}
-	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID})
+	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID, keys: keys.clone()})
 }
 
 // Publish adds a publish (a target path and its read-only flag) to the
@@ -344,6 +378,12 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 // the entry is pruned. A caller that stays for the answer and gets a conflict
 // has the entry removed.
 func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publish) error {
+	return r.PublishWith(ctx, volumeID, p, Keys{})
+}
+
+// PublishWith is Publish for a request that carries encryption keys (see Keys),
+// which a restage after a lost mapping needs. The keys are not recorded.
+func (r *Reconciler) PublishWith(ctx context.Context, volumeID string, p intent.Publish, keys Keys) error {
 	if err := r.checkTargetPath("publish", p.TargetPath); err != nil {
 		return err
 	}
@@ -387,7 +427,7 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 	if err != nil {
 		return fmt.Errorf("recording the publish of %s: %w", volumeID, err)
 	}
-	err = r.await(ctx, &request{kind: reqPublish, volume: volumeID, target: p.TargetPath})
+	err = r.await(ctx, &request{kind: reqPublish, volume: volumeID, target: p.TargetPath, keys: keys.clone()})
 	if errors.Is(err, ErrPublishConflict) && !existed {
 		// The record must only name targets the driver bound. The intent is
 		// written before the wait so that a caller that gives up still
@@ -616,6 +656,7 @@ func (r *Reconciler) await(ctx context.Context, req *request) error {
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
+		req.keys.Wipe()
 		return ErrStopped
 	}
 	r.queue = append(r.queue, req)
@@ -688,6 +729,7 @@ func (r *Reconciler) stop() {
 	r.queue = nil
 	r.mu.Unlock()
 	for _, req := range q {
+		req.keys.Wipe()
 		req.done <- ErrStopped
 	}
 }

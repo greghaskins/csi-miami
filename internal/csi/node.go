@@ -31,9 +31,9 @@ const DefaultStatsTimeout = 10 * time.Second
 // not have). NodeBackend is the production implementation; tests give the
 // service a fake.
 type nodeReconciler interface {
-	Stage(ctx context.Context, in intent.Intent) error
+	StageWith(ctx context.Context, in intent.Intent, keys reconcile.Keys) error
 	Unstage(ctx context.Context, volumeID string) error
-	Publish(ctx context.Context, volumeID string, p intent.Publish) error
+	PublishWith(ctx context.Context, volumeID string, p intent.Publish, keys reconcile.Keys) error
 	Unpublish(ctx context.Context, volumeID, targetPath string) error
 	// Get returns the volume's intent and whether there is one.
 	Get(volumeID string) (intent.Intent, bool, error)
@@ -208,6 +208,27 @@ func singleCapability(kind volume.Kind, c *csi.VolumeCapability) error {
 	return nil
 }
 
+// Secret keys of the node-stage and node-publish Secrets that carry the
+// encryption keys.
+const (
+	secretKey         = "key"
+	secretPreviousKey = "previousKey"
+)
+
+// keysOf copies the encryption keys out of a request's Secrets. The caller
+// wipes the result. The keys go nowhere but the in-memory request of the
+// reconciler: not the intent, not a log line, not a reply.
+func keysOf(secrets map[string]string) reconcile.Keys {
+	var k reconcile.Keys
+	if v, ok := secrets[secretKey]; ok && v != "" {
+		k.Key = []byte(v)
+	}
+	if v, ok := secrets[secretPreviousKey]; ok && v != "" {
+		k.PreviousKey = []byte(v)
+	}
+	return k
+}
+
 // NodeStageVolume records the volume as staged and waits for it to be staged
 // (its transport mounted and its directory present; no mount is made at the
 // stage path). A repeat with the same context and stage path is a
@@ -262,7 +283,9 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	} else {
 		in.EnsureItem = vc.Transport.Kind == transport.KindLocal
 	}
-	if err := n.rec.Stage(ctx, in); err != nil {
+	keys := keysOf(req.GetSecrets())
+	defer keys.Wipe()
+	if err := n.rec.StageWith(ctx, in, keys); err != nil {
 		return nil, nodeStatus(err)
 	}
 	return &csi.NodeStageVolumeResponse{}, nil
@@ -324,7 +347,9 @@ func (n *Node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolume
 	// A reader-only volume is never published read-write, whatever the CO
 	// sends: the access mode the volume was staged with decides.
 	readOnly := req.GetReadonly() || readerOnly(rec.AccessMode)
-	err = n.rec.Publish(ctx, id.String(), intent.Publish{TargetPath: req.GetTargetPath(), ReadOnly: readOnly})
+	keys := keysOf(req.GetSecrets())
+	defer keys.Wipe()
+	err = n.rec.PublishWith(ctx, id.String(), intent.Publish{TargetPath: req.GetTargetPath(), ReadOnly: readOnly}, keys)
 	if err != nil {
 		return nil, nodeStatus(err)
 	}

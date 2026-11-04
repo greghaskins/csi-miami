@@ -1,10 +1,12 @@
 package reconcile
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/item"
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/transport"
 )
 
@@ -137,6 +139,30 @@ type Options struct {
 	// Metrics and Events default to no-ops.
 	Metrics Metrics
 	Events  Events
+
+	// Prereq probes the node's prerequisites for the volume kind (see package
+	// prereq). It is called once per pass, must not block, and its report is
+	// what layer 1 of the volume item reads. Nil means no probe: nothing is
+	// reported missing.
+	Prereq func(context.Context) prereq.Report
+
+	// CacheDir is the directory volume caches live under, BinDir the directory
+	// the per-hash copies of the binary go in, and SystemdSocket systemd's
+	// private socket; all three are read by the volume item.
+	CacheDir      string
+	BinDir        string
+	SystemdSocket string
+
+	// TakeoverTimeout is how long a holder must be silent before another node
+	// may take a volume over, and HolderRenew how often a holder renews. Zero
+	// means the volume item's defaults (5m and 15s).
+	TakeoverTimeout time.Duration
+	HolderRenew     time.Duration
+
+	// Remediate permits the reconciler to repair what it finds wrong beyond
+	// converging intent (see the remediation task); false observes and reports
+	// only.
+	Remediate bool
 
 	// Now is the clock for the idle timeout. Nil means time.Now.
 	Now func() time.Time
