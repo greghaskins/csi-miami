@@ -20,6 +20,7 @@ const usage = `usage: miami <command>
 commands:
   node        run the node plugin
   controller  run the controller plugin
+  blockd      run the per-volume block server
   lock        run the lock helper
   version     print the build version
 `
@@ -47,6 +48,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runController(args[1:], stdout, stderr)
 	case "node":
 		return runNode(args[1:], stdout, stderr)
+	case "blockd":
+		return runBlockd(args[1:], stdout, stderr)
 	case "lock":
 		return runLock(args[1:], stdout, stderr)
 	default:
