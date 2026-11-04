@@ -67,17 +67,31 @@ func (c *Cache) ReadAt(i uint32, off int64, p []byte) error {
 	return c.preadChunk(i, off, p)
 }
 
-// WriteAt writes p into [off, off+len(p)) of chunk i, which becomes dirty. The
-// bytes of the chunk this write does not cover keep their previous value, or
-// read as zero for a chunk that was not resident (the caller preserves a
-// non-zero base by Insert-ing the chunk first). off and len(p) are multiples of
-// 4096 and p is aligned. ErrFull when the chunk is new and the dirty chunks
-// already fill the bound.
-func (c *Cache) WriteAt(i uint32, off int64, p []byte) error {
+// WriteAt writes p into [off, off+len(p)) of chunk i, which becomes dirty. off
+// and len(p) are multiples of 4096 and p is aligned. base, when not nil, is the
+// whole pre-write content (chunk-sized, aligned) of a chunk that is not
+// resident: the caller (which holds the real base of a chunk whose hash is
+// non-zero) passes it so the bytes this write does not cover keep their value.
+// base is nil for a resident chunk, a trimmed chunk, or a chunk whose base is
+// genuinely all-zero; WriteAt then materialises zeros. WriteAt NEVER invents a
+// zero base for a chunk the caller knows is non-zero — that is what base is for.
+// ErrFull when the chunk is new and the dirty chunks already fill the bound.
+//
+// On the first touch of a chunk the full-size file is established UNDER the lock
+// (from base or as zeros) BEFORE the chunk is marked dirty, so "dirty implies a
+// full-size file on disk" always holds and a crash can never make cache.Open
+// refuse the whole cache over a dirty chunk with no file. The sub-range pwrite
+// runs off the lock; the fsync obligation is recorded only after it, so a
+// concurrent FLUSH cannot drop this write's durability.
+func (c *Cache) WriteAt(i uint32, off int64, p, base []byte) error {
 	c.mu.Lock()
 	if err := c.checkRange(i, off, p); err != nil {
 		c.mu.Unlock()
 		return err
+	}
+	if base != nil && (int64(len(base)) != c.idx.Chunk || !aligned(base)) {
+		c.mu.Unlock()
+		return fmt.Errorf("cache: base is %d bytes (want the chunk size %d) or not aligned", len(base), c.idx.Chunk)
 	}
 	_, isDirty := c.dirty[i]
 	_, isZero := c.zero[i]
@@ -94,11 +108,18 @@ func (c *Cache) WriteAt(i uint32, off int64, p []byte) error {
 		c.mu.Unlock()
 		return err
 	}
-	hadFile := c.clean.has(i) || (isDirty && !isZero)
-	// The chunk becomes dirty (and so pinned against eviction) before the
-	// pwrite, which then runs outside c.mu. A pwrite that fails leaves a dirty
-	// chunk whose file is its pre-write content (or a sparse, all-zero file for
-	// a new chunk); both are valid chunk images, so the cache stays consistent.
+	// Establish the full-size file with the correct base before the dirty mark.
+	// A chunk that is resident with a full-size file (clean, or dirty and not
+	// trimmed) already has one; everything else — a new chunk, an evicted clean
+	// chunk, or a trimmed chunk whose stale file still lingers — is (re)created
+	// with O_TRUNC so no discarded bytes survive.
+	residentFull := c.clean.has(i) || (isDirty && !isZero)
+	if !residentFull {
+		if err := c.establishChunk(i, base); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+	}
 	c.clean.remove(i)
 	delete(c.zero, i)
 	delete(c.pendingUnlink, i)
@@ -110,7 +131,7 @@ func (c *Cache) WriteAt(i uint32, off int64, p []byte) error {
 	if gap != nil {
 		gap()
 	}
-	err := c.pwriteChunk(i, off, p, !hadFile)
+	err := c.pwriteChunk(i, off, p)
 
 	// The fsync obligation is recorded only after the data is on the file, so a
 	// FLUSH (Sync) that ran while the pwrite was in flight cannot have cleared
@@ -120,6 +141,25 @@ func (c *Cache) WriteAt(i uint32, off int64, p []byte) error {
 	c.mu.Lock()
 	c.unsynced[i] = struct{}{}
 	c.mu.Unlock()
+	return err
+}
+
+// establishChunk (re)creates chunk i's file at the full chunk size with
+// O_TRUNC, so any stale discarded content is dropped, filling it from base when
+// given (a non-zero pre-write image) or leaving it sparse (all zeros) otherwise.
+func (c *Cache) establishChunk(i uint32, base []byte) error {
+	f, err := os.OpenFile(c.cpath(i), c.flags(os.O_WRONLY|os.O_CREATE|os.O_TRUNC), 0o600) // #nosec G304 -- the cache's own directory
+	if err != nil {
+		return err
+	}
+	if base != nil {
+		_, err = f.WriteAt(base, 0)
+	} else {
+		err = f.Truncate(c.idx.Chunk)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
 	return err
 }
 
@@ -141,23 +181,12 @@ func (c *Cache) preadChunk(i uint32, off int64, p []byte) error {
 	return err
 }
 
-// pwriteChunk pwrites a sub-range to chunk i's file. When create is set the
-// file is made full-size (sparse) first, so a sub-range write to a new chunk
-// still yields a chunk-sized file whose gaps read as zero.
-func (c *Cache) pwriteChunk(i uint32, off int64, p []byte, create bool) error {
-	flags := os.O_WRONLY
-	if create {
-		flags |= os.O_CREATE
-	}
-	f, err := os.OpenFile(c.cpath(i), c.flags(flags), 0o600) // #nosec G304 -- the cache's own directory
+// pwriteChunk pwrites a sub-range to chunk i's file, which WriteAt has already
+// established at the full chunk size.
+func (c *Cache) pwriteChunk(i uint32, off int64, p []byte) error {
+	f, err := os.OpenFile(c.cpath(i), c.flags(os.O_WRONLY), 0o600) // #nosec G304 -- the cache's own directory
 	if err != nil {
 		return err
-	}
-	if create {
-		if err := f.Truncate(c.idx.Chunk); err != nil {
-			_ = f.Close()
-			return err
-		}
 	}
 	_, err = f.WriteAt(p, off)
 	if cerr := f.Close(); err == nil {
