@@ -405,6 +405,21 @@ func (c *Cache) usedBytes() int64 {
 	return c.dirtyBytes() + int64(c.clean.len())*c.idx.Chunk
 }
 
+// DirtyBytes is the bytes of unpublished dirty chunks, not counting trimmed
+// (zero) chunks, which hold no bytes.
+func (c *Cache) DirtyBytes() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dirtyBytes()
+}
+
+// Used is the bytes resident in the cache: dirty chunks plus clean copies.
+func (c *Cache) Used() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.usedBytes()
+}
+
 // evictLocked drops least-recently-used clean chunks until extra more bytes
 // fit under the bound, or no clean chunk is left.
 func (c *Cache) evictLocked(extra int64) {
@@ -754,7 +769,9 @@ func (c *Cache) syncLocked() error {
 		if err != nil {
 			return err
 		}
-		err = f.Sync()
+		// fdatasync, not fsync: the chunk's data (and the size set by a
+		// materialising truncate) must be durable, but its mtime need not be.
+		err = unix.Fdatasync(int(f.Fd()))
 		_ = f.Close()
 		if err != nil {
 			return err
