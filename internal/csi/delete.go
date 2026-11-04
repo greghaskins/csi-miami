@@ -109,7 +109,7 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 	}
 
 	if vctx.Kind == volume.KindVolume {
-		if err := c.refuseLiveHolder(ctx, id, dir); err != nil {
+		if err := c.refuseLiveHolder(ctx, id, dir, vctx.Volume.Takeover()); err != nil {
 			return nil, err
 		}
 	}
@@ -137,7 +137,7 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 // that has gone quiet for longer is a dead node's, and the delete goes on.
 // Deleting under a live holder would pull the chunks out from under a mounted
 // volume.
-func (c *Controller) refuseLiveHolder(ctx context.Context, id volume.ID, dir string) error {
+func (c *Controller) refuseLiveHolder(ctx context.Context, id volume.ID, dir string, takeover time.Duration) error {
 	info, err := holder.Read(ctx, filepath.Dir(dir), id.Name)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -145,7 +145,7 @@ func (c *Controller) refuseLiveHolder(ctx context.Context, id volume.ID, dir str
 		}
 		return unavailable("cannot read the holder of volume %q, so nothing is deleted: %v", id.Name, reason(err))
 	}
-	if info.Present && info.Age < volume.DefaultTakeoverTimeout {
+	if info.Present && info.Age < takeover {
 		return unavailable("volume %q is held by node %q (renewed %s ago); nothing is deleted until the node unstages it", id.Name, info.Node, info.Age.Round(time.Second))
 	}
 	return nil

@@ -30,9 +30,17 @@ func TestVolumeParamsDefaults(t *testing.T) {
 	if !reflect.DeepEqual(c.Volume, want) {
 		t.Errorf("defaults = %+v, want %+v", c.Volume, want)
 	}
-	p, err := ParseParameters(volParams(map[string]string{"takeoverTimeout": "10m"}))
-	if err != nil || p.TakeoverTimeout != 10*time.Minute {
-		t.Errorf("takeoverTimeout = %v, %v", p.TakeoverTimeout, err)
+	if c.Volume.Takeover() != DefaultTakeoverTimeout {
+		t.Errorf("default takeover = %v", c.Volume.Takeover())
+	}
+	tc, err := NewContext(volParams(map[string]string{"takeoverTimeout": "10m"}))
+	if err != nil || tc.Volume.TakeoverTimeout != 10*time.Minute {
+		t.Fatalf("takeoverTimeout = %+v, %v", tc.Volume, err)
+	}
+	sz, _ := tc.WithSize(1 << 30)
+	got, err := DecodeContext(sz.Encode())
+	if err != nil || got.Volume.TakeoverTimeout != 10*time.Minute || sz.Encode()["miami/takeoverTimeout"] != "10m0s" {
+		t.Errorf("takeoverTimeout does not round trip: %+v, %v", got.Volume, err)
 	}
 
 	sized, err := c.WithSize(1 << 30)

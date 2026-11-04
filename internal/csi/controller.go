@@ -120,7 +120,7 @@ func NewController(o ControllerOptions) (*Controller, error) {
 }
 
 // ControllerGetCapabilities reports CREATE_DELETE_VOLUME,
-// PUBLISH_UNPUBLISH_VOLUME, LIST_VOLUMES and EXPAND_VOLUME.
+// PUBLISH_UNPUBLISH_VOLUME, and LIST_VOLUMES.
 func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	rpc := func(t csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
 		return &csi.ControllerServiceCapability{Type: &csi.ControllerServiceCapability_Rpc{
@@ -131,7 +131,6 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 		rpc(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME),
 		rpc(csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME),
 		rpc(csi.ControllerServiceCapability_RPC_LIST_VOLUMES),
-		rpc(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME),
 	}}, nil
 }
 
@@ -252,39 +251,6 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 		VolumeContext:      encoded,
 		AccessibleTopology: topology,
 	}}, nil
-}
-
-// ControllerExpandVolume is accepted for a directory volume as a no-op (it has
-// no size) and answers with the requested capacity. Expanding a volume of kind
-// volume is Unimplemented until the expansion task lands.
-func (c *Controller) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	if req.GetVolumeId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
-	}
-	if req.GetCapacityRange() == nil {
-		return nil, status.Error(codes.InvalidArgument, "capacity range is required")
-	}
-	id, err := parseVolumeID(req.GetVolumeId())
-	if err != nil {
-		return nil, status.Error(codes.NotFound, "no such volume")
-	}
-	capacity, err := requiredBytes(req.GetCapacityRange())
-	if err != nil {
-		return nil, err
-	}
-	if _, err := c.pvs.GetPV(ctx, id.Name); err != nil {
-		if errors.Is(err, kube.ErrNotFound) {
-			return nil, status.Error(codes.NotFound, "no such volume")
-		}
-		if ctx.Err() != nil {
-			return nil, contextStatus(ctx.Err())
-		}
-		return nil, unavailable("cannot read the PV of volume %q: %s", id.Name, readReason(err))
-	}
-	if id.Kind == volume.KindVolume {
-		return nil, status.Error(codes.Unimplemented, "expanding a volume of kind volume is not implemented yet")
-	}
-	return &csi.ControllerExpandVolumeResponse{CapacityBytes: capacity}, nil
 }
 
 // asStatus returns err if it is already a gRPC status and Internal otherwise.

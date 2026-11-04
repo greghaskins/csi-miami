@@ -61,6 +61,9 @@ type VolumeParams struct { //nolint:revive // the name is fixed by the design (3
 	Cipher                     string
 	KeySize                    int
 	Generations                GenerationParams
+	// TakeoverTimeout is how long a holder may go without renewing before it
+	// counts as dead; zero means DefaultTakeoverTimeout.
+	TakeoverTimeout time.Duration
 }
 
 // check validates the fields that are set; derived fields still zero are not
@@ -169,6 +172,9 @@ func parseVolumeParams(params map[string]string) (VolumeParams, error) {
 			return v, err
 		}
 	}
+	if v.TakeoverTimeout, err = parseTakeoverTimeout(params); err != nil {
+		return v, err
+	}
 	if err := v.check(); err != nil {
 		return v, err
 	}
@@ -216,6 +222,14 @@ func parseDuration(name, raw string) (time.Duration, error) {
 		return 0, invalid("parameter " + name + " must be a positive duration such as 5m")
 	}
 	return d, nil
+}
+
+// Takeover returns the takeover timeout, the default when unset.
+func (v VolumeParams) Takeover() time.Duration {
+	if v.TakeoverTimeout > 0 {
+		return v.TakeoverTimeout
+	}
+	return DefaultTakeoverTimeout
 }
 
 // WithSize resolves a volume Context for a capacity of required bytes: the

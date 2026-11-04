@@ -178,6 +178,36 @@ func TestDeleteVolumeRefusesLiveHolder(t *testing.T) {
 	_ = h
 }
 
+// A takeoverTimeout set on the class decides what "live" means: a holder aged
+// past the default but inside the configured value still blocks the delete.
+func TestDeleteVolumeHonoursTheClassTakeoverTimeout(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	resp, err := e.ctrl.CreateVolume(context.Background(), e.volumeReq(nameA, 1<<30, "takeoverTimeout", "30m"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.pvs.Add(pvFor(resp))
+	id, parent := resp.GetVolume().GetVolumeId(), e.mountDir()
+	if _, err := holder.Acquire(context.Background(), parent, nameA, "node-a", holder.Judgement{}); err != nil {
+		t.Fatal(err)
+	}
+	age := func(d time.Duration) {
+		old := time.Now().Add(-d)
+		if err := os.Chtimes(holder.Path(parent, nameA), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	age(10 * time.Minute) // past the 5m default, inside 30m
+	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(id)); codeOf(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable: the class says 30m", codeOf(err))
+	}
+	age(40 * time.Minute)
+	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(id)); err != nil {
+		t.Fatalf("delete past the configured timeout: %v", err)
+	}
+}
+
 func TestDeleteVolumeWithoutHolder(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -186,30 +216,4 @@ func TestDeleteVolumeWithoutHolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustNotExist(t, filepath.Join(parent, nameA))
-}
-
-func TestControllerExpandVolume(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	ctx := context.Background()
-	resp := e.create(nameA)
-	e.pvs.Add(pvFor(resp))
-	id := resp.GetVolume().GetVolumeId()
-	rng := &csi.CapacityRange{RequiredBytes: 1 << 30}
-
-	got, err := e.ctrl.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{VolumeId: id, CapacityRange: rng})
-	if err != nil || got.GetCapacityBytes() != 1<<30 || got.GetNodeExpansionRequired() {
-		t.Errorf("directory expand = %v, %v", got, err)
-	}
-	for name, req := range map[string]*csi.ControllerExpandVolumeRequest{
-		"no volume ID":      {CapacityRange: rng},
-		"no capacity range": {VolumeId: id},
-	} {
-		if _, err := e.ctrl.ControllerExpandVolume(ctx, req); codeOf(err) != codes.InvalidArgument {
-			t.Errorf("%s: code %v", name, codeOf(err))
-		}
-	}
-	if _, err := e.ctrl.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{VolumeId: "directory:" + nameB, CapacityRange: rng}); codeOf(err) != codes.NotFound {
-		t.Errorf("unknown volume: code %v, want NotFound", codeOf(err))
-	}
 }

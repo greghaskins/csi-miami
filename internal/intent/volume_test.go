@@ -117,3 +117,15 @@ func TestVolumeKindNeedsVolumeParams(t *testing.T) {
 		t.Error("a directory record with volume parameters validates")
 	}
 }
+
+func TestVolumeIntentKeepsTheTakeoverTimeout(t *testing.T) {
+	t.Parallel()
+	s, _ := openStore(t)
+	in := volumeIntent()
+	in.Volume.TakeoverTimeout = 30 * time.Minute
+	mustSave(t, s, in)
+	got, ok, err := s.Get(in.VolumeID)
+	if err != nil || !ok || got.Volume.TakeoverTimeout != 30*time.Minute {
+		t.Errorf("Get = %+v, %v, %v", got.Volume, ok, err)
+	}
+}

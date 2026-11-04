@@ -35,12 +35,13 @@ const (
 	keyGenKeep           = contextPrefix + "generations.keep"
 	keyGenMaxAge         = contextPrefix + "generations.maxAge"
 	keyGenDirtyWatermark = contextPrefix + "generations.dirtyWatermark"
+	keyTakeoverTimeout   = contextPrefix + "takeoverTimeout" // optional: absent means the default
 )
 
 // volumeKeys are the context keys only a volume of kind volume carries.
 var volumeKeys = []string{
 	keyChunkSize, keyCacheSize, keyEncryption, keyCipher, keyKeySize, keySize,
-	keyGenInterval, keyGenKeep, keyGenMaxAge, keyGenDirtyWatermark,
+	keyGenInterval, keyGenKeep, keyGenMaxAge, keyGenDirtyWatermark, keyTakeoverTimeout,
 }
 
 // Context is the volume context set by CreateVolume, stored on the PV and
@@ -163,6 +164,9 @@ func (c Context) Encode() map[string]string {
 		set(keyGenKeep, strconv.Itoa(v.Generations.Keep))
 		set(keyGenMaxAge, v.Generations.MaxAge.String())
 		set(keyGenDirtyWatermark, num(v.Generations.DirtyWatermark))
+		if v.TakeoverTimeout > 0 {
+			set(keyTakeoverTimeout, v.TakeoverTimeout.String())
+		}
 	}
 	return m
 }
@@ -251,7 +255,7 @@ func NewContext(params map[string]string) (Context, error) {
 func decodeVolume(m map[string]string) (VolumeParams, error) {
 	var v VolumeParams
 	for _, k := range volumeKeys {
-		if m[k] == "" {
+		if m[k] == "" && k != keyTakeoverTimeout {
 			return v, invalid("volume context key " + k + " is required")
 		}
 	}
@@ -305,6 +309,11 @@ func decodeVolume(m map[string]string) (VolumeParams, error) {
 	}
 	if v.Generations.MaxAge, err = dur(keyGenMaxAge); err != nil {
 		return v, err
+	}
+	if m[keyTakeoverTimeout] != "" {
+		if v.TakeoverTimeout, err = dur(keyTakeoverTimeout); err != nil {
+			return v, err
+		}
 	}
 	if v.Size%v.ChunkSize != 0 {
 		return v, invalid("volume context key " + keySize + " must be a whole number of chunks")

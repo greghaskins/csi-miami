@@ -3,7 +3,6 @@ package volume
 import (
 	"sort"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/greghaskins/csi-miami/internal/transport"
@@ -41,10 +40,6 @@ type Params struct {
 	// Volume holds the parameters of a volume of kind volume, with derived
 	// fields still zero; nil for a directory.
 	Volume *VolumeParams
-	// TakeoverTimeout is the optional takeoverTimeout override; zero means
-	// DefaultTakeoverTimeout. It is validated here but is not part of the
-	// volume context.
-	TakeoverTimeout time.Duration
 }
 
 // ParseParameters parses and validates StorageClass parameters. Parameter
@@ -121,9 +116,6 @@ func ParseParameters(params map[string]string) (Params, error) {
 			return Params{}, err
 		}
 		p.Volume = &v
-		if p.TakeoverTimeout, err = parseTakeoverTimeout(params); err != nil {
-			return Params{}, err
-		}
 	}
 	return p, nil
 }
