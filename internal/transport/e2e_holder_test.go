@@ -68,7 +68,10 @@ func TestE2ENFS3HolderTwoClients(t *testing.T) {
 	if info.Age > 30*time.Second {
 		t.Errorf("a holder renewed just now is %s old on the server's clock", info.Age)
 	}
-	live := holder.Judge(info, holder.NodeState{Ready: true, InUse: true}, 5*time.Minute, holder.Observation{})
+	live, err := holder.Judge(info, holder.NodeState{Ready: true, InUse: true}, 5*time.Minute, holder.Observation{})
+	if err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
 	if live.Takeover {
 		t.Fatalf("a live holder was judged stale: %s", live.Reason)
 	}
@@ -82,7 +85,10 @@ func TestE2ENFS3HolderTwoClients(t *testing.T) {
 	// The first stops renewing; the judgement says stale (the node is gone
 	// from the cluster: the out-of-service taint stands in for the timed
 	// conditions, whose clocks the unit tests drive).
-	stale := holder.Judge(info, holder.NodeState{OutOfService: true}, 5*time.Minute, holder.Observation{})
+	stale, err := holder.Judge(info, holder.NodeState{OutOfService: true}, 5*time.Minute, holder.Observation{})
+	if err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
 	if !stale.Takeover {
 		t.Fatalf("out-of-service holder not judged stale: %s", stale.Reason)
 	}
