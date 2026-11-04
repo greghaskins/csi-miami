@@ -6,14 +6,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -32,8 +35,9 @@ const (
 	childEnv  = "CSI_MIAMI_BLOCKD_CHILD"
 	smokeVol  = "pvc-smoke"
 	smokeNode = "smoke-node"
-	smokeSize = 64 << 20
-	smokeChk  = 4 << 20
+	smokeSize = 32 << 20
+	smokeChk  = 1 << 20 // the minimum, so mkfs's large sequential writes land as
+	//                     full-chunk overwrites and avoid read-modify-write
 )
 
 // TestMain re-executes the binary as the block server when the child
@@ -50,21 +54,23 @@ func TestMain(m *testing.M) {
 func runChildServer() int {
 	epoch, _ := strconv.ParseUint(os.Getenv("BD_EPOCH"), 10, 64)
 	cfg := Config{
-		Volume:        os.Getenv("BD_VOLUME"),
-		StoreDir:      os.Getenv("BD_STORE"),
-		CacheDir:      os.Getenv("BD_CACHE"),
-		ControlSocket: os.Getenv("BD_CONTROL"),
-		Size:          smokeSize,
-		Chunk:         smokeChk,
-		CacheBound:    smokeSize,
-		Epoch:         epoch,
-		Node:          smokeNode,
-		Timeout:       30 * time.Second,
-		Holder:        NewFileChecker(os.Getenv("BD_STORE"), os.Getenv("BD_VOLUME"), smokeNode, epoch),
+		Volume:          os.Getenv("BD_VOLUME"),
+		StoreDir:        os.Getenv("BD_STORE"),
+		CacheDir:        os.Getenv("BD_CACHE"),
+		ControlSocket:   os.Getenv("BD_CONTROL"),
+		Size:            smokeSize,
+		Chunk:           smokeChk,
+		CacheBound:      smokeSize,
+		Epoch:           epoch,
+		Node:            smokeNode,
+		Timeout:         30 * time.Second,
+		DeadConnTimeout: 20 * time.Second,
+		Holder:          NewFileChecker(os.Getenv("BD_STORE"), os.Getenv("BD_VOLUME"), smokeNode, epoch),
 	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	if err := Run(ctx, cfg, testLog()); err != nil {
+	if err := Run(ctx, cfg, log); err != nil {
 		fmt.Fprintf(os.Stderr, "child blockd: %v\n", err)
 		return 1
 	}
@@ -193,7 +199,10 @@ func TestSmokeBlockdServesAndResumes(t *testing.T) {
 	cmd := startChild(t, store, cache, control, epoch)
 	cli := dialWait(t, control)
 	dev := deviceFor(t, smokeVol)
+	checkDeviceSize(t, dev)
+	t.Logf("mkfs %s", dev)
 	run(t, "mkfs.ext4", "-F", "-q", dev)
+	t.Logf("mkfs done; mounting")
 	mountExt4(t, dev, mnt)
 	want := writeFiles(t, mnt, 8)
 	unmount(t, mnt)
@@ -227,9 +236,44 @@ func TestSmokeBlockdServesAndResumes(t *testing.T) {
 func mountExt4(t *testing.T, dev, mnt string) {
 	t.Helper()
 	if err := unix.Mount(dev, mnt, "ext4", 0, ""); err != nil {
+		dumpNBD(t)
 		t.Fatalf("mount %s: %v", dev, err)
 	}
 	t.Cleanup(func() { _ = unix.Unmount(mnt, unix.MNT_DETACH) })
+}
+
+// checkDeviceSize asserts the kernel sees the device at the configured size.
+func checkDeviceSize(t *testing.T, dev string) {
+	t.Helper()
+	f, err := os.Open(dev) //nolint:gosec // the device we created
+	if err != nil {
+		t.Fatalf("open %s: %v", dev, err)
+	}
+	defer func() { _ = f.Close() }()
+	var size uint64
+	if _, _, e := unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.BLKGETSIZE64, uintptr(unsafe.Pointer(&size))); e != 0 {
+		t.Fatalf("BLKGETSIZE64 %s: %v", dev, e)
+	}
+	if size != smokeSize {
+		t.Fatalf("device size %d, want %d", size, smokeSize)
+	}
+	t.Logf("device %s is %d bytes", dev, size)
+}
+
+// dumpNBD logs the kernel's recent nbd messages, which is where the kernel says
+// why it failed a request.
+func dumpNBD(t *testing.T) {
+	t.Helper()
+	out, _ := exec.Command("dmesg").CombinedOutput()
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.Contains(l, "nbd") {
+			lines = append(lines, l)
+		}
+	}
+	if n := len(lines); n > 0 {
+		t.Logf("kernel nbd lines:\n%s", strings.Join(lines[max(0, n-15):], "\n"))
+	}
 }
 
 func unmount(t *testing.T, mnt string) {

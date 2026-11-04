@@ -79,11 +79,17 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	ctlErr := make(chan error, 1)
 	go func() { ctlErr <- s.serveControl(runCtx, lis) }()
 
+	var serveDied error
 	select {
 	case <-s.stop:
 		log.Info("blockd stopping on request", "volume", s.cfg.Volume)
 	case <-ctx.Done():
 		log.Info("blockd stopping on signal", "volume", s.cfg.Volume)
+	case serveDied = <-serveErr:
+		// Serve returned on its own: the kernel tore the connection down (a
+		// request timed out) or the socket broke. The device is no longer
+		// served, so there is nothing to keep running for.
+		log.Error("serve ended unexpectedly", "volume", s.cfg.Volume, "err", serveDied)
 	}
 
 	cancel() // stops the serve loop and the control loop
@@ -93,8 +99,10 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if err := nbd.Disconnect(dctx, idx); err != nil {
 		log.Warn("disconnect failed", "volume", s.cfg.Volume, "device", idx, "err", err)
 	}
-	if serr := <-serveErr; serr != nil {
-		log.Warn("serve ended", "volume", s.cfg.Volume, "err", serr)
+	if serveDied == nil {
+		if serr := <-serveErr; serr != nil {
+			log.Warn("serve ended", "volume", s.cfg.Volume, "err", serr)
+		}
 	}
 	if cerr := <-ctlErr; cerr != nil {
 		log.Warn("control ended", "volume", s.cfg.Volume, "err", cerr)
