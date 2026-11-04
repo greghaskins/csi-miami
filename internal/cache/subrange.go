@@ -103,11 +103,24 @@ func (c *Cache) WriteAt(i uint32, off int64, p []byte) error {
 	delete(c.zero, i)
 	delete(c.pendingUnlink, i)
 	c.dirty[i] = struct{}{}
-	c.unsynced[i] = struct{}{}
 	c.markIndexLocked()
+	gap := c.gapHook
 	c.mu.Unlock()
 
-	return c.pwriteChunk(i, off, p, !hadFile)
+	if gap != nil {
+		gap()
+	}
+	err := c.pwriteChunk(i, off, p, !hadFile)
+
+	// The fsync obligation is recorded only after the data is on the file, so a
+	// FLUSH (Sync) that ran while the pwrite was in flight cannot have cleared
+	// unsynced[i] and dropped this write's durability: WriteAt does not return
+	// (the write is not acknowledged) until unsynced[i] is set, so the next
+	// FLUSH — the one actually obligated to cover this write — fdatasyncs it.
+	c.mu.Lock()
+	c.unsynced[i] = struct{}{}
+	c.mu.Unlock()
+	return err
 }
 
 // preadChunk preads a sub-range from chunk i's file; a missing file (an

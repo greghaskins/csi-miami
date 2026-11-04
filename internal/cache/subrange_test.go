@@ -142,6 +142,50 @@ func TestWriteAtBoundaryCopiesWholeChunk(t *testing.T) {
 	}
 }
 
+// TestWriteAtDurabilityAcrossConcurrentSync proves a FLUSH landing while a
+// WriteAt's pwrite is in flight cannot drop the write's durability obligation.
+// With the mark-before-pwrite ordering the gap Sync cleared unsynced[0] and
+// WriteAt returned (the write ACKed) with the obligation gone; a later FLUSH
+// would never fdatasync the new data, which a node power loss then loses. With
+// the mark-after-pwrite ordering unsynced[0] is set when WriteAt returns, so
+// the next Sync covers it.
+func TestWriteAtDurabilityAcrossConcurrentSync(t *testing.T) {
+	c := newSubCache(t, srSize)
+	// Chunk 0 is a resident dirty chunk whose data is already durable.
+	if err := c.WriteAt(0, 0, filled(srChunk, 0x11)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	_, pendingBefore := c.unsynced[0]
+	c.mu.Unlock()
+	if pendingBefore {
+		t.Fatal("precondition: chunk 0 should be synced before the test write")
+	}
+
+	// A FLUSH lands in the window between WriteAt's lock release and its pwrite.
+	c.gapHook = func() {
+		if err := c.Sync(); err != nil {
+			t.Errorf("gap Sync: %v", err)
+		}
+	}
+	if err := c.WriteAt(0, 0, filled(srChunk, 0x22)); err != nil {
+		t.Fatal(err)
+	}
+	c.gapHook = nil
+
+	// The write is ACKed (WriteAt returned); chunk 0 must still be unsynced so a
+	// later FLUSH fdatasyncs the new data.
+	c.mu.Lock()
+	_, pending := c.unsynced[0]
+	c.mu.Unlock()
+	if !pending {
+		t.Fatal("a FLUSH during WriteAt dropped the write's durability obligation")
+	}
+}
+
 func TestWriteAtFullCacheRefuses(t *testing.T) {
 	c := newSubCache(t, srChunk) // one chunk of dirty capacity
 	if err := c.WriteAt(0, 0, filled(srChunk, 1)); err != nil {

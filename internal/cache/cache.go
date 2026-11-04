@@ -76,7 +76,8 @@ type Cache struct {
 	// pendingUnlink holds trimmed chunks whose c/<i> is removed once an index
 	// recording them as Zero is on disk; a Write cancels it.
 	pendingUnlink map[uint32]struct{}
-	indexWrites   int // index.json rewrites by flushLocked, for tests
+	indexWrites   int    // index.json rewrites by flushLocked, for tests
+	gapHook       func() // a seam: runs in WriteAt between the lock release and the pwrite, for tests
 	idxDirty      bool
 	timer         *time.Timer
 	closed        bool
