@@ -122,7 +122,6 @@ func TestSmokeExt4(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = unix.Close(rootFd) }()
 	if err := ext4.Freeze(rootFd); err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +144,9 @@ func TestSmokeExt4(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("write still blocked after Thaw")
 	}
+
+	// An open descriptor would keep the later unmount busy.
+	_ = unix.Close(rootFd)
 
 	// Online growth.
 	before := fsBytes(t, mnt)
