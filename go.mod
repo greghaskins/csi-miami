@@ -4,6 +4,8 @@ go 1.27.3
 
 require (
 	github.com/container-storage-interface/spec v1.13.0
+	github.com/coreos/go-systemd/v22 v22.7.0
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/mdlayher/genetlink v1.4.0
 	github.com/mdlayher/netlink v1.11.2
 	github.com/prometheus/client_golang v1.25.0
