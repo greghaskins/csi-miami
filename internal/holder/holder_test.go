@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,48 @@ func (e *env) names() []string {
 	return out
 }
 
+// holderFiles is the directory listing with the durable epoch-claim files
+// filtered out, so a test can assert that the holder file stands alone (its
+// temporary file removed) without listing the claims beside it.
+func (e *env) holderFiles() []string {
+	var out []string
+	for _, n := range e.names() {
+		if !strings.Contains(n, ".holder.epoch-") {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// claimedEpochs is the sorted set of epochs that have a durable claim file.
+func (e *env) claimedEpochs(name string) []uint64 {
+	prefix := name + ".holder.epoch-"
+	var out []uint64
+	for _, n := range e.names() {
+		if !strings.HasPrefix(n, prefix) {
+			continue
+		}
+		v, err := strconv.ParseUint(n[len(prefix):], 10, 64)
+		if err != nil {
+			e.t.Fatalf("unparsable claim file %q", n)
+		}
+		out = append(out, v)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// judgeTakeover reads name afresh and builds a takeover judgement bound to the
+// holder as it stands now, the way the reconciler does via Judge.
+func (e *env) judgeTakeover(name string) Judgement {
+	e.t.Helper()
+	info, err := Read(ctx, e.dir, name)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return Judgement{Takeover: true, Reason: "test", Info: info}
+}
+
 func (e *env) raw(name string) string {
 	b, err := os.ReadFile(Path(e.dir, name))
 	if err != nil {
@@ -57,9 +100,8 @@ func (e *env) raw(name string) string {
 }
 
 var (
-	ctx      = context.Background()
-	takeover = Judgement{Takeover: true, Reason: "test"}
-	keep     = Judgement{Reason: "test"}
+	ctx  = context.Background()
+	keep = Judgement{Reason: "test"}
 )
 
 func TestAcquireCreatesWithEpochOne(t *testing.T) {
@@ -74,8 +116,11 @@ func TestAcquireCreatesWithEpochOne(t *testing.T) {
 	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":0}`+"\n"; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
-	if got := e.names(); !slices.Equal(got, []string{"vol.holder"}) {
+	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
 		t.Errorf("directory holds %v, want only the holder file (the temporary file is removed)", got)
+	}
+	if got := e.claimedEpochs("vol"); !slices.Equal(got, []uint64{1}) {
+		t.Errorf("claimed epochs = %v, want [1]", got)
 	}
 	if ok, err := h.Mine(ctx); err != nil || !ok {
 		t.Errorf("Mine = %v, %v", ok, err)
@@ -96,7 +141,7 @@ func TestAcquireLosesTheLinkRace(t *testing.T) {
 	if !errors.Is(err, ErrHeld) || !strings.Contains(err.Error(), "kind-worker2") {
 		t.Errorf("err = %v, want ErrHeld naming kind-worker2", err)
 	}
-	if got := e.names(); !slices.Equal(got, []string{"vol.holder"}) {
+	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
 		t.Errorf("directory holds %v", got)
 	}
 }
@@ -127,7 +172,7 @@ func TestTakeoverIncrementsEpoch(t *testing.T) {
 	if err := first.Renew(ctx); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Acquire(ctx, e.dir, "vol", "kind-worker2", takeover)
+	second, err := Acquire(ctx, e.dir, "vol", "kind-worker2", e.judgeTakeover("vol"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,8 +185,11 @@ func TestTakeoverIncrementsEpoch(t *testing.T) {
 	if ok, _ := first.Mine(ctx); ok {
 		t.Error("the first holder still reports the file as its own")
 	}
-	if got := e.names(); !slices.Equal(got, []string{"vol.holder"}) {
+	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
 		t.Errorf("directory holds %v", got)
+	}
+	if got := e.claimedEpochs("vol"); !slices.Equal(got, []uint64{1, 2}) {
+		t.Errorf("claimed epochs = %v, want [1 2] (the previous epoch is kept to bound the window)", got)
 	}
 }
 
@@ -168,7 +216,7 @@ func TestRenewRewritesAtomically(t *testing.T) {
 	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":1}`+"\n"; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
-	if got := e.names(); !slices.Equal(got, []string{"vol.holder"}) {
+	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
 		t.Errorf("directory holds %v", got)
 	}
 	st, err := os.Stat(Path(e.dir, "vol"))
@@ -183,7 +231,7 @@ func TestRenewDetectsLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", takeover); err != nil {
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", e.judgeTakeover("vol")); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
@@ -227,10 +275,141 @@ func TestRenewDetectsATakeoverRacingTheRename(t *testing.T) {
 	}
 }
 
+// I2: a takeover that lands between writing the new content and the rename
+// must stop the losing holder before it renames, so it never overwrites the
+// new owner's file.
+func TestRenewDetectsLossBeforeTheRename(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook = func(point string) {
+		if point == "renew-written" {
+			hook = func(string) {}
+			// A taker's rename lands after we wrote our temp but before our own
+			// rename.
+			if err := os.WriteFile(Path(e.dir, "vol"), []byte(`{"node":"kind-worker2","epoch":2,"renewals":0}`+"\n"), 0o600); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
+		t.Fatalf("Renew = %v, want ErrLost", err)
+	}
+	// The loser did not overwrite the new owner: the file still names kind-worker2.
+	if got := e.raw("vol"); !strings.Contains(got, `"kind-worker2"`) || strings.Contains(got, `"renewals":1`) {
+		t.Errorf("the loser overwrote the new owner at the rename: %q", got)
+	}
+}
+
+// I1: the judgement is bound to the holder it judged. A renewal landing
+// between the judge read and the break means the holder is no longer the one
+// judged stale, so Acquire must refuse rather than break a now-live holder.
+func TestAcquireRefusesWhenTheJudgedHolderChanged(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The reconciler judged the holder as it was before this renewal.
+	stale := e.judgeTakeover("vol")
+	if err := h.Renew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Acquire(ctx, e.dir, "vol", "kind-worker2", stale)
+	if !errors.Is(err, ErrHeld) {
+		t.Fatalf("Acquire against a stale judgement = %v, want ErrHeld", err)
+	}
+	if got := e.raw("vol"); !strings.Contains(got, `"kind-worker"`) || !strings.Contains(got, `"renewals":1`) {
+		t.Errorf("the live holder was altered: %q", got)
+	}
+	if ok, err := h.Mine(ctx); err != nil || !ok {
+		t.Errorf("the live holder lost its volume: Mine = %v, %v", ok, err)
+	}
+	// A takeover judgement with no holder recorded is also refused.
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", Judgement{Takeover: true, Reason: "no info"}); !errors.Is(err, ErrHeld) {
+		t.Errorf("Acquire with an empty judged holder = %v, want ErrHeld", err)
+	}
+}
+
+// I3: Release keeps the durable claims, so the next acquire continues above
+// the highest epoch ever claimed rather than resetting to 1; the epoch never
+// goes backwards across a release and reacquire cycle.
+func TestEpochSurvivesReleaseAndNeverResets(t *testing.T) {
+	e := newEnv(t)
+	h1, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil || h1.Epoch() != 1 {
+		t.Fatalf("first acquire: epoch %d, %v", h1.Epoch(), err)
+	}
+	if err := h1.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h2.Epoch() != 2 {
+		t.Errorf("acquire after release: epoch %d, want 2 (never reset to 1)", h2.Epoch())
+	}
+	if err := h2.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h3, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h3.Epoch() != 3 {
+		t.Errorf("third acquire: epoch %d, want 3", h3.Epoch())
+	}
+	// After acquiring epoch 3, claims older than epoch 2 are pruned.
+	if got := e.claimedEpochs("vol"); !slices.Equal(got, []uint64{2, 3}) {
+		t.Errorf("claimed epochs = %v, want [2 3] (older claims pruned)", got)
+	}
+}
+
+// I3: two takers racing for the same holder get distinct epochs via the
+// durable claim, and the one whose rename lands first wins; the epoch never
+// goes backwards.
+func TestConcurrentTakeoversGetDistinctEpochs(t *testing.T) {
+	e := newEnv(t)
+	first, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	judged := e.judgeTakeover("vol")
+	var third *Holder
+	var thirdErr error
+	hook = func(point string) {
+		if point == "claimed" {
+			hook = func(string) {}
+			// A third node takes over after we claimed our epoch but before our
+			// rename. It claims the next epoch above ours and installs first.
+			third, thirdErr = Acquire(ctx, e.dir, "vol", "kind-worker3", judged)
+		}
+	}
+	_, err = Acquire(ctx, e.dir, "vol", "kind-worker2", judged)
+	if !errors.Is(err, ErrHeld) || !strings.Contains(err.Error(), "never decreases") {
+		t.Fatalf("the slower taker = %v, want ErrHeld naming the epoch rule", err)
+	}
+	if thirdErr != nil {
+		t.Fatalf("the faster taker: %v", thirdErr)
+	}
+	if third.Epoch() != 3 {
+		t.Errorf("the faster taker's epoch = %d, want 3 (above the loser's claim of 2)", third.Epoch())
+	}
+	if got := e.raw("vol"); !strings.Contains(got, `"kind-worker3"`) || !strings.Contains(got, `"epoch":3`) {
+		t.Errorf("the winner is not installed: %q", got)
+	}
+	if ok, _ := first.Mine(ctx); ok {
+		t.Error("the original holder still owns the file after a takeover")
+	}
+}
+
 func TestReleaseOnlyIfMine(t *testing.T) {
 	e := newEnv(t)
 	first, _ := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
-	second, err := Acquire(ctx, e.dir, "vol", "kind-worker2", takeover)
+	second, err := Acquire(ctx, e.dir, "vol", "kind-worker2", e.judgeTakeover("vol"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,8 +422,13 @@ func TestReleaseOnlyIfMine(t *testing.T) {
 	if err := second.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.names(); len(got) != 0 {
-		t.Errorf("directory holds %v after Release", got)
+	// The holder file is gone, but the durable epoch claims stay so a later
+	// acquire cannot reissue an epoch.
+	if got := e.holderFiles(); len(got) != 0 {
+		t.Errorf("holder file still present after Release: %v", got)
+	}
+	if got := e.claimedEpochs("vol"); !slices.Equal(got, []uint64{1, 2}) {
+		t.Errorf("claimed epochs = %v after Release, want [1 2] kept", got)
 	}
 	if err := second.Release(ctx); err != nil {
 		t.Errorf("Release of an absent file = %v, want nil", err)
@@ -289,6 +473,7 @@ func TestEpochNeverDecreases(t *testing.T) {
 	}
 	// Judged at epoch 1; before our rename another node takes over and moves
 	// the file to epoch 3.
+	judged := e.judgeTakeover("vol")
 	hook = func(point string) {
 		if point == "written" {
 			hook = func(string) {}
@@ -297,14 +482,14 @@ func TestEpochNeverDecreases(t *testing.T) {
 			}
 		}
 	}
-	_, err := Acquire(ctx, e.dir, "vol", "kind-worker2", takeover)
+	_, err := Acquire(ctx, e.dir, "vol", "kind-worker2", judged)
 	if !errors.Is(err, ErrHeld) || !strings.Contains(err.Error(), "never decreases") {
 		t.Fatalf("err = %v, want a refusal naming the epoch rule", err)
 	}
 	if got := e.raw("vol"); !strings.Contains(got, `"epoch":3`) {
 		t.Errorf("the file went backwards: %q", got)
 	}
-	if got := e.names(); !slices.Equal(got, []string{"vol.holder"}) {
+	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
 		t.Errorf("directory holds %v", got)
 	}
 }
@@ -324,15 +509,28 @@ func TestMineRereadsEveryCall(t *testing.T) {
 }
 
 func TestCorruptFileIsAnErrorNotAnAbsence(t *testing.T) {
-	e := newEnv(t)
-	if err := os.WriteFile(Path(e.dir, "vol"), []byte("junk"), 0o600); err != nil {
-		t.Fatal(err)
+	// Unparsable content, an empty node and a zero epoch are each corruption:
+	// Read and Acquire must error, never treat the holder as absent (which
+	// would let a second node create a fresh epoch-1 holder beside a live one).
+	corrupt := map[string]string{
+		"junk":       "junk",
+		"empty node": `{"node":"","epoch":2,"renewals":0}` + "\n",
+		"zero epoch": `{"node":"kind-worker","epoch":0,"renewals":0}` + "\n",
 	}
-	if _, err := Read(ctx, e.dir, "vol"); err == nil {
-		t.Error("Read of junk succeeded")
-	}
-	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker", takeover); err == nil {
-		t.Error("Acquire over junk succeeded")
+	for name, content := range corrupt {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			if err := os.WriteFile(Path(e.dir, "vol"), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Read(ctx, e.dir, "vol"); err == nil {
+				t.Errorf("Read of %s succeeded, want an error", name)
+			}
+			j := Judgement{Takeover: true, Reason: "x"}
+			if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", j); err == nil {
+				t.Errorf("Acquire over %s succeeded, want an error", name)
+			}
+		})
 	}
 }
 

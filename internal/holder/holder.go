@@ -7,6 +7,16 @@
 // before it publishes a generation and refuses unless node and epoch are
 // still its own, which is the fencing token.
 //
+// An epoch is issued exactly once for the life of the volume. Before it writes
+// epoch N into the holder file an acquirer must link(2) a durable claim file
+// `<name>.holder.epoch-<N>` beside the holder; the link fails with EEXIST when
+// another node already owns N, so the acquirer picks a higher N (the highest
+// claimed plus one) and tries again. Release leaves the claim files in place,
+// so the next first acquire does not reset to 1 but continues above the
+// highest epoch ever claimed, and two holders can never share an epoch nor can
+// an epoch move backwards. A successful acquire prunes claims older than
+// current-1, keeping the current and previous epoch to bound the window.
+//
 // Clocks differ between nodes, so a holder's age is the server's own: the
 // modification time of a probe file made now, minus the holder file's.
 package holder
@@ -22,6 +32,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -140,6 +151,12 @@ func load(ctx context.Context, dir, name string) (snapshot, error) {
 		if err := json.Unmarshal(b, &s.file); err != nil {
 			return snapshot{}, fmt.Errorf("the holder file is not valid: %w", err)
 		}
+		// A holder file names a node at an epoch that starts at 1; an empty
+		// node or a zero epoch is corruption, not a usable holder and not an
+		// absence.
+		if s.Node == "" || s.Epoch == 0 {
+			return snapshot{}, fmt.Errorf("the holder file is corrupt: node %q, epoch %d", s.Node, s.Epoch)
+		}
 		return s, nil
 	})
 }
@@ -208,6 +225,106 @@ func rename(ctx context.Context, dir, name, tmp string) error {
 	return err
 }
 
+// link hard-links oldpath to newpath atomically; EEXIST (fs.ErrExist) means
+// the name already exists and the link did nothing.
+func link(ctx context.Context, key, what, oldpath, newpath string) error {
+	_, err := step(ctx, key, what, func() (struct{}, error) {
+		return struct{}{}, os.Link(oldpath, newpath)
+	})
+	return err
+}
+
+// claimPath is the durable per-epoch claim file beside the holder file.
+func claimPath(dir, name string, epoch uint64) string {
+	return fmt.Sprintf("%s.epoch-%d", Path(dir, name), epoch)
+}
+
+// claimPrefix is the common prefix of every claim file for name in dir.
+func claimPrefix(name string) string { return name + ".holder.epoch-" }
+
+// maxClaimedEpoch is the highest epoch any node has ever claimed for name in
+// dir, or 0 when none has. Unparsable names are ignored.
+func maxClaimedEpoch(ctx context.Context, dir, name string) (uint64, error) {
+	prefix := claimPrefix(name)
+	return step(ctx, dir+"\x00claims", "list the epoch claims", func() (uint64, error) {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return 0, err
+		}
+		var mx uint64
+		for _, e := range ents {
+			n := e.Name()
+			if !strings.HasPrefix(n, prefix) {
+				continue
+			}
+			v, err := strconv.ParseUint(n[len(prefix):], 10, 64)
+			if err != nil {
+				continue
+			}
+			if v > mx {
+				mx = v
+			}
+		}
+		return mx, nil
+	})
+}
+
+// pruneClaims removes claim files older than keepFrom, best effort: the epoch
+// is already ours, so a failure to prune is not a failure to acquire.
+func pruneClaims(ctx context.Context, dir, name string, keepFrom uint64) {
+	prefix := claimPrefix(name)
+	_, _ = step(ctx, dir+"\x00claims", "prune old epoch claims", func() (struct{}, error) {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return struct{}{}, nil
+		}
+		for _, e := range ents {
+			n := e.Name()
+			if !strings.HasPrefix(n, prefix) {
+				continue
+			}
+			v, err := strconv.ParseUint(n[len(prefix):], 10, 64)
+			if err != nil || v >= keepFrom {
+				continue
+			}
+			_ = os.Remove(filepath.Join(dir, n))
+		}
+		return struct{}{}, nil
+	})
+}
+
+// claimEpoch reserves an epoch for this holder with a durable per-epoch claim
+// file: it links a temporary file to <name>.holder.epoch-<N> for N one above
+// the highest claimed (and above floor, the epoch being superseded). EEXIST
+// means another node took N, so it raises the floor past N and tries the next.
+// The returned epoch has been claimed by no one else, ever.
+func (h *Holder) claimEpoch(ctx context.Context, floor uint64) (uint64, error) {
+	for {
+		mx, err := maxClaimedEpoch(ctx, h.dir, h.name)
+		if err != nil {
+			return 0, err
+		}
+		n := max(mx, floor) + 1
+		tmp, err := writeTemp(ctx, h.dir, h.name, file{Node: h.node, Epoch: n})
+		if err != nil {
+			return 0, err
+		}
+		cp := claimPath(h.dir, h.name, n)
+		err = link(ctx, cp, "claim the epoch", tmp, cp)
+		removeTemp(tmp)
+		if errors.Is(err, fs.ErrExist) {
+			floor = n // guarantee progress even if the listing lagged the claim
+			hook("claim-lost")
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		hook("claimed")
+		return n, nil
+	}
+}
+
 // Holder is a holder file we own, at the epoch we took it.
 type Holder struct {
 	dir, name, node string
@@ -222,11 +339,19 @@ func (h *Holder) mine(s snapshot) bool {
 	return s.ok && s.Node == h.node && s.Epoch == h.epoch
 }
 
+// sameHolderAs reports whether this fresh snapshot is the very holder info
+// describes: same node, epoch and renewal count.
+func (s snapshot) sameHolderAs(info Info) bool {
+	return s.ok && s.Node == info.Node && s.Epoch == info.Epoch && s.Renewals == info.Renewals
+}
+
 // Acquire takes the holder file of name in dir for node. With no holder it
-// creates the file at epoch 1, atomically (a temporary file linked to the
-// final name, which fails if someone else won). With a holder it takes the
-// file over, at epoch + 1, only if judge says so; otherwise it fails with
-// ErrHeld.
+// creates the file at an epoch above every one ever claimed for the volume,
+// atomically (a temporary file linked to the final name, which fails if
+// someone else won). With a holder it takes the file over only if judge says
+// so, and only if the holder it finds is still exactly the one judge judged
+// (same node, epoch and renewals); otherwise it fails with ErrHeld, and the
+// next pass re-judges the holder as it stands.
 func Acquire(ctx context.Context, dir, name, node string, judge Judgement) (*Holder, error) {
 	if node == "" || strings.ContainsAny(name, "/\x00") || name == "" {
 		return nil, errors.New("holder: node and name are required, and the name is one path element")
@@ -242,32 +367,51 @@ func Acquire(ctx context.Context, dir, name, node string, judge Judgement) (*Hol
 	if !judge.Takeover {
 		return nil, fmt.Errorf("%w: %s at epoch %d (%s)", ErrHeld, cur.Node, cur.Epoch, judge.Reason)
 	}
-	return h.takeOver(ctx, cur)
+	// The judgement is bound to the holder it judged: a renewal or a takeover
+	// landing between the judge read and here means the holder is no longer
+	// the one that was judged stale, so we refuse rather than break a holder
+	// that may now be live.
+	if !judge.Info.Present || !cur.sameHolderAs(judge.Info) {
+		return nil, fmt.Errorf("%w: the holder changed since it was judged (now %s at epoch %d, %d renewals); re-judge", ErrHeld, cur.Node, cur.Epoch, cur.Renewals)
+	}
+	return h.takeOver(ctx, judge.Info)
 }
 
 func (h *Holder) create(ctx context.Context) (*Holder, error) {
-	h.epoch = 1
-	tmp, err := writeTemp(ctx, h.dir, h.name, file{Node: h.node, Epoch: 1})
+	epoch, err := h.claimEpoch(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	h.epoch = epoch
+	tmp, err := writeTemp(ctx, h.dir, h.name, file{Node: h.node, Epoch: epoch})
 	if err != nil {
 		return nil, err
 	}
 	defer removeTemp(tmp)
 	hook("created")
-	_, err = step(ctx, Path(h.dir, h.name), "link the holder file", func() (struct{}, error) {
-		return struct{}{}, os.Link(tmp, Path(h.dir, h.name))
-	})
+	err = link(ctx, Path(h.dir, h.name), "link the holder file", tmp, Path(h.dir, h.name))
 	if errors.Is(err, fs.ErrExist) {
 		return nil, h.heldBy(ctx)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return h, h.confirm(ctx)
+	if err := h.confirm(ctx); err != nil {
+		return nil, err
+	}
+	pruneClaims(ctx, h.dir, h.name, epoch-1)
+	return h, nil
 }
 
-func (h *Holder) takeOver(ctx context.Context, judged snapshot) (*Holder, error) {
-	h.epoch = judged.Epoch + 1
-	tmp, err := writeTemp(ctx, h.dir, h.name, file{Node: h.node, Epoch: h.epoch})
+func (h *Holder) takeOver(ctx context.Context, judged Info) (*Holder, error) {
+	// Claim an epoch strictly above the one being superseded. The claim is
+	// durable, so even a takeover we then abandon cannot be reissued.
+	epoch, err := h.claimEpoch(ctx, judged.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	h.epoch = epoch
+	tmp, err := writeTemp(ctx, h.dir, h.name, file{Node: h.node, Epoch: epoch})
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +419,10 @@ func (h *Holder) takeOver(ctx context.Context, judged snapshot) (*Holder, error)
 	hook("written")
 	// The file we replace must still be the one that was judged: the epoch
 	// never decreases, and a holder renewed or another taker in between means
-	// the judgement is out of date.
+	// the judgement is out of date. (NFSv3 has no conditional rename, so a one
+	// round-trip window remains between this check and the rename, accepted by
+	// the design: a taker that loses it is caught by its own confirm, and the
+	// fencing token stops either from publishing.)
 	now, err := load(ctx, h.dir, h.name)
 	if err != nil {
 		return nil, err
@@ -291,7 +438,11 @@ func (h *Holder) takeOver(ctx context.Context, judged snapshot) (*Holder, error)
 	if err := rename(ctx, h.dir, h.name, tmp); err != nil {
 		return nil, err
 	}
-	return h, h.confirm(ctx)
+	if err := h.confirm(ctx); err != nil {
+		return nil, err
+	}
+	pruneClaims(ctx, h.dir, h.name, epoch-1)
+	return h, nil
 }
 
 // confirm re-reads the file after we replaced or created it and checks that it
@@ -316,8 +467,16 @@ func (h *Holder) heldBy(ctx context.Context) error {
 }
 
 // Renew rewrites the holder file with one more renewal: a temporary file
-// renamed over it. ErrLost when the file is no longer ours, before the write
-// or after the rename (a takeover raced it); the Holder then stays lost.
+// renamed over it. It confirms ownership immediately before the rename, not
+// only when it starts, so a takeover that lands while the new content is being
+// written cannot be overwritten by the losing holder; it confirms again after
+// the rename to catch a takeover that raced the rename itself. ErrLost
+// whenever the file is no longer ours; the Holder then stays lost.
+//
+// NFSv3 has no conditional rename, so a one round-trip window remains between
+// the pre-rename check and the rename. The design accepts that overlap: a
+// rename that lands on a newer owner is caught by the post-rename check, and
+// the fencing token stops a lost holder from publishing regardless.
 func (h *Holder) Renew(ctx context.Context) error {
 	if h.lost.Load() {
 		return ErrLost
@@ -336,6 +495,17 @@ func (h *Holder) Renew(ctx context.Context) error {
 	}
 	defer removeTemp(tmp)
 	hook("renew-written")
+	// Re-confirm ownership in the same step as the rename: a takeover between
+	// the first read and here means the file is no longer ours and we must not
+	// install our content over the new owner's.
+	before, err := load(ctx, h.dir, h.name)
+	if err != nil {
+		return err
+	}
+	if !h.mine(before) {
+		h.lost.Store(true)
+		return ErrLost
+	}
 	if err := rename(ctx, h.dir, h.name, tmp); err != nil {
 		return err
 	}
