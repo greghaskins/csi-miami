@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -333,5 +334,47 @@ func TestMountPointIsNotCreatedThroughASymlink(t *testing.T) {
 				t.Errorf("calls = %+v", c)
 			}
 		})
+	}
+}
+
+// A mount made before the profile had noacl is still this driver's: it is
+// adopted, not reported foreign, and the drift is logged once.
+func TestNFS3AdoptsMountWithoutNoacl(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, _ := nfsSpec.MountPoint(root)
+	m := kernelNFS3(t, dir) // the kernel fixture predates noacl
+	if slices.Contains(m.SuperOptions, "noacl") {
+		t.Fatal("the fixture already has noacl")
+	}
+	var logs strings.Builder
+	f := newFake(table(rootMount(), m))
+	tr := newTransport(t, nfsSpec, root, f, Options{Log: slog.New(slog.NewTextHandler(&logs, nil))})
+
+	if got, err := tr.Mounted(context.Background()); err != nil || !got {
+		t.Fatalf("Mounted = %v, %v; want adopted", got, err)
+	}
+	for range 3 {
+		if err := tr.Mount(context.Background()); err != nil {
+			t.Fatalf("Mount: %v", err)
+		}
+	}
+	if c := kernelCalls(f); len(c) != 0 {
+		t.Errorf("adoption called the kernel: %+v", c)
+	}
+	if n := strings.Count(logs.String(), "without noacl"); n != 1 {
+		t.Errorf("the drift was logged %d times, want once:\n%s", n, logs.String())
+	}
+
+	// A mount that has it is adopted without a word.
+	with := kernelNFS3(t, dir)
+	with.SuperOptions = append(slices.Clone(with.SuperOptions), "noacl")
+	var quiet strings.Builder
+	root2 := t.TempDir()
+	dir2, _ := nfsSpec.MountPoint(root2)
+	with.MountPoint = dir2
+	tr2 := newTransport(t, nfsSpec, root2, newFake(table(rootMount(), with)), Options{Log: slog.New(slog.NewTextHandler(&quiet, nil))})
+	if err := tr2.Mount(context.Background()); err != nil || quiet.Len() != 0 {
+		t.Errorf("a mount with noacl: err %v, log %q", err, quiet.String())
 	}
 }

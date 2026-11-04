@@ -1,6 +1,8 @@
 package intent
 
 import (
+	"time"
+
 	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -27,6 +29,27 @@ type wireIntent struct {
 	// Generation is informational for a version 1 reader, which ignores it;
 	// a record without it reads as 0.
 	Generation uint64 `json:"generation"`
+	// Volume and Epoch exist only for the volume kind; a version 1 reader
+	// ignores them.
+	Volume *volumeRecord `json:"volume,omitempty"`
+	Epoch  uint64        `json:"epoch,omitempty"`
+}
+
+// volumeRecord is the on-disk form of a volume.VolumeParams, with its own
+// explicit keys. Durations are nanoseconds.
+type volumeRecord struct {
+	ChunkSize      int64  `json:"chunkSize"`
+	CacheSize      int64  `json:"cacheSize"`
+	Size           int64  `json:"size"`
+	Encryption     bool   `json:"encryption"`
+	Cipher         string `json:"cipher"`
+	KeySize        int    `json:"keySize"`
+	Interval       int64  `json:"interval"`
+	MaxAge         int64  `json:"maxAge"`
+	Keep           int    `json:"keep"`
+	DirtyWatermark int64  `json:"dirtyWatermark"`
+	// TakeoverTimeout is nanoseconds; absent means the default.
+	TakeoverTimeout int64 `json:"takeoverTimeout,omitempty"`
 }
 
 // transportRecord is the on-disk form of a transport.Spec, with its own
@@ -40,7 +63,18 @@ type transportRecord struct {
 }
 
 func toWire(in Intent) wireIntent {
+	var vr *volumeRecord
+	if v := in.Volume; v != nil {
+		vr = &volumeRecord{
+			ChunkSize: v.ChunkSize, CacheSize: v.CacheSize, Size: v.Size, Encryption: v.Encryption,
+			Cipher: v.Cipher, KeySize: v.KeySize, Interval: int64(v.Generations.Interval),
+			MaxAge: int64(v.Generations.MaxAge), Keep: v.Generations.Keep, DirtyWatermark: v.Generations.DirtyWatermark,
+			TakeoverTimeout: int64(v.TakeoverTimeout),
+		}
+	}
 	return wireIntent{
+		Volume:   vr,
+		Epoch:    in.Epoch,
 		Version:  in.Version,
 		VolumeID: in.VolumeID,
 		Kind:     string(in.Kind),
@@ -62,7 +96,20 @@ func toWire(in Intent) wireIntent {
 }
 
 func fromWire(w wireIntent) Intent {
+	var vp *volume.VolumeParams
+	if r := w.Volume; r != nil {
+		vp = &volume.VolumeParams{
+			ChunkSize: r.ChunkSize, CacheSize: r.CacheSize, Size: r.Size, Encryption: r.Encryption,
+			Cipher: r.Cipher, KeySize: r.KeySize, TakeoverTimeout: time.Duration(r.TakeoverTimeout),
+			Generations: volume.GenerationParams{
+				Interval: time.Duration(r.Interval), MaxAge: time.Duration(r.MaxAge),
+				Keep: r.Keep, DirtyWatermark: r.DirtyWatermark,
+			},
+		}
+	}
 	return Intent{
+		Volume:   vp,
+		Epoch:    w.Epoch,
 		Version:  w.Version,
 		VolumeID: w.VolumeID,
 		Kind:     volume.Kind(w.Kind),

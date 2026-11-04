@@ -201,8 +201,8 @@ func (n *Node) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.NodeG
 }
 
 // singleCapability checks the one capability of a node request.
-func singleCapability(c *csi.VolumeCapability) error {
-	if p := capabilityProblem(c); p != "" {
+func singleCapability(kind volume.Kind, c *csi.VolumeCapability) error {
+	if p := capabilityProblemFor(kind, c); p != "" {
 		return invalidf("volume_capability: %s", p)
 	}
 	return nil
@@ -224,7 +224,7 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	if capability == nil {
 		return nil, invalidf("volume_capability is required")
 	}
-	if err := singleCapability(capability); err != nil {
+	if err := singleCapability(id.Kind, capability); err != nil {
 		return nil, err
 	}
 	vc, err := volume.DecodeContext(req.GetVolumeContext())
@@ -245,13 +245,14 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 		StagePath:  req.GetStagingTargetPath(),
 		AccessMode: capability.GetAccessMode().GetMode().String(),
 		MountFlags: capability.GetMount().GetMountFlags(),
+		Volume:     vc.Volume,
 	}
 
 	prev, ok, err := n.rec.Get(in.VolumeID)
 	if err != nil {
 		return nil, nodeStatus(fmt.Errorf("%w: reading the record of %s: %w", reconcile.ErrIntentsUnknown, in.VolumeID, err))
 	}
-	if ok && (prev.Context() != vc || prev.StagePath != in.StagePath) {
+	if ok && (!prev.Context().Equal(vc) || prev.StagePath != in.StagePath) {
 		return nil, status.Errorf(codes.AlreadyExists, "volume %s is already staged with another volume context or staging path", in.VolumeID)
 	}
 	// The node may create a local volume's directory at its first stage
@@ -301,13 +302,13 @@ func (n *Node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolume
 	if capability == nil {
 		return nil, invalidf("volume_capability is required")
 	}
-	if err := singleCapability(capability); err != nil {
-		return nil, err
-	}
 	// An ID this driver could not have issued names no staged volume.
 	id, err := volume.ParseID(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "volume %q is not staged on this node", req.GetVolumeId())
+	}
+	if err := singleCapability(id.Kind, capability); err != nil {
+		return nil, err
 	}
 
 	rec, ok, err := n.rec.Get(id.String())

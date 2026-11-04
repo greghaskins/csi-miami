@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/transport"
@@ -106,6 +108,12 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 		return nil, unavailable("the directory of volume %q cannot be computed, so nothing is deleted: %v", id.Name, err)
 	}
 
+	if vctx.Kind == volume.KindVolume {
+		if err := c.refuseLiveHolder(ctx, id, dir, vctx.Volume.Takeover()); err != nil {
+			return nil, err
+		}
+	}
+
 	removed, err := blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) {
 		return removeItemDir(ctx, c.mounter, tr.Dir(), dir, id.Name)
 	})
@@ -115,9 +123,45 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 		}
 		return nil, asStatus(err)
 	}
+	if vctx.Kind == volume.KindVolume {
+		c.removeHolderFiles(dir, id.Name)
+	}
 	c.seen.forget(id.Name)
 	c.log.Info("volume deleted", "volume_id", id.String(), "directory_existed", removed)
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// refuseLiveHolder returns Unavailable while a node holds the volume of kind
+// volume: a holder file beside the directory that is younger than the takeover
+// timeout (its age is on the transport's clock, see holder.Read). A holder
+// that has gone quiet for longer is a dead node's, and the delete goes on.
+// Deleting under a live holder would pull the chunks out from under a mounted
+// volume.
+func (c *Controller) refuseLiveHolder(ctx context.Context, id volume.ID, dir string, takeover time.Duration) error {
+	info, err := holder.Read(ctx, filepath.Dir(dir), id.Name)
+	if err != nil {
+		if ctx.Err() != nil {
+			return contextStatus(ctx.Err())
+		}
+		return unavailable("cannot read the holder of volume %q, so nothing is deleted: %v", id.Name, reason(err))
+	}
+	if info.Present && info.Age < takeover {
+		return unavailable("volume %q is held by node %q (renewed %s ago); nothing is deleted until the node unstages it", id.Name, info.Node, info.Age.Round(time.Second))
+	}
+	return nil
+}
+
+// removeHolderFiles removes what a holder leaves beside a deleted volume's
+// directory: the holder file and its epoch claims. Best effort; the volume is
+// gone either way.
+func (c *Controller) removeHolderFiles(dir, name string) {
+	parent := filepath.Dir(dir)
+	files, _ := filepath.Glob(filepath.Join(parent, name+".holder*"))
+	for _, f := range files {
+		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			c.log.Warn("could not remove a holder file of a deleted volume", "volume", name, "error", reason(err))
+		}
+	}
 }
 
 // contextOfPV extracts the volume context from the PV of the volume id, and

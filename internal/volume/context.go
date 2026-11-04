@@ -2,8 +2,11 @@ package volume
 
 import (
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/transport"
 )
@@ -20,7 +23,26 @@ const (
 	keyTransportPath   = contextPrefix + "transport.path"
 	keySubdir          = contextPrefix + "subdir"
 	keyMode            = contextPrefix + "mode"
+
+	// Keys of the volume kind only.
+	keyChunkSize         = contextPrefix + "chunkSize"
+	keyCacheSize         = contextPrefix + "cacheSize"
+	keyEncryption        = contextPrefix + "encryption"
+	keyCipher            = contextPrefix + "cipher"
+	keyKeySize           = contextPrefix + "keySize"
+	keySize              = contextPrefix + "size"
+	keyGenInterval       = contextPrefix + "generations.interval"
+	keyGenKeep           = contextPrefix + "generations.keep"
+	keyGenMaxAge         = contextPrefix + "generations.maxAge"
+	keyGenDirtyWatermark = contextPrefix + "generations.dirtyWatermark"
+	keyTakeoverTimeout   = contextPrefix + "takeoverTimeout" // optional: absent means the default
 )
+
+// volumeKeys are the context keys only a volume of kind volume carries.
+var volumeKeys = []string{
+	keyChunkSize, keyCacheSize, keyEncryption, keyCipher, keyKeySize, keySize,
+	keyGenInterval, keyGenKeep, keyGenMaxAge, keyGenDirtyWatermark, keyTakeoverTimeout,
+}
 
 // Context is the volume context set by CreateVolume, stored on the PV and
 // sent on every node call.
@@ -38,6 +60,10 @@ type Context struct {
 	// only to a directory the driver makes: one that exists is adopted as it
 	// is. DirMode gives it as a number.
 	Mode string
+
+	// Volume holds the parameters of a volume of kind volume; nil for a
+	// directory. Compare Contexts with Equal, not ==.
+	Volume *VolumeParams
 }
 
 // DirMode returns the mode of the item directory as a number: DefaultMode
@@ -48,7 +74,18 @@ func (c Context) DirMode() uint32 { return ModeBits(c.Mode) }
 // NewContext produces. The error carries the gRPC code InvalidArgument.
 func (c Context) Validate() error {
 	if !c.Kind.Valid() {
-		return invalid("volume context " + keyKind + " must be directory")
+		return invalid("volume context " + keyKind + " must be directory or volume")
+	}
+	if (c.Kind == KindVolume) != (c.Volume != nil) {
+		return invalid("volume parameters belong to kind " + string(KindVolume) + " and to no other")
+	}
+	if c.Volume != nil {
+		if c.Transport.Kind == transport.KindLocal {
+			return invalid("kind " + string(KindVolume) + " needs a remote transport: transport.kind local is not supported")
+		}
+		if err := c.Volume.check(); err != nil {
+			return err
+		}
 	}
 	if err := c.Transport.Validate(); err != nil {
 		return err
@@ -110,6 +147,27 @@ func (c Context) Encode() map[string]string {
 	set(keyTransportPath, c.Transport.Path)
 	set(keySubdir, c.Subdir)
 	set(keyMode, c.Mode)
+	if v := c.Volume; v != nil {
+		num := func(n int64) string {
+			if n == 0 {
+				return ""
+			}
+			return strconv.FormatInt(n, 10)
+		}
+		set(keyChunkSize, num(v.ChunkSize))
+		set(keyCacheSize, num(v.CacheSize))
+		set(keySize, num(v.Size))
+		set(keyEncryption, map[bool]string{true: "on", false: "off"}[v.Encryption])
+		set(keyCipher, v.Cipher)
+		set(keyKeySize, strconv.Itoa(v.KeySize))
+		set(keyGenInterval, v.Generations.Interval.String())
+		set(keyGenKeep, strconv.Itoa(v.Generations.Keep))
+		set(keyGenMaxAge, v.Generations.MaxAge.String())
+		set(keyGenDirtyWatermark, num(v.Generations.DirtyWatermark))
+		if v.TakeoverTimeout > 0 {
+			set(keyTakeoverTimeout, v.TakeoverTimeout.String())
+		}
+	}
 	return m
 }
 
@@ -127,6 +185,9 @@ func DecodeContext(m map[string]string) (Context, error) {
 		switch k {
 		case keyKind, keyTransportKind, keyTransportServer, keyTransportExport, keyTransportPath, keySubdir, keyMode:
 		default:
+			if slices.Contains(volumeKeys, k) {
+				continue
+			}
 			unknown = append(unknown, k)
 		}
 	}
@@ -152,6 +213,19 @@ func DecodeContext(m map[string]string) (Context, error) {
 		Subdir: m[keySubdir],
 		Mode:   m[keyMode],
 	}
+	if c.Kind == KindVolume {
+		v, err := decodeVolume(m)
+		if err != nil {
+			return Context{}, err
+		}
+		c.Volume = &v
+	} else {
+		for _, k := range volumeKeys {
+			if _, set := m[k]; set {
+				return Context{}, invalid("volume context key " + k + " is only for kind " + string(KindVolume))
+			}
+		}
+	}
 	if err := c.Validate(); err != nil {
 		return Context{}, err
 	}
@@ -169,9 +243,80 @@ func NewContext(params map[string]string) (Context, error) {
 	if err != nil {
 		return Context{}, err
 	}
-	c := Context{Kind: p.Kind, Transport: p.Transport, Subdir: subdir, Mode: p.Mode}
+	c := Context{Kind: p.Kind, Transport: p.Transport, Subdir: subdir, Mode: p.Mode, Volume: p.Volume}
 	if err := c.Validate(); err != nil {
 		return Context{}, err
 	}
 	return c, nil
+}
+
+// decodeVolume reads the volume keys of a context. Every one is required and
+// must be in the form Encode writes.
+func decodeVolume(m map[string]string) (VolumeParams, error) {
+	var v VolumeParams
+	for _, k := range volumeKeys {
+		if m[k] == "" && k != keyTakeoverTimeout {
+			return v, invalid("volume context key " + k + " is required")
+		}
+	}
+	num := func(k string) (int64, error) {
+		n, err := strconv.ParseInt(m[k], 10, 64)
+		if err != nil || n <= 0 || strconv.FormatInt(n, 10) != m[k] {
+			return 0, invalid("volume context key " + k + " must be a positive number")
+		}
+		return n, nil
+	}
+	dur := func(k string) (time.Duration, error) {
+		d, err := time.ParseDuration(m[k])
+		if err != nil || d <= 0 || d.String() != m[k] {
+			return 0, invalid("volume context key " + k + " must be a positive duration")
+		}
+		return d, nil
+	}
+	var err error
+	if v.ChunkSize, err = num(keyChunkSize); err != nil {
+		return v, err
+	}
+	if v.CacheSize, err = num(keyCacheSize); err != nil {
+		return v, err
+	}
+	if v.Size, err = num(keySize); err != nil {
+		return v, err
+	}
+	if v.Generations.DirtyWatermark, err = num(keyGenDirtyWatermark); err != nil {
+		return v, err
+	}
+	switch m[keyEncryption] {
+	case "on":
+		v.Encryption = true
+	case "off":
+	default:
+		return v, invalid("volume context key " + keyEncryption + " must be on or off")
+	}
+	v.Cipher = m[keyCipher]
+	ks, err := num(keyKeySize)
+	if err != nil {
+		return v, err
+	}
+	v.KeySize = int(ks)
+	keep, err := num(keyGenKeep)
+	if err != nil {
+		return v, err
+	}
+	v.Generations.Keep = int(keep)
+	if v.Generations.Interval, err = dur(keyGenInterval); err != nil {
+		return v, err
+	}
+	if v.Generations.MaxAge, err = dur(keyGenMaxAge); err != nil {
+		return v, err
+	}
+	if m[keyTakeoverTimeout] != "" {
+		if v.TakeoverTimeout, err = dur(keyTakeoverTimeout); err != nil {
+			return v, err
+		}
+	}
+	if v.Size%v.ChunkSize != 0 {
+		return v, invalid("volume context key " + keySize + " must be a whole number of chunks")
+	}
+	return v, nil
 }
