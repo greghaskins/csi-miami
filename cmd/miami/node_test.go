@@ -36,6 +36,9 @@ func TestRunNodeFlags(t *testing.T) {
 				"Usage of miami node:", "-endpoint", "unix:///csi/csi.sock", "-node-id", "-kubelet-dir", "/var/lib/kubelet",
 				"-transports-root", "plugins/miami.csi.greghaskins.com/transports", "-state-dir", "-stage-root", "-metrics-addr", ":9810",
 				"-reconcile-interval", "-deadline", "-transport-idle", "-kubeconfig", "-no-events",
+				"-cache-dir", "/var/lib/miami/cache", "-bin-dir", "<kubelet-dir>/plugins/miami.csi.greghaskins.com/bin",
+				"-systemd-socket", "/run/systemd/private", "-takeover-timeout", "(default 5m0s)", "-holder-renew", "(default 15s)",
+				"-remediate",
 			},
 		},
 		{name: "unknown flag", args: []string{"-nope"}, wantCode: 2, wantStderr: []string{"flag provided but not defined: -nope"}},
@@ -44,6 +47,9 @@ func TestRunNodeFlags(t *testing.T) {
 		{name: "zero deadline", args: []string{"-node-id=n", "-deadline=0s"}, wantCode: 2, wantStderr: []string{"-deadline must be positive"}},
 		{name: "zero interval", args: []string{"-node-id=n", "-reconcile-interval=0s"}, wantCode: 2, wantStderr: []string{"-reconcile-interval must be positive"}},
 		{name: "negative idle", args: []string{"-node-id=n", "-transport-idle=-1s"}, wantCode: 2, wantStderr: []string{"-transport-idle must not be negative"}},
+		{name: "zero takeover timeout", args: []string{"-node-id=n", "-takeover-timeout=0s"}, wantCode: 2, wantStderr: []string{"-takeover-timeout must be positive"}},
+		{name: "renew not shorter than takeover", args: []string{"-node-id=n", "-holder-renew=5m"}, wantCode: 2, wantStderr: []string{"-holder-renew must be shorter"}},
+		{name: "relative cache dir", args: []string{"-node-id=n", "-cache-dir=c"}, wantCode: 2, wantStderr: []string{"-cache-dir must be an absolute path"}},
 		{name: "relative kubelet dir", args: []string{"-node-id=n", "-kubelet-dir=kubelet"}, wantCode: 2, wantStderr: []string{"-kubelet-dir must be an absolute path"}},
 	}
 	for _, tt := range tests {
@@ -93,6 +99,13 @@ func TestNodeConfigDefaultsFollowTheKubeletDir(t *testing.T) {
 	}
 	if c.transportsRoot != "/k/plugins/miami.csi.greghaskins.com/transports" {
 		t.Errorf("transports root default: %q", c.transportsRoot)
+	}
+	if c.binDir != "/k/plugins/miami.csi.greghaskins.com/bin" {
+		t.Errorf("bin dir default: %q", c.binDir)
+	}
+	c = nodeConfig{kubeletDir: "/k", binDir: "/b"}.withDefaults()
+	if c.binDir != "/b" {
+		t.Errorf("an explicit bin dir changed: %q", c.binDir)
 	}
 	c = nodeConfig{kubeletDir: "/k", stateDir: "/s", stageRoot: "/r", transportsRoot: "/t"}.withDefaults()
 	if c.stateDir != "/s" || c.stageRoot != "/r" || c.transportsRoot != "/t" {
@@ -154,7 +167,9 @@ func TestServeNodeWithServesUntilTheContextEnds(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	for _, want := range []string{`miami_csi_requests_total{code="OK",method="NodeGetInfo"} 1`, "miami_reconcile_duration_seconds_count", "go_goroutines"} {
+	for _, want := range []string{`miami_csi_requests_total{code="OK",method="NodeGetInfo"} 1`, "miami_reconcile_duration_seconds_count", "go_goroutines",
+		// The startup probe set one gauge per feature; this test's cache dir is unset and its socket absent.
+		`miami_node_capability{feature="cache-dir"} 0`, `miami_node_capability{feature="systemd-socket"} 0`} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("/metrics lacks %q", want)
 		}

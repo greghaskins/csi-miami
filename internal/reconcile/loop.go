@@ -10,6 +10,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/prereq"
 )
 
 // pass is the state of one run through the loop. It lives on the loop
@@ -28,6 +29,10 @@ type pass struct {
 	teardownErr map[string]error         // by volume, for the unstage requests
 	results     map[string]*volumeResult // by volume, for the volumes that were converged
 	dropErr     map[string]error         // by publish target, for the unpublish requests
+
+	// prereq is the node's prerequisite report of this pass (layer 1 of the
+	// volume item); the zero report when no probe is configured.
+	prereq prereq.Report
 
 	// collect is false in a pass where any record failed to load: only
 	// explicit Unpublish drops are carried out (garbage.go).
@@ -69,6 +74,9 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 	began := time.Now()
 	r.starts.Add(1)
 	defer func() {
+		for _, req := range batch {
+			req.keys.Wipe()
+		}
 		r.metrics.ObserveReconcile(time.Since(began))
 		r.ends.Add(1)
 	}()
@@ -98,6 +106,9 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 		dropErr:     map[string]error{},
 		trs:         map[string]*trResult{},
 		hung:        map[string]error{},
+	}
+	if r.opts.Prereq != nil {
+		p.prereq = r.opts.Prereq(ctx)
 	}
 	p.teardown(batch)
 	p.convergeAll()
