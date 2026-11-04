@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -87,13 +86,27 @@ func fsBytes(t *testing.T, dir string) uint64 {
 	return st.Blocks * uint64(st.Bsize)
 }
 
+// requireAdiantum asks the kernel's crypto API for the cipher, which loads or
+// instantiates it; /proc/crypto lists only what is already registered, so
+// reading it first would fail on a kernel that has the module but has not used
+// it yet.
+func requireAdiantum(t *testing.T) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_ALG, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatalf("AF_ALG: %v", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Bind(fd, &unix.SockaddrALG{Type: "skcipher", Name: "adiantum(xchacha12,aes)"}); err != nil {
+		t.Fatalf("the kernel has no Adiantum: %v", err)
+	}
+}
+
 func TestSmokeLUKSLifecycle(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Fatal("smoke must run as root: use `make smoke` as root")
 	}
-	if b, err := os.ReadFile("/proc/crypto"); err != nil || !strings.Contains(string(b), "adiantum") {
-		t.Fatalf("the kernel has no Adiantum in /proc/crypto (err %v)", err)
-	}
+	requireAdiantum(t)
 	ctx := context.Background()
 	r := tool.Real()
 	dir := t.TempDir()

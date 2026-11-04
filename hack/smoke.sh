@@ -56,6 +56,7 @@ fi
 # missing).
 modprobe loop || true
 modprobe dm_crypt || true
+modprobe adiantum || true
 
 if [ -n "${SMOKE_ARTIFACT_DIR:-}" ]; then
   mkdir -p "$SMOKE_ARTIFACT_DIR"
