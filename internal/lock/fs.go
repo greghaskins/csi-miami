@@ -232,3 +232,11 @@ func (d *osDir) Same(path string) (bool, error) {
 }
 
 func (d *osDir) Close() error { return unix.Close(d.fd) }
+
+// ProbeClock returns the current time on the clock of the server that holds
+// dir: it creates a file there, reads the modification time the server gave
+// it and removes the file. Clocks differ between nodes, so anything that
+// compares a file's age on a shared export reads "now" through this, never
+// from time.Now. The probe file is a hidden name in dir and does not outlive
+// the call.
+func ProbeClock(dir string) (time.Time, error) { return osFS{}.Probe(dir, "clock") }

@@ -186,3 +186,22 @@ func TestCleanDropsThePathButKeepsTheCause(t *testing.T) {
 		})
 	}
 }
+
+func TestProbeClockReadsAndRemoves(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	before := time.Now().Add(-time.Minute)
+	got, err := ProbeClock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Before(before) || got.After(time.Now().Add(time.Minute)) {
+		t.Errorf("ProbeClock = %v, want about now", got)
+	}
+	if left := names(t, dir); len(left) != 0 {
+		t.Errorf("ProbeClock left %v behind", left)
+	}
+	if _, err := ProbeClock(filepath.Join(dir, "missing")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("ProbeClock in a missing directory = %v, want ErrNotExist", err)
+	}
+}
