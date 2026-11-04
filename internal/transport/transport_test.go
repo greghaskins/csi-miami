@@ -28,7 +28,7 @@ import (
 // is a deliberate change to the driver.
 func TestNFS3DataIsPinned(t *testing.T) {
 	t.Parallel()
-	const want = "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10"
+	const want = "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl,addr=192.0.2.10"
 	if got := nfs3Data("192.0.2.10"); got != want {
 		t.Errorf("nfs3Data = %q, want %q", got, want)
 	}
@@ -37,6 +37,13 @@ func TestNFS3DataIsPinned(t *testing.T) {
 	}
 	if nfs3FSType != "nfs" {
 		t.Errorf("nfs3FSType = %q, want nfs", nfs3FSType)
+	}
+}
+
+func TestNFS3ProfileHasNoacl(t *testing.T) {
+	t.Parallel()
+	if !slices.Contains(strings.Split(nfs3Profile, ","), "noacl") {
+		t.Errorf("the profile %q lacks noacl", nfs3Profile)
 	}
 }
 
@@ -299,7 +306,7 @@ func TestNFS3MountSendsTheProfile(t *testing.T) {
 		Target: tr.Dir(),
 		FSType: "nfs",
 		Flags:  unix.MS_NOATIME | unix.MS_NOSUID | unix.MS_NODEV,
-		Data:   "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,addr=192.0.2.10",
+		Data:   "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl,addr=192.0.2.10",
 	}
 	if got := kernelCalls(f); len(got) != 1 || got[0] != want {
 		t.Errorf("calls = %+v, want exactly %+v", got, want)

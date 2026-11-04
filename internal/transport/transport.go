@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -125,6 +126,11 @@ type Options struct {
 	// directory. Nil means ResolveDirectory. It runs under ResolveTimeout,
 	// because filepath.EvalSymlinks can hang on a dead NFS mount.
 	ResolveHostPath func(path string) (string, error)
+
+	// Log receives the transport's own messages (today one: a mount that is
+	// adopted although it lacks an option the profile now has). Nil means
+	// slog.Default().
+	Log *slog.Logger
 }
 
 // New returns the Transport for spec, mounted under root. It fails with
