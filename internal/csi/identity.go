@@ -43,9 +43,13 @@ func (i *Identity) GetPluginCapabilities(context.Context, *csi.GetPluginCapabili
 			Service: &csi.PluginCapability_Service{Type: t},
 		}}
 	}
+	expansion := &csi.PluginCapability{Type: &csi.PluginCapability_VolumeExpansion_{
+		VolumeExpansion: &csi.PluginCapability_VolumeExpansion{Type: csi.PluginCapability_VolumeExpansion_ONLINE},
+	}}
 	return &csi.GetPluginCapabilitiesResponse{Capabilities: []*csi.PluginCapability{
 		service(csi.PluginCapability_Service_CONTROLLER_SERVICE),
 		service(csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS),
+		expansion,
 	}}, nil
 }
 

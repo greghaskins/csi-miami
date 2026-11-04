@@ -37,8 +37,19 @@ func TestIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got []csi.PluginCapability_Service_Type
+	expansion := false
 	for _, c := range caps.GetCapabilities() {
+		if c.GetVolumeExpansion() != nil {
+			if c.GetVolumeExpansion().GetType() != csi.PluginCapability_VolumeExpansion_ONLINE {
+				t.Errorf("volume expansion = %v, want ONLINE", c.GetVolumeExpansion().GetType())
+			}
+			expansion = true
+			continue
+		}
 		got = append(got, c.GetService().GetType())
+	}
+	if !expansion {
+		t.Error("the plugin does not advertise online volume expansion")
 	}
 	want := []csi.PluginCapability_Service_Type{
 		csi.PluginCapability_Service_CONTROLLER_SERVICE,
@@ -165,7 +176,7 @@ func TestServerServesAndStops(t *testing.T) {
 		t.Fatalf("GetPluginInfo = %v, %v", info, err)
 	}
 	caps, err := csi.NewControllerClient(conn).ControllerGetCapabilities(ctx, &csi.ControllerGetCapabilitiesRequest{})
-	if err != nil || len(caps.GetCapabilities()) != 3 {
+	if err != nil || len(caps.GetCapabilities()) != 4 {
 		t.Fatalf("ControllerGetCapabilities = %v, %v", caps, err)
 	}
 	// The node service was not registered.
