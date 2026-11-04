@@ -8,15 +8,15 @@
 package prereq
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/nbd"
@@ -42,7 +42,10 @@ const (
 	DefaultTimeout       = 2 * time.Second
 
 	defaultDeviceMapperControl = "/dev/mapper/control"
-	defaultProcCrypto          = "/proc/crypto"
+
+	// adiantumAlg is the kernel crypto API name of the cipher behind the
+	// driver's default xchacha12,aes-adiantum-plain64.
+	adiantumAlg = "adiantum(xchacha12,aes)"
 )
 
 // Options say where to look. Only CacheDir has no default.
@@ -58,10 +61,13 @@ type Options struct {
 
 	// NBD is the kernel's nbd. Nil means nbd.Real(Sysfs). Tests replace it.
 	NBD nbd.Devicer
-	// DeviceMapperControl and ProcCrypto default to /dev/mapper/control and
-	// /proc/crypto. Tests point them at fixtures.
+	// DeviceMapperControl defaults to /dev/mapper/control. Tests point it at
+	// a fixture.
 	DeviceMapperControl string
-	ProcCrypto          string
+	// BindCipher asks the kernel's crypto API for an algorithm of a type and
+	// name, failing when it cannot provide it. Nil means an AF_ALG bind. Tests
+	// replace it.
+	BindCipher func(algType, name string) error
 	// Timeout bounds each check. Zero means DefaultTimeout.
 	Timeout time.Duration
 }
@@ -132,8 +138,8 @@ func Probe(ctx context.Context, o Options) Report {
 	if o.DeviceMapperControl == "" {
 		o.DeviceMapperControl = defaultDeviceMapperControl
 	}
-	if o.ProcCrypto == "" {
-		o.ProcCrypto = defaultProcCrypto
+	if o.BindCipher == nil {
+		o.BindCipher = bindAlg
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = DefaultTimeout
@@ -144,7 +150,7 @@ func Probe(ctx context.Context, o Options) Report {
 	}{
 		{FeatureNBD, func(context.Context) error { return checkNBD(o) }},
 		{FeatureDeviceMapper, func(context.Context) error { return checkExists(o.DeviceMapperControl) }},
-		{FeatureAdiantum, func(context.Context) error { return checkAdiantum(o.ProcCrypto) }},
+		{FeatureAdiantum, func(context.Context) error { return checkAdiantum(o.BindCipher) }},
 		{FeatureSystemdSocket, func(c context.Context) error { return checkSocket(c, o.SystemdSocket, o.Timeout) }},
 		{FeatureCacheDir, func(context.Context) error { return checkWritable(o.CacheDir) }},
 	}
@@ -177,23 +183,26 @@ func checkExists(path string) error {
 	return nil
 }
 
-// checkAdiantum looks for the cipher in /proc/crypto.
-func checkAdiantum(path string) error {
-	f, err := os.Open(path) //nolint:gosec // the kernel's crypto list, or a test fixture
+// checkAdiantum asks the crypto API for the cipher. /proc/crypto lists only
+// algorithms already instantiated, so a node that has the module but has not
+// opened an Adiantum mapping yet would read as lacking it, and the volume
+// could never be staged to instantiate it. A bind succeeds exactly when the
+// kernel can provide the algorithm, and loads it on the way.
+func checkAdiantum(bind func(algType, name string) error) error {
+	if err := bind("skcipher", adiantumAlg); err != nil {
+		return fmt.Errorf("the kernel cannot provide %s: %w", adiantumAlg, err)
+	}
+	return nil
+}
+
+// bindAlg binds an AF_ALG socket to the algorithm.
+func bindAlg(algType, name string) error {
+	fd, err := unix.Socket(unix.AF_ALG, unix.SOCK_SEQPACKET, 0)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if strings.Contains(sc.Text(), "adiantum") {
-			return nil
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
-	}
-	return errors.New("the cipher adiantum is not listed in " + path)
+	defer func() { _ = unix.Close(fd) }()
+	return unix.Bind(fd, &unix.SockaddrALG{Type: algType, Name: name})
 }
 
 // checkSocket dials the socket and hangs up; the D-Bus handshake is the

@@ -2,10 +2,12 @@ package prereq
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"syscall"
 	"testing"
 	"time"
 
@@ -50,7 +52,7 @@ func fixture(t *testing.T) Options {
 		CacheDir:            filepath.Join(dir, "cache"),
 		NBD:                 fakeNBD{},
 		DeviceMapperControl: write("control", ""),
-		ProcCrypto:          write("crypto", "name         : adiantum(xchacha12,aes)\ndriver       : adiantum(xchacha12-neon,aes-ce)\n"),
+		BindCipher:          func(string, string) error { return nil },
 		Timeout:             time.Second,
 	}
 }
@@ -88,12 +90,8 @@ func TestProbeReportsEachMissingFeature(t *testing.T) {
 		{"a sysfs without nbd", func(t *testing.T, o *Options) { o.NBD = nil; o.Sysfs = t.TempDir() }, FeatureNBD},
 		{"nbd family unresolved", func(_ *testing.T, o *Options) { o.NBD = fakeNBD{err: nbd.ErrNoNBD} }, FeatureNBD},
 		{"no device-mapper control node", func(t *testing.T, o *Options) { o.DeviceMapperControl = filepath.Join(t.TempDir(), "none") }, FeatureDeviceMapper},
-		{"no adiantum", func(t *testing.T, o *Options) {
-			p := filepath.Join(t.TempDir(), "crypto")
-			if err := os.WriteFile(p, []byte("name : aes\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			o.ProcCrypto = p
+		{"no adiantum", func(_ *testing.T, o *Options) {
+			o.BindCipher = func(string, string) error { return syscall.ENOENT }
 		}, FeatureAdiantum},
 		{"an unreachable socket", func(t *testing.T, o *Options) { o.SystemdSocket = filepath.Join(t.TempDir(), "private") }, FeatureSystemdSocket},
 		{"a cache dir that cannot be written", roCache, FeatureCacheDir},
@@ -115,7 +113,7 @@ func TestProbeReportsEachMissingFeature(t *testing.T) {
 
 	// All at once, with nothing configured: every feature is a named entry.
 	rep := Probe(context.Background(), Options{
-		NBD: fakeNBD{err: nbd.ErrNoNBD}, DeviceMapperControl: "/nonexistent/c", ProcCrypto: "/nonexistent/p",
+		NBD: fakeNBD{err: nbd.ErrNoNBD}, DeviceMapperControl: "/nonexistent/c", BindCipher: func(string, string) error { return syscall.ENOENT },
 		SystemdSocket: "/nonexistent/s", CacheDir: "", Timeout: time.Second,
 	})
 	if got := rep.Missing(); !slices.Equal(got, Features) {
@@ -137,5 +135,21 @@ func TestProbeDoesNotBlock(t *testing.T) {
 	cancel()
 	if rep := Probe(ctx, o); len(rep.Missing()) != len(Features) {
 		t.Errorf("a cancelled probe reports %v missing", rep.Missing())
+	}
+}
+
+// The probe asks for the cipher the driver defaults to, as an skcipher.
+func TestProbeBindsAdiantum(t *testing.T) {
+	t.Parallel()
+	var typ, name string
+	if err := checkAdiantum(func(a, n string) error { typ, name = a, n; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if typ != "skcipher" || name != "adiantum(xchacha12,aes)" {
+		t.Errorf("bound %s %q", typ, name)
+	}
+	err := checkAdiantum(func(string, string) error { return syscall.ENOENT })
+	if !errors.Is(err, syscall.ENOENT) {
+		t.Errorf("a failed bind reads as %v, want it wrapped", err)
 	}
 }
