@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -559,5 +560,116 @@ func TestRealAcquirer(t *testing.T) {
 	info, err := a.Read(ctx, e.dir, "vol")
 	if err != nil || info.Epoch != h.Epoch() || !info.Present {
 		t.Errorf("Read = %+v, %v", info, err)
+	}
+}
+
+func TestAdoptContinuesTheExistingEpoch(t *testing.T) {
+	e := newEnv(t)
+	orig, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orig.Renew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := e.raw("vol")
+	claims := e.claimedEpochs("vol")
+	h, err := Adopt(ctx, e.dir, "vol", "kind-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Epoch() != orig.Epoch() {
+		t.Errorf("Epoch = %d, want %d", h.Epoch(), orig.Epoch())
+	}
+	if e.raw("vol") != before || !slices.Equal(e.claimedEpochs("vol"), claims) {
+		t.Error("Adopt changed the holder file or the epoch claims")
+	}
+	if ok, err := h.Mine(ctx); err != nil || !ok {
+		t.Errorf("Mine = %v, %v", ok, err)
+	}
+	if err := h.Renew(ctx); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":2}`+"\n"; got != want {
+		t.Errorf("content = %q, want %q", got, want)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(Path(e.dir, "vol")); !os.IsNotExist(err) {
+		t.Errorf("holder file after Release: %v, want removed", err)
+	}
+}
+
+func TestAdoptRefusesAnotherNodesHolder(t *testing.T) {
+	e := newEnv(t)
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", keep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Adopt(ctx, e.dir, "vol", "kind-worker"); !errors.Is(err, ErrHeld) {
+		t.Errorf("Adopt = %v, want ErrHeld", err)
+	}
+}
+
+func TestAdoptAfterATakeoverIsHeld(t *testing.T) {
+	e := newEnv(t)
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", e.judgeTakeover("vol")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Adopt(ctx, e.dir, "vol", "kind-worker"); !errors.Is(err, ErrHeld) {
+		t.Errorf("Adopt = %v, want ErrHeld", err)
+	}
+}
+
+func TestAdoptAbsentAndCorrupt(t *testing.T) {
+	e := newEnv(t)
+	if _, err := Adopt(ctx, e.dir, "vol", "kind-worker"); !errors.Is(err, ErrLost) {
+		t.Errorf("absent: Adopt = %v, want ErrLost", err)
+	}
+	if err := os.WriteFile(Path(e.dir, "vol"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Adopt(ctx, e.dir, "vol", "kind-worker")
+	if err == nil || h != nil || errors.Is(err, ErrHeld) || errors.Is(err, ErrLost) {
+		t.Errorf("corrupt: Adopt = %v, %v, want a plain corruption error", h, err)
+	}
+	if _, err := Adopt(ctx, e.dir, "a/b", "kind-worker"); err == nil {
+		t.Error("Adopt accepted a name with a slash")
+	}
+}
+
+// A call stuck on one volume must not make operations on a sibling volume under
+// the same directory fail with ErrBusy.
+func TestSiblingVolumesDoNotShareDeadlineKeys(t *testing.T) {
+	e := newEnv(t)
+	for _, n := range []string{"a", "b"} {
+		if _, err := Acquire(ctx, e.dir, n, "kind-worker", keep); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	probe = func(string) (time.Time, error) {
+		if first.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+		return e.now, nil
+	}
+	done := make(chan error, 1)
+	go func() { _, err := Read(ctx, e.dir, "a"); done <- err }()
+	<-entered // volume a's probe is now outstanding
+	if _, err := Read(ctx, e.dir, "b"); err != nil {
+		t.Errorf("Read of the sibling while a's probe is outstanding: %v", err)
+	}
+	if _, err := maxClaimedEpoch(ctx, e.dir, "b"); err != nil {
+		t.Errorf("maxClaimedEpoch of the sibling: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Errorf("Read of a: %v", err)
 	}
 }

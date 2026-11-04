@@ -170,7 +170,7 @@ func Read(ctx context.Context, dir, name string) (Info, error) {
 	}
 	// The probe is taken after the stat: a renewal landing in between can only
 	// make the age smaller, never larger.
-	now, err := step(ctx, dir+"\x00probe", "read the server's clock", func() (time.Time, error) { return probe(dir) })
+	now, err := step(ctx, Path(dir, name)+":probe", "read the server's clock", func() (time.Time, error) { return probe(dir) })
 	if err != nil {
 		return Info{}, err
 	}
@@ -246,7 +246,7 @@ func claimPrefix(name string) string { return name + ".holder.epoch-" }
 // dir, or 0 when none has. Unparsable names are ignored.
 func maxClaimedEpoch(ctx context.Context, dir, name string) (uint64, error) {
 	prefix := claimPrefix(name)
-	return step(ctx, dir+"\x00claims", "list the epoch claims", func() (uint64, error) {
+	return step(ctx, Path(dir, name)+":claims", "list the epoch claims", func() (uint64, error) {
 		ents, err := os.ReadDir(dir)
 		if err != nil {
 			return 0, err
@@ -273,7 +273,7 @@ func maxClaimedEpoch(ctx context.Context, dir, name string) (uint64, error) {
 // is already ours, so a failure to prune is not a failure to acquire.
 func pruneClaims(ctx context.Context, dir, name string, keepFrom uint64) {
 	prefix := claimPrefix(name)
-	_, _ = step(ctx, dir+"\x00claims", "prune old epoch claims", func() (struct{}, error) {
+	_, _ = step(ctx, Path(dir, name)+":prune", "prune old epoch claims", func() (struct{}, error) {
 		ents, err := os.ReadDir(dir)
 		if err != nil {
 			return struct{}{}, nil
@@ -375,6 +375,30 @@ func Acquire(ctx context.Context, dir, name, node string, judge Judgement) (*Hol
 		return nil, fmt.Errorf("%w: the holder changed since it was judged (now %s at epoch %d, %d renewals); re-judge", ErrHeld, cur.Node, cur.Epoch, cur.Renewals)
 	}
 	return h.takeOver(ctx, judge.Info)
+}
+
+// Adopt returns a Holder for a holder file that already names node, carrying
+// the file's existing epoch: after a plugin restart the ownership continues
+// where it was, so Renew, Mine and Release work as on an acquired Holder.
+// Adopt never claims or increments an epoch; only a takeover issues a new one.
+// It fails with ErrHeld when the file names another node (at whatever epoch),
+// with ErrLost when there is no holder file (nothing to adopt; Acquire it), and
+// with load's error when the file is corrupt or unreadable.
+func Adopt(ctx context.Context, dir, name, node string) (*Holder, error) {
+	if node == "" || strings.ContainsAny(name, "/\x00") || name == "" {
+		return nil, errors.New("holder: node and name are required, and the name is one path element")
+	}
+	cur, err := load(ctx, dir, name)
+	if err != nil {
+		return nil, err
+	}
+	if !cur.ok {
+		return nil, fmt.Errorf("%w: there is no holder file to adopt", ErrLost)
+	}
+	if cur.Node != node {
+		return nil, fmt.Errorf("%w: %s at epoch %d", ErrHeld, cur.Node, cur.Epoch)
+	}
+	return &Holder{dir: dir, name: name, node: node, epoch: cur.Epoch}, nil
 }
 
 func (h *Holder) create(ctx context.Context) (*Holder, error) {
