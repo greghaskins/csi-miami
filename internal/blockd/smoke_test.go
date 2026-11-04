@@ -143,18 +143,21 @@ func dialWait(t *testing.T, control string) *Client {
 	}
 }
 
-// deviceFor waits for the device carrying the volume's backend name.
-func deviceFor(t *testing.T, vol string) string {
+// deviceFor returns the device the running server serves, taken from its
+// control Status (authoritative) rather than by scanning sysfs, which cannot
+// tell a live device from a killed incarnation's dead-but-still-configured one.
+func deviceFor(t *testing.T, cli *Client) string {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if d, ok := findByBackend(vol); ok {
-			return fmt.Sprintf("/dev/nbd%d", d.Index)
-		}
-		time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	st, err := cli.Status(ctx)
+	if err != nil {
+		t.Fatalf("status: %v", err)
 	}
-	t.Fatalf("no device for %q", vol)
-	return ""
+	if st.Index < 0 {
+		t.Fatalf("server reports no device: %+v", st)
+	}
+	return fmt.Sprintf("/dev/nbd%d", st.Index)
 }
 
 func TestSmokeBlockdServesAndResumes(t *testing.T) {
@@ -198,7 +201,7 @@ func TestSmokeBlockdServesAndResumes(t *testing.T) {
 	// First incarnation: mkfs, mount, write with fsync, unmount, then SIGKILL.
 	cmd := startChild(t, store, cache, control, epoch)
 	cli := dialWait(t, control)
-	dev := deviceFor(t, smokeVol)
+	dev := deviceFor(t, cli)
 	checkDeviceSize(t, dev)
 	t.Logf("mkfs %s", dev)
 	run(t, "mkfs.ext4", "-F", "-q", dev)
@@ -213,10 +216,13 @@ func TestSmokeBlockdServesAndResumes(t *testing.T) {
 	}
 	_ = cmd.Wait()
 
-	// Second incarnation: resume from the cache index, remount, data present.
+	// Second incarnation: resume from the cache index, remount, data present. A
+	// kill -9 leaves the first device configured-but-dead until its dead-conn
+	// timeout, so the resume lands on a different index; Status names the live
+	// one, which a scan by backend name would not distinguish from the corpse.
 	startChild(t, store, cache, control, epoch)
 	cli = dialWait(t, control)
-	dev = deviceFor(t, smokeVol)
+	dev = deviceFor(t, cli)
 	mountExt4(t, dev, mnt)
 	readFiles(t, mnt, want)
 
