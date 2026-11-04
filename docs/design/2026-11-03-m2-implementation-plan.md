@@ -372,7 +372,7 @@ at the first error, which maps to a condition:
 
 | # | Layer | Observe | Converge | Condition on failure |
 |---|---|---|---|---|
-| 1 | prerequisites | `nbd.Available`, `/dev/mapper/control`, `/proc/crypto` has `adiantum`, systemd socket dials, cache dir writable | nothing; refuse | `prerequisite-missing` (`FailedPrecondition`) |
+| 1 | prerequisites | `nbd.Available`, `/dev/mapper/control`, an AF_ALG bind of `adiantum(xchacha12,aes)` succeeds, systemd socket dials, cache dir writable | nothing; refuse | `prerequisite-missing` (`FailedPrecondition`) |
 | 2 | holder | `holder.Read` | `Acquire` with the reconciler's `Judgement`; renew on every pass | `holder-contended` (`Unavailable`) |
 | 3 | binary | `<bin-dir>/miami-<hash>` present and same size | copy `/proc/self/exe`, temp and rename, mode 0755 | internal |
 | 4 | unit and device | `systemd.State` active and `nbd.Devices` has one with `Backend == volume` and `Pid == MainPID` | start the unit with `blockd` args (3.4); wait for the device under the deadline | `server-down` (`Unavailable`) |
@@ -592,7 +592,7 @@ and says so).
 - [ ] Commit.
 
 **Accept when** both smokes pass on both architectures (Adiantum is in the
-runner kernels; the test fails, not skips, if `/proc/crypto` lacks it).
+runner kernels; the test fails, not skips, if the AF_ALG bind fails).
 
 ### Task T7: The `volume` kind, parameters, intent, controller, `noacl`
 
