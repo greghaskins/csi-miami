@@ -3,6 +3,7 @@ package volume
 import (
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/greghaskins/csi-miami/internal/transport"
@@ -36,6 +37,14 @@ type Params struct {
 	SubdirTemplate string // empty when the StorageClass sets none: no prefix
 	Mode           string // canonical four-digit octal text; empty when the StorageClass sets none: DefaultMode
 	Tokens         Tokens // from the provisioner's extra create metadata
+
+	// Volume holds the parameters of a volume of kind volume, with derived
+	// fields still zero; nil for a directory.
+	Volume *VolumeParams
+	// TakeoverTimeout is the optional takeoverTimeout override; zero means
+	// DefaultTakeoverTimeout. It is validated here but is not part of the
+	// volume context.
+	TakeoverTimeout time.Duration
 }
 
 // ParseParameters parses and validates StorageClass parameters. Parameter
@@ -58,6 +67,9 @@ func ParseParameters(params map[string]string) (Params, error) {
 		case ParamKind, ParamSubdir, ParamMode,
 			transport.ParamKind, transport.ParamServer, transport.ParamExport, transport.ParamPath:
 		default:
+			if volumeParamNames[k] {
+				continue
+			}
 			if strings.HasPrefix(k, providerPrefix) {
 				continue
 			}
@@ -77,7 +89,14 @@ func ParseParameters(params map[string]string) (Params, error) {
 		},
 	}
 	if !p.Kind.Valid() {
-		return Params{}, invalid("parameter " + ParamKind + " must be directory")
+		return Params{}, invalid("parameter " + ParamKind + " must be directory or volume")
+	}
+	if p.Kind != KindVolume {
+		for _, k := range keys {
+			if volumeParamNames[k] {
+				return Params{}, invalid("parameter " + quote(k) + " is only for kind " + string(KindVolume))
+			}
+		}
 	}
 
 	if raw := params[ParamMode]; raw != "" {
@@ -93,6 +112,19 @@ func ParseParameters(params map[string]string) (Params, error) {
 		return Params{}, err
 	}
 	p.Transport = spec
+	if p.Kind == KindVolume {
+		if spec.Kind == transport.KindLocal {
+			return Params{}, invalid("kind " + string(KindVolume) + " needs a remote transport: transport.kind local is not supported")
+		}
+		v, err := parseVolumeParams(params)
+		if err != nil {
+			return Params{}, err
+		}
+		p.Volume = &v
+		if p.TakeoverTimeout, err = parseTakeoverTimeout(params); err != nil {
+			return Params{}, err
+		}
+	}
 	return p, nil
 }
 

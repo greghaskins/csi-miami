@@ -14,6 +14,9 @@ type Kind string
 // KindDirectory is a directory on a transport.
 const KindDirectory Kind = "directory"
 
+// KindVolume is a chunk-backed block volume kept on a remote transport.
+const KindVolume Kind = "volume"
+
 const (
 	// maxNameLen is the room reserved for a volume name, in bytes, when
 	// sizing a subdir (see maxSubdirLen) and the ceiling checked against a
@@ -34,7 +37,7 @@ func IsPVName(name string) bool { return pvNameShape.MatchString(name) }
 // Valid reports whether k is a kind this driver knows.
 func (k Kind) Valid() bool {
 	switch k {
-	case KindDirectory:
+	case KindDirectory, KindVolume:
 		return true
 	default:
 		return false
@@ -60,7 +63,7 @@ func (id ID) String() string {
 // gRPC code InvalidArgument.
 func (id ID) Validate() error {
 	if !id.Kind.Valid() {
-		return invalid("volume ID kind is not a known kind (directory)")
+		return invalid("volume ID kind is not a known kind (directory or volume)")
 	}
 	return validateName(id.Name)
 }
