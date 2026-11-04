@@ -83,7 +83,7 @@ func (c *Cache) ReadAt(i uint32, off int64, p []byte) error {
 // refuse the whole cache over a dirty chunk with no file. The sub-range pwrite
 // runs off the lock; the fsync obligation is recorded only after it, so a
 // concurrent FLUSH cannot drop this write's durability.
-func (c *Cache) WriteAt(i uint32, off int64, p, base []byte) error {
+func (c *Cache) WriteAt(i uint32, off int64, p, base []byte, zeroBase bool) error {
 	c.mu.Lock()
 	if err := c.checkRange(i, off, p); err != nil {
 		c.mu.Unlock()
@@ -95,6 +95,16 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte) error {
 	}
 	_, isDirty := c.dirty[i]
 	_, isZero := c.zero[i]
+	// A chunk resident with a full-size file (clean, or dirty and not trimmed)
+	// needs no base. Clean residency is NOT eviction-proof, though: a chunk the
+	// caller saw resident may have been evicted before we took this lock. Refuse
+	// — before touching anything — rather than invent a zero base for a chunk
+	// whose base is not zero; the caller fetches the base and retries.
+	residentFull := c.clean.has(i) || (isDirty && !isZero)
+	if !residentFull && base == nil && !zeroBase {
+		c.mu.Unlock()
+		return ErrNotResident
+	}
 	newCharge := !isDirty || isZero
 	if newCharge && c.dirtyBytes()+c.idx.Chunk > c.bound {
 		c.mu.Unlock()
@@ -109,11 +119,10 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte) error {
 		return err
 	}
 	// Establish the full-size file with the correct base before the dirty mark.
-	// A chunk that is resident with a full-size file (clean, or dirty and not
-	// trimmed) already has one; everything else — a new chunk, an evicted clean
+	// Everything not resident-with-a-full-file — a new chunk, an evicted clean
 	// chunk, or a trimmed chunk whose stale file still lingers — is (re)created
-	// with O_TRUNC so no discarded bytes survive.
-	residentFull := c.clean.has(i) || (isDirty && !isZero)
+	// with O_TRUNC (from base, or zeros for a genuine zero base) so no discarded
+	// bytes survive.
 	if !residentFull {
 		if err := c.establishChunk(i, base); err != nil {
 			c.mu.Unlock()

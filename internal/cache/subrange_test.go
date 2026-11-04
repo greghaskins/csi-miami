@@ -22,7 +22,44 @@ func TestProbeEvictedBaseBecomesZeros(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Chunk 0 was evicted; the caller passes the base it already holds.
-	if err := c.WriteAt(0, 0, filled(4096, 0x11), base); err != nil {
+	if err := c.WriteAt(0, 0, filled(4096, 0x11), base, false); err != nil {
+		t.Fatal(err)
+	}
+	got := AlignedBuffer(4096)
+	if err := c.ReadAt(0, 4096, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, base[4096:8192]) {
+		t.Fatalf("got %x.., want base", got[:4])
+	}
+}
+
+// TestProbeResidentThenEvictedBaseBecomesZeros: a chunk the caller saw resident
+// can be evicted before WriteAt takes the lock (Has does not touch the LRU).
+// WriteAt must refuse a nil base for such a non-zero chunk (ErrNotResident)
+// rather than materialise zeros; the retry with the fetched base preserves it
+// (finding 1 sibling).
+func TestProbeResidentThenEvictedBaseBecomesZeros(t *testing.T) {
+	c := newSubCache(t, 2*srChunk)
+	base := filled(srChunk, 0xAA)
+	if err := c.Insert(0, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Insert(1, filled(srChunk, 0xBB)); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Has(0) {
+		t.Fatal("precondition: chunk 0 should be resident")
+	}
+	if err := c.Insert(2, filled(srChunk, 0xCC)); err != nil { // evicts 0
+		t.Fatal(err)
+	}
+	// A nil-base write to the evicted non-zero chunk is refused, not zeroed.
+	if err := c.WriteAt(0, 0, filled(4096, 0x11), nil, false); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("nil-base write to an evicted non-zero chunk = %v, want ErrNotResident", err)
+	}
+	// The caller retries with the base it fetched; the untouched bytes keep it.
+	if err := c.WriteAt(0, 0, filled(4096, 0x11), base, false); err != nil {
 		t.Fatal(err)
 	}
 	got := AlignedBuffer(4096)
@@ -42,7 +79,7 @@ func TestProbeTrimmedChunkKeepsStaleBytes(t *testing.T) {
 	flushDelay = time.Hour
 	defer func() { flushDelay = old }()
 	c := newSubCache(t, srSize)
-	if err := c.WriteAt(0, 0, filled(srChunk, 0xAA), nil); err != nil {
+	if err := c.WriteAt(0, 0, filled(srChunk, 0xAA), nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Sync(); err != nil {
@@ -51,7 +88,7 @@ func TestProbeTrimmedChunkKeepsStaleBytes(t *testing.T) {
 	if err := c.MarkZero(0); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.WriteAt(0, 0, filled(4096, 0x11), nil); err != nil {
+	if err := c.WriteAt(0, 0, filled(4096, 0x11), nil, true); err != nil {
 		t.Fatal(err)
 	}
 	got := AlignedBuffer(4096)
@@ -89,7 +126,7 @@ func filled(n int, b byte) []byte {
 func TestWriteAtReadAtSubRange(t *testing.T) {
 	c := newSubCache(t, srSize)
 	want := filled(8192, 0xA7)
-	if err := c.WriteAt(0, 4096, want, nil); err != nil {
+	if err := c.WriteAt(0, 4096, want, nil, true); err != nil {
 		t.Fatalf("WriteAt: %v", err)
 	}
 	got := AlignedBuffer(8192)
@@ -112,7 +149,7 @@ func TestWriteAtReadAtSubRange(t *testing.T) {
 func TestWriteAtWholeChunk(t *testing.T) {
 	c := newSubCache(t, srSize)
 	want := filled(srChunk, 0x5c)
-	if err := c.WriteAt(1, 0, want, nil); err != nil {
+	if err := c.WriteAt(1, 0, want, nil, true); err != nil {
 		t.Fatalf("WriteAt whole chunk: %v", err)
 	}
 	got := AlignedBuffer(srChunk)
@@ -149,7 +186,7 @@ func TestReadAtMissAndZero(t *testing.T) {
 func TestWriteAtEvictsCleanKeepsDirty(t *testing.T) {
 	c := newSubCache(t, 2*srChunk) // room for two chunks
 	// A dirty, partially-written chunk is pinned.
-	if err := c.WriteAt(0, 0, filled(4096, 0x11), nil); err != nil {
+	if err := c.WriteAt(0, 0, filled(4096, 0x11), nil, true); err != nil {
 		t.Fatalf("WriteAt: %v", err)
 	}
 	if err := c.Insert(1, filled(srChunk, 0x22)); err != nil {
@@ -174,7 +211,7 @@ func TestWriteAtEvictsCleanKeepsDirty(t *testing.T) {
 func TestWriteAtBoundaryCopiesWholeChunk(t *testing.T) {
 	c := newSubCache(t, srSize)
 	base := filled(srChunk, 0xAA)
-	if err := c.WriteAt(0, 0, base, nil); err != nil {
+	if err := c.WriteAt(0, 0, base, nil, true); err != nil {
 		t.Fatalf("WriteAt base: %v", err)
 	}
 	if _, err := c.SetBoundary(); err != nil {
@@ -182,7 +219,7 @@ func TestWriteAtBoundaryCopiesWholeChunk(t *testing.T) {
 	}
 	// A sub-range write to a boundary chunk must copy the whole pre-write chunk
 	// first, so the frozen image is unchanged.
-	if err := c.WriteAt(0, 0, filled(4096, 0xBB), nil); err != nil {
+	if err := c.WriteAt(0, 0, filled(4096, 0xBB), nil, true); err != nil {
 		t.Fatalf("WriteAt sub-range: %v", err)
 	}
 	frozen := AlignedBuffer(srChunk)
@@ -209,7 +246,7 @@ func TestWriteAtBoundaryCopiesWholeChunk(t *testing.T) {
 func TestWriteAtDurabilityAcrossConcurrentSync(t *testing.T) {
 	c := newSubCache(t, srSize)
 	// Chunk 0 is a resident dirty chunk whose data is already durable.
-	if err := c.WriteAt(0, 0, filled(srChunk, 0x11), nil); err != nil {
+	if err := c.WriteAt(0, 0, filled(srChunk, 0x11), nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Sync(); err != nil {
@@ -228,7 +265,7 @@ func TestWriteAtDurabilityAcrossConcurrentSync(t *testing.T) {
 			t.Errorf("gap Sync: %v", err)
 		}
 	}
-	if err := c.WriteAt(0, 0, filled(srChunk, 0x22), nil); err != nil {
+	if err := c.WriteAt(0, 0, filled(srChunk, 0x22), nil, true); err != nil {
 		t.Fatal(err)
 	}
 	c.gapHook = nil
@@ -245,11 +282,11 @@ func TestWriteAtDurabilityAcrossConcurrentSync(t *testing.T) {
 
 func TestWriteAtFullCacheRefuses(t *testing.T) {
 	c := newSubCache(t, srChunk) // one chunk of dirty capacity
-	if err := c.WriteAt(0, 0, filled(srChunk, 1), nil); err != nil {
+	if err := c.WriteAt(0, 0, filled(srChunk, 1), nil, true); err != nil {
 		t.Fatalf("first WriteAt: %v", err)
 	}
 	// A second new dirty chunk cannot fit.
-	if err := c.WriteAt(1, 0, filled(4096, 2), nil); !errors.Is(err, ErrFull) {
+	if err := c.WriteAt(1, 0, filled(4096, 2), nil, true); !errors.Is(err, ErrFull) {
 		t.Fatalf("WriteAt into a full cache = %v, want ErrFull", err)
 	}
 }

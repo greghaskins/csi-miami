@@ -301,38 +301,43 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 	m.Lock()
 	defer m.Unlock()
 
-	// Sub-chunk write to a chunk not resident: if it has a non-zero base, fetch
-	// the whole base and hand it to the cache, which materialises the chunk from
-	// it under its lock, so the bytes this write does not cover keep their value
-	// (never invented as zeros, even if the chunk was evicted between here and
-	// the cache's lock). A zero or unnamed base is passed as nil; the cache
-	// materialises those gaps as zeros.
-	var base []byte
-	var basep *[]byte
-	full := intra == 0 && int64(len(src)) == b.chunkSize
-	if !full && !b.cache.Has(i) {
-		if h, ok := b.chunkHash(i); ok && h != b.zeroHash {
-			ctx, cancel := b.fetchCtx()
-			basep = b.getBuf()
-			fetched, err := b.fetchInto(ctx, i, *basep)
-			cancel()
-			if err != nil {
-				b.putBuf(basep)
-				return err
-			}
-			if fetched {
-				base = *basep
-			}
-		}
-	}
-	if basep != nil {
-		defer b.putBuf(basep)
-	}
 	bufp := b.getBuf()
 	defer b.putBuf(bufp)
 	buf := (*bufp)[:len(src)]
 	copy(buf, src)
-	return b.cache.WriteAt(i, intra, buf, base)
+
+	// zeroBase is true exactly when a zero base is the correct one: a full-chunk
+	// write (the base is overwritten whole) or a chunk whose stored hash is zero
+	// or unnamed. For a non-zero base we first try without one — if the chunk is
+	// resident the cache uses its file — and only fetch the base when the cache
+	// refuses (ErrNotResident) because the chunk is not, or no longer, resident.
+	// The cache enforces this; a stale Has check here could not.
+	full := intra == 0 && int64(len(src)) == b.chunkSize
+	zeroBase := full
+	if !full {
+		if h, ok := b.chunkHash(i); !ok || h == b.zeroHash {
+			zeroBase = true
+		}
+	}
+	err := b.cache.WriteAt(i, intra, buf, nil, zeroBase)
+	if !errors.Is(err, cache.ErrNotResident) {
+		return err
+	}
+	// The chunk has a non-zero base and was not resident when the cache took its
+	// lock. Fetch the base and retry; base is then non-nil, so this cannot
+	// recurse into ErrNotResident.
+	ctx, cancel := b.fetchCtx()
+	defer cancel()
+	basep := b.getBuf()
+	defer b.putBuf(basep)
+	fetched, ferr := b.fetchInto(ctx, i, *basep)
+	if ferr != nil {
+		return ferr
+	}
+	if !fetched { // the hash became zero/unnamed concurrently: a zero base is correct
+		return b.cache.WriteAt(i, intra, buf, nil, true)
+	}
+	return b.cache.WriteAt(i, intra, buf, *basep, false)
 }
 
 // Flush makes every dirty chunk and the index durable.
