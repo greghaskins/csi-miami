@@ -45,8 +45,14 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 }
 
 // Boundary snapshots the dirty set; the caller must hold the filesystem frozen.
+// It returns ErrPublishInFlight when a publish holds the lock, so the caller can
+// thaw and retry rather than block the freeze.
 func (c *Client) Boundary(ctx context.Context) error {
-	return c.call(ctx, "Boundary", struct{}{}, &struct{}{})
+	err := c.call(ctx, "Boundary", struct{}{}, &struct{}{})
+	if err != nil && isServerError(err, ErrPublishInFlight) {
+		return ErrPublishInFlight
+	}
+	return err
 }
 
 // Publish uploads the boundary generation. It returns ErrNoBoundary when none

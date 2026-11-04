@@ -69,6 +69,9 @@ var (
 	// ErrRefused is returned by Publish when the holder fencing check or the
 	// current-epoch check refused the generation; the dirty set is kept.
 	ErrRefused = errors.New("blockd: publish refused; the volume is no longer ours")
+	// ErrPublishInFlight is returned by Boundary when a publish already holds the
+	// publish lock; the caller (which must not block the freeze) retries later.
+	ErrPublishInFlight = errors.New("blockd: a publish is in flight")
 )
 
 // withDefaults fills the timeouts that default when unset.

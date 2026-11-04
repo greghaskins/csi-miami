@@ -37,7 +37,12 @@ var _ storer = (*chunk.Store)(nil)
 // crash-consistent; afterwards a write to a frozen chunk copies it first, so the
 // upload reads a stable image while the guest keeps writing.
 func (s *server) boundary() error {
-	s.publishMu.Lock()
+	// TryLock, not Lock: the caller holds the filesystem frozen while it calls
+	// Boundary, so it must not block for the duration of an in-flight publish's
+	// upload. A real publish is left to finish; the caller retries after it.
+	if !s.publishMu.TryLock() {
+		return ErrPublishInFlight
+	}
 	defer s.publishMu.Unlock()
 	chunks, err := s.back.cache.SetBoundary()
 	if err != nil {

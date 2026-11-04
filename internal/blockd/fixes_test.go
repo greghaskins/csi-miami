@@ -1,6 +1,7 @@
 package blockd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -153,6 +154,58 @@ func TestResumeWithActiveBoundaryRecovers(t *testing.T) {
 	}
 	if reply.Name == "" {
 		t.Fatal("publish after resume produced no manifest")
+	}
+}
+
+// Finding 1: a sub-chunk write to a chunk whose non-zero base is in the store
+// but not cached keeps the untouched bytes equal to the base, never zeros — the
+// backend fetches the base and hands it to the cache before the pwrite.
+func TestSubChunkWritePreservesBase(t *testing.T) {
+	cfg, _ := testConfig(t)
+	store := openStore(t, cfg)
+	d0 := pattern(0xA0, testChunk)
+	h0 := putChunk(t, store, d0)
+	writeCurrent(t, store, 1, 1, []chunk.Hash{h0, chunk.ZeroHash(testChunk)})
+
+	s := newTestServer(t, cfg)
+	writeDevice(t, s, 0, pattern(0x11, 4096), false) // 4 KiB at the start of chunk 0
+	got := readDevice(t, s, 0, testChunk)
+	if !bytes.Equal(got[:4096], pattern(0x11, 4096)) {
+		t.Fatal("the sub-chunk write did not land")
+	}
+	if !bytes.Equal(got[4096:], d0[4096:]) {
+		t.Fatal("the untouched bytes are not the base (invented zeros)")
+	}
+}
+
+// Finding 3: a cold read must succeed when the transport is reachable even if
+// the cache is full of dirty chunks; the fetched bytes serve the read and only
+// the cache insert is skipped.
+func TestColdReadIntoFullCacheSucceeds(t *testing.T) {
+	cfg, _ := testConfig(t)
+	cfg.CacheBound = testChunk // one chunk of capacity
+	store := openStore(t, cfg)
+	d0 := pattern(0xC0, testChunk)
+	h0 := putChunk(t, store, d0)
+	writeCurrent(t, store, 1, 1, []chunk.Hash{h0, chunk.ZeroHash(testChunk)})
+
+	s := newTestServer(t, cfg)
+	writeDevice(t, s, testChunk, pattern(0x22, testChunk), false) // pin chunk 1 dirty, fills the bound
+	got := readDevice(t, s, 0, testChunk)                         // cold read of the base chunk 0
+	if !bytes.Equal(got, d0) {
+		t.Fatal("cold read into a full cache did not return the base chunk")
+	}
+}
+
+// Finding 6: Boundary does not block on an in-flight publish; it returns
+// ErrPublishInFlight so the caller can thaw and retry.
+func TestBoundaryReturnsPublishInFlight(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	s.publishMu.Lock() // stand in for a publish holding the lock
+	defer s.publishMu.Unlock()
+	if err := s.boundary(); !errors.Is(err, ErrPublishInFlight) {
+		t.Fatalf("boundary while a publish holds the lock = %v, want ErrPublishInFlight", err)
 	}
 }
 

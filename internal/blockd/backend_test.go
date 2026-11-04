@@ -195,30 +195,32 @@ func TestCorruptChunkFailsThatReadOnly(t *testing.T) {
 	}
 }
 
-func TestReadHitAllocations(t *testing.T) {
+// TestReadZeroPathZeroAllocs checks the backend's own per-request machinery
+// allocates nothing: a 4 KiB read of a chunk the cache serves as zeros (no
+// store access, no file open) touches only the pooled aligned buffer and a
+// copy. A read of a resident data chunk inherits the cache's per-read file
+// open; that cost is the cache's, measured honestly by BenchmarkReadHit.
+func TestReadZeroPathZeroAllocs(t *testing.T) {
 	cfg, _ := testConfig(t)
 	s := newTestServer(t, cfg)
-	// A chunk served from the cache as zeros is a hit with no store access.
 	if err := s.back.cache.MarkZero(0); err != nil {
 		t.Fatalf("MarkZero: %v", err)
 	}
-	p := make([]byte, 4096) // a 4 KiB request, the common ext4 I/O size
+	p := make([]byte, 4096)
 	allocs := testing.AllocsPerRun(200, func() {
 		if _, err := s.back.ReadAt(p, 0); err != nil {
 			t.Fatal(err)
 		}
 	})
 	if allocs != 0 {
-		t.Fatalf("ReadAt hit allocated %.0f/op, want 0", allocs)
+		t.Fatalf("backend read machinery allocated %.0f/op, want 0", allocs)
 	}
 }
 
-// BenchmarkReadHit measures the backend's per-request overhead on a 4 KiB cache
-// hit. The chunk is served from the cache (the all-zero chunk) with no store
-// access, so the result reflects the backend's own machinery: a pooled, reused
-// aligned buffer and a copy, which allocate nothing. (A read of a non-zero
-// cached chunk inherits the cache's per-read file open; that cost is the
-// cache's, not the backend's.)
+// BenchmarkReadHit measures a 4 KiB read of a RESIDENT (written, synced) chunk:
+// the honest warm-hit path, which opens, preads and closes the chunk's O_DIRECT
+// file in the cache. It is not zero-alloc, and the number reported is the real
+// one (a per-chunk fd cache could drop the open/close later if G1 needs it).
 func BenchmarkReadHit(b *testing.B) {
 	cfg, _ := testConfig(b)
 	s, err := newServer(context.Background(), cfg, testLog())
@@ -227,7 +229,12 @@ func BenchmarkReadHit(b *testing.B) {
 	}
 	defer func() { _ = s.close() }()
 	s.setDevice(&fakeDevice{idx: 1})
-	if err := s.back.cache.MarkZero(0); err != nil {
+	// Make chunk 0 a resident, durable data chunk.
+	full := make([]byte, testChunk)
+	for i := range full {
+		full[i] = byte(i)
+	}
+	if _, err := s.back.WriteAt(full, 0, true); err != nil {
 		b.Fatal(err)
 	}
 	p := make([]byte, 4096)

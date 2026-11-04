@@ -163,21 +163,38 @@ func (b *backend) ReadAt(p []byte, off int64) (int, error) {
 
 // readSeg fills buf with [intra, intra+len(buf)) of chunk i from the cache. A
 // miss of a zero-based chunk reads as zeros; a miss of a non-zero chunk (an
-// eviction that raced phase 1) is fetched synchronously and retried.
+// eviction that raced phase 1, or a phase-1 insert the cache was too full to
+// keep) is fetched and served directly from the fetched bytes, so a cold read
+// succeeds even into a dirty-full cache — only the cache insert is skipped.
 func (b *backend) readSeg(i uint32, intra int64, buf []byte) error {
 	err := b.cache.ReadAt(i, intra, buf)
 	if !errors.Is(err, cache.ErrMiss) {
 		return err
 	}
-	h, ok := b.chunkHash(i)
-	if !ok || h == b.zeroHash {
-		clear(buf)
-		return nil
-	}
-	if err := b.fetchMisses([]uint32{i}); err != nil {
+	ctx, cancel := b.fetchCtx()
+	defer cancel()
+	wholep := b.getBuf()
+	defer b.putBuf(wholep)
+	fetched, err := b.fetchInto(ctx, i, *wholep)
+	if err != nil {
 		return err
 	}
-	return b.cache.ReadAt(i, intra, buf)
+	if !fetched {
+		clear(buf) // a zero or unnamed chunk reads as zeros
+		return nil
+	}
+	// Serve the request directly, and offer the chunk to the cache (a full
+	// cache just declines, which must not fail the read).
+	if ierr := b.cache.Insert(i, *wholep); ierr != nil && !errors.Is(ierr, cache.ErrFull) {
+		b.log.Warn("cache insert failed", "chunk", i, "err", ierr)
+	}
+	copy(buf, (*wholep)[intra:intra+int64(len(buf))])
+	return nil
+}
+
+// fetchCtx bounds a request's fetches below the nbd request timeout.
+func (b *backend) fetchCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(b.ctx, b.fetchBudget)
 }
 
 // fetchMisses fetches the given chunks from the store into the cache,
@@ -211,29 +228,40 @@ func (b *backend) fetchMisses(chunks []uint32) error {
 	return first
 }
 
-// fetchOne fetches chunk i from the store and inserts it into the cache. A
-// zero-based or unnamed chunk needs no fetch. A full cache cannot hold a clean
-// chunk, which is fine.
-func (b *backend) fetchOne(ctx context.Context, i uint32) error {
+// fetchInto fills buf (a whole chunk) with chunk i from the store. fetched is
+// false, with no error and buf untouched, for a zero-based or unnamed chunk
+// that the caller serves as zeros. It does not touch the cache.
+func (b *backend) fetchInto(ctx context.Context, i uint32, buf []byte) (fetched bool, err error) {
 	h, ok := b.chunkHash(i)
 	if !ok || h == b.zeroHash {
-		return nil
+		return false, nil
 	}
 	select {
 	case b.fetchSem <- struct{}{}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 	defer func() { <-b.fetchSem }()
 
+	w := &sliceWriter{buf: buf}
+	if err := b.store.Get(ctx, h, w); err != nil {
+		return false, err
+	}
+	if w.n != len(buf) {
+		return false, fmt.Errorf("blockd: chunk %d (%s) is %d bytes, want %d", i, h, w.n, len(buf))
+	}
+	return true, nil
+}
+
+// fetchOne fetches chunk i and inserts it into the cache as a clean copy. A
+// zero-based or unnamed chunk needs no fetch; a full cache declines the insert,
+// which is fine.
+func (b *backend) fetchOne(ctx context.Context, i uint32) error {
 	bufp := b.getBuf()
 	defer b.putBuf(bufp)
-	w := &sliceWriter{buf: *bufp}
-	if err := b.store.Get(ctx, h, w); err != nil {
+	fetched, err := b.fetchInto(ctx, i, *bufp)
+	if err != nil || !fetched {
 		return err
-	}
-	if w.n != len(*bufp) {
-		return fmt.Errorf("blockd: chunk %d (%s) is %d bytes, want %d", i, h, w.n, len(*bufp))
 	}
 	if err := b.cache.Insert(i, *bufp); err != nil && !errors.Is(err, cache.ErrFull) {
 		b.log.Warn("cache insert failed", "chunk", i, "err", err)
@@ -273,23 +301,38 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 	m.Lock()
 	defer m.Unlock()
 
+	// Sub-chunk write to a chunk not resident: if it has a non-zero base, fetch
+	// the whole base and hand it to the cache, which materialises the chunk from
+	// it under its lock, so the bytes this write does not cover keep their value
+	// (never invented as zeros, even if the chunk was evicted between here and
+	// the cache's lock). A zero or unnamed base is passed as nil; the cache
+	// materialises those gaps as zeros.
+	var base []byte
+	var basep *[]byte
 	full := intra == 0 && int64(len(src)) == b.chunkSize
 	if !full && !b.cache.Has(i) {
-		// Sub-chunk write to a chunk not in the cache: if it has a non-zero
-		// base, fetch the whole base so the bytes this write does not cover keep
-		// their value. A zero or unnamed base needs no fetch; the cache
-		// materialises the gaps as zeros.
 		if h, ok := b.chunkHash(i); ok && h != b.zeroHash {
-			if err := b.fetchMisses([]uint32{i}); err != nil {
+			ctx, cancel := b.fetchCtx()
+			basep = b.getBuf()
+			fetched, err := b.fetchInto(ctx, i, *basep)
+			cancel()
+			if err != nil {
+				b.putBuf(basep)
 				return err
 			}
+			if fetched {
+				base = *basep
+			}
 		}
+	}
+	if basep != nil {
+		defer b.putBuf(basep)
 	}
 	bufp := b.getBuf()
 	defer b.putBuf(bufp)
 	buf := (*bufp)[:len(src)]
 	copy(buf, src)
-	return b.cache.WriteAt(i, intra, buf)
+	return b.cache.WriteAt(i, intra, buf, base)
 }
 
 // Flush makes every dirty chunk and the index durable.
