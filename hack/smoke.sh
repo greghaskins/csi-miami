@@ -11,7 +11,9 @@
 # transport, in internal/nbd, which serves a device through the kernel's nbd
 # module (loaded below) and drives it with dd and blkdiscard, in
 # internal/systemd, which starts transient units on the host's systemd, and in
-# cmd/miami, which runs the node command and drives it over its CSI socket.
+# internal/crypt and internal/ext4, which run the LUKS2 and ext4 tools on loop
+# devices, and in cmd/miami, which runs the node command and drives it over
+# its CSI socket.
 # Each package is built as its own test binary and run in its own namespace.
 #
 # A last step, `tools`, builds the image that would ship (hack/image-build.sh
@@ -49,6 +51,12 @@ if ! modprobe nbd; then
   exit 1
 fi
 
+# The LUKS2 smoke test needs loop devices and dm-crypt; either may be built
+# in, so a failed modprobe is not fatal here (the test fails if they are
+# missing).
+modprobe loop || true
+modprobe dm_crypt || true
+
 if [ -n "${SMOKE_ARTIFACT_DIR:-}" ]; then
   mkdir -p "$SMOKE_ARTIFACT_DIR"
 fi
@@ -56,7 +64,7 @@ fi
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-for path in internal/mount internal/transport internal/reconcile internal/nbd internal/systemd cmd/miami; do
+for path in internal/mount internal/transport internal/reconcile internal/nbd internal/systemd internal/crypt internal/ext4 cmd/miami; do
   pkg="$(basename "$path")"
   go test -c -tags smoke -o "$dir/$pkg.test" "./$path"
 
