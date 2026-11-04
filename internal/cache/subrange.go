@@ -95,6 +95,13 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte, zeroBase bool) erro
 	}
 	_, isDirty := c.dirty[i]
 	_, isZero := c.zero[i]
+	// A locally-trimmed chunk reads as zeros whatever the base manifest still
+	// names, so its own zero state is authoritative over the caller's argument:
+	// it never needs a base and must never resurrect the discarded one.
+	if isZero {
+		zeroBase = true
+		base = nil
+	}
 	// A chunk resident with a full-size file (clean, or dirty and not trimmed)
 	// needs no base. Clean residency is NOT eviction-proof, though: a chunk the
 	// caller saw resident may have been evicted before we took this lock. Refuse

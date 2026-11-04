@@ -178,6 +178,29 @@ func TestSubChunkWritePreservesBase(t *testing.T) {
 	}
 }
 
+// Round 5: a write into a locally-trimmed chunk whose base-manifest hash is
+// non-zero must keep the uncovered bytes at zero, not resurrect the pre-trim
+// base. (zeroBase computed from the manifest hash would be false; the chunk's
+// own zero state must win in the cache.)
+func TestProbeTrimThenSubRangeWriteResurrectsBase(t *testing.T) {
+	cfg, _ := testConfig(t)
+	store := openStore(t, cfg)
+	d0, d1 := pattern(6, testChunk), pattern(7, testChunk)
+	h0, h1 := putChunk(t, store, d0), putChunk(t, store, d1)
+	writeCurrent(t, store, 1, 1, []chunk.Hash{h0, h1})
+	s := newTestServer(t, cfg)
+	if err := s.back.Trim(0, int64(testChunk)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readDevice(t, s, 4096, 4096), make([]byte, 4096)) {
+		t.Fatal("precondition: the trimmed chunk should read as zeros")
+	}
+	writeDevice(t, s, 0, pattern(9, 4096), false)
+	if got := readDevice(t, s, 4096, 4096); !bytes.Equal(got, make([]byte, 4096)) {
+		t.Fatalf("uncovered bytes after trim+write: got %x.., want zeros", got[:4])
+	}
+}
+
 // Finding 3: a cold read must succeed when the transport is reachable even if
 // the cache is full of dirty chunks; the fetched bytes serve the read and only
 // the cache insert is skipped.
