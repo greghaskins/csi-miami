@@ -202,7 +202,7 @@ func TestReadHitAllocations(t *testing.T) {
 	if err := s.back.cache.MarkZero(0); err != nil {
 		t.Fatalf("MarkZero: %v", err)
 	}
-	p := make([]byte, testChunk)
+	p := make([]byte, 4096) // a 4 KiB request, the common ext4 I/O size
 	allocs := testing.AllocsPerRun(200, func() {
 		if _, err := s.back.ReadAt(p, 0); err != nil {
 			t.Fatal(err)
@@ -213,12 +213,12 @@ func TestReadHitAllocations(t *testing.T) {
 	}
 }
 
-// BenchmarkReadHit measures the backend's per-request overhead on a cache hit.
-// The chunk is served from the cache (the all-zero chunk) with no store access,
-// so the result reflects the backend's own machinery: a pooled, reused aligned
-// buffer and a copy, which allocate nothing. (A read of a non-zero cached chunk
-// inherits the merged cache's per-read file open; that cost is the cache's, not
-// the backend's.)
+// BenchmarkReadHit measures the backend's per-request overhead on a 4 KiB cache
+// hit. The chunk is served from the cache (the all-zero chunk) with no store
+// access, so the result reflects the backend's own machinery: a pooled, reused
+// aligned buffer and a copy, which allocate nothing. (A read of a non-zero
+// cached chunk inherits the cache's per-read file open; that cost is the
+// cache's, not the backend's.)
 func BenchmarkReadHit(b *testing.B) {
 	cfg, _ := testConfig(b)
 	s, err := newServer(context.Background(), cfg, testLog())
@@ -230,7 +230,7 @@ func BenchmarkReadHit(b *testing.B) {
 	if err := s.back.cache.MarkZero(0); err != nil {
 		b.Fatal(err)
 	}
-	p := make([]byte, testChunk)
+	p := make([]byte, 4096)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {

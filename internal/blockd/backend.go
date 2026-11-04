@@ -17,14 +17,21 @@ import (
 // fetchConcurrency bounds how many chunk fetches from the store run at once.
 const fetchConcurrency = 8
 
-// writeStripes is the number of mutexes that serialise read-modify-write of a
-// chunk. The cache gives no ordering between concurrent writes to the same
-// chunk, so the backend owns the chunk for the span of its RMW.
+// writeStripes is the number of mutexes that serialise work on one chunk. The
+// cache runs the per-request pread/pwrite outside its own lock and relies on
+// the caller to serialise writes to a single chunk; the backend does that here,
+// one stripe per chunk index.
 const writeStripes = 1024
+
+// maxReadChunks bounds the per-request stack array that records cache misses:
+// an nbd request is at most maxRequest bytes and a chunk at least
+// chunk.MinChunkSize, so a read spans at most this many chunks.
+const maxReadChunks = maxRequest/(1<<20) + 2
 
 // backend implements nbd.Backend over the cache with fetch-on-miss from the
 // store. Reads and writes are byte ranges the nbd server has already bounded by
-// the device size; the backend translates them to whole chunks.
+// the device size and the 4096-byte block size, so every offset and length is
+// 4096-aligned; the backend translates them to per-chunk sub-ranges.
 type backend struct {
 	cache *cache.Cache
 	store *chunk.Store
@@ -83,6 +90,8 @@ func (b *backend) getBuf() *[]byte { return b.bufPool.Get().(*[]byte) }
 
 func (b *backend) putBuf(p *[]byte) { b.bufPool.Put(p) }
 
+func (b *backend) stripe(i uint32) *sync.Mutex { return &b.stripes[i%writeStripes] }
+
 // chunkHash is the base-manifest hash of chunk i, or ok false when i is beyond
 // the base manifest (a new or grown region that reads as zeros).
 func (b *backend) chunkHash(i uint32) (chunk.Hash, bool) {
@@ -101,55 +110,113 @@ func (b *backend) setManifest(m []chunk.Hash) {
 	b.mu.Unlock()
 }
 
-// ReadAt fills p with the device bytes at off. A chunk not in the cache is
-// fetched from the store; a chunk the base manifest names as zero, or does not
-// name at all, needs no fetch. A corrupt chunk (chunk.ErrCorrupt) fails this
-// one request with a short read, which the nbd server turns into EIO; the
-// device is not wedged. The hot path (every chunk a cache hit) allocates
-// nothing: the scratch buffer comes from a pool.
+// segment is the chunk index, intra-chunk offset and length of the piece of a
+// request at byte position pos.
+func (b *backend) segment(pos int64, remaining int) (i uint32, intra, n int64) {
+	i = uint32(pos / b.chunkSize) //nolint:gosec // bounded by the device size
+	intra = pos % b.chunkSize
+	n = min(int64(remaining), b.chunkSize-intra)
+	return i, intra, n
+}
+
+// ReadAt fills p with the device bytes at off. Any chunk the cache does not
+// hold is fetched from the store first, the misses of one request fetched
+// concurrently (bounded) so a multi-chunk read does not serialise on a slow
+// transport. A chunk the base manifest names as zero, or does not name, reads
+// as zeros with no fetch. A corrupt chunk (chunk.ErrCorrupt) fails this one
+// request, which the nbd server turns into EIO; the device is not wedged. The
+// hot path (every chunk a cache hit) allocates nothing.
 func (b *backend) ReadAt(p []byte, off int64) (int, error) {
+	// Phase 1: fetch the missing, non-zero chunks of this request concurrently.
+	var missBuf [maxReadChunks]uint32
+	miss := missBuf[:0]
+	for pos := off; pos < off+int64(len(p)); {
+		i, _, n := b.segment(pos, int(off+int64(len(p))-pos))
+		if !b.cache.Has(i) {
+			if h, ok := b.chunkHash(i); ok && h != b.zeroHash && len(miss) < cap(miss) {
+				miss = append(miss, i)
+			}
+		}
+		pos += n
+	}
+	if len(miss) > 0 {
+		if err := b.fetchMisses(miss); err != nil {
+			return 0, err
+		}
+	}
+
+	// Phase 2: serve every segment from the cache.
 	bufp := b.getBuf()
 	defer b.putBuf(bufp)
 	buf := *bufp
-
-	var fctx context.Context
-	var cancel context.CancelFunc
 	done := 0
 	for done < len(p) {
-		pos := off + int64(done)
-		i := uint32(pos / b.chunkSize) //nolint:gosec // bounded by the device size
-		intra := pos % b.chunkSize
-		n := min(int64(len(p)-done), b.chunkSize-intra)
-
-		err := b.cache.Read(i, buf)
-		if errors.Is(err, cache.ErrMiss) {
-			if fctx == nil {
-				fctx, cancel = context.WithTimeout(b.ctx, b.fetchBudget)
-			}
-			err = b.fetch(fctx, i, buf)
-		}
-		if err != nil {
-			if cancel != nil {
-				cancel()
-			}
+		i, intra, n := b.segment(off+int64(done), len(p)-done)
+		if err := b.readSeg(i, intra, buf[:n]); err != nil {
 			return done, err
 		}
-		copy(p[done:done+int(n)], buf[intra:intra+n])
+		copy(p[done:done+int(n)], buf[:n])
 		done += int(n)
-	}
-	if cancel != nil {
-		cancel()
 	}
 	return done, nil
 }
 
-// fetch fills buf with chunk i from the store and inserts it into the cache. A
-// chunk the base manifest names as zero, or does not name, is served as zeros
-// with no store access. A corrupt chunk is not inserted.
-func (b *backend) fetch(ctx context.Context, i uint32, buf []byte) error {
+// readSeg fills buf with [intra, intra+len(buf)) of chunk i from the cache. A
+// miss of a zero-based chunk reads as zeros; a miss of a non-zero chunk (an
+// eviction that raced phase 1) is fetched synchronously and retried.
+func (b *backend) readSeg(i uint32, intra int64, buf []byte) error {
+	err := b.cache.ReadAt(i, intra, buf)
+	if !errors.Is(err, cache.ErrMiss) {
+		return err
+	}
 	h, ok := b.chunkHash(i)
 	if !ok || h == b.zeroHash {
 		clear(buf)
+		return nil
+	}
+	if err := b.fetchMisses([]uint32{i}); err != nil {
+		return err
+	}
+	return b.cache.ReadAt(i, intra, buf)
+}
+
+// fetchMisses fetches the given chunks from the store into the cache,
+// concurrently and bounded, under one deadline below the nbd request timeout.
+func (b *backend) fetchMisses(chunks []uint32) error {
+	ctx, cancel := context.WithTimeout(b.ctx, b.fetchBudget)
+	defer cancel()
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		first error
+	)
+	fail := func(e error) {
+		mu.Lock()
+		if first == nil {
+			first = e
+			cancel()
+		}
+		mu.Unlock()
+	}
+	for _, i := range chunks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := b.fetchOne(ctx, i); err != nil {
+				fail(err)
+			}
+		}()
+	}
+	wg.Wait()
+	return first
+}
+
+// fetchOne fetches chunk i from the store and inserts it into the cache. A
+// zero-based or unnamed chunk needs no fetch. A full cache cannot hold a clean
+// chunk, which is fine.
+func (b *backend) fetchOne(ctx context.Context, i uint32) error {
+	h, ok := b.chunkHash(i)
+	if !ok || h == b.zeroHash {
 		return nil
 	}
 	select {
@@ -159,49 +226,35 @@ func (b *backend) fetch(ctx context.Context, i uint32, buf []byte) error {
 	}
 	defer func() { <-b.fetchSem }()
 
-	w := &sliceWriter{buf: buf}
+	bufp := b.getBuf()
+	defer b.putBuf(bufp)
+	w := &sliceWriter{buf: *bufp}
 	if err := b.store.Get(ctx, h, w); err != nil {
 		return err
 	}
-	if w.n != len(buf) {
-		return fmt.Errorf("blockd: chunk %d (%s) is %d bytes, want %d", i, h, w.n, len(buf))
+	if w.n != len(*bufp) {
+		return fmt.Errorf("blockd: chunk %d (%s) is %d bytes, want %d", i, h, w.n, len(*bufp))
 	}
-	// Best effort: a full cache cannot hold a clean chunk, which is fine.
-	if err := b.cache.Insert(i, buf); err != nil && !errors.Is(err, cache.ErrFull) {
+	if err := b.cache.Insert(i, *bufp); err != nil && !errors.Is(err, cache.ErrFull) {
 		b.log.Warn("cache insert failed", "chunk", i, "err", err)
 	}
 	return nil
 }
 
-// WriteAt stores p at off, dirtying the chunks it touches. A sub-chunk write is
-// read-modify-write: the current chunk is read (fetched on a miss) and the
-// payload overlaid. fua syncs the cache before returning. A cache that is full
-// of dirty chunks fails the write with EIO rather than block, so the filesystem
-// goes read-only and no kernel thread waits on the transport.
+// WriteAt stores p at off. A full-chunk segment is written straight through; a
+// sub-chunk segment to a chunk the cache does not already hold first fetches
+// the base so the bytes it does not cover keep their value. A cache full of
+// dirty chunks fails the write with EIO rather than block, so the filesystem
+// goes read-only and no kernel thread waits on the transport. fua syncs the
+// cache before returning.
 func (b *backend) WriteAt(p []byte, off int64, fua bool) (int, error) {
-	bufp := b.getBuf()
-	defer b.putBuf(bufp)
-	buf := *bufp
-
-	var fctx context.Context
-	var cancel context.CancelFunc
 	done := 0
 	for done < len(p) {
-		pos := off + int64(done)
-		i := uint32(pos / b.chunkSize) //nolint:gosec // bounded by the device size
-		intra := pos % b.chunkSize
-		n := min(int64(len(p)-done), b.chunkSize-intra)
-
-		if err := b.writeChunk(&fctx, &cancel, i, intra, buf, p[done:done+int(n)]); err != nil {
-			if cancel != nil {
-				cancel()
-			}
+		i, intra, n := b.segment(off+int64(done), len(p)-done)
+		if err := b.writeSeg(i, intra, p[done:done+int(n)]); err != nil {
 			return done, err
 		}
 		done += int(n)
-	}
-	if cancel != nil {
-		cancel()
 	}
 	if fua {
 		if err := b.cache.Sync(); err != nil {
@@ -211,31 +264,32 @@ func (b *backend) WriteAt(p []byte, off int64, fua bool) (int, error) {
 	return done, nil
 }
 
-// writeChunk writes src into chunk i at offset intra, under the chunk's stripe
-// lock so a concurrent write to the same chunk cannot interleave its
-// read-modify-write.
-func (b *backend) writeChunk(fctx *context.Context, cancel *context.CancelFunc, i uint32, intra int64, buf, src []byte) error {
-	m := &b.stripes[i%writeStripes]
+// writeSeg writes src into chunk i at offset intra, under the chunk's stripe
+// lock so a concurrent write to the same chunk cannot interleave. src is a
+// slice of the nbd payload (not aligned), so it is copied into an aligned
+// buffer for the cache's O_DIRECT write.
+func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
+	m := b.stripe(i)
 	m.Lock()
 	defer m.Unlock()
 
-	if intra == 0 && int64(len(src)) == b.chunkSize {
-		copy(buf, src) // full-chunk overwrite: no read needed
-	} else {
-		err := b.cache.Read(i, buf)
-		if errors.Is(err, cache.ErrMiss) {
-			if *fctx == nil {
-				//nolint:gosec // the cancel is stored through the pointer and called by WriteAt
-				*fctx, *cancel = context.WithTimeout(b.ctx, b.fetchBudget)
+	full := intra == 0 && int64(len(src)) == b.chunkSize
+	if !full && !b.cache.Has(i) {
+		// Sub-chunk write to a chunk not in the cache: if it has a non-zero
+		// base, fetch the whole base so the bytes this write does not cover keep
+		// their value. A zero or unnamed base needs no fetch; the cache
+		// materialises the gaps as zeros.
+		if h, ok := b.chunkHash(i); ok && h != b.zeroHash {
+			if err := b.fetchMisses([]uint32{i}); err != nil {
+				return err
 			}
-			err = b.fetch(*fctx, i, buf)
 		}
-		if err != nil {
-			return err
-		}
-		copy(buf[intra:intra+int64(len(src))], src)
 	}
-	return b.cache.Write(i, buf)
+	bufp := b.getBuf()
+	defer b.putBuf(bufp)
+	buf := (*bufp)[:len(src)]
+	copy(buf, src)
+	return b.cache.WriteAt(i, intra, buf)
 }
 
 // Flush makes every dirty chunk and the index durable.
@@ -248,19 +302,32 @@ func (b *backend) Trim(off, n int64) error {
 	first := (off + b.chunkSize - 1) / b.chunkSize // first wholly-covered chunk
 	last := (off + n) / b.chunkSize                // one past the last wholly-covered
 	for i := first; i < last; i++ {
-		if err := b.cache.MarkZero(uint32(i)); err != nil { //nolint:gosec // bounded by the device size
+		idx := uint32(i) //nolint:gosec // bounded by the device size
+		m := b.stripe(idx)
+		m.Lock()
+		err := b.cache.MarkZero(idx)
+		m.Unlock()
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// grow raises the device size; new chunks read as zeros until written.
+func (b *backend) grow(size int64) error {
+	if err := b.cache.Grow(size); err != nil {
+		return err
+	}
+	b.size.Store(size)
+	return nil
+}
+
 // prefetch walks the base manifest and inserts the chunks the cache does not
-// hold, so a volume that fits its cache fills after stage. It is best effort:
-// a fetch error is skipped, and it stops when the cache is full. It runs only
+// hold, so a volume that fits its cache fills after stage. It is best effort: a
+// fetch error is skipped, and it stops when the cache is full. It runs only
 // when CacheBound >= Size.
 func (b *backend) prefetch(ctx context.Context) {
-	buf := cache.AlignedBuffer(int(b.chunkSize))
 	b.mu.RLock()
 	n := len(b.manifest)
 	b.mu.RUnlock()
@@ -272,34 +339,10 @@ func (b *backend) prefetch(ctx context.Context) {
 		if b.cache.Has(idx) {
 			continue
 		}
-		h, ok := b.chunkHash(idx)
-		if !ok || h == b.zeroHash {
-			continue
-		}
-		select {
-		case b.fetchSem <- struct{}{}:
-		case <-ctx.Done():
-			return
-		}
-		w := &sliceWriter{buf: buf}
-		err := b.store.Get(ctx, h, w)
-		<-b.fetchSem
-		if err != nil || w.n != len(buf) {
-			continue
-		}
-		if err := b.cache.Insert(idx, buf); errors.Is(err, cache.ErrFull) {
+		if err := b.fetchOne(ctx, idx); errors.Is(err, cache.ErrFull) {
 			return
 		}
 	}
-}
-
-// grow raises the device size; new chunks read as zeros until written.
-func (b *backend) grow(size int64) error {
-	if err := b.cache.Grow(size); err != nil {
-		return err
-	}
-	b.size.Store(size)
-	return nil
 }
 
 // sliceWriter fills a fixed buffer, refusing to overflow it. The store's Get

@@ -3,7 +3,10 @@ package blockd
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +27,7 @@ type storer interface {
 	WriteManifest(ctx context.Context, m chunk.Manifest) error
 	Publish(ctx context.Context, name string) error
 	Prune(ctx context.Context, keep int) (removedManifests, removedChunks int, err error)
+	Manifests(ctx context.Context) ([]string, error)
 }
 
 var _ storer = (*chunk.Store)(nil)
@@ -61,12 +65,20 @@ func (s *server) publish(ctx context.Context, trigger string) (PublishReply, err
 		return PublishReply{}, ErrNoBoundary
 	}
 
+	s.mu.Lock()
+	s.publishInFlight = true
+	s.mu.Unlock()
+
 	reply, err := s.doPublish(ctx, trigger, boundary)
 
+	// I7: LastAttempt moves on every attempt, but LastPublish (set inside
+	// doPublish) only on a success, so a VolumeCondition derived from the
+	// generation age goes overdue while publishes keep failing.
 	s.mu.Lock()
+	s.publishInFlight = false
 	s.haveBound = false
 	s.boundarySet = nil
-	s.lastPublish = time.Now()
+	s.lastAttempt = time.Now()
 	s.refused = reply.Refused
 	switch {
 	case reply.Refused:
@@ -102,23 +114,20 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 		chunks[i] = hashes[k]
 	}
 
-	s.mu.Lock()
-	seq := s.seq + 1
-	s.mu.Unlock()
-	m := chunk.Manifest{
-		Volume:   s.cfg.Volume,
-		Epoch:    s.cfg.Epoch,
-		Sequence: seq,
-		Size:     size,
-		Chunk:    s.cfg.Chunk,
-		Time:     time.Now().UTC(),
-		Chunks:   chunks,
+	// The next sequence is derived from the store, not from an in-memory
+	// counter, so a prior failed or crashed publish (which may have left an
+	// orphan manifest at some sequence) cannot make this one rebuild a name that
+	// link(2) then refuses with EEXIST, wedging every later generation.
+	seq, err := s.nextSequence(ctx)
+	if err != nil {
+		s.back.cache.ClearBoundary(false)
+		return PublishReply{}, err
 	}
 
 	// Fencing, after the slow upload and immediately before we commit: the
 	// holder must still be ours and current must not already name a higher
 	// epoch. On refusal nothing is written and the dirty set is kept.
-	refused, err := s.refusedToPublish(ctx, m)
+	refused, err := s.refusedToPublish(ctx)
 	switch {
 	case err != nil:
 		s.back.cache.ClearBoundary(false)
@@ -128,7 +137,8 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 		return PublishReply{Refused: true, Uploaded: uploaded}, ErrRefused
 	}
 
-	if err := s.store.WriteManifest(ctx, m); err != nil {
+	m, err := s.writeManifest(ctx, size, seq, chunks)
+	if err != nil {
 		s.back.cache.ClearBoundary(false)
 		return PublishReply{}, err
 	}
@@ -142,14 +152,69 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 	s.back.cache.SetBase(m.Name(), s.cfg.Epoch)
 	s.back.cache.ClearBoundary(true)
 	s.mu.Lock()
-	s.seq = seq
+	s.seq = m.Sequence
 	s.base = m.Name()
+	s.lastPublishTime = m.Time
 	s.mu.Unlock()
-	if _, _, perr := s.store.Prune(ctx, generationsKeep); perr != nil {
+	// M7: a taker may have acquired the holder during the upload; pruning while
+	// not ours could remove a chunk the taker's new manifest just referenced
+	// (the decision-32 window), so re-check immediately before Prune.
+	if mine, merr := s.cfg.Holder.Mine(ctx); merr != nil || !mine {
+		s.log.Warn("skipping prune: holder no longer ours", "volume", s.cfg.Volume, "err", merr)
+	} else if _, _, perr := s.store.Prune(ctx, generationsKeep); perr != nil {
 		s.log.Warn("prune after publish failed", "volume", s.cfg.Volume, "err", perr)
 	}
 	s.log.Info("published generation", "volume", s.cfg.Volume, "trigger", trigger, "manifest", m.Name(), "uploaded", uploaded)
 	return PublishReply{Name: m.Name(), Uploaded: uploaded}, nil
+}
+
+// nextSequence is one past the highest sequence any manifest at our epoch has
+// in the store. Our own writes are always visible to our own client, so a
+// failed publish's orphan manifest is counted and never recollided with.
+func (s *server) nextSequence(ctx context.Context) (uint64, error) {
+	names, err := s.store.Manifests(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var mx uint64
+	for _, n := range names {
+		ep, sq, perr := chunk.ParseManifestName(n)
+		if perr == nil && ep == s.cfg.Epoch && sq > mx {
+			mx = sq
+		}
+	}
+	return mx + 1, nil
+}
+
+// writeManifest writes the generation's manifest under its name, tolerating the
+// one case link(2) and NFSv3 make awkward: a LINK that is not idempotent may
+// report failure although the name now holds exactly our bytes (a retransmit),
+// which we accept; a name that holds different bytes is bumped once.
+func (s *server) writeManifest(ctx context.Context, size int64, seq uint64, chunks []chunk.Hash) (chunk.Manifest, error) {
+	now := time.Now().UTC()
+	for attempt := 0; attempt < 2; attempt++ {
+		m := chunk.Manifest{
+			Volume:   s.cfg.Volume,
+			Epoch:    s.cfg.Epoch,
+			Sequence: seq,
+			Size:     size,
+			Chunk:    s.cfg.Chunk,
+			Time:     now,
+			Chunks:   chunks,
+		}
+		err := s.store.WriteManifest(ctx, m)
+		if err == nil {
+			return m, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return chunk.Manifest{}, err
+		}
+		if existing, rerr := s.store.ReadManifest(ctx, m.Name()); rerr == nil && bytes.Equal(existing.Marshal(), m.Marshal()) {
+			return m, nil // our own bytes are already there: a retransmitted link
+		}
+		seq++
+	}
+	return chunk.Manifest{}, fmt.Errorf("blockd: manifest name kept colliding at epoch %d", s.cfg.Epoch)
 }
 
 // baseManifestChunks is the base lineage's chunk hashes, padded with the zero
@@ -171,7 +236,7 @@ func (s *server) baseManifestChunks(n int) []chunk.Hash {
 
 // refusedToPublish is the fencing gate: the holder must still name our node at
 // our epoch, and current must not already name a manifest at a higher epoch.
-func (s *server) refusedToPublish(ctx context.Context, m chunk.Manifest) (bool, error) {
+func (s *server) refusedToPublish(ctx context.Context) (bool, error) {
 	mine, err := s.cfg.Holder.Mine(ctx)
 	if err != nil {
 		return false, err
@@ -188,7 +253,7 @@ func (s *server) refusedToPublish(ctx context.Context, m chunk.Manifest) (bool, 
 		if err != nil {
 			return false, err
 		}
-		if ep > m.Epoch {
+		if ep > s.cfg.Epoch {
 			return true, nil
 		}
 	}

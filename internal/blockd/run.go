@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -110,6 +112,9 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if err := s.back.cache.Sync(); err != nil {
 		return fmt.Errorf("blockd: final sync: %w", err)
 	}
+	// M8: a serve that died on its own is logged at Error but not returned, so
+	// the transient unit exits clean (inactive, collected) rather than failed;
+	// the reconciler notices the gone device through sysfs and restages.
 	return nil
 }
 
@@ -124,8 +129,8 @@ func serverFlags(readOnly bool) uint64 {
 
 // connectDevice connects the device to the serving end of the socket pair. A
 // Connect cut off by its context may still have created the device, so on an
-// error it looks for a device carrying this volume's backend name and
-// disconnects it before returning the error.
+// error it looks for a device THIS process created and disconnects it before
+// returning the error.
 func connectDevice(ctx context.Context, cfg Config, cliFile *os.File) (int, error) {
 	cctx, ccancel := context.WithTimeout(ctx, connectTimeout)
 	defer ccancel()
@@ -139,7 +144,7 @@ func connectDevice(ctx context.Context, cfg Config, cliFile *os.File) (int, erro
 		Backend:         cfg.Volume,
 	})
 	if err != nil {
-		if d, ok := findByBackend(cfg.Volume); ok {
+		if d, ok := findOurDevice(cfg.Volume); ok {
 			dctx, dcancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			defer dcancel()
 			_ = nbd.Disconnect(dctx, d.Index)
@@ -149,18 +154,41 @@ func connectDevice(ctx context.Context, cfg Config, cliFile *os.File) (int, erro
 	return idx, nil
 }
 
-// findByBackend finds a configured device whose backend identifier is name.
-func findByBackend(name string) (nbd.Device, bool) {
+// findOurDevice finds a configured device this process created: the backend
+// identifier matches and the sysfs serving pid (a TID) belongs to this process.
+// After a crash the dead device keeps the same backend string, so matching the
+// name alone could pick another incarnation's corpse — still carrying its
+// dm-crypt mapping and mount — and disconnect it. The pid check (I3) avoids it.
+func findOurDevice(name string) (nbd.Device, bool) {
 	devs, err := nbd.Devices("/sys")
 	if err != nil {
 		return nbd.Device{}, false
 	}
+	me := os.Getpid()
 	for _, d := range devs {
-		if d.Backend == name && d.Pid != 0 {
+		if d.Backend == name && d.Pid != 0 && tgidOf(d.Pid) == me {
 			return d, true
 		}
 	}
 	return nbd.Device{}, false
+}
+
+// tgidOf maps a thread id (what sysfs records as an nbd device's pid) to its
+// thread-group id, the process it belongs to, or -1 when it cannot be read.
+func tgidOf(tid int) int {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", tid)) //nolint:gosec // a /proc path from a sysfs-reported tid
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if rest, ok := strings.CutPrefix(line, "Tgid:"); ok {
+			if g, err := strconv.Atoi(strings.TrimSpace(rest)); err == nil {
+				return g
+			}
+			return -1
+		}
+	}
+	return -1
 }
 
 // socketpair returns a connected pair: a net.Conn for Serve and an *os.File for

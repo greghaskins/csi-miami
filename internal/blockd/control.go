@@ -16,14 +16,16 @@ const controlServiceName = "Control"
 // Status is what the control service reports about the running server. It never
 // carries a key or any chunk content.
 type Status struct {
-	Index            int   // the nbd device index, -1 before the device connects
-	Size             int64 // the device size in bytes
-	Dirty            int64 // unpublished dirty bytes
-	Cached           int64 // bytes resident in the cache
-	Base             string
-	LastPublish      time.Time
-	LastPublishError string
-	Refused          bool
+	Index            int       // the nbd device index, -1 before the device connects
+	Size             int64     // the device size in bytes
+	Dirty            int64     // unpublished dirty bytes (trimmed chunks hold none)
+	Cached           int64     // bytes resident in the cache (dirty plus clean copies)
+	Base             string    // the manifest the cache descends from
+	LastPublish      time.Time // time of the last SUCCESSFUL publish
+	LastAttempt      time.Time // time of the last publish attempt, success or not
+	LastPublishError string    // the last attempt's error, "" on success or refusal
+	Refused          bool      // the last attempt was refused by the fencing check
+	PublishInFlight  bool      // a publish is running now
 	BinaryHash       string
 }
 
