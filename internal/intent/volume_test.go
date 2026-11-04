@@ -60,7 +60,7 @@ func TestVolumeIntentLoads(t *testing.T) {
 	}
 	s, dir := openStore(t)
 	want := stored(volumeIntent())
-	if err := os.WriteFile(filepath.Join(dir, Escape(want.VolumeID)+".json"), golden, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, Escape(want.VolumeID)+".json"), golden, 0o600); err != nil { // #nosec G703 -- a test file in a temp dir
 		t.Fatal(err)
 	}
 	got := mustLoad(t, s)
