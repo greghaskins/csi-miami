@@ -420,6 +420,11 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.Holder, cur current) (nbd.Device, error) {
 	// A cache never exists without the record that lets a node with no intent
 	// find the volume again (see Orphans); a server is not started without it.
+	// The unit executes the host copy of the binary; a plugin that has only
+	// drained or unstaged since it started has not made it yet.
+	if err := it.ensureBinary(); err != nil {
+		return nbd.Device{}, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
 	if err := it.saveDrainRecord(v); err != nil {
 		return nbd.Device{}, fmt.Errorf("volume item %s: %w: writing the drain record: %w", v.in.VolumeID, item.ErrServerDown, err)
 	}

@@ -105,7 +105,9 @@ func (p *pass) drainOne(d item.Drainer, in intent.Intent) {
 	}
 	r.metrics.IncReconcileError("drain")
 	r.log.Warn("draining a volume this node holds did not finish; it is retried", "volume", in.VolumeID, "error", err)
-	p.results[in.VolumeID] = &volumeResult{stage: err, publish: map[string]error{}}
+	// No volumeResult: a drained volume has no intent, so it is in no condition
+	// and in no stage or publish answer. Its failure is this log line, the
+	// error counter and, after a long time, ReasonDrainStuck.
 	ds.next = now.Add(ds.delay)
 	ds.delay = min(ds.delay*2, r.opts.MarkRetryMax)
 	if !ds.warned && max(0, now.Sub(ds.since)) >= r.opts.MarkWarnAfter {

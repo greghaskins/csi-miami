@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/systemd"
@@ -25,9 +27,6 @@ func orphanEnv(t *testing.T) *env {
 	t.Helper()
 	e := newEnv(t)
 	e.holderAt(testNode, 1)
-	if err := e.it.ensureBinary(); err != nil {
-		t.Fatal(err)
-	}
 	e.makeCache(1, "", 3, 4)
 	e.ctl.dirty = 2 << 20
 	e.ctl.down = true
@@ -142,22 +141,6 @@ func TestDrainDiscardsACacheTheStoreHasMovedPast(t *testing.T) {
 	}
 }
 
-func TestDrainDiscardLeavesAnotherNodesHolderAlone(t *testing.T) {
-	e := orphanEnv(t)
-	in := e.drainIntent(t)
-	e.curName = "9.1"
-	e.holderAt(otherNode, 2) // an operator's detach already moved the volume
-	if err := e.it.Drain(bg, in); err != nil {
-		t.Fatal(err)
-	}
-	// Not ours: nothing of ours is touched, the cache is left for the node's
-	// own stage decision to deal with.
-	if got := e.holderInfo(); got.Node != otherNode {
-		t.Errorf("holder = %+v", got)
-	}
-	e.rec.none(t, "systemd.Start", "ctl.")
-}
-
 // The fence is what an operator's detach landing mid-drain meets: the publish
 // is refused, the data is given up, and the new holder's file is untouched.
 func TestDrainRefusedByTheFenceDiscardsAndReleasesNothing(t *testing.T) {
@@ -253,33 +236,232 @@ func TestDrainRefusesWhenSomethingUsesTheVolume(t *testing.T) {
 	}
 }
 
-func TestDrainLeavesAVolumeThatIsNotOursAlone(t *testing.T) {
-	t.Run("the holder names another node", func(t *testing.T) {
+// Decision 52's proof rule, as in an unstage: a holder file that names another
+// node proves the volume was given up, so the surviving cache is discarded
+// (reported) and nothing of the other node's is released.
+func TestDrainDiscardsWhenTheHolderNamesAnotherNode(t *testing.T) {
+	e := orphanEnv(t)
+	in := e.drainIntent(t)
+	e.holderAt(otherNode, 2)
+	if err := e.it.Drain(bg, in); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(e.events, []string{ReasonGenerationLost}) {
+		t.Errorf("events = %v", e.events)
+	}
+	if e.cacheExists() || e.drainRecordExists() {
+		t.Error("the cache or its record is left")
+	}
+	if got := e.holderInfo(); got.Node != otherNode || got.Epoch != 2 {
+		t.Errorf("holder = %+v: another node's file must not be released", got)
+	}
+	e.rec.none(t, "systemd.Start", "ctl.Publish")
+}
+
+// An absent holder is proof only with the store's current above the cache's
+// epoch; with nothing to show it is not, and the cache is kept.
+func TestDrainWithNoHolderNeedsProof(t *testing.T) {
+	absent := func(e *env) {
+		if err := os.Remove(holder.Path(e.v.holdDir, e.v.name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("current above the cache's epoch is proof", func(t *testing.T) {
 		e := orphanEnv(t)
 		in := e.drainIntent(t)
-		e.holderAt(otherNode, 2)
+		absent(e)
+		e.curName = "9.1"
 		if err := e.it.Drain(bg, in); err != nil {
 			t.Fatal(err)
 		}
-		if !e.cacheExists() || e.holderInfo().Node != otherNode {
-			t.Error("the cache or another node's holder was touched")
+		if e.cacheExists() || !slices.Equal(e.events, []string{ReasonGenerationLost}) {
+			t.Errorf("cache %t, events %v", e.cacheExists(), e.events)
 		}
-		e.rec.none(t, "systemd.Start", "ctl.")
 	})
-	t.Run("there is no holder file", func(t *testing.T) {
+	t.Run("a held epoch above current is not", func(t *testing.T) {
 		e := orphanEnv(t)
+		e.makeCache(5, "")
 		in := e.drainIntent(t)
-		_ = os.Remove(filepath.Join(e.v.holdDir, e.v.name+".holder"))
+		absent(e)
+		e.curName = "3.1"
 		if err := e.it.Drain(bg, in); err != nil {
 			t.Fatal(err)
 		}
-		// Absence proves nothing (the transport may not be mounted): the
-		// cache stays.
 		if !e.cacheExists() {
-			t.Error("the cache was removed on an absent holder file")
+			t.Error("the cache was discarded without proof")
+		}
+	})
+	t.Run("no proof keeps the cache and warns once", func(t *testing.T) {
+		e := orphanEnv(t)
+		in := e.drainIntent(t)
+		absent(e)
+		for range 3 {
+			if err := e.it.Drain(bg, in); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !e.cacheExists() || !e.drainRecordExists() {
+			t.Error("the cache or its record was removed")
 		}
 		e.rec.none(t, "systemd.Start", "ctl.")
+		if n := strings.Count(e.logs.String(), "level=WARN"); n != 1 {
+			t.Errorf("%d warnings over 3 passes, want 1:\n%s", n, e.logs.String())
+		}
+		if !strings.Contains(e.logs.String(), "force-detach") {
+			t.Errorf("the warning does not name the way out:\n%s", e.logs.String())
+		}
 	})
+}
+
+// The volume's store directory is gone: it was deleted, and nothing is left to
+// drain into.
+func TestDrainDiscardsWhenTheVolumeWasDeleted(t *testing.T) {
+	e := orphanEnv(t)
+	in := e.drainIntent(t)
+	if err := os.RemoveAll(e.v.storeDir); err != nil {
+		t.Fatal(err)
+	}
+	e.it.cfg.Current = storeCurrent // the real reader, which reports a missing store directory
+	mp, err := e.in.Transport.MountPoint(e.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// With the transport not mounted, a missing directory is an empty mount
+	// point and says nothing.
+	if err := e.it.Drain(bg, in); err == nil || !e.cacheExists() {
+		t.Fatalf("discarded under an unmounted transport: %v", err)
+	}
+	e.events = nil
+	e.mnt.add(mp, "nfs", "nas.example.com:/export")
+	if err := e.it.Drain(bg, in); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(e.events, []string{ReasonGenerationLost}) {
+		t.Errorf("events = %v", e.events)
+	}
+	if e.cacheExists() || e.drainRecordExists() {
+		t.Error("the cache or its record is left")
+	}
+}
+
+// B-M2: the fence is `current` above the larger of the cache's epoch and the
+// held one. A holder file regressed to an older claim of ours (held 1) under a
+// cache built and published at epoch 3 is not fenced by its own epoch-3
+// generation.
+func TestDrainFenceUsesTheLargerOfTheIndexAndHeldEpoch(t *testing.T) {
+	e := orphanEnv(t) // holder: this node, epoch 1
+	e.makeCache(3, "3.1", 3)
+	e.curName = "3.1"
+	e.ctl.base, e.ctl.dirty = "3.1", 1<<20
+	if err := e.it.Drain(bg, e.drainIntent(t)); err != nil {
+		t.Fatal(err)
+	}
+	e.rec.inOrder(t, "systemd.Start", "ctl.Publish unstage")
+	if len(e.events) != 0 {
+		t.Errorf("events = %v: our own epoch-3 generation fenced us", e.events)
+	}
+}
+
+// And a current above both is a fence even when the cache descends from it.
+func TestDrainFencedByAGenerationAboveBothEpochsDiscards(t *testing.T) {
+	e := orphanEnv(t)
+	e.makeCache(3, "5.1", 3) // built on a manifest of epoch 5, under epoch 3
+	e.curName = "5.1"
+	if err := e.it.Drain(bg, e.drainIntent(t)); err != nil {
+		t.Fatal(err)
+	}
+	e.rec.none(t, "systemd.Start")
+	if !slices.Equal(e.events, []string{ReasonGenerationLost}) || e.cacheExists() {
+		t.Errorf("events %v, cache %t", e.events, e.cacheExists())
+	}
+}
+
+// B-I1: a fresh plugin process has copied no binary yet.
+func TestDrainCopiesTheHostBinaryFirst(t *testing.T) {
+	e := orphanEnv(t)
+	if err := e.it.Drain(bg, e.drainIntent(t)); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.sd.units) == 0 {
+		t.Fatal("no unit started")
+	}
+	if _, err := os.Stat(e.sd.units[0].ExecStart[0]); err != nil {
+		t.Errorf("the drain started a unit whose binary does not exist: %v", err)
+	}
+}
+
+// B-I2 (and the coordinator's ruling): the record is kept until the holder is
+// released. A release that fails strands nothing: the next pass finds the
+// record, releases, and only then removes it.
+func TestDrainKeepsTheRecordUntilTheReleaseSucceeds(t *testing.T) {
+	skipIfRoot(t)
+	e := orphanEnv(t)
+	in := e.drainIntent(t)
+	e.it.cfg.Systemd = chmodAfterStop{e.sd, e.v.holdDir}
+	t.Cleanup(func() { _ = os.Chmod(e.v.holdDir, 0o750) }) //nolint:gosec // a directory in the test's temporary tree
+	err := e.it.Drain(bg, in)
+	_ = os.Chmod(e.v.holdDir, 0o750) //nolint:gosec // a directory in the test's temporary tree
+	if !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("Drain = %v, want a retryable release failure", err)
+	}
+	if !e.holderInfo().Present || !e.drainRecordExists() {
+		t.Fatalf("holder %t, record %t: the volume is stranded", e.holderInfo().Present, e.drainRecordExists())
+	}
+	if !e.orphan(t) {
+		t.Fatal("the record of a volume with no cache is not found by the next pass")
+	}
+	// The next pass: no cache, so release if ours, then drop the record.
+	e.it.cfg.Systemd = e.sd
+	if err := e.it.Drain(bg, e.drainIntent(t)); err != nil {
+		t.Fatal(err)
+	}
+	if e.holderInfo().Present || e.drainRecordExists() {
+		t.Errorf("holder %t, record %t after the retry", e.holderInfo().Present, e.drainRecordExists())
+	}
+}
+
+// A volume with no cache whose holder is another node's: only the record goes.
+func TestDrainWithNoCacheLeavesAnotherNodesHolder(t *testing.T) {
+	e := orphanEnv(t)
+	in := e.drainIntent(t)
+	e.holderAt(otherNode, 2)
+	if err := os.RemoveAll(e.v.cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.it.Drain(bg, in); err != nil {
+		t.Fatal(err)
+	}
+	if e.drainRecordExists() || e.holderInfo().Node != otherNode {
+		t.Errorf("record %t, holder %+v", e.drainRecordExists(), e.holderInfo())
+	}
+}
+
+// B-I3: a failed attempt adopts the holder again; the earlier descriptor is
+// closed, not leaked.
+func TestDrainRetryDoesNotLeakHolderDescriptors(t *testing.T) {
+	e := orphanEnv(t)
+	in := e.drainIntent(t)
+	e.ctl.publishErr = errors.New("the transport hung")
+	count := func() int { ents, _ := os.ReadDir("/proc/self/fd"); return len(ents) }
+	_ = e.it.Drain(bg, in)
+	before := count()
+	for range 20 {
+		_ = e.it.Drain(bg, in)
+	}
+	if after := count(); after-before >= 15 {
+		t.Errorf("fds %d -> %d over 20 failed drains", before, after)
+	}
+}
+
+type chmodAfterStop struct {
+	*fakeSystemd
+	dir string
+}
+
+func (c chmodAfterStop) Stop(ctx context.Context, name string) error {
+	err := c.fakeSystemd.Stop(ctx, name)
+	_ = os.Chmod(c.dir, 0o555) //nolint:gosec // a directory in the test's temporary tree
+	return err
 }
 
 func TestDrainWithAnUnreadableIndexLeavesTheCache(t *testing.T) {
@@ -336,8 +518,9 @@ func TestConvergeWritesTheDrainRecordAndTeardownRemovesIt(t *testing.T) {
 
 func TestOrphansIgnoresWhatIsNotADrainableCache(t *testing.T) {
 	e := orphanEnv(t)
-	// A record whose cache is gone is stale and is removed; a corrupt record
-	// and a record under the wrong name are skipped and left.
+	// A record whose cache is gone is still an orphan (the holder may remain
+	// to be released); a corrupt record and a record under the wrong name are
+	// skipped and left.
 	if err := os.RemoveAll(e.v.cacheDir); err != nil {
 		t.Fatal(err)
 	}
@@ -354,11 +537,8 @@ func TestOrphansIgnoresWhatIsNotADrainableCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(orphans) != 0 {
-		t.Errorf("orphans = %+v", orphans)
-	}
-	if e.drainRecordExists() {
-		t.Error("the stale record was kept")
+	if len(orphans) != 1 || orphans[0].VolumeID != e.in.VolumeID {
+		t.Errorf("orphans = %+v, want the volume whose cache is gone", orphans)
 	}
 	for _, p := range []string{stray, wrong} {
 		if _, err := os.Stat(p); err != nil {
@@ -375,4 +555,36 @@ func (e *env) drainIntent(t *testing.T) (in intent.Intent) {
 		t.Fatalf("Orphans = %+v, %v", orphans, err)
 	}
 	return orphans[0]
+}
+
+// B-I2 for an unstage: a release that fails is retryable and keeps the record.
+func TestTeardownReleaseFailureIsRetryableAndKeepsTheRecord(t *testing.T) {
+	skipIfRoot(t)
+	e := dirtyEnv(t)
+	e.mustConverge() // writes the drain record
+	e.it.cfg.Systemd = chmodAfterStop{e.sd, e.v.holdDir}
+	t.Cleanup(func() { _ = os.Chmod(e.v.holdDir, 0o750) }) //nolint:gosec // a directory in the test's temporary tree
+	err := e.it.Teardown(bg, e.in, item.Observed{})
+	_ = os.Chmod(e.v.holdDir, 0o750) //nolint:gosec // a directory in the test's temporary tree
+	if !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("Teardown = %v, want a retryable release failure", err)
+	}
+	if !e.holderInfo().Present || !e.drainRecordExists() {
+		t.Fatalf("holder %t, record %t", e.holderInfo().Present, e.drainRecordExists())
+	}
+	e.it.cfg.Systemd = e.sd
+	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if e.holderInfo().Present || e.drainRecordExists() {
+		t.Error("holder or record left after the retry")
+	}
+}
+
+// The release is made to fail with a read-only directory, which root ignores.
+func skipIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("a read-only directory does not stop root")
+	}
 }

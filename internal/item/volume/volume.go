@@ -192,8 +192,9 @@ type Item struct {
 	log  *slog.Logger
 	busy deadline.Set // store reads and device sizes that have not returned
 
-	mu   sync.Mutex
-	vols map[string]*vstate
+	mu     sync.Mutex
+	vols   map[string]*vstate
+	warned map[string]struct{} // volumes warned about once (drain.go)
 
 	// bin remembers what ensureBinary has verified, so the running binary is
 	// hashed once and not on every pass.
@@ -282,7 +283,7 @@ func New(cfg Config) (*Item, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Item{cfg: cfg, log: log, vols: map[string]*vstate{}}, nil
+	return &Item{cfg: cfg, log: log, vols: map[string]*vstate{}, warned: map[string]struct{}{}}, nil
 }
 
 // statusT is the block server's status.

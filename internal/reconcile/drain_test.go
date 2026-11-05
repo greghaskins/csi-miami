@@ -240,8 +240,12 @@ func TestFailedDrainBacksOffAndWarnsAfterTheMarkBound(t *testing.T) {
 	if attempt() != n+1 {
 		t.Error("the backoff grew past MarkRetryMax")
 	}
-	if c := e.metrics.conditionCount(ConditionFailed); c != 1 {
-		t.Errorf("volumes in condition %s = %d, want the orphan", ConditionFailed, c)
+	// A volume with no intent is in no condition (A-m5).
+	if c := e.metrics.conditionCount(ConditionFailed); c != 0 {
+		t.Errorf("volumes in condition %s = %d, want none for an orphan", ConditionFailed, c)
+	}
+	if _, ok := e.r.lastErr[orphan.VolumeID]; ok {
+		t.Error("an orphan has a last error, which only converged volumes have")
 	}
 
 	// It recovers: drained, forgotten, nothing left to retry.

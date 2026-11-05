@@ -115,7 +115,7 @@ func TestAcquireCreatesWithEpochOne(t *testing.T) {
 	if h.Epoch() != 1 {
 		t.Errorf("Epoch = %d, want 1", h.Epoch())
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":0}`+"\n"; got != want {
+	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1}`+"\n"; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
 	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
@@ -181,7 +181,7 @@ func TestTakeoverIncrementsEpoch(t *testing.T) {
 	if second.Epoch() != 2 {
 		t.Errorf("Epoch = %d, want 2", second.Epoch())
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2,"renewals":0}`+"\n"; got != want {
+	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2}`+"\n"; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
 	if ok, _ := first.Mine(ctx); ok {
@@ -216,7 +216,7 @@ func TestRenewTouchesInPlace(t *testing.T) {
 	if !os.SameFile(before, after) {
 		t.Error("a renewal replaced the file; it must touch it in place")
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":0}`+"\n"; got != want {
+	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1}`+"\n"; got != want {
 		t.Errorf("a renewal changed the content: %q, want %q", got, want)
 	}
 	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
@@ -243,7 +243,7 @@ func TestRenewDetectsLoss(t *testing.T) {
 		t.Errorf("the loser overwrote the winner: %q", e.raw("vol"))
 	}
 	// Lost stays lost, even if the file would look ours again.
-	if err := os.WriteFile(Path(e.dir, "vol"), []byte(`{"node":"kind-worker","epoch":1,"renewals":0}`+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(Path(e.dir, "vol"), []byte(`{"node":"kind-worker","epoch":1}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
@@ -275,7 +275,7 @@ func TestRenewRacingATakeoverLeavesTheTakersFileIntact(t *testing.T) {
 	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
 		t.Fatalf("Renew = %v, want ErrLost", err)
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2,"renewals":0}`+"\n"; got != want {
+	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2}`+"\n"; got != want {
 		t.Errorf("the taker's file changed: %q, want %q", got, want)
 	}
 	if st, err := os.Stat(Path(e.dir, "vol")); err != nil || time.Since(st.ModTime()) < 30*time.Minute {
@@ -419,7 +419,7 @@ func TestLateRenewalCannotRegressTheFile(t *testing.T) {
 			t.Fatalf("Renew = %v, want ErrLost", err)
 		}
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2,"renewals":0}`+"\n"; got != want {
+	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2}`+"\n"; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
 }
@@ -791,5 +791,79 @@ func TestSiblingVolumesDoNotShareDeadlineKeys(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Errorf("Read of a: %v", err)
+	}
+}
+
+// A-I1: on NFS, unlinking a file this client still has open renames it to
+// .nfsXXXX, which a crash then leaves behind for good. The descriptor is
+// closed before the unlink.
+func TestReleaseClosesTheDescriptorBeforeTheRemove(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := h.fd
+	old := removeFile
+	t.Cleanup(func() { removeFile = old })
+	var closedAtRemove bool
+	removeFile = func(path string) error {
+		_, err := f.Stat()
+		closedAtRemove = errors.Is(err, os.ErrClosed)
+		return old(path)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !closedAtRemove {
+		t.Error("the file was removed while the holder's descriptor was still open")
+	}
+	if _, err := os.Stat(Path(e.dir, "vol")); !os.IsNotExist(err) {
+		t.Errorf("holder file after Release: %v", err)
+	}
+}
+
+// B-M6: the name is another inode (a taker's file) that happens to say what
+// ours says: not ours to remove.
+func TestReleaseLeavesAnotherInodeAlone(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(e.dir, "copy")
+	if err := os.WriteFile(tmp, []byte(e.raw("vol")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, Path(e.dir, "vol")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); !errors.Is(err, ErrLost) {
+		t.Fatalf("Release = %v, want ErrLost", err)
+	}
+	if _, err := os.Stat(Path(e.dir, "vol")); err != nil {
+		t.Errorf("another inode's file was removed: %v", err)
+	}
+}
+
+// A-m3: ESTALE from the final stat of the kept descriptor is a loss.
+func TestRenewEstaleOnTheFinalStatIsLost(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := statFile
+	t.Cleanup(func() { statFile = old })
+	calls := 0
+	statFile = func(f *os.File) (os.FileInfo, error) {
+		calls++
+		if calls == 2 { // the first is the inode comparison, the second the final look
+			return nil, syscall.ESTALE
+		}
+		return old(f)
+	}
+	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
+		t.Fatalf("Renew = %v, want ErrLost", err)
 	}
 }

@@ -85,10 +85,12 @@ func (it *Item) Teardown(ctx context.Context, in intent.Intent, _ item.Observed)
 	if err := it.discardCache(v, "the volume is unstaged"); err != nil {
 		return err
 	}
+	if err := it.release(ctx, v, st); err != nil {
+		return it.incomplete(ctx, v, st, "releasing the holder file: %v", err)
+	}
 	if err := it.removeDrainRecord(v); err != nil {
 		return err
 	}
-	it.release(ctx, v, st)
 	st.fz.Lock()
 	st.gone = true
 	st.fz.Unlock()
@@ -487,22 +489,30 @@ func (it *Item) lost(v vol, bytes int64, why string) {
 }
 
 // release gives the holder file up: it is removed only if it is still ours. A
-// failure is logged; the file then ages out under the usual conditions.
-func (it *Item) release(ctx context.Context, v vol, st *vstate) {
+// failure is returned and is retryable: the cache is already gone, so nothing
+// else would ever find a holder file left naming this node (the caller keeps
+// the drain record until this has succeeded). A holder that is not ours, or
+// absent, is nothing to release.
+func (it *Item) release(ctx context.Context, v vol, st *vstate) error {
 	h := st.h
 	if h == nil {
 		var err error
 		if h, err = it.cfg.Holder.Adopt(ctx, v.holdDir, v.name, it.cfg.Node); err != nil {
-			if !errors.Is(err, holder.ErrLost) && !errors.Is(err, holder.ErrHeld) {
-				it.log.Warn("could not look at the holder file to release it", "volume", v.in.VolumeID, "error", err)
+			if errors.Is(err, holder.ErrLost) || errors.Is(err, holder.ErrHeld) {
+				return nil
 			}
-			return
+			return err
 		}
 	}
-	if err := h.Release(ctx); err != nil {
-		it.log.Warn("could not release the holder file", "volume", v.in.VolumeID, "error", err)
+	err := h.Release(ctx)
+	if errors.Is(err, holder.ErrLost) {
+		err = nil // the name is not the file this holder installed: not ours
+	}
+	if err != nil {
+		return err
 	}
 	st.h = nil
+	return nil
 }
 
 // publishRefused wraps blockd's refusal with the item's condition.

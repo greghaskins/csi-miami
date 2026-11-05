@@ -710,7 +710,7 @@ hot path (`ReadAt`/`WriteAt`) allocates nothing per request in a benchmark
 Options{Sysfs, SystemdSocket, CacheDir}) Report` with `Report.Missing()
 []string`; node flags `--cache-dir` (default `/var/lib/miami/cache`),
 `--bin-dir` (default `<kubelet>/plugins/<driver>/bin`), `--systemd-socket`
-(default `/run/systemd/private`), `--takeover-timeout` (5m), `--holder-renew`
+(default `/run/systemd/private`), `--holder-renew`
 (15s), `--remediate` (false until T15).
 
 - [ ] Tests: `TestNodeStageReadsKeyFromSecrets`, `TestNodePublishCarriesKeyForRestage`,
@@ -846,7 +846,12 @@ take the holder the item read, so the judge needs no path); `item.Drainer`
 keeps beside each cache (`<cache dir>/<name>.drain.json`: the intent without
 its publishes, written before a server starts) because the cache directory
 alone does not say where the volume is; the reconciler drains at its start
-pass and on timer passes. `holder.Judge` (the timed rules) is removed.
+pass and on timer passes. `holder.Judge` (the timed rules) is removed. A cache
+left by a build from before this change has no drain record and is not drained
+until it is restaged (nothing is deployed yet). The drain applies decision 52's
+proof rule: a holder file naming another node, a store that moved past the
+cache, or a deleted volume discards with `GenerationLost`; an absent holder
+without proof keeps the cache and warns once.
 
 ### Task T13w: Node wiring of the volume kind
 
@@ -869,16 +874,7 @@ generation timers, the judge and the orphan drain, all behind seams.
 - [ ] Tests: flag parsing; a fake-backed construction test asserting every
       Config field is set (no nil seam reaches production); smoke covers the
       real stack via T11's `TestSmokeVolumeStack` and the e2e (T21).
-- [x] Commit.
-
-Landed in T13 (the node's wiring is T13w): `reconcile.NewEmergencyJudge`
-(`Judge` is `volume.Config.Judge`, `TookOver` is `volume.Config.Takeover`; both
-take the holder the item read, so the judge needs no path); `item.Drainer`
-(`Orphans`, `Drain`), implemented by the volume item over a drain record it
-keeps beside each cache (`<cache dir>/<name>.drain.json`: the intent without
-its publishes, written before a server starts) because the cache directory
-alone does not say where the volume is; the reconciler drains at its start
-pass and on timer passes. `holder.Judge` (the timed rules) is removed.
+- [ ] Commit.
 
 ### Task T14: Probe and conditions for volumes
 
@@ -1036,7 +1032,12 @@ decision a task amended; never rewrite), this plan's status.
       next unstage retry finds the holder taken, reports `GenerationLost`
       and finishes. The out-of-service taint does the same for every
       volume of a dead node. State plainly what is lost: whatever the old
-      holder had not published.
+      holder had not published. Also: a surviving cache with no holder file
+      and no proof it was given up is kept and logged once per process; the
+      removing the cache directory by hand gives it up (the force-detach annotation
+      acts on a holder file, and there is none); and a cache
+      from a build before the drain record existed is not drained until
+      restaged.
 - [ ] Reviewed by the orchestrator; commit.
 
 ## 7. Risks and the check that retires each

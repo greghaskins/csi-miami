@@ -82,7 +82,16 @@ func (it *Item) saveDrainRecord(v vol) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// The rename is what makes the record exist after a crash.
+	d, err := os.Open(it.cfg.CacheDir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return d.Sync()
 }
 
 // removeDrainRecord removes the record; a missing one is fine.
@@ -93,11 +102,12 @@ func (it *Item) removeDrainRecord(v vol) error {
 	return nil
 }
 
-// Orphans returns the intent of every volume that has a drain record and a
-// surviving cache directory. Whether the volume is also staged is the
-// reconciler's to say (it has the intents); a record whose cache is gone is
-// stale and is removed. A record that does not decode, does not validate or
-// sits under another volume's name is skipped and left for a person.
+// Orphans returns the intent of every volume that has a drain record. Whether
+// the volume is also staged is the reconciler's to say (it has the intents).
+// A record whose cache is gone is returned too: the record outlives the cache
+// until the holder file is released, so that a release that failed is found
+// and retried (Drain). A record that does not decode, does not validate or sits
+// under another volume's name is skipped and left for a person.
 func (it *Item) Orphans(ctx context.Context) ([]intent.Intent, error) {
 	ents, err := os.ReadDir(it.cfg.CacheDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -121,20 +131,8 @@ func (it *Item) Orphans(ctx context.Context) ([]intent.Intent, error) {
 			it.log.Warn("a drain record is not usable and is left alone", "file", e.Name(), "error", err)
 			continue
 		}
-		v, err := it.volOf(in)
-		if err != nil {
+		if _, err := it.volOf(in); err != nil {
 			it.log.Warn("a drain record is not usable and is left alone", "file", e.Name(), "error", err)
-			continue
-		}
-		if _, err := os.Stat(v.cacheDir); errors.Is(err, os.ErrNotExist) {
-			// Nothing survived: the record is all that is left of a volume that
-			// was unstaged or discarded.
-			if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
-				it.log.Warn("could not remove a stale drain record", "file", e.Name(), "error", rerr)
-			}
-			continue
-		} else if err != nil {
-			it.log.Warn("could not look at a cache directory", "volume", in.VolumeID, "error", err)
 			continue
 		}
 		out = append(out, in)
@@ -197,7 +195,10 @@ func (it *Item) Drain(ctx context.Context, in intent.Intent) error {
 		return err
 	}
 	if _, err := os.Stat(v.cacheDir); errors.Is(err, os.ErrNotExist) {
-		return it.removeDrainRecord(v)
+		// The cache is gone: it was removed after a verified publish or on
+		// proof. What may remain is the holder file, if that release failed;
+		// the record is kept until it is done.
+		return it.finishDrain(ctx, v, it.state(v.in.VolumeID), false)
 	}
 	idx, err := cache.ReadIndex(v.cacheDir)
 	if err != nil {
@@ -211,37 +212,66 @@ func (it *Item) Drain(ctx context.Context, in intent.Intent) error {
 	if v.bound < v.size {
 		v.bound = v.size
 	}
+	dirty := int64(len(idx.Dirty)) * v.chunk
 
 	if err := it.drainable(ctx, v); err != nil {
 		return err
 	}
+	st := it.state(v.in.VolumeID)
+	st.fz.Lock()
+	st.tearingDown = true // no generation starts while it drains
+	st.fz.Unlock()
 
 	h, err := it.cfg.Holder.Adopt(ctx, v.holdDir, v.name, it.cfg.Node)
 	switch {
-	case errors.Is(err, holder.ErrHeld), errors.Is(err, holder.ErrLost):
-		// Another node holds the volume, or the file is absent (which a
-		// transport that is not mounted looks like): not ours to drain.
-		it.log.Debug("a surviving cache is not drained: this node does not hold the volume", "volume", v.in.VolumeID, "reason", err)
+	case errors.Is(err, holder.ErrHeld):
+		// Proof, as in an unstage: the holder file names another node, so the
+		// volume was given up and this cache's writes can never be published.
+		it.lost(v, dirty, "the holder file names another node; the volume was given up")
+		return it.finishDrain(ctx, v, st, false)
+	case errors.Is(err, holder.ErrLost):
+		// No holder file. Absence alone proves nothing (the transport may not be
+		// mounted); a store that has moved on past the cache does.
+		cur, cerr := it.readCurrent(ctx, v)
+		switch {
+		case errors.Is(cerr, item.ErrItemMissing):
+			if !it.transportMounted(ctx, v) {
+				return it.incomplete(ctx, v, st, "the volume's directory is missing and its transport does not look mounted")
+			}
+			it.lost(v, dirty, "the volume's directory is gone; it was deleted")
+			return it.finishDrain(ctx, v, st, false)
+		case cerr != nil:
+			return fmt.Errorf("volume item %s: draining: %w: %w", v.in.VolumeID, item.ErrUnstageIncomplete, cerr)
+		case cur.ok && cur.epoch > idx.Epoch:
+			it.lost(v, dirty, "there is no holder file and the store has moved past the surviving cache")
+			return it.finishDrain(ctx, v, st, false)
+		}
+		it.warnOnce(v, "a surviving cache has no holder file and no proof the volume was given up, so it is left alone; its unpublished writes stay until an operator removes the cache directory by hand, or stages the volume here again. The emergency detach (PV annotation force-detach) acts on a holder file and has none to act on")
 		return nil
 	case err != nil:
 		return fmt.Errorf("volume item %s: draining: %w: reading the holder file: %w", v.in.VolumeID, item.ErrUnstageIncomplete, err)
 	}
-	st := it.state(v.in.VolumeID)
+	// The earlier attempt's holder, if any, is replaced: close its descriptor.
 	st.fz.Lock()
-	st.tearingDown = true // no generation starts while it drains
+	if st.h != nil {
+		_ = st.h.Close()
+	}
 	st.h = h
 	st.fz.Unlock()
 
 	cur, err := it.readCurrent(ctx, v)
+	if errors.Is(err, item.ErrItemMissing) && it.transportMounted(ctx, v) {
+		it.lost(v, dirty, "the volume's directory is gone; it was deleted")
+		return it.finishDrain(ctx, v, st, false)
+	}
 	if err != nil {
 		return fmt.Errorf("volume item %s: draining: %w: %w", v.in.VolumeID, item.ErrUnstageIncomplete, err)
 	}
-	dirty := int64(len(idx.Dirty)) * v.chunk
 	if !reuse(idx, cur) {
 		it.lost(v, dirty, "the store has moved past the surviving cache")
 		return it.finishDrain(ctx, v, st, false)
 	}
-	if cur.ok && cur.epoch > h.Epoch() {
+	if cur.ok && cur.epoch > max(idx.Epoch, h.Epoch()) {
 		it.lost(v, dirty, "our ownership was fenced by a newer generation; its data was given up")
 		return it.finishDrain(ctx, v, st, false)
 	}
@@ -256,9 +286,40 @@ func (it *Item) Drain(ctx context.Context, in intent.Intent) error {
 	return it.finishDrain(ctx, v, st, true)
 }
 
-// finishDrain takes the server down (if any), removes the cache and its
-// record, and releases the holder file if it is still ours. A release after the
-// fence is a no-op: the file names the node that took the volume.
+// warnOnce logs msg at Warn the first time for the volume in this process.
+func (it *Item) warnOnce(v vol, msg string) {
+	it.mu.Lock()
+	_, seen := it.warned[v.in.VolumeID]
+	it.warned[v.in.VolumeID] = struct{}{}
+	it.mu.Unlock()
+	if seen {
+		it.log.Debug(msg, "volume", v.in.VolumeID)
+		return
+	}
+	it.log.Warn(msg, "volume", v.in.VolumeID, "cache", v.cacheDir)
+}
+
+// transportMounted reports whether the volume's transport is in the mount
+// table: a store directory that is "gone" under a transport that is not
+// mounted is an empty mount point, not a deleted volume.
+func (it *Item) transportMounted(ctx context.Context, v vol) bool {
+	mp, err := v.in.Transport.MountPoint(it.cfg.Root)
+	if err != nil {
+		return false
+	}
+	t, err := it.cfg.Mounter.Mounts(ctx)
+	if err != nil {
+		return false
+	}
+	_, ok := t.At(mp)
+	return ok
+}
+
+// finishDrain takes the server down (if any), removes the cache, releases the
+// holder file if it is still ours, and only then removes the record: a release
+// that fails leaves the record, so the next pass finds the volume and releases
+// again. A release after the fence is a no-op: the file names the node that
+// took the volume.
 func (it *Item) finishDrain(ctx context.Context, v vol, st *vstate, served bool) error {
 	if served || it.serverPresent(ctx, v) {
 		if err := it.stopServerAndUnit(ctx, v); err != nil {
@@ -268,10 +329,12 @@ func (it *Item) finishDrain(ctx context.Context, v vol, st *vstate, served bool)
 	if err := it.discardCache(v, "the volume was drained"); err != nil {
 		return err
 	}
+	if err := it.release(ctx, v, st); err != nil {
+		return it.incomplete(ctx, v, st, "releasing the holder file: %v", err)
+	}
 	if err := it.removeDrainRecord(v); err != nil {
 		return err
 	}
-	it.release(ctx, v, st)
 	st.fz.Lock()
 	st.gone = true
 	st.fz.Unlock()
