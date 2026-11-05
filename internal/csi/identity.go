@@ -35,8 +35,8 @@ func (i *Identity) GetPluginInfo(context.Context, *csi.GetPluginInfoRequest) (*c
 	return &csi.GetPluginInfoResponse{Name: DriverName, VendorVersion: i.version}, nil
 }
 
-// GetPluginCapabilities reports the controller service and volume
-// accessibility constraints (topology).
+// GetPluginCapabilities reports the controller service, volume accessibility
+// constraints (topology) and online volume expansion.
 func (i *Identity) GetPluginCapabilities(context.Context, *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
 	service := func(t csi.PluginCapability_Service_Type) *csi.PluginCapability {
 		return &csi.PluginCapability{Type: &csi.PluginCapability_Service_{
@@ -46,6 +46,10 @@ func (i *Identity) GetPluginCapabilities(context.Context, *csi.GetPluginCapabili
 	return &csi.GetPluginCapabilitiesResponse{Capabilities: []*csi.PluginCapability{
 		service(csi.PluginCapability_Service_CONTROLLER_SERVICE),
 		service(csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS),
+		// Online only: a volume grows under its mounted file system.
+		{Type: &csi.PluginCapability_VolumeExpansion_{
+			VolumeExpansion: &csi.PluginCapability_VolumeExpansion{Type: csi.PluginCapability_VolumeExpansion_ONLINE},
+		}},
 	}}, nil
 }
 
