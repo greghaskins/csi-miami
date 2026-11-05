@@ -340,8 +340,19 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 	return b.cache.WriteAt(i, intra, buf, *basep, false)
 }
 
+// flushHook, when set, runs at the start of every Flush. Nothing in the
+// program sets it: only the smoke tests' child process does, from a _test.go
+// file that is not part of the binary, to stall a flush past the nbd request
+// timeout.
+var flushHook func()
+
 // Flush makes every dirty chunk and the index durable.
-func (b *backend) Flush() error { return b.cache.Sync() }
+func (b *backend) Flush() error {
+	if flushHook != nil {
+		flushHook()
+	}
+	return b.cache.Sync()
+}
 
 // Trim marks whole chunks inside the range as the all-zero chunk; a partial
 // chunk at either edge keeps its data. It accepts a multi-GiB range in one
