@@ -154,7 +154,26 @@ not rely on it.
   previous generation (see [restore.md](restore.md)) or force-detach and stage
   elsewhere.
 - **`key-required` / `bad-key`.** The class's Secret is missing, empty or
-  wrong; see the key in the README.
+  wrong; see the key in the README. A key that is shorter than 32 bytes or
+  longer than 4096 bytes is refused at stage and publish with
+  `InvalidArgument` (the message gives the length, never the key); make one
+  with `openssl rand -base64 48`.
+
+## A compromised key
+
+Rotating the key (`previousKey`, see the README) changes a keyslot of the
+LUKS header, not the volume's master key, and does not re-encrypt anything.
+Older generations in the store, NAS snapshots and offsite copies carry older
+headers that the old key still opens, so a key that may have leaked is not
+fixed by rotation. To recover:
+
+1. Create a new claim from an encrypted class with a new key (a new Secret
+   entry, 32 bytes or more), so the new volume has a new master key.
+2. Mount both volumes in one pod and copy the data across (`rsync -a`), then
+   switch the workload to the new claim.
+3. Delete the old claim, then delete or expire every copy of the old volume's
+   store: older generations, NAS snapshots and the offsite copy. Until they
+   are gone, anyone with the old key and a copy can read what was in them.
 
 ## Restarts
 
