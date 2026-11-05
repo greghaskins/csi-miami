@@ -743,24 +743,6 @@ func (n *testNS) forceDeletePod(t *testing.T, name string) {
 	})
 }
 
-// volumeCondition is the value of miami_volume_condition for a condition on
-// a node plugin.
-func (e *env) volumeCondition(ctx context.Context, node, condition string) (float64, error) {
-	p, err := e.nodePluginPod(ctx, node)
-	if err != nil {
-		return 0, err
-	}
-	ms, err := e.scrape(ctx, p.Name, nodePort)
-	if err != nil {
-		return 0, err
-	}
-	v, ok := ms.value("miami_volume_condition", map[string]string{"condition": condition})
-	if !ok {
-		return 0, fmt.Errorf("no series for condition %q", condition)
-	}
-	return v, nil
-}
-
 // kernelLog reads the runner's kernel log. The kind nodes share the runner's
 // kernel, so a hung task in any of them is in this one log.
 func kernelLog() (string, error) {
