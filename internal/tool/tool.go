@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Programs are the external programs the driver starts, by name. The image
@@ -46,7 +47,10 @@ type Result struct {
 // Real returns the Runner that starts processes on the host.
 func Real() Runner { return host{} }
 
-type host struct{}
+type host struct {
+	// open is os.OpenFile unless a test replaces it.
+	open func(name string, flag int, perm os.FileMode) (*os.File, error)
+}
 
 func (host) Run(ctx context.Context, argv []string, extra []*os.File) ([]byte, []byte, int, error) {
 	if len(argv) == 0 {
@@ -107,14 +111,22 @@ func ProbeDevice(r Runner, dev string, offset int64) (Device, error) {
 	return p.ProbeDevice(dev, offset)
 }
 
-// ProbeSize is how much of the device is read at the offset.
+// ProbeSize is how much of the device is read at the offset, and the
+// alignment the offset must have: one 4 KiB sector.
 const ProbeSize = 4096
 
-// ProbeDevice stats dev, requires a block device, opens it read-only, finds
-// its size and reads ProbeSize bytes at offset. A missing device node,
-// anything that is not a block device, a device that cannot be opened or read,
-// and an offset that leaves no room for the read are errors.
-func (host) ProbeDevice(dev string, offset int64) (Device, error) {
+// ProbeDevice stats dev, requires a block device, opens it read-only and not
+// exclusively, finds its size and reads one ProbeSize sector at offset with
+// O_DIRECT. Direct, because a write through a dm-crypt mapping over the device
+// goes below the device's page cache: a buffered read could return a zero page
+// cached by an earlier probe after the file system was made. The offset must be
+// a multiple of ProbeSize and leave room for the read. A missing device node,
+// anything that is not a block device, and a device that cannot be opened or
+// read are errors.
+func (h host) ProbeDevice(dev string, offset int64) (Device, error) {
+	if offset < 0 || offset%ProbeSize != 0 {
+		return Device{}, fmt.Errorf("tool: offset %d on %s is not a multiple of %d", offset, dev, ProbeSize)
+	}
 	fi, err := os.Stat(dev)
 	if err != nil {
 		return Device{}, fmt.Errorf("tool: device %s: %w", dev, err)
@@ -122,7 +134,17 @@ func (host) ProbeDevice(dev string, offset int64) (Device, error) {
 	if fi.Mode()&os.ModeDevice == 0 || fi.Mode()&os.ModeCharDevice != 0 {
 		return Device{}, fmt.Errorf("tool: %s is not a block device (mode %s)", dev, fi.Mode())
 	}
-	f, err := os.Open(dev) //nolint:gosec // the driver's own device path, opened read-only
+	return h.readSector(dev, offset)
+}
+
+// readSector opens dev (read-only, not exclusive, O_DIRECT), finds its size and
+// reads the sector at offset.
+func (h host) readSector(dev string, offset int64) (Device, error) {
+	open := h.open
+	if open == nil {
+		open = os.OpenFile
+	}
+	f, err := open(dev, os.O_RDONLY|syscall.O_DIRECT, 0)
 	if err != nil {
 		return Device{}, fmt.Errorf("tool: device %s: %w", dev, err)
 	}
@@ -131,10 +153,12 @@ func (host) ProbeDevice(dev string, offset int64) (Device, error) {
 	if err != nil {
 		return Device{}, fmt.Errorf("tool: size of %s: %w", dev, err)
 	}
-	if offset < 0 || offset+ProbeSize > size {
+	if offset+ProbeSize > size {
 		return Device{}, fmt.Errorf("tool: %s is %d bytes, which has no room for a read at offset %d", dev, size, offset)
 	}
-	buf := make([]byte, ProbeSize)
+	// O_DIRECT needs an aligned buffer.
+	raw := make([]byte, 2*ProbeSize)
+	buf := raw[(ProbeSize-int(uintptr(unsafe.Pointer(&raw[0]))%ProbeSize))%ProbeSize:][:ProbeSize]
 	if _, err := f.ReadAt(buf, offset); err != nil {
 		return Device{}, fmt.Errorf("tool: reading %s at offset %d: %w", dev, offset, err)
 	}

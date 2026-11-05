@@ -108,7 +108,7 @@ func TestNonZeroPayloadWithoutASignatureIsNeverFormatted(t *testing.T) {
 	e.tools.luksKey = e.keys.Key
 	e.tools.payloadDirty = true
 	err := e.converge()
-	if err == nil || !strings.Contains(err.Error(), "no file system signature") {
+	if err == nil || !strings.Contains(err.Error(), "the encrypted volume holds data but no file system signature; if this volume was never used, delete the claim and recreate it") {
 		t.Fatalf("Converge = %v, want the refusal", err)
 	}
 	e.rec.none(t, "tool mkfs.ext4", "mount ext4")

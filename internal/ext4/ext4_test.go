@@ -194,3 +194,17 @@ func TestHasFilesystemJudgesBlankOnTheRawPayload(t *testing.T) {
 		t.Errorf("a missing mapping: got %v, %v with %d tools run, want an error and none", got, err, len(gone.Calls()))
 	}
 }
+
+// A signature means Fsck and no look at the raw area at all.
+func TestHasFilesystemWithASignatureDoesNotProbeTheRawArea(t *testing.T) {
+	t.Parallel()
+	f := &fake.Runner{Replies: []fake.Reply{{Stdout: "ext4\n"}}, Device: func(dev string, _ int64) (tool.Device, error) {
+		if dev == "/dev/nbd0" {
+			return tool.Device{}, errors.New("the raw device was probed")
+		}
+		return tool.Device{Size: 1 << 30}, nil
+	}}
+	if got, err := ext4.HasFilesystem(ctx, f, "/dev/mapper/m", ext4.Area{Dev: "/dev/nbd0", Offset: 4096}); err != nil || !got {
+		t.Fatalf("got %v, %v", got, err)
+	}
+}

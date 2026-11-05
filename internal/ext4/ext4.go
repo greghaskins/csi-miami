@@ -14,6 +14,10 @@ import (
 // MountOptions are the options every ext4 stage mount uses.
 const MountOptions = "discard,errors=remount-ro"
 
+// ErrDataWithoutSignature is HasFilesystem's error for a device whose start
+// reads as data though blkid finds no file system: not blank, so not formatted.
+var ErrDataWithoutSignature = errors.New("ext4: the device holds data but no file system signature")
+
 // ErrFsck is returned when e2fsck leaves errors uncorrected or fails.
 var ErrFsck = errors.New("ext4: filesystem check failed")
 
@@ -50,20 +54,21 @@ func HasFilesystem(ctx context.Context, r tool.Runner, dev string, blank Area) (
 	if _, err := tool.ProbeDevice(r, dev, 0); err != nil {
 		return false, fmt.Errorf("ext4: %w", err)
 	}
-	raw, err := tool.ProbeDevice(r, blank.Dev, blank.Offset)
-	if err != nil {
-		return false, fmt.Errorf("ext4: %w", err)
-	}
 	stdout, stderr, code, err := r.Run(ctx, []string{"blkid", "-p", "-o", "value", "-s", "TYPE", dev}, nil)
 	if err != nil {
 		return false, fmt.Errorf("ext4: blkid: %w", err)
 	}
 	switch {
 	case code == 0 && strings.TrimSpace(string(stdout)) != "":
+		// A signature: Fsck's, and the raw area is not looked at.
 		return true, nil
 	case code == 2 || code == 0:
+		raw, err := tool.ProbeDevice(r, blank.Dev, blank.Offset)
+		if err != nil {
+			return false, fmt.Errorf("ext4: %w", err)
+		}
 		if !raw.Blank {
-			return false, fmt.Errorf("ext4: %s holds data but no file system signature; not treating it as blank", dev)
+			return false, fmt.Errorf("%w: %s", ErrDataWithoutSignature, dev)
 		}
 		return false, nil
 	}

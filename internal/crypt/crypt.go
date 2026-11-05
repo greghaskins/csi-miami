@@ -147,8 +147,8 @@ func output(stdout, stderr []byte) string {
 // the offset of its segment in the header's JSON metadata. A format writes the
 // header and the key slots below it and nothing above, so the first bytes of
 // the payload are zero until something is written through the mapping, and then
-// they are ciphertext, never zeros. The offset is checked: positive, a whole
-// number of sectors, and leaving room on the device to read from.
+// they are ciphertext, never zeros. The offset is checked: positive, a multiple of
+// 4096 (one direct-read sector), and leaving room on the device to read from.
 func PayloadOffset(ctx context.Context, r tool.Runner, dev string) (int64, error) {
 	stdout, stderr, code, err := r.Run(ctx, []string{"cryptsetup", "luksDump", "--dump-json-metadata", dev}, nil)
 	if err != nil {
@@ -170,8 +170,8 @@ func PayloadOffset(ctx context.Context, r tool.Runner, dev string) (int64, error
 		return 0, errors.New("crypt: luksDump: the metadata has no data segment")
 	}
 	off, err := strconv.ParseInt(seg.Offset, 10, 64)
-	if err != nil || off <= 0 || off%512 != 0 {
-		return 0, fmt.Errorf("crypt: luksDump: the data segment's offset %q is not a positive whole number of sectors", seg.Offset)
+	if err != nil || off <= 0 || off%tool.ProbeSize != 0 {
+		return 0, fmt.Errorf("crypt: luksDump: the data segment's offset %q is not a positive multiple of 4096", seg.Offset)
 	}
 	d, err := tool.ProbeDevice(r, dev, 0)
 	if err != nil {

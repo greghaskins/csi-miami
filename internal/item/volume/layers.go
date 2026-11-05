@@ -821,6 +821,15 @@ func (it *Item) ensureMounted(ctx context.Context, v vol, st *vstate, blk, nbdPa
 		area.Offset = off
 	}
 	has, err := ext4.HasFilesystem(ctx, it.cfg.Tools, blk, area)
+	if errors.Is(err, ext4.ErrDataWithoutSignature) {
+		// A crash inside mkfs lands here: it zaps the old superblock, so the
+		// payload is written and there is no signature. A person decides.
+		what := "the volume"
+		if v.params.Encryption {
+			what = "the encrypted volume"
+		}
+		return fmt.Errorf("volume item %s: %s holds data but no file system signature; if this volume was never used, delete the claim and recreate it: %w", v.in.VolumeID, what, err)
+	}
 	if err != nil {
 		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
 	}

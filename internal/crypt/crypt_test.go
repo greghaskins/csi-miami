@@ -217,6 +217,7 @@ func TestPayloadOffset(t *testing.T) {
 		"not a number":     dump("x"),
 		"zero":             dump("0"),
 		"not whole sector": dump("1000"),
+		"not 4k aligned":   dump("1536"),
 		"beyond device":    dump("2147483648"),
 		"not json":         {Stdout: "LUKS header"},
 		"no segment":       {Stdout: `{"segments":{}}`},
