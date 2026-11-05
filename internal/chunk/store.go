@@ -342,3 +342,63 @@ func (s *Store) Manifests(ctx context.Context) ([]string, error) {
 	}
 	return names, nil
 }
+
+// EnsureZero makes sure the all-zero chunk of chunkSize is stored, so that a
+// manifest naming it (as every unwritten or discarded region does) can be
+// verified and assembled from files alone. Absent, it is created as a sparse
+// file by truncation, since its content is zeros and so its name verifies;
+// present, nothing is written (one stat). A writer calls it before each
+// manifest that names the zero chunk, because Prune can drop it between
+// generations.
+func (s *Store) EnsureZero(ctx context.Context, chunkSize int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	h := ZeroHash(chunkSize)
+	if ok, err := s.Has(h); err != nil || ok {
+		return err
+	}
+	final := s.ChunkPath(h)
+	dir := filepath.Dir(final)
+	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // shared store directory, read by restore tools
+		return err
+	}
+	tmp, err := writeTemp(dir, ".tmp-"+h.String()+"-", func(f *os.File) error { return f.Truncate(chunkSize) })
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(dir)
+}
+
+// PublishFirst makes the named manifest current only if there is no current:
+// the temporary file is hard-linked to current, which fails (fs.ErrExist) on an
+// existing name where Publish's rename would replace it. It is how a volume's
+// first generation is created, so that it can never roll back a volume that
+// has since gone live.
+func (s *Store) PublishFirst(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, _, err := ParseManifestName(name); err != nil {
+		return err
+	}
+	if _, err := os.Stat(s.manifestPath(name)); err != nil {
+		return err
+	}
+	tmp, err := writeTemp(s.root, ".current-", func(f *os.File) error {
+		_, err := f.WriteString(name + "\n")
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp) }()
+	if err := os.Link(tmp, s.currentPath()); err != nil {
+		return err
+	}
+	return syncDir(s.root)
+}

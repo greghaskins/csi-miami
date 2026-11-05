@@ -62,8 +62,9 @@ func (d *fakeDevice) disconnect(context.Context) error { d.disconnected = true; 
 // assert the publish order.
 type recordingStore struct {
 	storer
-	mu  sync.Mutex
-	ops []string
+	mu      sync.Mutex
+	ops     []string
+	zeroErr error // returned by EnsureZero while set
 }
 
 func (r *recordingStore) record(op string) {
@@ -81,6 +82,23 @@ func (r *recordingStore) calls() []string {
 func (r *recordingStore) Put(ctx context.Context, h chunk.Hash, rd io.Reader, n int64) error {
 	r.record("put")
 	return r.storer.Put(ctx, h, rd, n)
+}
+
+func (r *recordingStore) EnsureZero(ctx context.Context, chunkSize int64) error {
+	r.record("zero")
+	r.mu.Lock()
+	err := r.zeroErr
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return r.storer.EnsureZero(ctx, chunkSize)
+}
+
+func (r *recordingStore) setZeroErr(err error) {
+	r.mu.Lock()
+	r.zeroErr = err
+	r.mu.Unlock()
 }
 
 func (r *recordingStore) WriteManifest(ctx context.Context, m chunk.Manifest) error {
