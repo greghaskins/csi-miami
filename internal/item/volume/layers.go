@@ -421,6 +421,26 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 		},
 		Restart:      "on-failure",
 		RestartDelay: RestartDelay,
+		Sandbox:      blockdSandbox(it.cfg.CacheDir, v.holdDir),
+	}
+}
+
+// blockdSandbox confines the block server, which runs as root on files from a
+// shared export. It writes in the node's cache directory (the volume's cache,
+// the lock file beside it and the control socket are all in it) and, on the
+// transport, below the directory that holds the volume's directory and its
+// holder file (the fencing check makes a probe file there); it reads everything
+// else. The capabilities are the nbd netlink calls and the device node
+// (CAP_NET_ADMIN, CAP_SYS_ADMIN), and root's file access on the cache and the
+// transport.
+func blockdSandbox(cacheDir, holdDir string) *systemd.Sandbox {
+	return &systemd.Sandbox{
+		ReadWritePaths: []string{cacheDir, holdDir},
+		Capabilities: []int{
+			unix.CAP_SYS_ADMIN, unix.CAP_NET_ADMIN,
+			unix.CAP_DAC_OVERRIDE, unix.CAP_DAC_READ_SEARCH, unix.CAP_FOWNER, unix.CAP_CHOWN,
+			unix.CAP_SYS_RESOURCE,
+		},
 	}
 }
 

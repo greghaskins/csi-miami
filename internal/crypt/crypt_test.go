@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/crypt"
 	"github.com/greghaskins/csi-miami/internal/tool"
@@ -227,5 +228,39 @@ func TestPayloadOffset(t *testing.T) {
 		if got, err := crypt.PayloadOffset(ctx, f, "/dev/nbd0"); err == nil {
 			t.Errorf("%s: accepted, offset %d", name, got)
 		}
+	}
+}
+
+func TestCheckKeyBounds(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		n  int
+		ok bool
+	}{{0, false}, {31, false}, {32, true}, {4096, true}, {4097, false}, {1 << 20, false}} {
+		err := crypt.CheckKey(make([]byte, tc.n))
+		if (err == nil) != tc.ok || (err != nil && !errors.Is(err, crypt.ErrKeyLength)) {
+			t.Errorf("CheckKey(%d bytes) = %v, want ok=%v", tc.n, err, tc.ok)
+		}
+	}
+}
+
+// A key too large for a pipe is refused up front instead of blocking the
+// writer for good.
+func TestOversizeKeyIsRefusedNotBlocked(t *testing.T) {
+	t.Parallel()
+	f := &fake.Runner{}
+	big := make([]byte, 1<<20)
+	done := make(chan error, 1)
+	go func() { done <- crypt.Open(ctx, f, "/dev/nbd0", "miami-v", big) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, crypt.ErrKeyLength) {
+			t.Fatalf("Open with a 1 MiB key = %v, want ErrKeyLength", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Open blocked writing an oversize key to a pipe")
+	}
+	if len(f.Calls()) != 0 {
+		t.Fatal("cryptsetup ran with an oversize key")
 	}
 }

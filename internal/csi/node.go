@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/greghaskins/csi-miami/internal/chunk"
+	"github.com/greghaskins/csi-miami/internal/crypt"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
@@ -224,16 +225,26 @@ const (
 
 // keysOf copies the encryption keys out of a request's Secrets. The caller
 // wipes the result. The keys go nowhere but the in-memory request of the
-// reconciler: not the intent, not a log line, not a reply.
-func keysOf(secrets map[string]string) reconcile.Keys {
+// reconciler: not the intent, not a log line, not a reply. A key shorter than
+// crypt.MinKeyLen or longer than crypt.MaxKeyLen is InvalidArgument; the error
+// names the Secret entry and the length, never the value.
+func keysOf(secrets map[string]string) (reconcile.Keys, error) {
 	var k reconcile.Keys
-	if v, ok := secrets[secretKey]; ok && v != "" {
-		k.Key = []byte(v)
+	for _, e := range []struct {
+		entry string
+		dst   *[]byte
+	}{{secretKey, &k.Key}, {secretPreviousKey, &k.PreviousKey}} {
+		v, ok := secrets[e.entry]
+		if !ok || v == "" {
+			continue
+		}
+		if err := crypt.CheckKey([]byte(v)); err != nil {
+			k.Wipe()
+			return reconcile.Keys{}, invalidf("secret entry %q: the key is %d bytes; it must be %d to %d bytes (generate one with: openssl rand -base64 48)", e.entry, len(v), crypt.MinKeyLen, crypt.MaxKeyLen)
+		}
+		*e.dst = []byte(v)
 	}
-	if v, ok := secrets[secretPreviousKey]; ok && v != "" {
-		k.PreviousKey = []byte(v)
-	}
-	return k
+	return k, nil
 }
 
 // NodeStageVolume records the volume as staged and waits for it to be staged
@@ -290,7 +301,10 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	} else {
 		in.EnsureItem = vc.Transport.Kind == transport.KindLocal
 	}
-	keys := keysOf(req.GetSecrets())
+	keys, err := keysOf(req.GetSecrets())
+	if err != nil {
+		return nil, err
+	}
 	defer keys.Wipe()
 	if err := n.rec.StageWith(ctx, in, keys); err != nil {
 		return nil, nodeStatus(err)
@@ -354,7 +368,10 @@ func (n *Node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolume
 	// A reader-only volume is never published read-write, whatever the CO
 	// sends: the access mode the volume was staged with decides.
 	readOnly := req.GetReadonly() || readerOnly(rec.AccessMode)
-	keys := keysOf(req.GetSecrets())
+	keys, err := keysOf(req.GetSecrets())
+	if err != nil {
+		return nil, err
+	}
 	defer keys.Wipe()
 	err = n.rec.PublishWith(ctx, id.String(), intent.Publish{TargetPath: req.GetTargetPath(), ReadOnly: readOnly}, keys)
 	if err != nil {

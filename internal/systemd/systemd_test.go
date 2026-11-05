@@ -353,3 +353,28 @@ func TestStartWithADifferentExecStartIsErrExecStartDiffers(t *testing.T) {
 		t.Fatalf("a unit waiting to restart is not a different ExecStart: %v", err)
 	}
 }
+
+func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
+	plain := Unit{Name: UnitName(vol), ExecStart: []string{"/bin/true"}}
+	for _, p := range properties(plain) {
+		switch p.Name {
+		case "NoNewPrivileges", "ProtectSystem", "ProtectHome", "PrivateTmp", "ReadWritePaths", "CapabilityBoundingSet":
+			t.Errorf("an unsandboxed unit carries %s", p.Name)
+		}
+	}
+	u := plain
+	u.Sandbox = &Sandbox{ReadWritePaths: []string{"/a", "/b"}, Capabilities: []int{0, 12, 21}}
+	got := map[string]any{}
+	for _, p := range properties(u) {
+		got[p.Name] = p.Value.Value()
+	}
+	for name, want := range map[string]any{
+		"NoNewPrivileges": true, "ProtectSystem": "strict", "ProtectHome": "yes", "PrivateTmp": true,
+		"ReadWritePaths":        []string{"/a", "/b"},
+		"CapabilityBoundingSet": uint64(1<<0 | 1<<12 | 1<<21),
+	} {
+		if !reflect.DeepEqual(got[name], want) {
+			t.Errorf("%s = %v, want %v", name, got[name], want)
+		}
+	}
+}

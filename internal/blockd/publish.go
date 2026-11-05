@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -201,6 +202,11 @@ func (s *server) nextSequence(ctx context.Context) (uint64, error) {
 			mx = sq
 		}
 	}
+	if mx == math.MaxUint64 {
+		// A planted manifest at the largest sequence would wrap the next one to
+		// 0 and collide with, or sort before, everything: refuse instead.
+		return 0, fmt.Errorf("blockd: the manifest sequence of epoch %d is exhausted", s.cfg.Epoch)
+	}
 	return mx + 1, nil
 }
 
@@ -229,6 +235,9 @@ func (s *server) writeManifest(ctx context.Context, size int64, seq uint64, chun
 		}
 		if existing, rerr := s.store.ReadManifest(ctx, m.Name()); rerr == nil && bytes.Equal(existing.Marshal(), m.Marshal()) {
 			return m, nil // our own bytes are already there: a retransmitted link
+		}
+		if seq == math.MaxUint64 {
+			break
 		}
 		seq++
 	}

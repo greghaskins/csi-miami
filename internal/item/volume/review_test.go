@@ -1061,3 +1061,40 @@ func TestServerOutdatedComparesTheBinaryHash(t *testing.T) {
 		t.Error("a status with no hash (an older server) counts as outdated; it says nothing")
 	}
 }
+
+// The block server runs as root on a shared export: its unit is sandboxed to
+// the cache directory and the directory holding the volume and its holder
+// file, and holds only the capabilities it needs.
+func TestBlockdUnitIsSandboxed(t *testing.T) {
+	sb := blockdSandbox("/var/lib/x/cache", "/var/lib/x/transports/t")
+	if sb == nil || len(sb.ReadWritePaths) != 2 || sb.ReadWritePaths[0] != "/var/lib/x/cache" || sb.ReadWritePaths[1] != "/var/lib/x/transports/t" {
+		t.Fatalf("sandbox = %+v", sb)
+	}
+	has := map[int]bool{}
+	for _, c := range sb.Capabilities {
+		has[c] = true
+	}
+	if !has[unix.CAP_SYS_ADMIN] || !has[unix.CAP_NET_ADMIN] {
+		t.Errorf("capabilities %v lack what the nbd calls need", sb.Capabilities)
+	}
+	for _, c := range []int{unix.CAP_SYS_MODULE, unix.CAP_SYS_PTRACE, unix.CAP_SYS_BOOT, unix.CAP_SETUID, unix.CAP_NET_RAW} {
+		if has[c] {
+			t.Errorf("capability %d is granted", c)
+		}
+	}
+}
+
+func TestStartedUnitCarriesTheSandbox(t *testing.T) {
+	e := newEnv(t)
+	e.mustConverge()
+	if len(e.sd.units) == 0 {
+		t.Fatal("no unit was started")
+	}
+	sb := e.sd.units[len(e.sd.units)-1].Sandbox
+	if sb == nil {
+		t.Fatal("the block server's unit is not sandboxed")
+	}
+	if !slices.Equal(sb.ReadWritePaths, []string{e.cacheDir, e.v.holdDir}) {
+		t.Errorf("ReadWritePaths = %v, want the cache directory and %s", sb.ReadWritePaths, e.v.holdDir)
+	}
+}

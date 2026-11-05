@@ -72,6 +72,27 @@ type Unit struct {
 	Environment       []string
 	Restart           string
 	RestartDelay      time.Duration
+
+	// Sandbox, when set, confines the service (see Sandbox).
+	Sandbox *Sandbox
+}
+
+// Sandbox is the confinement of a unit whose process works on files an
+// untrusted writer can influence (the shared store) while running as root: a
+// flaw in how it handles them is then bounded by what the unit can reach.
+// systemd applies it with a private mount namespace:
+//
+//	NoNewPrivileges=yes   nothing it runs gains privileges;
+//	ProtectSystem=strict  the whole file system is read-only except /dev,
+//	                      /proc and /sys, and ReadWritePaths;
+//	ProtectHome=yes       /home, /root and /run/user are empty;
+//	PrivateTmp=yes        /tmp and /var/tmp are its own;
+//	CapabilityBoundingSet only Capabilities can ever be held.
+type Sandbox struct {
+	// ReadWritePaths are the existing paths the service may write below.
+	ReadWritePaths []string
+	// Capabilities are the capability numbers (unix.CAP_*) it may hold.
+	Capabilities []int
 }
 
 // State is what systemd reports about a unit. Present is false for a unit
@@ -356,10 +377,30 @@ func properties(u Unit) []sdbus.Property {
 	if u.Restart != "" {
 		props = append(props, sdbus.Property{Name: "Restart", Value: godbus.MakeVariant(u.Restart)})
 	}
+	if u.Sandbox != nil {
+		props = append(props, sandboxProperties(*u.Sandbox)...)
+	}
 	if u.RestartDelay > 0 {
 		props = append(props, sdbus.Property{Name: "RestartUSec", Value: godbus.MakeVariant(uint64(u.RestartDelay / time.Microsecond))})
 	}
 	return props
+}
+
+// sandboxProperties are the D-Bus properties of a Sandbox. The capability
+// bounding set is a bit mask (CapabilityBoundingSet is a uint64 on the bus).
+func sandboxProperties(sb Sandbox) []sdbus.Property {
+	var mask uint64
+	for _, c := range sb.Capabilities {
+		mask |= 1 << uint(c) //nolint:gosec // capability numbers are small constants
+	}
+	return []sdbus.Property{
+		{Name: "NoNewPrivileges", Value: godbus.MakeVariant(true)},
+		{Name: "ProtectSystem", Value: godbus.MakeVariant("strict")},
+		{Name: "ProtectHome", Value: godbus.MakeVariant("yes")},
+		{Name: "PrivateTmp", Value: godbus.MakeVariant(true)},
+		{Name: "ReadWritePaths", Value: godbus.MakeVariant(append([]string(nil), sb.ReadWritePaths...))},
+		{Name: "CapabilityBoundingSet", Value: godbus.MakeVariant(mask)},
+	}
 }
 
 func checkName(name string) error {

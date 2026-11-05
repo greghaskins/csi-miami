@@ -163,7 +163,7 @@ func resumeCache(ctx context.Context, c *cache.Cache, cfg *Config, store *chunk.
 	if idx.Boundary != nil {
 		c.ClearBoundary(false)
 	}
-	base, t, err := loadBase(ctx, store, idx.Base)
+	base, t, err := loadBase(ctx, store, cfg.Volume, idx.Base)
 	if err != nil {
 		return nil, "", time.Time{}, err
 	}
@@ -185,6 +185,9 @@ func createCache(ctx context.Context, cfg Config, store *chunk.Store) (*cache.Ca
 		if err != nil {
 			return nil, nil, "", time.Time{}, err
 		}
+		if err := checkVolume(m, cfg.Volume); err != nil {
+			return nil, nil, "", time.Time{}, err
+		}
 		if m.Chunk != cfg.Chunk {
 			return nil, nil, "", time.Time{}, fmt.Errorf("blockd: current manifest chunk size %d, config says %d", m.Chunk, cfg.Chunk)
 		}
@@ -202,14 +205,28 @@ func createCache(ctx context.Context, cfg Config, store *chunk.Store) (*cache.Ca
 	return c, base, name, baseTime, nil
 }
 
+// checkVolume refuses a manifest that names another volume: the store is on a
+// shared export, where a writer could drop another volume's (valid) manifest
+// into this one's directory, and the device would come up with that volume's
+// data.
+func checkVolume(m chunk.Manifest, volume string) error {
+	if m.Volume != volume {
+		return fmt.Errorf("blockd: manifest %s belongs to another volume, not %s", m.Name(), volume)
+	}
+	return nil
+}
+
 // loadBase reads the chunk hashes and time of the named manifest; the empty
 // name is no base: nil chunks and a zero time.
-func loadBase(ctx context.Context, store *chunk.Store, name string) ([]chunk.Hash, time.Time, error) {
+func loadBase(ctx context.Context, store *chunk.Store, volume, name string) ([]chunk.Hash, time.Time, error) {
 	if name == "" {
 		return nil, time.Time{}, nil
 	}
 	m, err := store.ReadManifest(ctx, name)
 	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if err := checkVolume(m, volume); err != nil {
 		return nil, time.Time{}, err
 	}
 	return m.Chunks, m.Time, nil
