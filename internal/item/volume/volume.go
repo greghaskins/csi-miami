@@ -214,6 +214,9 @@ type Item struct {
 	// bin remembers what ensureBinary has verified, so the running binary is
 	// hashed once and not on every pass.
 	bin binMemo
+	// srcHex is the hex SHA-256 of the running binary as ensureBinary last
+	// hashed it; ServerOutdated reads it from another goroutine.
+	srcHex atomic.Pointer[string]
 }
 
 var _ item.Item = (*Item)(nil)

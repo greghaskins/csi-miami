@@ -258,6 +258,7 @@ func (s *server) status() Status {
 		PublishInFlight:  s.publishInFlight,
 		BinaryHash:       s.binaryHash,
 		Epoch:            s.cfg.Epoch,
+		Fetch:            s.back.fetches.snapshot(),
 	}
 	s.mu.Unlock()
 	return st

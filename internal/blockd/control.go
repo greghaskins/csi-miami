@@ -29,6 +29,7 @@ type Status struct {
 	PublishInFlight  bool      // a publish is running now
 	BinaryHash       string
 	Epoch            uint64 // the holder epoch this server publishes under
+	Fetch            FetchStats
 }
 
 // PublishArgs is the argument of Publish; Trigger is interval|watermark|request|unstage.
