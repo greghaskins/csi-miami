@@ -506,6 +506,15 @@ jobs:
   # node plugin and changes none of the mounts. A failing
   # run uploads what the tests dumped (driver logs, YAML, events, mountinfo),
   # the test output, kind's logs and the NFS server's output.
+  #
+  # The nfs3 legs also run the volume kind's tests (exit criteria 1 to 9 and
+  # 6a of the M2 plan): ext4 semantics, a reschedule, a node plugin restart, a
+  # block server kill, a NAS outage longer than the major timeout with no hung
+  # task in the kernel log, takeover by the out-of-service taint and by the
+  # force-detach annotation, an orphan drain, a node reboot that reuses the
+  # cache, the restore drill and an online expansion. They need the nbd and
+  # dm-crypt modules on the runner (hack/e2e-kind.sh loads them) and
+  # cryptsetup and e2fsprogs for the restore drill.
   e2e-kind:
     name: e2e-kind (${{ matrix.transport }}, ${{ matrix.arch }})
     needs: [changes, build]
@@ -569,8 +578,6 @@ jobs:
           E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-kind
           TRANSPORT: ${{ matrix.transport }}
           E2E_IMAGE: ${{ steps.image.outputs.image }}
-          E2E_FAILFAST: "0"
-          E2E_RUN: ^(TestVolumeTakeover|TestVolumeOrphanDrain|TestVolumeNodeRebootReusesCache)$
         run: sudo -E env "PATH=$PATH" make e2e E2E_MODE=kind E2E_TRANSPORT="$TRANSPORT" E2E_IMAGE="$E2E_IMAGE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
