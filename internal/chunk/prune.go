@@ -17,9 +17,13 @@ const staleTemp = 24 * time.Hour
 // Prune keeps the newest keep manifests (and whatever current names, even if
 // older), removes the other manifests, then removes every chunk that no kept
 // manifest references. It reads all kept manifests before deleting anything,
-// so an unreadable one stops it with the store untouched. It must run on the
-// node that holds the volume: a Put racing a Prune of the same hash would be
-// told the chunk is present and then lose it.
+// so an unreadable one stops it with the store untouched.
+//
+// Prune assumes it is the only thing writing the store: a Put racing a Prune of
+// the same hash would be told the chunk is present and then lose it. That holds
+// only because the caller serialises the two, the node that holds the volume
+// calling it after its own publish, one publish at a time, with its holder
+// re-checked just before. Nothing in the store itself enforces it.
 func (s *Store) Prune(ctx context.Context, keep int) (removedManifests, removedChunks int, err error) {
 	if keep < 1 {
 		return 0, 0, fmt.Errorf("chunk: prune: keep %d, need at least 1", keep)
@@ -59,6 +63,15 @@ func (s *Store) Prune(ctx context.Context, keep int) (removedManifests, removedC
 		}
 		removedManifests++
 	}
+	// A manifest write that died leaves its temporary file beside the
+	// manifests; it is not a manifest, so nothing above looked at it.
+	if ents, err := os.ReadDir(filepath.Join(s.root, "manifests")); err == nil {
+		for _, e := range ents {
+			if !e.IsDir() {
+				s.removeStaleTemp(e, filepath.Join(s.root, "manifests", e.Name()))
+			}
+		}
+	}
 	fans, err := os.ReadDir(filepath.Join(s.root, "chunks"))
 	if err != nil {
 		return removedManifests, 0, err
@@ -97,6 +110,9 @@ func (s *Store) Prune(ctx context.Context, keep int) (removedManifests, removedC
 	return removedManifests, removedChunks, nil
 }
 
+// removeStaleTemp removes a leftover temporary file older than staleTemp. It
+// is best effort: a file that cannot be removed is tried again at the next
+// prune, and a failure here must not stop the prune of what is garbage.
 func (s *Store) removeStaleTemp(e fs.DirEntry, path string) {
 	if len(e.Name()) == 0 || e.Name()[0] != '.' {
 		return
