@@ -150,7 +150,8 @@ func TestVolumeConditionHasEveryConditionAtZeroAndNoOtherLabel(t *testing.T) {
 		got[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
 	}
 	want := []string{"ok", "unresponsive", "transport-unavailable", "transport-conflict", "stage-conflict",
-		"publish-conflict", "item-missing", "item-not-directory", "failed"}
+		"publish-conflict", "item-missing", "item-not-directory", "failed",
+		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused"}
 	if len(got) != len(want) {
 		t.Errorf("series = %v, want exactly %v", got, want)
 	}

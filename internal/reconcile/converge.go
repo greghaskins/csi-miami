@@ -258,7 +258,7 @@ func (p *pass) convergeStage(in intent.Intent) error {
 	if err != nil {
 		return fmt.Errorf("volume %s: %w", in.VolumeID, err)
 	}
-	if err := it.Converge(p.ctx, in, item.Observed{Mounts: obs}); err != nil {
+	if err := it.Converge(p.ctx, in, item.Observed{Mounts: obs, Prereq: p.prereq, Keys: p.keys[in.VolumeID]}); err != nil {
 		p.noteHung(dir, err)
 		return p.fail("item", err)
 	}
@@ -408,6 +408,16 @@ const (
 	ConditionItemMissing          = "item-missing"
 	ConditionItemNotDirectory     = "item-not-directory"
 	ConditionFailed               = "failed"
+
+	// The conditions of the volume kind (layers 1 to 7 of the item, and the
+	// generation timers).
+	ConditionPrerequisiteMissing = "prerequisite-missing"
+	ConditionHolderContended     = "holder-contended"
+	ConditionServerDown          = "server-down"
+	ConditionKeyRequired         = "key-required"
+	ConditionBadKey              = "bad-key"
+	ConditionGenerationOverdue   = "generation-overdue"
+	ConditionPublishRefused      = "publish-refused"
 )
 
 // Conditions lists every condition, so that a metric can create them all at
@@ -416,6 +426,8 @@ var Conditions = []string{
 	ConditionOK, ConditionUnresponsive, ConditionTransportUnavailable, ConditionTransportConflict,
 	ConditionStageConflict, ConditionPublishConflict, ConditionItemMissing, ConditionItemNotDirectory,
 	ConditionFailed,
+	ConditionPrerequisiteMissing, ConditionHolderContended, ConditionServerDown, ConditionKeyRequired,
+	ConditionBadKey, ConditionGenerationOverdue, ConditionPublishRefused,
 }
 
 // conditionOf classifies an error by the sentinel it wraps. A transport that
@@ -440,6 +452,20 @@ func conditionOf(err error) string {
 		return ConditionItemMissing
 	case errors.Is(err, ErrItemNotDirectory):
 		return ConditionItemNotDirectory
+	case errors.Is(err, ErrPrerequisiteMissing):
+		return ConditionPrerequisiteMissing
+	case errors.Is(err, ErrHolderContended):
+		return ConditionHolderContended
+	case errors.Is(err, ErrServerDown):
+		return ConditionServerDown
+	case errors.Is(err, ErrKeyRequired):
+		return ConditionKeyRequired
+	case errors.Is(err, ErrBadKey):
+		return ConditionBadKey
+	case errors.Is(err, ErrGenerationOverdue):
+		return ConditionGenerationOverdue
+	case errors.Is(err, ErrPublishRefused):
+		return ConditionPublishRefused
 	default:
 		return ConditionFailed
 	}

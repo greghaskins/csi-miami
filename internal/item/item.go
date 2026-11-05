@@ -9,6 +9,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -19,6 +20,26 @@ import (
 type Observed struct {
 	// Mounts is /proc/self/mountinfo, in full.
 	Mounts observe.Table
+
+	// Prereq is the node's prerequisite report of this pass, the zero report
+	// (nothing missing) when no probe is configured. Only the volume kind
+	// reads it.
+	Prereq prereq.Report
+
+	// Keys are the encryption keys of the stage or publish request this pass
+	// is answering, empty on a pass no request caused. They live in memory
+	// for the pass: the reconciler wipes them when the request is finished
+	// with, so an Item must not keep a reference to either slice.
+	Keys Keys
+}
+
+// Keys are the encryption keys a request carried; see Observed.Keys.
+type Keys struct {
+	// Key opens the volume (and formats it at its first stage).
+	Key []byte
+	// PreviousKey, when set, is the key the volume was last opened with, for a
+	// rotation to Key.
+	PreviousKey []byte
 }
 
 // Item makes one kind of volume real between its transport and its publish
@@ -88,6 +109,42 @@ var (
 	// driver makes none there, and kubelet's reference check would see it.
 	// It wraps mount.ErrConflict. Nothing is changed.
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
+)
+
+// The errors of the volume kind. Each is one condition of the reconciler.
+var (
+	// ErrPrerequisiteMissing is returned, before anything is started or
+	// created, when the node lacks a feature the volume needs (the nbd
+	// module, device-mapper, the Adiantum cipher, systemd's socket, a
+	// writable cache directory). A person has to change the node.
+	ErrPrerequisiteMissing = errors.New("the node lacks a prerequisite of the volume")
+
+	// ErrHolderContended is returned when another node holds the volume and
+	// may not be taken over (yet), or when our own ownership was lost. It is
+	// retryable.
+	ErrHolderContended = errors.New("the volume is held by another node")
+
+	// ErrServerDown is returned when the block server of the volume is not
+	// serving: its unit is not running, restarting or not answering. It is
+	// retryable.
+	ErrServerDown = errors.New("the volume's block server is not serving")
+
+	// ErrKeyRequired is returned when the volume must be formatted or opened
+	// and the request carried no key.
+	ErrKeyRequired = errors.New("the volume needs an encryption key and the request carried none")
+
+	// ErrBadKey is returned when the key (and the previous key, if any) does
+	// not open the volume.
+	ErrBadKey = errors.New("the encryption key does not open the volume")
+
+	// ErrGenerationOverdue is the condition of a volume whose newest published
+	// generation is older than generations.maxAge. It is reported, not an error
+	// of Converge.
+	ErrGenerationOverdue = errors.New("the volume's newest generation is overdue")
+
+	// ErrPublishRefused is the condition of a volume whose generations the
+	// store refuses because the volume is no longer ours.
+	ErrPublishRefused = errors.New("the store refuses the volume's generations: it is no longer ours")
 )
 
 // ErrNoOpenat2 is returned when the kernel has no openat2(2) (before Linux

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
+	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/prereq"
@@ -33,6 +34,11 @@ type pass struct {
 	// prereq is the node's prerequisite report of this pass (layer 1 of the
 	// volume item); the zero report when no probe is configured.
 	prereq prereq.Report
+
+	// keys are the encryption keys of the stage and publish requests of this
+	// batch, by volume; they are the requests' own copies, wiped when the
+	// batch is finished with.
+	keys map[string]item.Keys
 
 	// collect is false in a pass where any record failed to load: only
 	// explicit Unpublish drops are carried out (garbage.go).
@@ -110,12 +116,32 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 	if r.opts.Prereq != nil {
 		p.prereq = r.opts.Prereq(ctx)
 	}
+	p.keys = batchKeys(batch)
 	p.teardown(batch)
 	p.convergeAll()
 	p.reportIntents()
 	p.reportConditions()
 	p.collectGarbage(batch, len(loaded.Failures) == 0)
 	p.answer(batch)
+}
+
+// batchKeys collects the keys the stage and publish requests of a batch
+// carried, by volume. A volume with several requests with keys takes the
+// first with a key; they are the same Secret's.
+func batchKeys(batch []*request) map[string]item.Keys {
+	keys := map[string]item.Keys{}
+	for _, req := range batch {
+		if req.kind != reqStage && req.kind != reqPublish {
+			continue
+		}
+		if len(req.keys.Key) == 0 && len(req.keys.PreviousKey) == 0 {
+			continue
+		}
+		if _, ok := keys[req.volume]; !ok {
+			keys[req.volume] = item.Keys{Key: req.keys.Key, PreviousKey: req.keys.PreviousKey}
+		}
+	}
+	return keys
 }
 
 // answer delivers each request the result of its own step. A Stage hears
