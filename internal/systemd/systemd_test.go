@@ -369,7 +369,7 @@ func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
 		got[p.Name] = p.Value.Value()
 	}
 	for name, want := range map[string]any{
-		"NoNewPrivileges": true, "ProtectSystem": "strict", "ProtectHome": "yes", "PrivateTmp": true,
+		"NoNewPrivileges": true, "ProtectSystem": "strict", "ProtectHome": "yes",
 		"ReadWritePaths":        []string{"/a", "/b"},
 		"CapabilityBoundingSet": uint64(1<<0 | 1<<12 | 1<<21),
 	} {

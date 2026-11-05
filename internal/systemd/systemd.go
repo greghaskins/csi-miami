@@ -86,10 +86,12 @@ type Unit struct {
 //	ProtectSystem=strict  the whole file system is read-only except /dev,
 //	                      /proc and /sys, and ReadWritePaths;
 //	ProtectHome=yes       /home, /root and /run/user are empty;
-//	PrivateTmp=yes        /tmp and /var/tmp are its own;
 //	CapabilityBoundingSet only Capabilities can ever be held.
 type Sandbox struct {
-	// ReadWritePaths are the existing paths the service may write below.
+	// ReadWritePaths are the existing paths the service may write below. There
+	// is no PrivateTmp: a cache or store directory may be under /tmp (the smoke
+	// tests put them there), which a private /tmp would hide, and the read-only
+	// file system already stops writes anywhere else.
 	ReadWritePaths []string
 	// Capabilities are the capability numbers (unix.CAP_*) it may hold.
 	Capabilities []int
@@ -397,7 +399,6 @@ func sandboxProperties(sb Sandbox) []sdbus.Property {
 		{Name: "NoNewPrivileges", Value: godbus.MakeVariant(true)},
 		{Name: "ProtectSystem", Value: godbus.MakeVariant("strict")},
 		{Name: "ProtectHome", Value: godbus.MakeVariant("yes")},
-		{Name: "PrivateTmp", Value: godbus.MakeVariant(true)},
 		{Name: "ReadWritePaths", Value: godbus.MakeVariant(append([]string(nil), sb.ReadWritePaths...))},
 		{Name: "CapabilityBoundingSet", Value: godbus.MakeVariant(mask)},
 	}
