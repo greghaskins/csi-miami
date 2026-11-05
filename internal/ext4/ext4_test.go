@@ -184,7 +184,7 @@ func TestHasFilesystemJudgesBlankOnTheRawPayload(t *testing.T) {
 	if got, err := ext4.HasFilesystem(ctx, made, mapper, area); err != nil || !got {
 		t.Errorf("a made file system: got %v, %v, want one", got, err)
 	}
-	gone := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(dev string, off int64) (tool.Device, error) {
+	gone := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(dev string, _ int64) (tool.Device, error) {
 		if dev == mapper {
 			return tool.Device{}, fs.ErrNotExist
 		}
