@@ -132,3 +132,603 @@ de3a7aaec6bdbb8279d4c2478529c5d82e3b39cd:claude-session-id:25
 84feb5f27aacf36f0d27719e7822e18c4037c145:claude-session-id:14
 # Smoke-test the sibling cover, superblock read-only and dangling links
 77a122dda744fbd3164983f639294d3f3509395d:claude-session-id:19
+
+# Messages of commits already on main that carry an AI co-author trailer with a
+# noreply address, which the ai-noreply-email rule did not exist to catch when
+# they were written (in history order, with their subjects):
+# docs: architecture brief for discussion
+aed2b45be7c5c5e6b03f52a26b7b566fb663f883:ai-noreply-email:10
+# docs: record decisions 1 to 5; replace object volumes with directory items
+7a82be9ed9da0c9d56681ef4de90fcaa9a132b67:ai-noreply-email:8
+# docs: RWX images via holder-node re-export; record decisions 6 to 8
+fba4474bf7715da71812290646f0bd6a3e6a4e06:ai-noreply-email:9
+# docs: record decisions 9 to 12; directory items first, probe, tiers
+7b00ab53d2c9ab0c59e94a79bd31cd3eccfa3c2c:ai-noreply-email:9
+# docs: image, supply chain and CI section; decisions 13 to 15
+159af188c4bb0594d4dc95e7e7127262311fdc62:ai-noreply-email:9
+# docs: single static binary built with ko; decisions 16 and 17
+fcc4ba17d36870ffc540e0ebb29e2740e857c769:ai-noreply-email:8
+# docs: keep e2fsprogs and cryptsetup on a self-built tools base under ko
+1344f1065a9ff6afa3314bc471bdc56ec5b25399:ai-noreply-email:7
+# docs: one multi-stage buildx image instead of a maintained tools base
+b2aa0ee6371543fa1d6662e8fe0d94c804f94d06:ai-noreply-email:3
+# docs: native per-architecture builds and a manifest job, no emulation
+39fb7d783d07979d2739771b6109a145dedd9745:ai-noreply-email:3
+# hack: scrub check for forbidden tokens, keyed so the list reveals nothing
+c839e16d8593f86bb6b29cb5a75539b48ca57e38:ai-noreply-email:3
+# scrub: gitleaks hooks and workflows fed by a private rule set
+5d9dfeb72a8e25987346c78bf99f9163de3bd078:ai-noreply-email:12
+# scrub-text: overwrite matching titles and bodies, not only delete comments
+b32b986b5bdb7228e6ea947e1862253dc885d2b5:ai-noreply-email:8
+# secret-scan: present the checks as ordinary gitleaks secret scanning
+9910e5bf7e5ba8ee1d215f54e098d78381921bdd:ai-noreply-email:7
+# secret-scan: pre-push hook and a Claude Code pre-publish hook
+baa35d605ce01959a108b977f37740ee63192f1f:ai-noreply-email:7
+# secret-scan: pre-push reads the range pre-commit provides, never scans nothing
+cef4362f681beaa0918ae55f57646ea40b18e071:ai-noreply-email:6
+# secret-scan: accept the config base64-encoded on one line
+e3f922fe7dc0900e5b251807469fe44c52e496ea:ai-noreply-email:6
+# secret-scan: every script refuses on its own when no config is set
+1214f12db91495c0f8e8cd24542de406ca2c2bee:ai-noreply-email:3
+# docs: M1 implementation plan
+8dbe79372cd709b1c26d44fc6f6368967cfefc73:ai-noreply-email:9
+# docs: one NFSv3 option set, no hard variant; softerr and lookupcache=positive
+03d46be398defdaf6ead971627d3cfe974af1753:ai-noreply-email:3
+# docs: working mode for M1, the hand-off between sessions
+bcd2eb32fcbf590ac1f89f5467359f1fc4773643:ai-noreply-email:3
+# Add the miami command skeleton and pin Go and golangci-lint
+557bf97c2c94d304935e962a84f57befa5d14571:ai-noreply-email:12
+# Add Makefile and a scratch-based Dockerfile
+277e239e3a8546b8d0693ccbc82379af90176205:ai-noreply-email:12
+# Add the ci workflow and name the secret-scan check
+f579ebb00a9392f8b27017c19b6d780632a80f45:ai-noreply-email:12
+# Ignore per-agent worktrees
+6d9874bfd2933e1b0bc83073810d8f2ec1f75133:ai-noreply-email:8
+# docs: merge commits instead of squash on main
+2f6e6f452136245390500f47db10f728e0874fc9:ai-noreply-email:13
+# Pin Go 1.27.3 and the exact checkout release
+180cce2899461bdd49666e10c5206a343b49934e:ai-noreply-email:12
+# Harden ci.yml: concurrency, least privilege and pinned tooling
+c442eb83ae6f8c1520581628e6bd6c6228b78e1e:ai-noreply-email:22
+# Make the Makefile checks exact and match what CI runs
+50c71f1b49cb08bba2e046c75f5c5d4efa5036b6:ai-noreply-email:14
+# Check stdout and stderr exactly and send subcommand help to stdout
+3e1d468ca52215e8f8043c0bd923ebc69962eb6e:ai-noreply-email:12
+# Make .dockerignore an allowlist
+669b3a1f54c979e6cf9257cdc3e9af104f4c49fe:ai-noreply-email:7
+# Add a content hash of the image's build inputs
+34b28c452fe95ac050fe9f776bbf8f107ca8b5b4:ai-noreply-email:13
+# Build images by content hash instead of by commit
+b5205f11f75c704cfd56c934e64a4ceba1109c3d:ai-noreply-email:21
+# docs: record content-addressed images
+113d11af9f4415034896870db13c896217e33a41:ai-noreply-email:10
+# Hash the image build script and make registry checks strict
+55c0c7442123509fccc25e86e63b012932e8fede:ai-noreply-email:19
+# Prefix content tags with x- instead of c-
+bac4e3967f0cb8f60faf61f58e838f5957398455:ai-noreply-email:7
+# Create the index from the digests that were run, and tighten ci.yml
+dde425ac07bc194f01bcd1e271ec273aa7cf32d3:ai-noreply-email:21
+# docs: bring the design documents in line with the CI as built
+9061c01c3b5a35d7385e2f65a04555369e49578e:ai-noreply-email:16
+# Add transport.Spec with validation, canonical form and ID
+3d4823f2e1c1c70dd7d52931ed7537599a52f04d:ai-noreply-email:15
+# Add volume ID, context and StorageClass parameter parsing
+21147a492e4097f0ac6194583ff02cd5cf04f82a:ai-noreply-email:20
+# Add observe: a mountinfo parser and mount table queries
+7a89770e03fcb945e5f80e46b2b73fff198845b0:ai-noreply-email:13
+# Add mount: mount(2) wrappers under deadlines, and a test fake
+9f0dcde08ff8fe6cd75a8f6ca0e2dceab850d251:ai-noreply-email:24
+# Add a smoke test against the real kernel and run it in CI
+5aa6b1e699d778fac559c0a39bd262283e946cef:ai-noreply-email:17
+# Tighten transport.Spec: normal form, host grammar, limits
+02a943e145c13726f74b6736c652a654acdf5409:ai-noreply-email:21
+# Give every volume its own directory: subdir is a prefix
+851eb80dea60f5efd27c5e8d76d8a14da1895755:ai-noreply-email:32
+# Record decision 20: one directory per volume
+b7e27306979dc153c00c53d3fcc5d4b5cb55ba0e:ai-noreply-email:9
+# Parse mountinfo exactly: single-space fields, empty source, odd bytes
+e71e78337a7da8ab746f58e1d3dccbf3bd56a0a1:ai-noreply-email:17
+# Resolve mounts through the mount tree, not mount IDs
+f074a5f705eaa0e3ce6ab948e5a9f5f62a5bc605:ai-noreply-email:26
+# Make the Mounter refuse overlapping calls and resolve its paths
+8a1acbd4c99e1c7a2dfa11b824d99aff4b02b032:ai-noreply-email:30
+# Make the fake Mounter behave like the real one under failure
+094ca0f2d7bec48c7fb4be7b5b7b4913b6190b13:ai-noreply-email:17
+# Fix lint findings in the new tests
+d79baec24f6084f5069e1eecb68196351a23ed29:ai-noreply-email:6
+# Smoke-test the kernel behaviours the review reproduced
+1841e5b234a058a2a92b769a4df2722796011e0e:ai-noreply-email:21
+# Document ErrBusy, resolved paths and Mounts in the package comment
+ab33287234b0f666dcb1edc767c66ba344c7f637:ai-noreply-email:3
+# Cross the shortest mount point first, and read mountinfo consistently
+de3a7aaec6bdbb8279d4c2478529c5d82e3b39cd:ai-noreply-email:24
+# Keep a hung bind source off the target, and refuse dangling links
+0f2d7faad1f4d77178c73194c4c5c7c90ac63983:ai-noreply-email:24
+# Free what a block caused when the fake is unblocked
+84feb5f27aacf36f0d27719e7822e18c4037c145:ai-noreply-email:13
+# Smoke-test the sibling cover, superblock read-only and dangling links
+77a122dda744fbd3164983f639294d3f3509395d:ai-noreply-email:18
+# Scan only text from accounts with write access
+4bc0f39d87b01966cd3dcd94ff5bc0b2e660704c:ai-noreply-email:13
+# Document that the text scan covers write-access accounts
+929e1508e43f2b14720fdfd2d89a75396468ac81:ai-noreply-email:7
+# Gate the text scan on the author's write access
+8d3fea8fb64170d2a23acab72b5cba58b94b1af0:ai-noreply-email:13
+# Describe the write-access rule in the brief's CI row
+ffe2a87e0f76fa6aec2b05eee8403303c38c487b:ai-noreply-email:3
+# Identify trusted bot accounts by ID from a repository secret
+cdeba3a59b15a601860e9f18d54cde8d0b146062:ai-noreply-email:13
+# Say the bot list is an owner-held list of account IDs
+e6264e31172a0f2450c85d5a7d1e880d078d3028:ai-noreply-email:3
+# Merge main into m1/t03-mount-observe
+980a27335c2b59ef9678436ba229b5a7008d12a5:ai-noreply-email:7
+# Add the intent record, its validation and file name escaping
+270120c2cd698062bc8fb53138631e2e41a271b5:ai-noreply-email:13
+# Add the intent store with atomic writes and counted load failures
+aa00b215ae4231fe1a5ef361400ecda2cf7bd852:ai-noreply-email:14
+# Carry the subdir prefix in the intent instead of a name
+2d45f518153e545fa541c4b6bd2675748300c950:ai-noreply-email:9
+# Validate the intent through volume.Context and accept an empty subdir
+dfe6dabcc10df34b7498856c54da54609b7b102f:ai-noreply-email:9
+# Document the intent package's format and validation contract
+9255af58c5af9e0b8a85900d1b52c6e354cc9d45:ai-noreply-email:9
+# Make the intent record self-owned, structural, silent and updatable
+9231fabe9c3d3d576829ba8d54669129edd5206b:ai-noreply-email:29
+# docs: public visibility and commit attribution rules
+5f2b5c58941bb8af6fa19ac8709fa80f6d491e28:ai-noreply-email:7
+# Add the nfs3 and local transports with adoption from the mount table
+794ef36de05e338d9c79c849911c0dc666550e83:ai-noreply-email:9
+# Scan commit messages as files so findings can be exempted one by one
+205279a20c4ba3f78895e2fc7f488ba65297c01f:ai-noreply-email:18
+# Note in the brief that findings may be exempted through .gitleaksignore
+80a0128a77b1c4c13eb4332d27ecf1836a347baf:ai-noreply-email:6
+# Smoke-test the local transport across a simulated restart
+a4e0d1b96d44927710ae4721313bdbfdcf97cec5:ai-noreply-email:7
+# Add the kernel NFSv3 e2e harness and the e2e CI job
+3b312f9bd36f27e51be9a92447bf28a155900c8c:ai-noreply-email:7
+# Do not disable NFSv2 in nfsd
+b23aa864fadec32a6e15f93dbc9707b96b1abf4a:ai-noreply-email:5
+# Take the adopted super options from the kernel's own report
+f05ac8fb1409e27ad0114516f22ec07bc8f03101:ai-noreply-email:5
+# Log the kernel release and whether nfsd had to be loaded
+49c8496bae912b1b7a7657926a2ac935ca72b4af:ai-noreply-email:5
+# Pin jq in mise.toml for the secret-scan hooks
+07b7aadb860d84d6002376770ac120ed6a9279aa:ai-noreply-email:7
+# Fail the smoke and e2e scripts when their tests are missing
+7e929eec73c3e407a4ae31ba44f40cb8306ab3a3:ai-noreply-email:7
+# docs: one spelling per NFS server, public repository, propagation claim
+016e516c181cb14d21506377e6a48cac6d6dd45c:ai-noreply-email:5
+# Harden adoption, bound hung resolutions, and expose a Transport state
+f77e9179cae5c3b06c9f276c96aa0b8d6b7cea8a:ai-noreply-email:9
+# secret-scan-text: overwrite only the field that matched
+6c6a38b502f93c14ba01d99560727cf92aa86a64:ai-noreply-email:10
+# Brief: secret-scan removes the comment or overwrites only the match
+0271cf40ddd7066969cf252cff73f03e1cdd84bd:ai-noreply-email:5
+# Merge main into m1/t05-intent-clean
+d10eb66670a6d025df8140676c2917f803db984d:ai-noreply-email:6
+# Merge main into m1/t04-transport
+4739d35eab39ca505d26aa0538c57a2e2c5bee3f:ai-noreply-email:6
+# Merge main into m1/t04-transport
+cde31581adb3e7c3b0b2b829430605eddd5cc9a9:ai-noreply-email:6
+# Merge main into m1/t05-intent-clean
+56074759ddfdb63a5e06d65a5d040c99d9555f2c:ai-noreply-email:6
+# Merge main into m1/t04-transport
+e0ff400844bf114c3cc86c25d49f7d09a3fe02da:ai-noreply-email:6
+# Clear a matched text field instead of leaving a notice
+85a4cbf50fa1cb32726106fb736db433a6443741:ai-noreply-email:13
+# Merge main into m1/t04-transport
+fcf9fba66748a0f6700ae6948609fa763a1a6129:ai-noreply-email:6
+# Merge main into m1/t00-scan-clear
+438eeb5a4d7b7fec067249e375584bbb077fa4a5:ai-noreply-email:6
+# Move the abandoned-goroutine helper to internal/deadline
+1a182c9bd5caa48b4d3d40e84cd250487c7ed338:ai-noreply-email:10
+# transport: make the driver IPv4 only
+b27f61d2001def8f3a6ef39e31f180ccf179e4a6:ai-noreply-email:16
+# docs: record decision 21, IPv4 only
+fd2eddc1c635b9ac5198f4c29bb50466a2ba7921:ai-noreply-email:7
+# secret-scan-text: use pull_request instead of pull_request_target
+7d0a16b7f6d87875c71dfd6816e056119fb128cb:ai-noreply-email:16
+# transport: make addr refuse IPv6 on its own
+b0b5555519b8759399c096b47279c1e9d582b3d6:ai-noreply-email:7
+# docs: restore the secret-scan wording and rewrap decision 21
+465a09b98fa09df66d1f5a654d9cb6afdb98426b:ai-noreply-email:8
+# Merge main into m1/t00-pull-request-event
+a74d1e4c5f02ab33d2470ab72167c219e3e9d561:ai-noreply-email:6
+# Add the item interface and the directory item
+1f17ff57d2608cce9447ebb71612e296a8ddd8b2:ai-noreply-email:15
+# Add the node reconciler
+fe2e73ae2e96aef98b1915066f5a51d530c7ef76:ai-noreply-email:18
+# Smoke-test the reconciler on the real kernel
+850ea1d867b9b589bf5cdf7b8c5a2f7544578216:ai-noreply-email:11
+# Pin setup-envtest and csi-sanity in mise.toml
+cfd41f2977729d51cb5ba0c40c4ea4163c373e85:ai-noreply-email:8
+# Add internal/kube: PV reads through client-go
+97a054e5a0677af4014cfc3ea17a26ee4dd30d90:ai-noreply-email:11
+# Add internal/csi: identity and controller services
+fa03fc88b9bc81786a567757ef0412015bf2e768:ai-noreply-email:18
+# Use deadline.Set in the transport test added on main
+c0a4722745d3dfdd7ad50edaa8346da188e42863:ai-noreply-email:6
+# Serve CSI from miami controller
+80d58819ba38893dd578bca53d8f18d8c21095f8:ai-noreply-email:11
+# Test the controller against envtest and csi-sanity
+1c2a64e659767b144630ab5dd09bbfea003cba94:ai-noreply-email:14
+# Document the abandoned-removal case on the delete path
+8e6f0d2973625ad7419058386532824262d83311:ai-noreply-email:3
+# Add Store.DeleteIf for deletes decided on a stale read
+d4f1ffa0c7d226048bf828f26583292c811f89ff:ai-noreply-email:8
+# Unstage only mounts the driver can show it made
+14874bec19654e3df89c258c7dac962776445460:ai-noreply-email:14
+# Merge main into m1/t08-controller
+1ca8aaa7c80fc459a4b9d3ad2b186bd9940edbc1:ai-noreply-email:3
+# Treat an unreadable intent record as unknown, never as absent
+c9a194f83129f4e67123a105ccf351573e9afc6c:ai-noreply-email:16
+# Require provisioner-shaped volume names
+79095df50cc46f8d187ddd40755c763937f924b2:ai-noreply-email:17
+# Answer each request with the outcome of its own step
+27e5293f1b38786cd9ae9578f404470f5afe7547:ai-noreply-email:15
+# Keep a later Stage from being torn down by an earlier Unstage
+9bc0b42677b40327de0eb83f6f3f92d0c5cf93d9:ai-noreply-email:13
+# Read PVs through the dynamic client, and trust only the API server's 404
+af97a486f5771d8fb64556805d9a206e80e7f8af:ai-noreply-email:20
+# Refuse publish targets the driver must not mount on or unmount
+4477edbc516712b14aa955ab7bdc6b744d1df2c2:ai-noreply-email:14
+# Test that an unreadable mount table stops the delete
+f932d9a74996999aac45cbfb1e0e5cbdbd7c1c9e:ai-noreply-email:9
+# Raise events and warnings on a change of condition, not of wording
+f8cb853a14b3e9a8d3f4acaf4f04908308c247c0:ai-noreply-email:15
+# Keep unmounting after a cover comes off and reveals a hidden mount
+d67b47b46a7128b43ccd0e31c62f7f6a59e3ebcd:ai-noreply-email:13
+# Test requests made during a pass, and unreadable records on the kernel
+c9b0689b99aa1a7b016b6da505eba64ebfa4d14b:ai-noreply-email:12
+# Remove a volume's directory relative to descriptors
+188eb2099267fc1634713ce47125ab6e599c4016:ai-noreply-email:24
+# Update package docs for the unreadable-record and ownership rules
+aa51d2c9b13b510aedc4920b4809f034e4a6d239:ai-noreply-email:6
+# Bound stuck operations, and let ListVolumes answer with what it has
+4d69b13224465ce6b84f43745d6f9283c813c801:ai-noreply-email:17
+# Replace a socket only when nothing listens on it
+18b77d1545cda459c54221864c1af7402515efa9:ai-noreply-email:10
+# Check the result of stopping the live server in its test
+cd469fe2694980e046e5b009b902b1082ca5467f:ai-noreply-email:3
+# Leave local volumes to the node
+990b0d597a0aa9c9bc7e0ff5383098456d23ebcb:ai-noreply-email:18
+# Keep paths and addresses out of errors and logs
+2a0420061b9300c028c33c75f407f239ed0e0ccf:ai-noreply-email:14
+# Record the delete path's choices in the plan
+96f1934da25b0edad96e16fb4199601dff57d205:ai-noreply-email:3
+# Recognise the driver's own bind of a directory that has been removed
+d2fdcde7e30d7f15aab787ed3b4b40b0765a3a04:ai-noreply-email:14
+# Hold every unmount of a publish target to the ownership test
+95bb1a3caa8fffc96d00f14a5078a37122379af6:ai-noreply-email:18
+# Give the intent record a generation so a rewrite is never mistaken for the read
+9dccd171b21b71cda5185d955498a349fc81c2dd:ai-noreply-email:15
+# Refuse a publish target that contains a root or a stage path
+ef3b7b97eccfe6f575754b7b5fdd5ecbb904c355:ai-noreply-email:8
+# Say what is safe to do about an unreadable record
+4020e96c477580c7b2c73ac52530baee96005380:ai-noreply-email:13
+# Classify errors with one precedence order for the CSI layer
+5822a2f4a721f221e064ae99f62a0046df1bc5cf:ai-noreply-email:17
+# Wait for a pass that began after the trigger, and cover the publish event key
+2100699d257bc9150af389fb2d5a8d1f73327434:ai-noreply-email:13
+# Silence gosec on a test that writes a fixture it read
+0cbb6eda5f875964413ea173cb430f600c632232:ai-noreply-email:3
+# Take a 404 as no PV only when it is about this PV
+9a1b602ca3439284f8368ae6cf67d20efb1fd346:ai-noreply-email:14
+# Refuse PV-shaped subdir elements in any case
+b4da70492fd0555075e1e8c10ec9c3a4890bc9be:ai-noreply-email:10
+# Test that only a refused connection makes a socket stale
+f08ff3971721b760231c38ed555311b34a09f4fa:ai-noreply-email:7
+# Check the transport root against the mount table, and create relative to descriptors
+80a3d4ac38401343f09c84c8b0f22081a3b5bc30:ai-noreply-email:27
+# Scope exit criterion 3 to nfs3 and fix stale comments
+ba4ac9d083b86866f57aafe1c48249c670149b18:ai-noreply-email:9
+# Test a derived drop against the volume's own directory
+7ca16e28fd417e5be5ca9d6b1e54b52bb98c3f56:ai-noreply-email:19
+# Release an operation's slot before its result is sent
+29c41ea25e3e7a22ae777c93d1d9ca92a642695c:ai-noreply-email:10
+# Test the ancestor rule on its own
+a8820afcec592056cc67afbe411df2195a5f1cb6:ai-noreply-email:10
+# Give every unreadable mount table, and every unreadable record, one answer
+56581aaba6d0dc80f220742504ad41c5ca928870:ai-noreply-email:13
+# Pin the precedence order with a real mount timeout, and note a Publish edge
+bedb72f394288b53df5afa90b708f0f7b9dc9ab3:ai-noreply-email:12
+# Test a derived drop against another volume's bind on the kernel
+c5c505dd5b3086b5279f1031c2d30069f28407d3:ai-noreply-email:3
+# Merge main into m1/t08-controller
+b4087254928b5597a2ee28b9a7b2dd26b7a27131:ai-noreply-email:6
+# Adapt the reconciler and directory tests to decision 22
+2584bfcd10137802b180b9d949c03db6d9f0a258:ai-noreply-email:17
+# Create the item directory of a local volume at first stage
+3c5d176c145b7fe61186fda5f5e461247c23a239:ai-noreply-email:12
+# Add the Prometheus registry and the gRPC metrics interceptor
+c99192aac51660ff91f074247c28ba0f944b185c:ai-noreply-email:12
+# Record Kubernetes events on the PersistentVolume of a volume
+42865d410ee01e811fef1ca0c71d54b6160a615e:ai-noreply-email:10
+# Serve the CSI node service over the reconciler
+9f97b617e2943eecfb5f879b23808f737c473c54:ai-noreply-email:13
+# Add the miami node command and metrics on both roles
+005c845e68a1be230428e60569d21ab654196897:ai-noreply-email:12
+# Run the node half of csi-sanity and a node smoke test
+ae55bc89b05132044677ea8b8e65ef1b73142472:ai-noreply-email:11
+# Create the counters of the reconcile steps at zero
+5fe318722d2dedc55ad33fa1cd23378b3834e001:ai-noreply-email:9
+# Wait for the pass count to settle in the ordering test
+3ccc960d1cd4de33475044a7330ab06ca2b7de7b:ai-noreply-email:9
+# Create a local item directory only at first stage
+b51cd457bfc1e7b2bd98f51dbe655320fdd7164a:ai-noreply-email:20
+# Serve the reconciler's metrics on the node only and stop in order
+51021898465b3fc1ab181599b689351637b87358:ai-noreply-email:9
+# Name an event by the PV's UID and fix the plan's events and RBAC
+2f2f15a853b4e6891478786d10776a6bca57b09f:ai-noreply-email:10
+# Add the kustomize base, the e2e overlay and the policy test
+e63fc00ecf8b274787143cb152a0311ac71a1919:ai-noreply-email:17
+# Add the deploy check on a three-node kind cluster
+e6854c708fb2486afeafb68bc076d2f8779f8551:ai-noreply-email:14
+# Label the image with its source, licence and description
+37b8777d07d584ab0f9ff0ea4dd9d0ad353ab593:ai-noreply-email:7
+# Keep kube-openapi at the release the pinned client libraries build with
+319fe71cfdd3b67fe30a002c69a77f29d7473eff:ai-noreply-email:8
+# Install kubectl from its release download in the deploy job
+bdbfcc247931b2f3f5b651b2063818cac293bd16:ai-noreply-email:7
+# Look for the sidecars' leases by their real names
+9259343aa0c36817a61dff693326c1150c05168c:ai-noreply-email:7
+# Poll at a one-second interval in the deploy check
+b29b23363cdde3a168a9cd2ac57a63306775e4b9:ai-noreply-email:7
+# Export the metric family names for tests of a running driver
+2a7d6dd27aef96f6a94478cb3e6d77ecbe1ba19f:ai-noreply-email:5
+# Factor the kind cluster steps out of the deploy check
+5303960891ef73b41138d4c39daf075594c7ed3b:ai-noreply-email:5
+# Add the kind end-to-end tests for exit criteria 1 to 6
+4ba2343077e44d10955b0294d5ca6333b8e3cab0:ai-noreply-email:5
+# Give hack/e2e.sh a kind mode
+a913c8e483aee03778025a4cc66e20d599e990ff:ai-noreply-email:5
+# Wire the kind e2e legs, arm64 sanity and the docs-only filter into CI
+0a5ab951344ccf7b4a45eb1a89d87716b852a5e2:ai-noreply-email:5
+# Spell out MIAMI, open with the scene and diagram the mounting modes
+956a22f67a554ca6be99653a29dcaa8db0332d07:ai-noreply-email:3
+# Play the opening scene as the kubectl investigation
+7675359f721dddb8fa8fd0071c099dfa0f628d74:ai-noreply-email:3
+# Report why a wait failed and make failure artifacts uploadable
+cde96074d366d61b9db5c625329f1917d3253c7d:ai-noreply-email:5
+# Recognise a bind of a directory on an NFS mount
+3499565be732c53ac3c5375400e17945aa6edfb2:ai-noreply-email:5
+# Give the e2e node plugin the host directory the local class uses
+893e88c2bd18965109b64dbc88d1ba8ebe56ee31:ai-noreply-email:5
+# Keep the transport out of the host mount table
+28fa8fb583ba40ef08e4722ecf84bc944cf47a15:ai-noreply-email:5
+# Read the transport from the plugin's mount namespace in the e2e tests
+99b837b451ae18ae668968ce9b0708466536c745:ai-noreply-email:5
+# Fix the deploy check's broken pipe and run every kind test
+28c4da94341379d4741a199b6881cc624fa67c79:ai-noreply-email:5
+# Take back the private transport root, and record the NFS unstage defect
+ff242b426317e4e7c1cfb6275cbbcdade1ed71b4:ai-noreply-email:5
+# Record that the nfs3 mount works with allowPrivilegeEscalation false
+c0995fcad0003da4e371f2323b84b0151bf9da6b:ai-noreply-email:5
+# Recognise a bind of a directory on an NFS mount
+0a0476fb5a826868c28d435beb35c7bb7da0106f:ai-noreply-email:5
+# Test on the real kernel that no stage mount is made
+a3299a28e01fcea9785f4552536645cdaac6cbcf:ai-noreply-email:9
+# Record decision 25: directory items make no stage mount
+07540eac5184a541ad811dbfd0177b344cfa2e08:ai-noreply-email:10
+# Make directory items bind publishes from the item directory
+64999e7c01639bcde549fae72bfd649d13a942ec:ai-noreply-email:18
+# Merge the no-stage-mount fix into m1/t10-e2e
+78567fc88920fcb423347dcda9090196c44494b7:ai-noreply-email:5
+# Assert the e2e criteria for a directory item with no stage mount
+8a984586df0597fb87536ed0f880607196cf5ae4:ai-noreply-email:5
+# Pin the NFS bind-root behaviour in the nfs3 e2e test
+d9b2378edc84b550f251a24443294e43b81ab40c:ai-noreply-email:9
+# Remove an earlier build's stage bind and judge only with the transport up
+72b223e4049013126fe9c85d74eaec5c91043009:ai-noreply-email:16
+# Correct stale wording about the stage path and bind recognition
+fc3ca78855909107dbcfddefd748431174243a6c:ai-noreply-email:8
+# Use a foreign file system in the stage conflict smoke test
+be16743461647057e604e87461cdeac05d5a58a6:ai-noreply-email:8
+# Cut the README down and draw the modes as plain text
+3285f679fab8347f5392482c346faa66769b8573:ai-noreply-email:3
+# Stop the deploy check dying of SIGPIPE when it prints sample metrics
+88983aab6adc27c7bcb0e1ba27e94897ca12188f:ai-noreply-email:9
+# Merge the reviewed no-stage-mount fix into m1/t10-e2e
+c2ee4d48c1221778e9b3158367ac515390195434:ai-noreply-email:5
+# Spell MIAMI with Across in the brief, rename Try it to Installation and add Contributing
+147f7d8597d6e9b917b0a268f936ecb8688b2981:ai-noreply-email:3
+# Merge main into m1/t10-e2e
+5955fffe893da1d77f46bbaea58f6f31cf2c9789:ai-noreply-email:5
+# Draw what runs where and list the modes by milestone
+765a0401c2ce9cf467c8f136ce4f015c95d84f2c:ai-noreply-email:3
+# Default the node transports root under the kubelet directory
+7c5381e28d3e5109a46d46c9eb44c085c5510614:ai-noreply-email:12
+# Make the deploy manifests portable across real clusters
+287b987055af5e796be36e128ef7cbd199751d88:ai-noreply-email:13
+# Record decision 27 and the deploy lessons in the design documents
+bbe71fbe814a8716eae703cf86f67bba6a9d3a6b:ai-noreply-email:7
+# Add a mode StorageClass parameter for directory volumes
+8d78d82b5e571126f23e116625dc9b192bef5f70:ai-noreply-email:19
+# Report a transport's health: ESTALE, an up gauge, volume conditions
+d271c27ca2e50bf69a2c8024e75d0f9ee09e028b:ai-noreply-email:25
+# Mount only subPaths of the kubelet directory into the sidecars
+6b6fda5feb219cf3b36254f29d6bebf85a6e17d1:ai-noreply-email:12
+# Align lesson 12 and decision 27 with the sidecar mounts and T14
+29eef71a353fd413a0856c87e0d845d2a3096cad:ai-noreply-email:8
+# Add the NFS server restart end-to-end test
+d21a13b207c7900d7280c2aaaef2a34f55c1feba:ai-noreply-email:22
+# Lead with the goal and the three responsibilities, and scope the later blob storage
+134a9f8c63597b90942b20f2daeb7f65c5644b80:ai-noreply-email:3
+# Keep the server restart outage shorter than the soft mount's timeout
+d21020c63d7b29687652d1356ca75d6ff13666be:ai-noreply-email:18
+# Present location, form, sharing and encryption as independent choices
+60aa1f1e95da08ce28b8a880b5a3dc58fcd88971:ai-noreply-email:3
+# Make blobs the third item type
+05bca87ea3d6bc410760c957c3e0c0efa0b883f8:ai-noreply-email:3
+# Document the mode parameter, transport health and what a restart showed
+76f19c4dd10971b9f8cc54f447b152a97e6a5ce4:ai-noreply-email:13
+# Add internal/lock: a directory lock with a server-clock stale rule
+0840e2811ac02e743b9e51b6fedbe5ad20354468:ai-noreply-email:19
+# Add miami lock acquire, release and run
+cb9712029776c51c05a27f9d06d2ab716a6851de:ai-noreply-email:18
+# Test the lock helper on the real nfs3 transport
+d7bc9071f9e878fac84abac874f23d0659f65697:ai-noreply-email:20
+# Test the lock helper between pods on the kind cluster
+283c2d983b16a5b4eff2814dad5db3e7d06a5739:ai-noreply-email:18
+# Record decision 29: the miami lock contract
+393b3c095bf9554fdaf19cf400650a397137fa1d:ai-noreply-email:9
+# Satisfy the linters in the lock package and command
+2388ae9fe67f53000ae6621ce9d9576cbe99b7ca:ai-noreply-email:7
+# Merge main into m1/t14-transport-health
+931acc0e971c2450ca0ff81890e174e9c676d914:ai-noreply-email:7
+# Check --renew only for lock run
+94549c98ce3bb2ec6d3d75a205833785fba355fa:ai-noreply-email:7
+# Address review: profile comment, mode upgrade order, setuid, up log
+cb778cb19136d164abf129b3438e23ccb64d36df:ai-noreply-email:21
+# Pin the lock directory so a lost lock is never touched
+e318e7da0cb34b75d55da8196e733b640d229984:ai-noreply-email:17
+# Stop the command at the renewal limit and signal its group
+5985bf42288831dffb560dc0d26186d0b274fe2c:ai-noreply-email:15
+# Assert the age of the stamp at the break and update decision 29
+ebff228947bbe5abe7c2018276fd38671a111777:ai-noreply-email:12
+# Merge main into m1/t11-lock
+bc5cba0deff17fca9ce5ded165d2889e995d0b1b:ai-noreply-email:9
+# Describe encryption for every item type
+a8dda170407d22c0e37b41267a54d34d87a384d2:ai-noreply-email:3
+# Replace the milestones with a matrix of what is supported today
+123731a49ce0a56c46f9f3cc4b4a3d4bf89b6b72:ai-noreply-email:3
+# Give each option in the support matrix its own status
+9c6249f29d52a7783bb56510d4039642183feb1d:ai-noreply-email:3
+# Bold the options in the support matrix
+bd885cc2367795b95cfb5e9a8d03e8a0338c05af:ai-noreply-email:3
+# Record the goals the README states ahead of the design
+3988e679849a403e4cecc8af22358218d59d385e:ai-noreply-email:3
+# Raise the nfs3 soft-mount major timeout to 180 s
+9bab828e21b302387b373a22437f1ca3374679a6:ai-noreply-email:13
+# Document the 180 s major timeout as decision 30
+86dbb0ec7d2fa805f0208b4f2f40f7dafc0426f4:ai-noreply-email:14
+# Update the server-restart e2e comments for the 180 s major timeout
+ba34c2f779ce16764cefc1af6a04b07e0d2508d2:ai-noreply-email:7
+# T12: README install steps, StorageClass parameters, the lock contract and limitations
+7402ef66877cce4f23cf351bec8ca8e72393637c:ai-noreply-email:22
+# Rewrap three lines left long by the T15 edits
+360db69531ce516bd69c78a37e3ab4d20185109e:ai-noreply-email:7
+# T12: Fix facts to match sources exactly
+ad736a1195aa0af566e607e86a98eb2475f7429f:ai-noreply-email:18
+# T12: Fix retry loop and overlay placeholder
+e9946cd2a9972421b4186da0caa940be73dd5b26:ai-noreply-email:11
+# Record SMB as a candidate second NAS transport for the design pass
+9ed4c81037e8b3c2c0f6009017992376aaf37c04:ai-noreply-email:9
+# Scope the controller's Lease grant to the driver namespace
+a789949295be10bd6b4c52aa112457bc0fc1607c:ai-noreply-email:10
+# Assert the node sidecars' hardening in the policy test
+bf6cdb15bc36681e2e4a4a94ae75e04b4b68f968:ai-noreply-email:12
+# Bind sources beneath the transport root by descriptor
+e9d1c57033950da7a7951ea2c49f3d0b5e8d2f24:ai-noreply-email:9
+# Prove the descriptor bind on the real kernel
+d35ea86ad783f0f9093982382d0f56fd6aac3cd9:ai-noreply-email:7
+# Record decision 31: bind by descriptor beneath the root
+3ef49433d28011c5daf4290046b8a6f5c58ecc7b:ai-noreply-email:3
+# Do not persist the token in the text-scan workflow's checkout
+eec0046bf39ad5540d2cd17377dc28cc92095d8c:ai-noreply-email:11
+# Break a lock only when it is lock-shaped, and take turns breaking
+80b325eb19df5054d30ff6a2599bcc820c1946fd:ai-noreply-email:5
+# Report a broken stale lock, exit 3 for a path that is not a lock
+d223049af19558d83c319575dc4f43e71c19c76e:ai-noreply-email:5
+# Record decision 32: breaking a miami lock safely
+aa8b56557475ea49f8d2e7f1e44ffaff2b33451f:ai-noreply-email:5
+# Give events fixed text per reason, not the error
+fad541ed4b3ad822b302de06f62bbb16941a1ae9:ai-noreply-email:13
+# Narrow the node's events grant and drop an unneeded verb
+b64fadc00c78115988d51e5930f29358c4394aaf:ai-noreply-email:12
+# Use an unpullable placeholder for the driver image
+de42409bd3c2eb4bd2c46fabf8777c3d0866c470:ai-noreply-email:8
+# Record decision 33 and the accepted endpoint and tag limits
+8c53b8e2dda78e56aa37efc796c7ff0121c9d97d:ai-noreply-email:8
+# Pin the descriptor lifetime on the timeout paths
+eee70542feb79af1bbbbed7803e277657e1a7fc1:ai-noreply-email:10
+# Harden the lock breakers after review
+8276937eb2096f64d8f3d7aa3ffb266cfeb5dc4d:ai-noreply-email:5
+# Document the reworded overlap, the nfs allowance and the cleanup names
+ee18322654d14b6f0e66e8c96ca7bff0439d0d2e:ai-noreply-email:5
+# Merge main into m1/t12-readme
+178d3900be1a39f217029eacd5f8d3d02b69f348:ai-noreply-email:6
+# Merge main into design/smb-transport-candidate
+25fcdffed6755366edc865305f7a5a0c33d095f7:ai-noreply-email:6
+# Merge main into m1/t18-deploy-rbac-policy-test
+297ec7d35efc4cb7d16d7c2157aeb0e8ed159f1a:ai-noreply-email:6
+# Merge main into m1/text-scan-no-persist
+fc697900e689b5eb5027d02ea5a8656bef0e3204:ai-noreply-email:6
+# Merge main into m1/t19-deploy-event-minors
+bda1dc76747eb62a71baeb4f469786cffedd6bb0:ai-noreply-email:3
+# Merge main into m1/t16-bind-source-fd
+8822dd362aebc803492ee6df90d00882b4fa3fb2:ai-noreply-email:3
+# Merge main into m1/t17-lock-break-safety
+3b772d8fac50789e11191b61a0cd4917ea3eeddb:ai-noreply-email:3
+# Merge main into design/smb-transport-candidate
+a984595655a8a13b968e9ff7bd4f63a654679b3e:ai-noreply-email:6
+# Merge main into m1/t18-deploy-rbac-policy-test
+efe37b18212ee3a39eec150287f786d4a92ea5a5:ai-noreply-email:6
+# Merge main into m1/text-scan-no-persist
+660520d66acc7e73bc1a67b3c562cc12d64fcdeb:ai-noreply-email:6
+# Merge main into m1/t16-bind-source-fd
+42bb7d50011b5b94cb49cf7f6de84ce9c43c0a9a:ai-noreply-email:6
+# Merge main into m1/t19-deploy-event-minors
+a33ea7d0d81984594bee6ef2c78717e0ae6e9b74:ai-noreply-email:3
+# Merge main into m1/t17-lock-break-safety
+8b01a761e4203721cb04cd65235ff7998e26d6ae:ai-noreply-email:3
+# README: exit code 3, lock shape, 30 s rule, overlap bound, holder note
+fe7d7bc4be4b067cd6077253ca48ea0690282ab4:ai-noreply-email:5
+# Merge PR 27 (design/smb-transport-candidate) into the stack
+e941d5cd65369ebdf51fecb897f8400c07d4f4f9:ai-noreply-email:6
+# Merge PR 29 (m1/t18-deploy-rbac-policy-test) into the stack
+abaa934ebecc63c8450809f9706cbbccd4739b9a:ai-noreply-email:6
+# Merge PR 31 (m1/text-scan-no-persist) into the stack
+453de6cf5be67ca45e63482cc2e6594a0c0dd957:ai-noreply-email:6
+# Merge PR 30 (m1/t16-bind-source-fd) into the stack
+74d8d61713331140e5cb3e07ab6950eaa165ddef:ai-noreply-email:6
+# Keep looks off the restore's deadline key; state both overlap cases
+aed0f03f36488741298d1d5c9905fa349a5e4119:ai-noreply-email:5
+# Merge main into m1/t17-lock-break-safety
+918577ed9a16a0b145046442607e679ce72c4285:ai-noreply-email:6
+# Merge main into m1/t19-deploy-event-minors
+683037a1441249fe907de46f47d4be60ab898b93:ai-noreply-email:6
+# Merge PR 32 (m1/t17-lock-break-safety) into the stack
+b04e541484cdfd6cdf6f77aa5603960f1370a381:ai-noreply-email:6
+# Merge PR 33 (m1/t19-deploy-event-minors) into the stack
+16c83687781b3b6fbca8c67a899d044734d47236:ai-noreply-email:6
+# Unmount by the mount ID that was judged
+d98d500cb140f2e7b603df69e2b57e7ceb04410b:ai-noreply-email:12
+# Mount the transport and every bind nosuid and nodev
+163ee86cf75820f3835219e66ab96bc048c5ca6e:ai-noreply-email:12
+# Publish a reader-only volume read-only whatever the request says
+d1b57fb6c5b40a3d87ca4d0a3021076fe757e81e:ai-noreply-email:8
+# Hold loaded records to the rules a request is held to
+715d170c778015236b8186c5698cb203d2cdf909:ai-noreply-email:12
+# Merge a staged record inside the store, and stat outside its lock
+11fb4b0b0fb3c347babce677ae2087d37e2be287:ai-noreply-email:13
+# Lock the intent store directory for the life of the store
+1a22feef200a4fe26dce2fcfe16e718564c7c576:ai-noreply-email:10
+# Refuse a second transport that maps to a mounted transport's directory
+dd570bfc54e7e87b28b1261cdf40d67146402cbd:ai-noreply-email:10
+# Record decision 34 and the limits accepted in the review
+bd7c8535eff630c8174235d08de8b470a1323a8e:ai-noreply-email:11
+# Fix formatting and lint findings in the new tests
+4417077a8f76093573942f064dec6518b128bb94:ai-noreply-email:3
+# Scope the agent publish scan to this repository
+0c42af1815fc156f8bee3286703edc530bb1781f:ai-noreply-email:10
+# Merge main into m1/t20-mount-reconcile-minors
+7b3e6872f3fc9cf22a945f6ab0a871973f96e97e:ai-noreply-email:3
+# Address review of PR 36
+85eeaf7090b51829669bb3e9bedf6000851a5ea9:ai-noreply-email:11
+# Check nosuid and nodev only where the smoke test made a bind
+61262ada45dba2511e9be454f5f5820939331330:ai-noreply-email:6
+# Keep the driver off control planes with a node affinity
+93fa5a4b8952f988d332e0b0c12852f09882a3ee:ai-noreply-email:11
+# Rename the example StorageClasses to the naming convention
+a43db1cd51561d647872fce20da40b121f0b8dac:ai-noreply-email:9
+# Document the control-plane exclusion and the class naming
+1b00cbb4488baef08c179581e797a226a7e1f4dd:ai-noreply-email:8
+# Merge PR 36 (m1/t20-mount-reconcile-minors) into the stack
+c4c905b923e854f36830b42623d5947070bad12f:ai-noreply-email:6
+# Merge PR 37 (m1/scope-publish-scan) into the stack
+5a9d744da1ef2f84aab76f252ec42ff35efad6d7:ai-noreply-email:6
+# Merge PR 38 (m1/t21-taints-and-class-names) into the stack
+9a610136ee7ce4af699162feb9af5a741792bc94:ai-noreply-email:6
+# Put the location before the type in StorageClass names
+bda700b34aed0fa75cbae35cfa4839579fce6f9b:ai-noreply-email:9
