@@ -125,6 +125,9 @@ func TestWireItems(t *testing.T) {
 	if opts.Generations != want {
 		t.Errorf("Generations = %+v, want %+v", opts.Generations, want)
 	}
+	if opts.Probe == nil {
+		t.Error("the active probe is not switched on")
+	}
 	// The reconciler accepts what was wired.
 	dir := t.TempDir()
 	store, err := intent.Open(filepath.Join(dir, "intents"))

@@ -350,3 +350,36 @@ func TestEventDetailIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// Every reason a volume can raise has text of its own, fixed, naming the node
+// and nothing else: no path, no key, no error. The type says whether a person
+// should look.
+func TestEventTextFixedPerReason(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		reason  string
+		typ     string
+		message string
+	}{
+		{reconcile.ReasonVolumeUnhealthy, "Warning", "the volume's device on node node-a did not answer two reads of its first sector; the volume is reported abnormal. Restart the volume's pod once the store is reachable and the cache has drained: the file system stays read-only until it is remounted"},
+		{reconcile.ReasonKeyRequired, "Warning", "the volume on node node-a needs an encryption key that the stage request did not carry"},
+		{reconcile.ReasonGenerationOverdue, "Warning", "the volume's newest generation is older than its maximum age and node node-a holds unpublished writes"},
+		{ReasonPublishRefused, "Warning", "the store refused a generation of this volume from node node-a because the volume is no longer held by that node; see the node plugin's log"},
+		{ReasonGenerationLost, "Warning", "unpublished writes of this volume were discarded on node node-a; see the node plugin's log"},
+		{ReasonServerRestarted, "Normal", "the volume's block server was restarted on node node-a; its device and mounts were kept"},
+		{reconcile.ReasonEmergencyDetach, "Warning", "an emergency detach was carried out by node node-a"},
+	}
+	for _, c := range cases {
+		if got := eventMessage(c.reason, "node-a", ""); got != c.message {
+			t.Errorf("%s message = %q, want %q", c.reason, got, c.message)
+		}
+		if got := eventType(c.reason); got != c.typ {
+			t.Errorf("%s type = %s, want %s", c.reason, got, c.typ)
+		}
+		for _, bad := range []string{"/", "key=", "error"} {
+			if strings.Contains(c.message, bad) {
+				t.Errorf("%s message %q contains %q", c.reason, c.message, bad)
+			}
+		}
+	}
+}

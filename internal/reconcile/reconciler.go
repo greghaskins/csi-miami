@@ -18,6 +18,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/item/directory"
 	"github.com/greghaskins/csi-miami/internal/mount"
+	"github.com/greghaskins/csi-miami/internal/probe"
 	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -133,6 +134,10 @@ type Reconciler struct {
 	orphans     map[string]*drainState // volume → retry state of a drain that has not finished (drain.go)
 	drainDue    bool                   // the next pass drains orphans: the start pass and the timer passes
 	gens        *generations           // the generation timers (generation.go)
+	probes      *probe.Prober          // the active probe (probes.go), nil when off
+	probeNote   sync.Map               // volume → note on why its probe failed, read by VolumeCondition
+	probeStack  map[string]uint64      // volume → stack number the probe state belongs to
+	probeBad    map[string]bool        // volume → whether its probe state was last reported abnormal
 	stopMargin  time.Duration          // added to the items' freeze bound when Run waits for generations
 	reported    map[string]string      // transport dir → kind, for the metrics seam
 	up          map[string]bool        // transport dir → whether it answered its last probe, to log changes
@@ -231,6 +236,8 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		marked:      map[string]*markState{},
 		orphans:     map[string]*drainState{},
 		gens:        newGenerations(),
+		probeBad:    map[string]bool{},
+		probeStack:  map[string]uint64{},
 		stopMargin:  defaultStopMargin,
 		reported:    map[string]string{},
 		up:          map[string]bool{},
@@ -250,6 +257,9 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 	}
 	if r.opts.Now == nil {
 		r.opts.Now = time.Now
+	}
+	if o := opts.Probe; o != nil {
+		r.probes = probe.New(probe.Options{Read: o.Read, Timeout: o.Timeout, Failures: o.Failures, Now: r.opts.Now})
 	}
 	items := opts.Items
 	if items == nil {
@@ -752,6 +762,11 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	r.mu.Unlock()
 	defer r.stop()
 	defer r.waitForGenerations()
+	if r.probes != nil {
+		// A read on a dead device is not waited for: it ends when the kernel
+		// gives the device back, and the process may exit before.
+		defer r.probes.Close()
+	}
 
 	ticks, stopTicks := r.newTicker(r.opts.Interval)
 	defer stopTicks()

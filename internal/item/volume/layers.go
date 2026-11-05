@@ -100,6 +100,7 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 	if err != nil {
 		return err
 	}
+	st.blk = blk
 	if err := it.ensureMounted(ctx, v, st, blk, cur, obs.Mounts); err != nil {
 		return err
 	}
@@ -240,6 +241,11 @@ func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*h
 // stopStack stops everything raised above the store: the mount, the mapping,
 // the server and its device. The cache stays.
 func (it *Item) stopStack(ctx context.Context, v vol, st *vstate) error {
+	// Whatever read of the old device the probe has in flight is not about the
+	// stack that replaces this one (ProbeDevice's stack number).
+	it.mu.Lock()
+	st.stack++
+	it.mu.Unlock()
 	if err := it.unmountAndClose(ctx, v, st); err != nil {
 		return err
 	}
@@ -447,6 +453,16 @@ func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.H
 				case ss.Index != dev.Index:
 					return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit serves device %d, the volume's device is %d", v.in.VolumeID, item.ErrServerDown, ss.Index, dev.Index)
 				}
+				// systemd restarts a crashed server inside its restart delay, so
+				// the unit is often active again by the next pass; the main
+				// process is what shows it was a different one.
+				if st.pid != 0 && us.MainPID != 0 && us.MainPID != st.pid {
+					it.log.Info("the block server was restarted", "volume", v.in.VolumeID)
+					it.event(v.in.VolumeID, ReasonServerRestarted)
+				}
+				if us.MainPID != 0 {
+					st.pid = us.MainPID
+				}
 				return dev, nil
 			}
 			return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit is active and the volume has no device", v.in.VolumeID, item.ErrServerDown)
@@ -489,7 +505,21 @@ func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.H
 	if haveDev {
 		want = dev.Index
 	}
-	return it.waitServing(ctx, v, want)
+	dev, err = it.waitServing(ctx, v, want)
+	if err != nil {
+		return nbd.Device{}, err
+	}
+	// The unit was started onto a device that was already there: this is the
+	// restart of a server that died under a staged volume (decision 51).
+	if haveDev {
+		it.log.Info("the block server was started again for its surviving device", "volume", v.in.VolumeID)
+		it.event(v.in.VolumeID, ReasonServerRestarted)
+	}
+	st.pid = 0
+	if now, serr := it.cfg.Systemd.State(ctx, v.unit); serr == nil && now.Active == "active" {
+		st.pid = now.MainPID
+	}
+	return dev, nil
 }
 
 // findDevice looks for the nbd device whose backend is the volume.

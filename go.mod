@@ -3,7 +3,7 @@ module github.com/greghaskins/csi-miami
 go 1.27.3
 
 require (
-	github.com/container-storage-interface/spec v1.13.0
+	github.com/container-storage-interface/spec v1.12.0
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/mdlayher/genetlink v1.4.0

@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -215,8 +216,63 @@ func TestUnitDeadDeviceAliveRestartsUnitKeepsMount(t *testing.T) {
 	if !e.cacheExists() {
 		t.Error("the node-local cache was removed: the server resumes from it")
 	}
+	if want := []string{ReasonServerRestarted}; !slices.Equal(e.events, want) {
+		t.Errorf("events = %v, want %v: a restart onto the surviving device is reported", e.events, want)
+	}
+}
+
+func TestServerRestartedWhenTheProcessChangesUnderTheSameUnit(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.mustConverge() // records the server's process
 	if len(e.events) != 0 {
-		t.Errorf("events = %v", e.events)
+		t.Fatalf("events = %v after adopting a running server", e.events)
+	}
+	// systemd restarted the server inside its restart delay: the unit is
+	// active again, with another main process.
+	e.sd.SetState(e.v.unit, systemd.State{Active: "active", Sub: "running", MainPID: 43, Present: true})
+	e.mustConverge()
+	if want := []string{ReasonServerRestarted}; !slices.Equal(e.events, want) {
+		t.Fatalf("events = %v, want %v", e.events, want)
+	}
+	e.mustConverge()
+	if len(e.events) != 1 {
+		t.Errorf("events = %v: one restart is one event", e.events)
+	}
+}
+
+func TestNoServerRestartedForAFirstStageOrAPluginRestart(t *testing.T) {
+	e := newEnv(t)
+	e.mustConverge()
+	if len(e.events) != 0 {
+		t.Errorf("first stage: events = %v", e.events)
+	}
+	e.newItem() // the plugin restarted; the server was never touched
+	e.sd.SetState(e.v.unit, systemd.State{Active: "active", Sub: "running", MainPID: 99, Present: true})
+	e.mustConverge()
+	if len(e.events) != 0 {
+		t.Errorf("after a plugin restart: events = %v", e.events)
+	}
+}
+
+func TestProbeDeviceIsTheDevicePodsSee(t *testing.T) {
+	e := newEnv(t)
+	if dev, _, ok := e.it.ProbeDevice(e.in); ok {
+		t.Fatalf("a volume never converged names %q", dev)
+	}
+	e.mustConverge()
+	dev, _, ok := e.it.ProbeDevice(e.in)
+	if want := "/dev/mapper/miami-" + e.v.name; !ok || dev != want {
+		t.Errorf("encrypted: ProbeDevice = %q, %v; want %q", dev, ok, want)
+	}
+
+	p := newEnv(t)
+	p.in.Volume.Encryption = false
+	p.keys = item.Keys{}
+	p.mustConverge()
+	dev, _, ok = p.it.ProbeDevice(p.in)
+	if want := filepath.Join(p.devDir, "nbd0"); !ok || dev != want {
+		t.Errorf("plain: ProbeDevice = %q, %v; want %q", dev, ok, want)
 	}
 }
 
@@ -527,5 +583,22 @@ func TestNewRequiresItsDependencies(t *testing.T) {
 		if _, err := New(cfg); err == nil {
 			t.Errorf("%s: New succeeded", name)
 		}
+	}
+}
+
+func TestStoppingTheStackChangesTheProbeStackNumber(t *testing.T) {
+	e := newEnv(t)
+	e.mustConverge()
+	_, before, _ := e.it.ProbeDevice(e.in)
+	st := e.it.state(e.in.VolumeID)
+	v, err := e.it.volOf(e.in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.it.stopStack(context.Background(), v, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, after, _ := e.it.ProbeDevice(e.in); after == before {
+		t.Errorf("stack number %d did not change when the stack was stopped", after)
 	}
 }

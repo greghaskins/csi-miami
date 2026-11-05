@@ -180,7 +180,8 @@ func requireID(s string) (volume.ID, error) {
 	return id, nil
 }
 
-// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME and GET_VOLUME_STATS.
+// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME, GET_VOLUME_STATS and
+// VOLUME_CONDITION (see conditioner).
 func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	rpc := func(t csi.NodeServiceCapability_RPC_Type) *csi.NodeServiceCapability {
 		return &csi.NodeServiceCapability{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: t}}}
@@ -188,6 +189,7 @@ func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequ
 	return &csi.NodeGetCapabilitiesResponse{Capabilities: []*csi.NodeServiceCapability{
 		rpc(csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME),
 		rpc(csi.NodeServiceCapability_RPC_GET_VOLUME_STATS),
+		rpc(csi.NodeServiceCapability_RPC_VOLUME_CONDITION),
 	}}, nil
 }
 
@@ -424,7 +426,15 @@ func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeSta
 		n.log.Warn("volume stats: the file system could not be read", "volume_id", id.String(), "reason", reason(err), "error", err.Error())
 		return nil, nodeStatus(fmt.Errorf("volume stats of %s: %w", id, err))
 	}
-	return &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}, nil
+	resp := &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}
+	// The condition is the active probe's verdict on the volume's device. A
+	// directory volume has no probe and reports normal. The alpha API is
+	// read by the kubelet only with the CSIVolumeHealth gate on.
+	if c, ok := n.rec.(conditioner); ok {
+		abnormal, msg := c.VolumeCondition(id.String())
+		resp.VolumeCondition = &csi.VolumeCondition{Abnormal: abnormal, Message: msg}
+	}
+	return resp, nil
 }
 
 // hasPath reports whether p is one of the volume's publish targets.
@@ -446,4 +456,13 @@ func usageOf(st unix.Statfs_t) []*csi.VolumeUsage {
 		{Unit: csi.VolumeUsage_BYTES, Available: avail * bsize, Total: total * bsize, Used: (total - free) * bsize},
 		{Unit: csi.VolumeUsage_INODES, Available: ffree, Total: files, Used: files - ffree},
 	}
+}
+
+// conditioner is implemented by a node reconciler that knows whether a
+// volume's device answers its active probe. The node service asks it when the
+// reconciler can say.
+type conditioner interface {
+	// VolumeCondition returns whether the volume is abnormal and why, in fixed
+	// text that names no path.
+	VolumeCondition(volumeID string) (abnormal bool, message string)
 }

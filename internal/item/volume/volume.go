@@ -62,6 +62,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
+	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/nbd"
 	"github.com/greghaskins/csi-miami/internal/systemd"
@@ -90,11 +91,18 @@ const (
 	// ReasonPublishRefused is a final or a scheduled generation the store
 	// refused because the volume is no longer ours; the unpublished writes
 	// are kept (scheduled) or discarded (unstage).
-	ReasonPublishRefused = "PublishRefused"
+	ReasonPublishRefused = kube.ReasonPublishRefused
 	// ReasonGenerationLost is unpublished writes that were discarded without
 	// being published: an unstage whose final generation failed, or a cache
 	// that could not be reused.
-	ReasonGenerationLost = "GenerationLost"
+	ReasonGenerationLost = kube.ReasonGenerationLost
+	// ReasonServerRestarted is a block server that was restarted under a
+	// volume that was already staged (decision 51): the unit was started again
+	// onto the surviving device, or systemd restarted it and the main process
+	// is not the one last seen. The mapping and the mount were not touched.
+	// It means "the blockd unit restarted": a restart that happened while the
+	// plugin was down, and a re-point by the same process, raise nothing.
+	ReasonServerRestarted = kube.ReasonServerRestarted
 )
 
 // ErrGenerationSkipped is returned by Generation when a publish was already in
@@ -234,6 +242,17 @@ type vstate struct {
 	// size, so they are run once per size per process and never decided from
 	// a guess about how full the file system looks.
 	resizedTo int64
+
+	// pid is the main process of the volume's unit when it was last seen
+	// active, 0 when never seen by this process: a restart is a different pid
+	// under the same unit. blk is the block device the file system is on (the
+	// mapper, or the nbd device of a plain volume), set by the last Converge
+	// that got that far. Both are touched by the loop goroutine only, but
+	// ProbeDevice reads blk from the same goroutine, so they need no lock.
+	pid int
+	blk string
+	// stack counts the times the stack was stopped to be rebuilt in place.
+	stack uint64
 }
 
 // New returns the volume Item. It fails if a required field is missing.
