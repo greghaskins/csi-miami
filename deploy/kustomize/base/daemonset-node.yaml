@@ -15,6 +15,18 @@
 # `Bidirectional` mount propagation only to privileged containers. It sets
 # seccompProfile RuntimeDefault anyway; a runtime ignores the profile for a
 # privileged container, and the API server accepts the combination.
+#
+# The volume kind (ext4 over dm-crypt over an nbd device) needs more of the
+# host than the directory kind. `privileged` already carries CAP_SYS_ADMIN
+# (mount, the nbd netlink family, device-mapper ioctls, FIFREEZE) and a device
+# cgroup that allows every device, so the security context is unchanged; what
+# a container cannot get from a privileged flag alone is the host's /dev as it
+# changes at runtime, the host's systemd socket and the host's sysfs, so those
+# are three more hostPaths (below), each mounted at its own path in the miami
+# container only. There is no hostPID (the block server of a volume runs as a
+# systemd unit on the host) and no hostPath for the volume cache: it lives in
+# the kubelet directory, the one mount the container already shares with the
+# host (see `volumes`).
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -90,6 +102,27 @@ spec:
             - name: kubelet-dir
               mountPath: /var/lib/kubelet
               mountPropagation: Bidirectional
+            # The host's /dev. The nbd and device-mapper nodes (/dev/nbdN,
+            # /dev/mapper/*, /dev/mapper/control) appear after the container
+            # starts, so a copy of /dev taken at start would never show them:
+            # HostToContainer makes new mounts and nodes under it visible. One
+            # way only; nothing the container does under /dev reaches the host
+            # as a mount.
+            - name: host-dev
+              mountPath: /dev
+              mountPropagation: HostToContainer
+            # systemd's private socket, /run/systemd/private, how the node
+            # starts and stops each volume's block server as a transient unit.
+            # Read-only is enough: connecting to a unix socket needs write
+            # permission on the socket file, not a writable mount.
+            - name: host-run-systemd
+              mountPath: /run/systemd
+              readOnly: true
+            # The nbd devices' sysfs entries (/sys/block/nbdN, read for the
+            # device index and the backend identifier). The node only reads it.
+            - name: host-sys
+              mountPath: /sys
+              readOnly: true
         - name: csi-node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0@sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
           args:
@@ -153,8 +186,30 @@ spec:
         # transports root (plugins/<driver>/transports). The kubelet requires
         # its directory to be a shared mount, so a Bidirectional mount of it
         # propagates on every distribution; an arbitrary hostPath cannot
-        # promise that.
+        # promise that. The volume kind's cache (plugins/<driver>/cache) and
+        # the per-hash binary copies the block servers run
+        # (plugins/<driver>/bin) are under it too, which is why the node needs
+        # no hostPath of its own for them: the host's block server and the
+        # container see the same absolute path.
         - name: kubelet-dir
           hostPath:
             path: /var/lib/kubelet
+            type: Directory
+        # The volume kind's three further hostPaths, all for the miami
+        # container alone (see its volumeMounts for what each is for).
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        # DirectoryOrCreate so a node without systemd still starts the pod and
+        # serves the directory kind; the volume kind then refuses with the
+        # systemd-socket prerequisite missing, as it does on any node whose
+        # socket is absent.
+        - name: host-run-systemd
+          hostPath:
+            path: /run/systemd
+            type: DirectoryOrCreate
+        - name: host-sys
+          hostPath:
+            path: /sys
             type: Directory
