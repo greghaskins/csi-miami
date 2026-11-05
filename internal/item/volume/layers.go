@@ -58,6 +58,11 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 	if err != nil {
 		return err
 	}
+	// The size is the largest any record holds, so a restage never brings the
+	// volume up smaller than it was grown to.
+	if v, err = it.raiseSize(ctx, v, st, cur); err != nil {
+		return err
+	}
 	if cur.ok && cur.epoch > h.Epoch() {
 		if err := it.refuseIfBound(v, obs.Mounts); err != nil {
 			return err
@@ -424,6 +429,13 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 // mount above are never touched. Only a start with no device in the kernel
 // decides what to do with a node-local cache.
 func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.Holder, cur current) (nbd.Device, error) {
+	// Every start, the unmount and drain restarts included, is at the size
+	// the records hold (Converge raised its own copy already; this is a no-op
+	// then).
+	v, err := it.raiseSize(ctx, v, st, cur)
+	if err != nil {
+		return nbd.Device{}, err
+	}
 	// A cache never exists without the record that lets a node with no intent
 	// find the volume again (see Orphans); a server is not started without it.
 	// The unit executes the host copy of the binary; a plugin that has only

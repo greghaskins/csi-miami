@@ -167,12 +167,14 @@ func (c *Controller) refuseHeldVolume(ctx context.Context, id volume.ID, dir str
 		id.Name, info.Node, info.Epoch, note, kube.AnnotationForceDetach, want)
 }
 
-// removeHolderFiles removes what a holder leaves beside a deleted volume's
-// directory: the holder file and its epoch claims. Best effort; the volume is
-// gone either way.
+// removeHolderFiles removes what a holder and an expansion leave beside a
+// deleted volume's directory: the holder file and its epoch claims, and the
+// size record. Best effort; the volume is gone either way.
 func (c *Controller) removeHolderFiles(dir, name string) {
 	parent := filepath.Dir(dir)
 	files, _ := filepath.Glob(filepath.Join(parent, name+".holder*"))
+	sizes, _ := filepath.Glob(filepath.Join(parent, name+".size*"))
+	files = append(files, sizes...)
 	for _, f := range files {
 		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			c.log.Warn("could not remove a holder file of a deleted volume", "volume", name, "error", reason(err))
@@ -198,6 +200,13 @@ func (c *Controller) removeHolderFiles(dir, name string) {
 //     volume.NewContext produces and repairs nothing, and the kind matches the
 //     ID.
 func contextOfPV(pv *kube.PV, id volume.ID) (volume.Context, error) {
+	return contextOfPVFor(pv, id, true)
+}
+
+// contextOfPVFor is contextOfPV, with the reclaim policy checked only when
+// mustDelete is set: it is a deletion's safeguard, and an expansion is as good
+// on a PV the cluster means to keep.
+func contextOfPVFor(pv *kube.PV, id volume.ID, mustDelete bool) (volume.Context, error) {
 	if pv.Name != id.Name {
 		return volume.Context{}, errors.New("the PV returned has another name")
 	}
@@ -210,7 +219,7 @@ func contextOfPV(pv *kube.PV, id volume.ID) (volume.Context, error) {
 	if pv.VolumeHandle != id.String() {
 		return volume.Context{}, errors.New("the PV's volume handle is not the requested volume ID")
 	}
-	if pv.ReclaimPolicy != reclaimDelete {
+	if mustDelete && pv.ReclaimPolicy != reclaimDelete {
 		return volume.Context{}, errors.New("the PV's reclaim policy is not Delete")
 	}
 	vctx, err := volume.DecodeContext(pv.VolumeAttributes)

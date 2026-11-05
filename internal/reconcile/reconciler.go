@@ -369,6 +369,9 @@ func (r *Reconciler) StageWith(ctx context.Context, in intent.Intent, keys Keys)
 			// caller that read it earlier must not give the permission back
 			// after the loop took it.
 			merged.EnsureItem = rec.EnsureItem
+			// A repeated stage carries the PV's immutable size; the growth
+			// the node has been asked for since is not undone by it.
+			merged.GrownSize = max(merged.GrownSize, rec.GrownSize)
 		}
 		*rec = merged
 		return nil
@@ -380,6 +383,48 @@ func (r *Reconciler) StageWith(ctx context.Context, in intent.Intent, keys Keys)
 		return fmt.Errorf("recording the intent of %s: %w", in.VolumeID, err)
 	}
 	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID, keys: keys.clone()})
+}
+
+// Expand raises the size the volume's record asks for to size (a whole number
+// of chunks, in bytes) and waits for a pass to bring the volume to it. The
+// record only ever rises: a size at or below the one it has changes nothing,
+// and the pass still runs, which finishes a grow an earlier call left half
+// done. The record keeps the size when the pass fails, so the next pass tries
+// again. Only a volume of kind volume has a size to raise; a volume with no
+// intent is ErrUnknownVolume.
+func (r *Reconciler) Expand(ctx context.Context, volumeID string, size int64) error {
+	if size <= 0 {
+		return fmt.Errorf("%w: the size %d is not positive", ErrInvalidRequest, size)
+	}
+	id, err := volume.ParseID(volumeID)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	if id.Kind != volume.KindVolume {
+		return fmt.Errorf("%w: only a volume of kind %s has a size", ErrInvalidRequest, volume.KindVolume)
+	}
+	unlock, err := r.locks.lock(ctx, volumeID)
+	if err != nil {
+		return fmt.Errorf("waiting for volume %s: %w", volumeID, err)
+	}
+	defer unlock()
+	err = r.store.Update(volumeID, func(in *intent.Intent) error {
+		if in.VolumeID == "" {
+			return fmt.Errorf("%w: %s", ErrUnknownVolume, volumeID)
+		}
+		if size <= in.GrownSize {
+			return errNoChange
+		}
+		in.GrownSize = size
+		return nil
+	})
+	if err != nil && !errors.Is(err, errNoChange) {
+		if errors.Is(err, ErrUnknownVolume) {
+			return err
+		}
+		return fmt.Errorf("recording the size of %s: %w", volumeID, err)
+	}
+	return r.await(ctx, &request{kind: reqStage, volume: volumeID})
 }
 
 // Publish adds a publish (a target path and its read-only flag) to the

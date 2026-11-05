@@ -387,8 +387,11 @@ pod ──bind──▶ stage mount: ext4 (discard, errors=remount-ro)
   The chunk store then holds plaintext ext4 blocks; the class name says so.
 - **Formatting and checking** stay the real tools of decision 16: `mkfs.ext4`
   once, `e2fsck -p` on every stage, `resize2fs` online for growth.
-- **Growth** is online: `ControllerExpandVolume` records the new size in the
-  volume context; the node grows the nbd device (the server extends its size,
+- **Growth** is online: `ControllerExpandVolume` records the new size in a
+  small record beside the volume's directory in the store (a PV's attributes
+  are immutable, so the volume context cannot carry it; the record only
+  grows), and a stage takes the largest of the context's size, that record and
+  the current manifest's, so no restage comes back smaller; the node grows the nbd device (the server extends its size,
   new chunks are zero), `cryptsetup resize`, then `resize2fs` on the mounted
   filesystem. Shrink is refused.
 - **fsGroup** applies: the volume has an fsType and is RWO, so decision 27's

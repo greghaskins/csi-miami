@@ -39,6 +39,9 @@ type wireIntent struct {
 	// ignores them.
 	Volume *volumeRecord `json:"volume,omitempty"`
 	Epoch  uint64        `json:"epoch,omitempty"`
+	// GrownSize is informational for a version 1 reader, which ignores it; a
+	// record without it reads as 0.
+	GrownSize int64 `json:"grownSize,omitempty"`
 }
 
 // volumeRecord is the on-disk form of a volume.VolumeParams, with its own
@@ -80,11 +83,12 @@ func toWire(in Intent) wireIntent {
 		since = in.UnstagingSince.UnixNano()
 	}
 	return wireIntent{
-		Volume:   vr,
-		Epoch:    in.Epoch,
-		Version:  in.Version,
-		VolumeID: in.VolumeID,
-		Kind:     string(in.Kind),
+		Volume:    vr,
+		Epoch:     in.Epoch,
+		GrownSize: in.GrownSize,
+		Version:   in.Version,
+		VolumeID:  in.VolumeID,
+		Kind:      string(in.Kind),
 		Transport: transportRecord{
 			Kind:   in.Transport.Kind,
 			Server: in.Transport.Server,
@@ -117,11 +121,12 @@ func fromWire(w wireIntent) Intent {
 		}
 	}
 	return Intent{
-		Volume:   vp,
-		Epoch:    w.Epoch,
-		Version:  w.Version,
-		VolumeID: w.VolumeID,
-		Kind:     volume.Kind(w.Kind),
+		Volume:    vp,
+		Epoch:     w.Epoch,
+		GrownSize: w.GrownSize,
+		Version:   w.Version,
+		VolumeID:  w.VolumeID,
+		Kind:      volume.Kind(w.Kind),
 		Transport: transport.Spec{
 			Kind:   w.Transport.Kind,
 			Server: w.Transport.Server,

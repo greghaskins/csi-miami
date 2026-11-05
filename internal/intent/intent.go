@@ -120,6 +120,14 @@ type Intent struct {
 	// Epoch is the holder epoch the node acquired the volume at, 0 for a
 	// record with none. Informational for a version 1 reader.
 	Epoch uint64
+	// GrownSize is the size in bytes a NodeExpandVolume asked this volume to
+	// grow to, 0 for none. It is outside Volume on purpose: Volume mirrors
+	// the volume context, which is immutable, and a repeated stage compares
+	// against it. The item takes the largest of Volume.Size, GrownSize and the
+	// store's own records, so the size only ever rises. The reconciler keeps
+	// it across a repeated stage and the store drops it with the record at
+	// unstage. Informational for a version 1 reader.
+	GrownSize int64
 }
 
 // ID returns the volume ID in the record, split into kind and name. It

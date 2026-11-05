@@ -197,6 +197,8 @@ func TestRBACRuleSets(t *testing.T) {
 		{"miami-controller", []rule{
 			{"", "persistentvolumes", []string{"get", "list", "watch", "create", "patch", "delete"}},
 			{"", "persistentvolumeclaims", []string{"get", "list", "watch", "update"}},
+			// csi-resizer's only grant the others do not cover.
+			{"", "persistentvolumeclaims/status", []string{"patch"}},
 			{"storage.k8s.io", "storageclasses", []string{"get", "list", "watch"}},
 			{"storage.k8s.io", "volumeattachments", []string{"get", "list", "watch", "patch"}},
 			{"storage.k8s.io", "volumeattachments/status", []string{"patch"}},
@@ -858,8 +860,7 @@ func TestControllerDeployment(t *testing.T) {
 			t.Errorf("%s: capabilities add = %v, want %v", c.Name, sc.Capabilities.Add, add)
 		}
 	}
-	// No resizer in M1.
-	if want := []string{"miami", "csi-provisioner", "csi-attacher", "livenessprobe"}; !reflect.DeepEqual(names, want) {
+	if want := []string{"miami", "csi-provisioner", "csi-attacher", "csi-resizer", "livenessprobe"}; !reflect.DeepEqual(names, want) {
 		t.Errorf("containers = %v, want %v", names, want)
 	}
 
@@ -884,6 +885,16 @@ func TestControllerDeployment(t *testing.T) {
 		if !hasArg(a.Args, x) {
 			t.Errorf("csi-attacher lacks %s", x)
 		}
+	}
+
+	r := container(t, spec, "csi-resizer")
+	for _, x := range []string{"--leader-election", "--csi-address=/csi/csi.sock", "--handle-volume-inuse-error=false", "--feature-gates=VolumeAttributesClass=false"} {
+		if !hasArg(r.Args, x) {
+			t.Errorf("csi-resizer lacks %s", x)
+		}
+	}
+	if !strings.HasPrefix(r.Image, "registry.k8s.io/sig-storage/csi-resizer:v2.3.0@sha256:") {
+		t.Errorf("csi-resizer image = %q, want v2.3.0 pinned by digest", r.Image)
 	}
 
 	// Both volumes are private to the pod.

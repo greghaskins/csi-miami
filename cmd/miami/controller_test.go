@@ -108,7 +108,7 @@ func TestServeControllerWithServesUntilTheContextEnds(t *testing.T) {
 		t.Errorf("GetPluginInfo = %v", info)
 	}
 	caps, err := csi.NewControllerClient(conn).ControllerGetCapabilities(callCtx, &csi.ControllerGetCapabilitiesRequest{})
-	if err != nil || len(caps.GetCapabilities()) != 3 {
+	if err != nil || len(caps.GetCapabilities()) != 4 {
 		t.Errorf("ControllerGetCapabilities = %v, %v", caps, err)
 	}
 

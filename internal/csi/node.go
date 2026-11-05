@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/chunk"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
@@ -37,6 +38,9 @@ type nodeReconciler interface {
 	Unpublish(ctx context.Context, volumeID, targetPath string) error
 	// Get returns the volume's intent and whether there is one.
 	Get(volumeID string) (intent.Intent, bool, error)
+	// Expand raises the size the volume's record asks for and waits for the
+	// volume to be brought to it.
+	Expand(ctx context.Context, volumeID string, size int64) error
 }
 
 // NodeBackend is the production nodeReconciler: the reconciler for the
@@ -180,8 +184,8 @@ func requireID(s string) (volume.ID, error) {
 	return id, nil
 }
 
-// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME, GET_VOLUME_STATS and
-// VOLUME_CONDITION (see conditioner).
+// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME, GET_VOLUME_STATS,
+// VOLUME_CONDITION (see conditioner) and EXPAND_VOLUME.
 func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	rpc := func(t csi.NodeServiceCapability_RPC_Type) *csi.NodeServiceCapability {
 		return &csi.NodeServiceCapability{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: t}}}
@@ -190,6 +194,7 @@ func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequ
 		rpc(csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME),
 		rpc(csi.NodeServiceCapability_RPC_GET_VOLUME_STATS),
 		rpc(csi.NodeServiceCapability_RPC_VOLUME_CONDITION),
+		rpc(csi.NodeServiceCapability_RPC_EXPAND_VOLUME),
 	}}, nil
 }
 
@@ -465,4 +470,53 @@ type conditioner interface {
 	// VolumeCondition returns whether the volume is abnormal and why, in fixed
 	// text that names no path.
 	VolumeCondition(volumeID string) (abnormal bool, message string)
+}
+
+// NodeExpandVolume grows a staged volume of kind volume online: the reconciler
+// raises the volume's record and the item brings the stack to it, in order the
+// block server's device, the encryption mapping and the mounted file system.
+// The size is rounded up to whole chunks. A size below the volume's current
+// one (the larger of the context's and any earlier growth) is OutOfRange; a
+// size equal to it is a success that still runs a pass, which finishes a grow
+// that was interrupted. It returns the size the volume has. A directory has
+// no size: Unimplemented.
+func (n *Node) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	id, err := requireID(req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	if err := cleanAbs("volume_path", req.GetVolumePath()); err != nil {
+		return nil, err
+	}
+	r := req.GetCapacityRange()
+	if r.GetRequiredBytes() <= 0 {
+		return nil, invalidf("a required size is required")
+	}
+	if _, err := requiredBytes(r); err != nil {
+		return nil, err
+	}
+	if id.Kind != volume.KindVolume {
+		return nil, status.Error(codes.Unimplemented, "only a volume of kind volume can be expanded")
+	}
+	in, ok, err := n.rec.Get(id.String())
+	if err != nil {
+		return nil, nodeStatus(fmt.Errorf("%w: reading the record of %s: %w", reconcile.ErrIntentsUnknown, id.String(), err))
+	}
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "volume %s is not staged on this node", id.String())
+	}
+	if in.Volume == nil || in.Volume.ChunkSize <= 0 {
+		return nil, status.Errorf(codes.FailedPrecondition, "the record of volume %s has no chunk size", id.String())
+	}
+	want := chunk.RoundUp(r.GetRequiredBytes(), in.Volume.ChunkSize)
+	if limit := r.GetLimitBytes(); limit > 0 && want > limit {
+		return nil, status.Errorf(codes.OutOfRange, "the size rounded up to whole %d byte chunks (%d) exceeds the limit", in.Volume.ChunkSize, want)
+	}
+	if cur := max(in.Volume.Size, in.GrownSize); want < cur {
+		return nil, status.Errorf(codes.OutOfRange, "the volume is %d bytes and does not shrink to %d", cur, want)
+	}
+	if err := n.rec.Expand(ctx, id.String(), want); err != nil {
+		return nil, nodeStatus(err)
+	}
+	return &csi.NodeExpandVolumeResponse{CapacityBytes: want}, nil
 }
