@@ -24,9 +24,8 @@
 # Each package is built as its own test binary and run in its own namespace.
 #
 # A last step, `tools`, builds the image that would ship (hack/image-build.sh
-# --load, for this machine's architecture) and runs the tools it carries:
-# cryptsetup --version and -V of mkfs.ext4 and e2fsck, and the resize2fs banner, with the image's own entrypoint
-# replaced. It needs docker; without it the step is skipped with a notice,
+# --load, for this machine's architecture) and starts each tool of
+# hack/tools.txt from it, with the image's own entrypoint replaced. It needs docker; without it the step is skipped with a notice,
 # unless SMOKE_REQUIRE_TOOLS=1 (CI sets it), when a missing docker fails.
 #
 # If SMOKE_ARTIFACT_DIR is set, a failing test leaves mountinfo-<test>.txt
@@ -111,14 +110,26 @@ hack/image-build.sh --arch "$arch" --tag "$tag" --load
 if ! docker image inspect "$tag" >/dev/null 2>&1; then
   tag="${tag}-dirty"
 fi
-docker run --rm --entrypoint /sbin/cryptsetup "$tag" --version
-docker run --rm --entrypoint /sbin/mkfs.ext4 "$tag" -V
-docker run --rm --entrypoint /sbin/e2fsck "$tag" -V
-# resize2fs has no version flag: it prints its banner and then the usage
-# message with a failing status, so the banner is what is checked.
-out="$(docker run --rm --entrypoint /sbin/resize2fs "$tag" 2>&1 || true)"
-echo "$out"
-case "$out" in
-  "resize2fs "[0-9]*) ;;
-  *) echo "smoke: resize2fs did not start from the image" >&2; exit 1 ;;
-esac
+# Every program of hack/tools.txt (the list the image is built from) is started
+# from the image with the arguments the file gives. A program that cannot be
+# executed (the runtime reports 125 to 127: not in the image, a library
+# missing) or that prints nothing fails the step; its own exit status does not
+# matter, because resize2fs has no version flag and prints its banner and then
+# a usage error.
+while read -r prog args; do
+  case "$prog" in "" | "#"*) continue ;; esac
+  set +e
+  # shellcheck disable=SC2086 # the probe arguments are split on purpose
+  out="$(docker run --rm --entrypoint "$prog" "$tag" $args 2>&1)"
+  code=$?
+  set -e
+  echo "smoke: $prog: $(printf '%s' "$out" | head -n1)"
+  if [ "$code" -ge 125 ] && [ "$code" -le 127 ]; then
+    echo "smoke: $prog cannot run from the image (exit $code): $out" >&2
+    exit 1
+  fi
+  if [ -z "$out" ]; then
+    echo "smoke: $prog printed nothing" >&2
+    exit 1
+  fi
+done < hack/tools.txt

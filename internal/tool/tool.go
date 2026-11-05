@@ -1,8 +1,9 @@
 // Package tool is the one place the driver starts an external program.
 //
-// The driver execs exactly two tools, cryptsetup and the e2fsprogs binaries;
-// everything else is syscalls, netlink or D-Bus. Callers hold a Runner, so a
-// test substitutes tool/fake and never needs the real binaries.
+// The driver execs exactly the programs of Programs (cryptsetup, the
+// e2fsprogs binaries and blkid); everything else is syscalls, netlink or
+// D-Bus. Callers hold a Runner, so a test substitutes tool/fake and never needs
+// the real binaries.
 package tool
 
 import (
@@ -15,6 +16,11 @@ import (
 	"syscall"
 	"time"
 )
+
+// Programs are the external programs the driver starts, by name. The image
+// carries each of them (hack/tools.txt is the list the Dockerfile and the smoke
+// test read), and TestProgramsAreTheImagesTools keeps the three in agreement.
+var Programs = []string{"cryptsetup", "mkfs.ext4", "e2fsck", "resize2fs", "blkid"}
 
 // Runner runs one program to completion.
 //

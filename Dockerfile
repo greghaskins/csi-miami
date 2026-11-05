@@ -1,5 +1,5 @@
 # One image, built natively on each architecture (no emulation). The final
-# stage holds the binary and the tools it runs (cryptsetup, e2fsprogs) with
+# stage holds the binary and the tools it runs (the list is hack/tools.txt) with
 # their shared libraries: no shell, no package manager.
 
 # golang:1.27.3, pinned by digest; keep the tag in step with go.mod and mise.toml.
@@ -22,10 +22,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
 FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS tools
 # resize2fs is in e2fsprogs-extra and lives in /usr/sbin; the other tools are in
 # /sbin. Link it there so every tool has one path, /sbin/<name>.
-RUN apk add --no-cache cryptsetup e2fsprogs e2fsprogs-extra \
+# blkid is its own package. The programs to carry are the paths in
+# hack/tools.txt, the same list the smoke test starts from the built image.
+RUN apk add --no-cache cryptsetup e2fsprogs e2fsprogs-extra blkid \
  && ln -s /usr/sbin/resize2fs /sbin/resize2fs
-COPY hack/image-closure.sh /image-closure.sh
-RUN /image-closure.sh /closure /sbin/cryptsetup /sbin/mkfs.ext4 /sbin/e2fsck /sbin/resize2fs
+COPY hack/image-closure.sh hack/tools.txt /
+RUN /image-closure.sh /closure $(grep -v '^#' /tools.txt | cut -d' ' -f1)
 
 FROM scratch
 # Labels only; they add no file to the image. The source label links the

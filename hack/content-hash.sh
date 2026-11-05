@@ -7,7 +7,7 @@
 # it is identical on every runner and every architecture.
 #
 # The inputs are the Dockerfile, the build context allowlisted in
-# .dockerignore (go.mod, go.sum, cmd, internal, hack/image-closure.sh) and the two scripts
+# .dockerignore (go.mod, go.sum, cmd, internal, hack/image-closure.sh, hack/tools.txt) and the two scripts
 # that decide how the image is built and hashed. Keep this list in agreement with
 # .dockerignore. `--paths` prints the list, one path per line, for
 # hack/image-build.sh.
@@ -24,6 +24,7 @@ paths=(
   internal
   hack/content-hash.sh
   hack/image-closure.sh
+  hack/tools.txt
   hack/image-build.sh
 )
 
