@@ -100,6 +100,8 @@ const (
 	// volume that was already staged (decision 51): the unit was started again
 	// onto the surviving device, or systemd restarted it and the main process
 	// is not the one last seen. The mapping and the mount were not touched.
+	// It means "the blockd unit restarted": a restart that happened while the
+	// plugin was down, and a re-point by the same process, raise nothing.
 	ReasonServerRestarted = kube.ReasonServerRestarted
 )
 
@@ -249,6 +251,8 @@ type vstate struct {
 	// ProbeDevice reads blk from the same goroutine, so they need no lock.
 	pid int
 	blk string
+	// stack counts the times the stack was stopped to be rebuilt in place.
+	stack uint64
 }
 
 // New returns the volume Item. It fails if a required field is missing.

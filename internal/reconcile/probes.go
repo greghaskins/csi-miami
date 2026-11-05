@@ -14,8 +14,10 @@ import (
 type Probed interface {
 	// ProbeDevice returns the block device to read the first sector of (the
 	// mapper, or the nbd device of a plain volume), and false when the volume
-	// has none yet. It decides from memory and touches nothing.
-	ProbeDevice(in intent.Intent) (string, bool)
+	// has none yet. stack changes when the item rebuilt the volume's stack in
+	// place, which ends the verdict on the old one. It decides from memory and
+	// touches nothing.
+	ProbeDevice(in intent.Intent) (device string, stack uint64, ok bool)
 }
 
 // ProbeOptions turn the active probe on and tune it. The zero value probes
@@ -56,11 +58,21 @@ func (p *pass) probeTick() {
 		if !ok {
 			continue
 		}
-		dev, ok := pr.ProbeDevice(in)
+		dev, stack, ok := pr.ProbeDevice(in)
 		if !ok {
 			continue
 		}
 		live[id] = struct{}{}
+		if old, seen := r.probeStack[id]; seen && old != stack {
+			// The old stack's reads are not the new one's: start clean.
+			r.probes.Forget(id)
+			delete(r.probeBad, id)
+			r.probeNote.Delete(id)
+			if pm != nil {
+				pm.DeleteVolumeProbe(id)
+			}
+		}
+		r.probeStack[id] = stack
 		st := r.probes.State(id)
 		res.probeFailed = st.Abnormal
 		if st.Known && pm != nil {
@@ -89,6 +101,7 @@ func (p *pass) probeTick() {
 		}
 		r.probes.Forget(id)
 		delete(r.probeBad, id)
+		delete(r.probeStack, id)
 		r.probeNote.Delete(id)
 		if pm != nil {
 			pm.DeleteVolumeProbe(id)

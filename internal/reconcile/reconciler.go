@@ -136,6 +136,7 @@ type Reconciler struct {
 	gens        *generations           // the generation timers (generation.go)
 	probes      *probe.Prober          // the active probe (probes.go), nil when off
 	probeNote   sync.Map               // volume → note on why its probe failed, read by VolumeCondition
+	probeStack  map[string]uint64      // volume → stack number the probe state belongs to
 	probeBad    map[string]bool        // volume → whether its probe state was last reported abnormal
 	stopMargin  time.Duration          // added to the items' freeze bound when Run waits for generations
 	reported    map[string]string      // transport dir → kind, for the metrics seam
@@ -236,6 +237,7 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		orphans:     map[string]*drainState{},
 		gens:        newGenerations(),
 		probeBad:    map[string]bool{},
+		probeStack:  map[string]uint64{},
 		stopMargin:  defaultStopMargin,
 		reported:    map[string]string{},
 		up:          map[string]bool{},

@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -256,11 +257,11 @@ func TestNoServerRestartedForAFirstStageOrAPluginRestart(t *testing.T) {
 
 func TestProbeDeviceIsTheDevicePodsSee(t *testing.T) {
 	e := newEnv(t)
-	if dev, ok := e.it.ProbeDevice(e.in); ok {
+	if dev, _, ok := e.it.ProbeDevice(e.in); ok {
 		t.Fatalf("a volume never converged names %q", dev)
 	}
 	e.mustConverge()
-	dev, ok := e.it.ProbeDevice(e.in)
+	dev, _, ok := e.it.ProbeDevice(e.in)
 	if want := "/dev/mapper/miami-" + e.v.name; !ok || dev != want {
 		t.Errorf("encrypted: ProbeDevice = %q, %v; want %q", dev, ok, want)
 	}
@@ -269,7 +270,7 @@ func TestProbeDeviceIsTheDevicePodsSee(t *testing.T) {
 	p.in.Volume.Encryption = false
 	p.keys = item.Keys{}
 	p.mustConverge()
-	dev, ok = p.it.ProbeDevice(p.in)
+	dev, _, ok = p.it.ProbeDevice(p.in)
 	if want := filepath.Join(p.devDir, "nbd0"); !ok || dev != want {
 		t.Errorf("plain: ProbeDevice = %q, %v; want %q", dev, ok, want)
 	}
@@ -582,5 +583,22 @@ func TestNewRequiresItsDependencies(t *testing.T) {
 		if _, err := New(cfg); err == nil {
 			t.Errorf("%s: New succeeded", name)
 		}
+	}
+}
+
+func TestStoppingTheStackChangesTheProbeStackNumber(t *testing.T) {
+	e := newEnv(t)
+	e.mustConverge()
+	_, before, _ := e.it.ProbeDevice(e.in)
+	st := e.it.state(e.in.VolumeID)
+	v, err := e.it.volOf(e.in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.it.stopStack(context.Background(), v, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, after, _ := e.it.ProbeDevice(e.in); after == before {
+		t.Errorf("stack number %d did not change when the stack was stopped", after)
 	}
 }

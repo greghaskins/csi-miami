@@ -38,6 +38,7 @@ type genItem struct {
 	stuck       chan struct{}
 	thawed      atomic.Bool
 	maxRun      int
+	stack       uint64 // the stack number ProbeDevice reports
 	clock       *fakeClock
 }
 

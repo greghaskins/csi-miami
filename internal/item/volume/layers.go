@@ -241,6 +241,11 @@ func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*h
 // stopStack stops everything raised above the store: the mount, the mapping,
 // the server and its device. The cache stays.
 func (it *Item) stopStack(ctx context.Context, v vol, st *vstate) error {
+	// Whatever read of the old device the probe has in flight is not about the
+	// stack that replaces this one (ProbeDevice's stack number).
+	it.mu.Lock()
+	st.stack++
+	it.mu.Unlock()
 	if err := it.unmountAndClose(ctx, v, st); err != nil {
 		return err
 	}

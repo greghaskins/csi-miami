@@ -11,6 +11,10 @@
 // than the timeout is counted as a failure by the next Observe, while its
 // goroutine is left to finish by itself. Two consecutive failures mark the
 // volume abnormal; one success clears it.
+//
+// Close cancels the context of reads in flight but cannot interrupt one inside
+// the kernel, so a plugin that exits with reads hung on dead devices may take
+// up to the nbd dead-connection timeout to actually exit.
 package probe
 
 import (

@@ -15,8 +15,10 @@ import (
 
 // ProbeDevice makes the generation tests' stand-in item probeable; a
 // reconciler probes only when Options.Probe is set.
-func (g *genItem) ProbeDevice(in intent.Intent) (string, bool) {
-	return "/dev/probe-test", in.Volume != nil
+func (g *genItem) ProbeDevice(in intent.Intent) (string, uint64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return "/dev/probe-test", g.stack, in.Volume != nil
 }
 
 // probeMetrics records the probe gauge beside the usual metrics.
@@ -260,5 +262,25 @@ func TestAbnormalConditionTellsTheOperatorToRestartThePod(t *testing.T) {
 	e.r.probeNote.Store(e.in.VolumeID, StoreUnreachable)
 	if _, msg := e.r.VolumeCondition(e.in.VolumeID); !strings.Contains(msg, StoreUnreachable) {
 		t.Errorf("message %q does not say the store is unreachable", msg)
+	}
+}
+
+// A stack rebuilt in place ends the verdict on the old one: a read still in
+// flight on the old device must not count against the new.
+func TestRebuiltStackStartsTheProbeClean(t *testing.T) {
+	t.Parallel()
+	e := newProbeEnv(t)
+	e.rs.set(errors.New("input/output error"))
+	for range 3 {
+		e.tick()
+	}
+	if abnormal, _ := e.r.VolumeCondition(e.in.VolumeID); !abnormal {
+		t.Fatal("not abnormal")
+	}
+	e.rs.set(nil)
+	e.g.set(func(g *genItem) { g.stack++ })
+	e.tick()
+	if abnormal, _ := e.r.VolumeCondition(e.in.VolumeID); abnormal {
+		t.Error("the old stack's failures were carried to the new one")
 	}
 }

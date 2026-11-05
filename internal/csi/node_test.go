@@ -179,7 +179,7 @@ func TestNodeGetInfoAndCapabilities(t *testing.T) {
 	for _, c := range caps.GetCapabilities() {
 		got = append(got, c.GetRpc().GetType())
 	}
-	want := []csi.NodeServiceCapability_RPC_Type{csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS, volumeConditionCapability}
+	want := []csi.NodeServiceCapability_RPC_Type{csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS, csi.NodeServiceCapability_RPC_VOLUME_CONDITION}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("capabilities = %v, want %v", got, want)
 	}
