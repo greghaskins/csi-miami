@@ -974,6 +974,21 @@ prerequisites, limitations, the restore drill pointer, the `-plain`
 naming), `docs/design/2026-10-30-architecture-brief.md` (append any
 decision a task amended; never rewrite), this plan's status.
 
+- [ ] Fold decisions 51 and 52 and the `--disable-keyring` note into the
+      spec's section 4 (4.4 restart model, 4.6 exclusivity, the failure
+      table: a NotReady node is never taken over).
+- [ ] Operator runbook for a volume that cannot leave its node (a dead
+      node, or an unstage failing permanently, e.g. a corrupt cache index):
+      delete the pod (force if needed); set the PV annotation
+      `miami.csi.greghaskins.com/force-detach` to the holder's
+      `<node>@<epoch>` named in the warning; wait for the attach to move,
+      which depends on the attach-detach controller's forced detach after
+      its unmount wait (about six minutes, also on a healthy node once the
+      pod object is gone); the new node's judge takes over, the old node's
+      next unstage retry finds the holder taken, reports `GenerationLost`
+      and finishes. The out-of-service taint does the same for every
+      volume of a dead node. State plainly what is lost: whatever the old
+      holder had not published.
 - [ ] Reviewed by the orchestrator; commit.
 
 ## 7. Risks and the check that retires each
