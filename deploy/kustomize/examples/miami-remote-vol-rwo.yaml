@@ -1,0 +1,33 @@
+# Named miami-LOCATION-TYPE-SHARING[-plain]: vol is a volume (ext4 on a block
+# device the node serves from chunks on the server), remote is a network
+# server (NFSv3 today), rwo is one node. A volume is encrypted (LUKS2) unless
+# the class says otherwise, so the encrypted class has no suffix; see
+# miami-remote-vol-rwo-plain.yaml for the other.
+#
+# The key is in a Secret in the claim's namespace, named below. Create it
+# before the first claim in a namespace (a `key` entry, and optionally a
+# `previousKey` while rotating). Both the node-stage and the node-publish
+# references name the same Secret, so a restage from a publish still has the
+# key after a plugin restart. The class must not outlive the Secret.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: miami-remote-vol-rwo
+provisioner: miami.csi.greghaskins.com
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+parameters:
+  kind: volume
+  transport.kind: nfs3
+  transport.server: 192.0.2.10
+  transport.export: /export
+  # Optional: a prefix under the export, one directory per namespace and claim.
+  subdir: ${pvc.namespace}/${pvc.name}
+  # kubelet applies a pod's fsGroup to a volume only when the PV carries a
+  # filesystem type, and the provisioner sets one only from this parameter.
+  csi.storage.k8s.io/fstype: ext4
+  csi.storage.k8s.io/node-stage-secret-name: miami-volume-key
+  csi.storage.k8s.io/node-stage-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/node-publish-secret-name: miami-volume-key
+  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
