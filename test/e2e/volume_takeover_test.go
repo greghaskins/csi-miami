@@ -97,6 +97,20 @@ func takeover(t *testing.T, e *env, mode string) {
 	}
 	t.Logf("pod b has waited %s holder-contended; the holder is still %s", holdWait, held)
 
+	// The holder never released: its plugin has been off since the crash and
+	// stays off until the takeover is done, so the pod on the other worker can
+	// only get the volume because the operator gave the holder up. Nothing
+	// has drained it, and the holder file still names the old node at its
+	// original epoch.
+	ctx, cancel = e.withDeadline()
+	still, err := e.holder(ctx, vol)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if still != held {
+		t.Fatalf("before the operator acts the holder of %s is %s, want %s still: it released or was taken without an operator", vol.PV, still, held)
+	}
 	// The operator gives the holder up.
 	switch mode {
 	case "out-of-service-taint":

@@ -459,18 +459,38 @@ func (e *env) pluginOff(t *testing.T, node string) {
 	})
 }
 
-// waitPluginGone waits for the node plugin pod on a node to be gone.
+// waitPluginGone waits for the node plugin pod on a node to be gone. When it
+// is not, the failure carries the pod's state (phase, deletion time, container
+// states) and the tail of the node's kubelet log, which say what held it.
 func (e *env) waitPluginGone(t *testing.T, node string) {
 	t.Helper()
-	e.waitFor(t, "the node plugin pod on "+node+" to be gone", func(ctx context.Context) (string, bool, error) {
+	last, ok := poll(e.Timeout, func(ctx context.Context) (string, bool, error) {
 		pods, err := e.Client.CoreV1().Pods(e.DriverNS).List(ctx, metav1.ListOptions{
 			LabelSelector: componentLabel + "=" + roleNode, FieldSelector: "spec.nodeName=" + node,
 		})
 		if err != nil {
 			return "", false, err
 		}
-		return fmt.Sprintf("%d node plugin pods on %s", len(pods.Items), node), len(pods.Items) == 0, nil
+		var parts []string
+		for i := range pods.Items {
+			p := &pods.Items[i]
+			parts = append(parts, fmt.Sprintf("%s phase %s deletionTimestamp %v", p.Name, p.Status.Phase, p.DeletionTimestamp))
+			for _, c := range p.Status.ContainerStatuses {
+				parts = append(parts, fmt.Sprintf("  container %s: %+v", c.Name, c.State))
+			}
+		}
+		return fmt.Sprintf("%d node plugin pods on %s: %s", len(pods.Items), node, strings.Join(parts, "; ")), len(pods.Items) == 0, nil
 	})
+	if ok {
+		return
+	}
+	ctx, cancel := e.withDeadline()
+	defer cancel()
+	klog, err := nodeExec(ctx, node, "journalctl", "-u", "kubelet", "--no-pager", "-n", "120")
+	if err != nil {
+		klog = "(" + err.Error() + ")"
+	}
+	t.Fatalf("timed out after %s waiting for the node plugin pod on %s to be gone; last saw: %s\nkubelet log of %s:\n%s", e.Timeout, node, last, node, klog)
 }
 
 // downTheNode takes a node out from under a volume it holds the way a crash
