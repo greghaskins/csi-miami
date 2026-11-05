@@ -10,16 +10,26 @@ import (
 
 // StorageClass parameters of the volume kind.
 const (
-	ParamChunkSize          = "chunkSize"
-	ParamCacheSize          = "cacheSize"
-	ParamEncryption         = "encryption"
-	ParamCipher             = "cipher"
-	ParamKeySize            = "keySize"
-	ParamGenInterval        = "generations.interval"
-	ParamGenKeep            = "generations.keep"
-	ParamGenMaxAge          = "generations.maxAge"
-	ParamGenDirtyWatermark  = "generations.dirtyWatermark"
-	ParamTakeoverTimeout    = "takeoverTimeout"
+	ParamChunkSize         = "chunkSize"
+	ParamCacheSize         = "cacheSize"
+	ParamEncryption        = "encryption"
+	ParamCipher            = "cipher"
+	ParamKeySize           = "keySize"
+	ParamGenInterval       = "generations.interval"
+	ParamGenKeep           = "generations.keep"
+	ParamGenMaxAge         = "generations.maxAge"
+	ParamGenDirtyWatermark = "generations.dirtyWatermark"
+	// ParamTakeoverTimeout is the retired StorageClass parameter of the timed
+	// takeover (decision 52): NewContext rejects it, and a PV's context that
+	// still carries it is read and ignored.
+	ParamTakeoverTimeout = "takeoverTimeout"
+	// ForceDetachAnnotation is the PV annotation of the emergency detach
+	// (decision 52) and OutOfServiceTaint the standard node taint that does the
+	// same for every volume a node holds. They live here because the node
+	// agent's judge and the API client both name them and neither may import
+	// the other.
+	ForceDetachAnnotation   = "miami.csi.greghaskins.com/force-detach"
+	OutOfServiceTaint       = "node.kubernetes.io/out-of-service"
 	cipherAdiantum          = "xchacha12,aes-adiantum-plain64"
 	cipherXTS               = "aes-xts-plain64"
 	minGenerationInterval   = time.Minute
@@ -30,8 +40,6 @@ const (
 	DefaultGenerationKeep   = 3
 	DefaultGenerationEvery  = 5 * time.Minute
 	DefaultGenerationMaxAge = time.Hour
-	DefaultTakeoverTimeout  = 5 * time.Minute
-	minTakeoverTimeout      = time.Minute
 )
 
 // volumeParamNames are the StorageClass parameters only the volume kind has.
@@ -61,9 +69,6 @@ type VolumeParams struct { //nolint:revive // the name is fixed by the design (3
 	Cipher                     string
 	KeySize                    int
 	Generations                GenerationParams
-	// TakeoverTimeout is how long a holder may go without renewing before it
-	// counts as dead; zero means DefaultTakeoverTimeout.
-	TakeoverTimeout time.Duration
 }
 
 // check validates the fields that are set; derived fields still zero are not
@@ -172,30 +177,15 @@ func parseVolumeParams(params map[string]string) (VolumeParams, error) {
 			return v, err
 		}
 	}
-	if v.TakeoverTimeout, err = parseTakeoverTimeout(params); err != nil {
-		return v, err
+	if _, ok := params[ParamTakeoverTimeout]; ok {
+		return v, invalid("parameter " + ParamTakeoverTimeout + " is no longer supported: decision 52 removed the timed takeover. " +
+			"A volume moves to another node only after its holder has synced it, or by an operator's emergency detach " +
+			"(the PV annotation " + ForceDetachAnnotation + " naming the holder's <node>@<epoch>, or the " + OutOfServiceTaint + " taint on its node)")
 	}
 	if err := v.check(); err != nil {
 		return v, err
 	}
 	return v, nil
-}
-
-// parseTakeoverTimeout reads the optional takeoverTimeout parameter; zero
-// means the default.
-func parseTakeoverTimeout(params map[string]string) (time.Duration, error) {
-	raw, ok := params[ParamTakeoverTimeout]
-	if !ok {
-		return 0, nil
-	}
-	d, err := parseDuration(ParamTakeoverTimeout, raw)
-	if err != nil {
-		return 0, err
-	}
-	if d < minTakeoverTimeout {
-		return 0, invalid("parameter " + ParamTakeoverTimeout + " must be at least 1m")
-	}
-	return d, nil
 }
 
 // parseBytes reads a size: decimal bytes, or a number with a Ki, Mi, Gi or Ti
@@ -222,14 +212,6 @@ func parseDuration(name, raw string) (time.Duration, error) {
 		return 0, invalid("parameter " + name + " must be a positive duration such as 5m")
 	}
 	return d, nil
-}
-
-// Takeover returns the takeover timeout, the default when unset.
-func (v VolumeParams) Takeover() time.Duration {
-	if v.TakeoverTimeout > 0 {
-		return v.TakeoverTimeout
-	}
-	return DefaultTakeoverTimeout
 }
 
 // WithSize resolves a volume Context for a capacity of required bytes: the

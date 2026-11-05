@@ -147,10 +147,15 @@ type Config struct {
 	// Node is this node's name, the holder's identity.
 	Node string
 
-	// Judge is the reconciler's takeover verdict on a holder of the volume
-	// that names another node; nil never takes over. The item adds one rule of
-	// its own on top, for a holder file that names this node (see ensureHolder).
-	Judge func(volumeID string) holder.Judgement
+	// Judge is the reconciler's takeover verdict on the holder file it is given
+	// (the one the item just read, which names another node); nil never takes
+	// over. It is consulted for no other holder: the item has one rule of its
+	// own, for a holder file that names this node, and decides it first (see
+	// judge). Takeover is called, when not nil, after a takeover of another
+	// node's holder succeeded, with the judgement that allowed it: Info names
+	// the abandoned node and epoch and Reason the trigger.
+	Judge    func(ctx context.Context, volumeID string, info holder.Info) holder.Judgement
+	Takeover func(volumeID string, j holder.Judgement)
 
 	// BinaryHash names the host copy of the binary, <BinDir>/miami-<hash>: the
 	// build's version string. Exe is the file copied, /proc/self/exe by

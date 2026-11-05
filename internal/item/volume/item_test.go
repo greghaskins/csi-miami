@@ -278,12 +278,70 @@ func TestHolderContended(t *testing.T) {
 
 	// With the reconciler's verdict to take over, the volume is ours at a
 	// higher epoch.
-	e.judge = func(string) holder.Judgement {
-		return holder.Judgement{Takeover: true, Reason: "node is out of service"}
+	e.judge = func(_ string, info holder.Info) holder.Judgement {
+		return holder.Judgement{Takeover: true, Reason: "node is out of service", Info: info}
 	}
 	e.mustConverge()
 	if got := e.holderInfo(); got.Node != testNode || got.Epoch != 2 {
 		t.Errorf("holder after takeover = %+v", got)
+	}
+	if len(e.takeovers) != 1 || e.takeovers[0].Info.Node != otherNode || e.takeovers[0].Info.Epoch != 1 {
+		t.Errorf("takeovers reported = %+v, want the abandoned %s at epoch 1", e.takeovers, otherNode)
+	}
+}
+
+// The reconciler's judge is asked about the holder the item read, only when
+// the holder names another node; and a takeover that did not happen is not
+// reported.
+func TestJudgeIsGivenTheHolderAndOnlyForAnotherNode(t *testing.T) {
+	e := newEnv(t)
+	e.holderAt(otherNode, 3)
+	var seen []holder.Info
+	e.judge = func(_ string, info holder.Info) holder.Judgement {
+		seen = append(seen, info)
+		return holder.Judgement{Reason: "no"}
+	}
+	if err := e.converge(); !errors.Is(err, item.ErrHolderContended) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(seen) != 1 || seen[0].Node != otherNode || seen[0].Epoch != 3 || !seen[0].Present {
+		t.Errorf("judge saw %+v", seen)
+	}
+	if len(e.takeovers) != 0 {
+		t.Errorf("a refused acquire reported a takeover: %+v", e.takeovers)
+	}
+
+	// A holder file naming this node is the item's own rule, and a missing
+	// file is not a holder: neither reaches the judge.
+	seen = nil
+	e2 := newEnv(t)
+	e2.judge = e.judge
+	e2.judge = func(_ string, info holder.Info) holder.Judgement {
+		t.Errorf("judge consulted for %+v", info)
+		return holder.Judgement{}
+	}
+	e2.mustConverge()
+	if len(e2.takeovers) != 0 {
+		t.Errorf("a plain acquire reported a takeover: %+v", e2.takeovers)
+	}
+}
+
+// A fenced own ownership is re-taken by the item's own rule and is not an
+// abandonment of anyone.
+func TestSelfFencedTakeoverIsNotReported(t *testing.T) {
+	e := newEnv(t)
+	e.holderAt(testNode, 2)
+	e.curName = "5.1"
+	e.judge = func(string, holder.Info) holder.Judgement {
+		t.Error("the reconciler's judge was consulted")
+		return holder.Judgement{}
+	}
+	_, err := e.it.acquire(bg, e.v, current{name: "5.1", ok: true, epoch: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.takeovers) != 0 {
+		t.Errorf("takeovers reported = %+v", e.takeovers)
 	}
 }
 

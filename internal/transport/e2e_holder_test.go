@@ -61,20 +61,14 @@ func TestE2ENFS3HolderTwoClients(t *testing.T) {
 
 	// The second client sees the first's file and is refused.
 	info, err := holder.Read(ctx, dirs[1], vol)
-	if err != nil || !info.Present || info.Node != "kind-worker" || info.Renewals != 1 {
+	if err != nil || !info.Present || info.Node != "kind-worker" {
 		t.Fatalf("Read through the second mount = %+v, %v", info, err)
 	}
 	t.Logf("age on the server's clock: %s", info.Age)
 	if info.Age > 30*time.Second {
 		t.Errorf("a holder renewed just now is %s old on the server's clock", info.Age)
 	}
-	live, err := holder.Judge(info, holder.NodeState{Ready: true, InUse: true}, 5*time.Minute, holder.Observation{})
-	if err != nil {
-		t.Fatalf("Judge: %v", err)
-	}
-	if live.Takeover {
-		t.Fatalf("a live holder was judged stale: %s", live.Reason)
-	}
+	live := holder.Judgement{Reason: "no emergency detach", Info: info}
 	if _, err := holder.Acquire(ctx, dirs[1], vol, "kind-worker2", live); !errors.Is(err, holder.ErrHeld) {
 		t.Fatalf("second Acquire = %v, want ErrHeld", err)
 	}
@@ -82,16 +76,9 @@ func TestE2ENFS3HolderTwoClients(t *testing.T) {
 		t.Fatalf("first Mine = %v, %v", ok, err)
 	}
 
-	// The first stops renewing; the judgement says stale (the node is gone
-	// from the cluster: the out-of-service taint stands in for the timed
-	// conditions, whose clocks the unit tests drive).
-	stale, err := holder.Judge(info, holder.NodeState{OutOfService: true}, 5*time.Minute, holder.Observation{})
-	if err != nil {
-		t.Fatalf("Judge: %v", err)
-	}
-	if !stale.Takeover {
-		t.Fatalf("out-of-service holder not judged stale: %s", stale.Reason)
-	}
+	// An operator abandons the first holder (the emergency detach); the
+	// judgement is the reconciler's, whose rules its own tests drive.
+	stale := holder.Judgement{Takeover: true, Reason: "emergency detach", Info: info}
 	second, err := holder.Acquire(ctx, dirs[1], vol, "kind-worker2", stale)
 	if err != nil {
 		t.Fatalf("takeover: %v", err)

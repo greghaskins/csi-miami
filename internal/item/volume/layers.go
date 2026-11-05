@@ -174,10 +174,13 @@ func (it *Item) acquire(ctx context.Context, v vol, cur current) (*holder.Holder
 		}
 		// The file vanished between the read and the adoption: acquire it.
 	}
-	j := it.judge(v, info, cur)
+	j := it.judge(ctx, v, info, cur)
 	h, err := it.cfg.Holder.Acquire(ctx, v.holdDir, v.name, it.cfg.Node, j)
 	switch {
 	case err == nil:
+		if j.Takeover && j.Info.Present && j.Info.Node != it.cfg.Node && it.cfg.Takeover != nil {
+			it.cfg.Takeover(v.in.VolumeID, j)
+		}
 		return h, nil
 	case errors.Is(err, holder.ErrHeld):
 		return nil, fmt.Errorf("volume item %s: %w: %w (%s)", v.in.VolumeID, item.ErrHolderContended, err, j.Reason)
@@ -185,19 +188,21 @@ func (it *Item) acquire(ctx context.Context, v vol, cur current) (*holder.Holder
 	return nil, fmt.Errorf("volume item %s: acquiring the holder file: %w", v.in.VolumeID, err)
 }
 
-// judge is Config.Judge with this item's one rule on top: a holder file that
-// names this node at an epoch older than the store's `current` is a fenced
-// ownership of our own (another node took the volume over, published, and our
-// late renewal put our older claim back), and the only way out is to take our
-// own file over, at an epoch above everything claimed. The reconciler's judge
-// says no to a node's own Ready, in-use holder, so the rule lives here.
-func (it *Item) judge(v vol, info holder.Info, cur current) holder.Judgement {
+// judge decides whether the holder found may be replaced. This item's one rule
+// comes first: a holder file that names this node at an epoch older than the
+// store's `current` is a fenced ownership of our own (another node took the
+// volume over and published, and a late renewal put our older claim back), and
+// the only way out is to take our own file over, at an epoch above everything
+// claimed. Otherwise only a holder that names another node is put to
+// Config.Judge; a holder that names this node and is not fenced is adopted
+// before this is reached, and a missing file needs no judgement.
+func (it *Item) judge(ctx context.Context, v vol, info holder.Info, cur current) holder.Judgement {
 	if info.Present && info.Node == it.cfg.Node && cur.ok && cur.epoch > info.Epoch {
 		return holder.Judgement{Takeover: true, Reason: fencedReason, Info: info}
 	}
 	var j holder.Judgement
-	if it.cfg.Judge != nil {
-		j = it.cfg.Judge(v.in.VolumeID)
+	if it.cfg.Judge != nil && info.Present && info.Node != it.cfg.Node {
+		j = it.cfg.Judge(ctx, v.in.VolumeID, info)
 	}
 	if j.Takeover && !j.Info.Present {
 		j.Info = info
@@ -216,6 +221,9 @@ func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*h
 	// data and removes it, reporting any unpublished chunks, if not.
 	if err := it.stopStack(ctx, v, st); err != nil {
 		return nil, err
+	}
+	if st.h != nil {
+		_ = st.h.Close()
 	}
 	st.h = nil
 	h, err := it.acquire(ctx, v, cur)
@@ -410,6 +418,11 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 // mount above are never touched. Only a start with no device in the kernel
 // decides what to do with a node-local cache.
 func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.Holder, cur current) (nbd.Device, error) {
+	// A cache never exists without the record that lets a node with no intent
+	// find the volume again (see Orphans); a server is not started without it.
+	if err := it.saveDrainRecord(v); err != nil {
+		return nbd.Device{}, fmt.Errorf("volume item %s: %w: writing the drain record: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
 	us, err := it.cfg.Systemd.State(ctx, v.unit)
 	if err != nil {
 		return nbd.Device{}, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)

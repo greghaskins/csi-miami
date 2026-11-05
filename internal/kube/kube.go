@@ -13,6 +13,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 // ErrNotFound is wrapped by the error GetPV returns when the API server
@@ -46,7 +48,7 @@ type PV struct {
 // (decision 52). Its value is "<node>@<epoch>", naming the holder whose
 // unsynced data the operator gives up; it takes effect only when it equals the
 // holder file's node and epoch exactly, and is ignored otherwise.
-const AnnotationForceDetach = "miami.csi.greghaskins.com/force-detach"
+const AnnotationForceDetach = volume.ForceDetachAnnotation
 
 // PVReader reads PersistentVolumes by name.
 type PVReader interface {
@@ -62,6 +64,7 @@ var pvResource = schema.GroupVersionResource{Version: "v1", Resource: "persisten
 // Client is a PVReader that asks the API server directly.
 type Client struct {
 	pvs      dynamic.NamespaceableResourceInterface
+	nodes    dynamic.NamespaceableResourceInterface
 	deadline time.Duration
 }
 
@@ -118,7 +121,7 @@ func NewClient(cfg *rest.Config, deadline time.Duration) (*Client, error) {
 	if deadline <= 0 {
 		deadline = DefaultDeadline
 	}
-	return &Client{pvs: dyn.Resource(pvResource), deadline: deadline}, nil
+	return &Client{pvs: dyn.Resource(pvResource), nodes: dyn.Resource(nodeResource), deadline: deadline}, nil
 }
 
 // GetPV implements PVReader with one GET under the client's deadline.
@@ -205,14 +208,17 @@ func unexpectedResponse(status metav1.Status) bool {
 // itself wrote about the PV called name: details naming the resource
 // persistentvolumes and that name, and not client-go's stand-in for a response
 // that was not a Status.
-func isPVNotFound(err error, name string) bool {
+func isPVNotFound(err error, name string) bool { return isNotFoundOf(err, "persistentvolumes", name) }
+
+// isNotFoundOf is isPVNotFound for any resource.
+func isNotFoundOf(err error, resource, name string) bool {
 	var st apierrors.APIStatus
 	if !errors.As(err, &st) {
 		return false
 	}
 	status := st.Status()
 	d := status.Details
-	return d != nil && d.Kind == "persistentvolumes" && d.Name == name && !unexpectedResponse(status)
+	return d != nil && d.Kind == resource && d.Name == name && !unexpectedResponse(status)
 }
 
 // decodePV reads the fields of PV out of the object. A field of the wrong

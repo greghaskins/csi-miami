@@ -171,7 +171,7 @@ func TestDeleteVolumeRefusesAnyHolder(t *testing.T) {
 		age  time.Duration
 	}{
 		{"fresh holder", 0},
-		{"old holder", 100 * volume.DefaultTakeoverTimeout},
+		{"old holder", 100 * 5 * time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

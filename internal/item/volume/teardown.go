@@ -85,6 +85,9 @@ func (it *Item) Teardown(ctx context.Context, in intent.Intent, _ item.Observed)
 	if err := it.discardCache(v, "the volume is unstaged"); err != nil {
 		return err
 	}
+	if err := it.removeDrainRecord(v); err != nil {
+		return err
+	}
 	it.release(ctx, v, st)
 	st.fz.Lock()
 	st.gone = true

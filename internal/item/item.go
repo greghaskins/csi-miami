@@ -248,3 +248,19 @@ func UnmountIf(ctx context.Context, m mount.Mounter, mountPoint string, owned Ow
 	}
 	return nil
 }
+
+// Drainer is implemented by an item kind whose node-local state can outlive
+// its intent record: a crash, then the volume's pod moves, leaves a cache that
+// holds writes no one else has. The reconciler drains such a volume itself
+// (decision 52), because the holder file keeps every other node off it.
+//
+// Orphans lists the intents the kind recorded for volumes with surviving
+// node-local state; the reconciler drops those that have an intent record
+// and calls Drain, with the volume's transport mounted, for the rest. Drain
+// either finishes the volume (nil), leaves it exactly as it is and says why
+// (an error, to be retried), or finds it is not this node's to drain (nil with
+// nothing touched). Both run on the reconciler's loop.
+type Drainer interface {
+	Orphans(ctx context.Context) ([]intent.Intent, error)
+	Drain(ctx context.Context, in intent.Intent) error
+}

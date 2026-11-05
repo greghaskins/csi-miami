@@ -118,14 +118,34 @@ func TestVolumeKindNeedsVolumeParams(t *testing.T) {
 	}
 }
 
-func TestVolumeIntentKeepsTheTakeoverTimeout(t *testing.T) {
+// A record written before decision 52 carries a takeoverTimeout; it still
+// loads, and rewriting it drops the key.
+func TestVolumeIntentWithALegacyTakeoverTimeoutLoads(t *testing.T) {
 	t.Parallel()
-	s, _ := openStore(t)
+	s, dir := openStore(t)
 	in := volumeIntent()
-	in.Volume.TakeoverTimeout = 30 * time.Minute
 	mustSave(t, s, in)
-	got, ok, err := s.Get(in.VolumeID)
-	if err != nil || !ok || got.Volume.TakeoverTimeout != 30*time.Minute {
-		t.Errorf("Get = %+v, %v, %v", got.Volume, ok, err)
+	path := s.Path(in.VolumeID)
+	b, err := os.ReadFile(path) //nolint:gosec // the test store's own file
+	if err != nil {
+		t.Fatal(err)
 	}
+	patched := strings.Replace(string(b), `"keep": 3,`, `"keep": 3,
+      "takeoverTimeout": 1800000000000,`, 1)
+	if patched == string(b) {
+		t.Fatalf("the record has no keep field to patch:\n%s", b)
+	}
+	if err := os.WriteFile(path, []byte(patched), 0o600); err != nil { //nolint:gosec // the test store's own file
+		t.Fatal(err)
+	}
+	got, ok, err := s.Get(in.VolumeID)
+	if err != nil || !ok || got.Volume == nil || got.Volume.Size != in.Volume.Size {
+		t.Fatalf("Get = %+v, %v, %v", got.Volume, ok, err)
+	}
+	mustSave(t, s, got)
+	rewritten, _ := os.ReadFile(path) //nolint:gosec // the test store's own file
+	if strings.Contains(string(rewritten), "takeoverTimeout") {
+		t.Error("a rewrite kept the legacy key")
+	}
+	_ = dir
 }
