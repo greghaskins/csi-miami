@@ -29,7 +29,7 @@ func TestVolumeNASOutageNoHungTask(t *testing.T) {
 	class := e.volumeClass(t, volumeClassEncrypted)
 
 	n.createVolumePVC(t, class, "data", "1Gi")
-	n.createPod(t, podSpec{Name: "writer", Claim: "data", Node: node, Run: loop})
+	n.createPod(t, podSpec{Name: "writer", Claim: "data", Node: node, Run: fsyncLoop})
 	pod := n.waitPodReady(t, "writer", "")
 	vol := n.volumeVol(t, "data")
 	e.waitVolumeStack(t, node, vol, pod.UID)
@@ -38,6 +38,14 @@ func TestVolumeNASOutageNoHungTask(t *testing.T) {
 	cur0 := e.waitStoreCurrent(t, vol, "", "the first generation (current)")
 	n.waitLog(t, "writer", "ten writes", func(l string) bool { return lastWrote(l) >= 10 })
 
+	// The detector must be able to see the hang this test is about.
+	hung, err := readHungTask()
+	if err != nil {
+		t.Fatalf("reading the hung-task detector's settings: %v", err)
+	}
+	if hung.Timeout <= 0 || hung.Warnings == 0 || hung.Interval <= 0 {
+		t.Fatalf("the hung-task detector is off or mute (timeout %d s, check interval %d s, warnings %d): the test would pass blind", hung.Timeout, hung.Interval, hung.Warnings)
+	}
 	logBefore, err := kernelLog()
 	if err != nil {
 		t.Fatal(err)
@@ -57,14 +65,19 @@ func TestVolumeNASOutageNoHungTask(t *testing.T) {
 	})
 	ctx, cancel := e.withDeadline()
 	readyBefore, readyErr := e.nfsServerReadyCount(ctx)
+	// The generation current names just before the outage: the generations that
+	// resume after it must be newer than this one.
+	curBefore, curErr := e.currentID(ctx, vol)
 	err = e.stopNFSServer(ctx)
 	cancel()
-	if readyErr != nil || err != nil {
-		t.Fatalf("stopping the NFS server: %v %v", readyErr, err)
+	if readyErr != nil || err != nil || curErr != nil {
+		t.Fatalf("stopping the NFS server: %v %v %v", readyErr, err, curErr)
 	}
 	stopped := time.Now()
-	hold := majorTimeout + 35*time.Second
-	t.Logf("the NFS server is stopped; holding it down for %s (major timeout %s plus 30 s, and a margin)", hold, majorTimeout)
+	// Long enough for a call stuck on the dead server to be reported: the major
+	// timeout, then the detector's threshold, then one more check.
+	hold := majorTimeout + time.Duration(hung.Timeout+hung.Interval+20)*time.Second
+	t.Logf("the NFS server is stopped; holding it down for %s (major timeout %s plus the detector's %d s threshold and %d s check interval, and a margin); current %+v", hold, majorTimeout, hung.Timeout, hung.Interval, curBefore)
 
 	// Sample the writer's progress through the outage: every window of 20
 	// seconds must show new lines, and no write may have been reported to fail
@@ -101,26 +114,38 @@ func TestVolumeNASOutageNoHungTask(t *testing.T) {
 
 	// Generations resume: current moves to a manifest that is newer than the
 	// one before the outage, while the writer goes on.
-	cur1 := e.waitStoreCurrent(t, vol, cur0, "a generation after the outage to move current")
+	var cur1 manifestID
+	e.waitFor(t, fmt.Sprintf("a generation after the outage: current newer than %+v, which it named when the server stopped", curBefore), func(ctx context.Context) (string, bool, error) {
+		c, err := e.currentID(ctx, vol)
+		cur1 = c
+		return fmt.Sprintf("current %+v", c), err == nil && c.after(curBefore), err
+	})
 	n.waitLog(t, "writer", "writes after the server came back", func(l string) bool { return lastWrote(l) >= last+5 })
 
 	logAfter, err := kernelLog()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var hung []string
+	var stuck []string
 	for _, l := range newKernelLines(logBefore, logAfter) {
 		if strings.Contains(l, "blocked for more than") {
-			hung = append(hung, l)
+			stuck = append(stuck, l)
 		}
 	}
-	if len(hung) > 0 {
-		t.Errorf("the kernel reported %d hung tasks during the outage:\n%s", len(hung), strings.Join(hung, "\n"))
+	if len(stuck) > 0 {
+		t.Errorf("the kernel reported %d hung tasks during the outage:\n%s", len(stuck), strings.Join(stuck, "\n"))
 	}
 
+	// Read back from the device, not from memory.
+	ctx, cancel = e.withDeadline()
+	err = dropCaches(ctx, node)
+	cancel()
+	if err != nil {
+		t.Fatalf("dropping the page cache: %v", err)
+	}
 	got := n.runOnce(t, "data", node, "cat /data/loop.log")
 	if err := checkSequence(got, last+5); err != nil {
 		t.Errorf("after the outage: %v", err)
 	}
-	t.Logf("outage of %s: no hung task in the kernel log; writes continued to line %d; current %q -> %q", time.Since(stopped).Round(time.Second), last, cur0, cur1)
+	t.Logf("outage of %s: no hung task in the kernel log (detector: %d s threshold, %d s interval); writes continued to line %d; current %+v -> %+v (it was %q at the first generation)", time.Since(stopped).Round(time.Second), hung.Timeout, hung.Interval, last, curBefore, cur1, cur0)
 }

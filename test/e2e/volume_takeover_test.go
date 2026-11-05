@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -13,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -39,6 +39,12 @@ func TestVolumeTakeover(t *testing.T) {
 	for _, mode := range []string{"out-of-service-taint", "force-detach-annotation"} {
 		t.Run(mode, func(t *testing.T) { takeover(t, e, mode) })
 	}
+	t.Run("old-node-unstage-discards", func(t *testing.T) {
+		t.Skip("not exercisable on kind: the nodes share one kernel, where the volume's device-mapper name and nbd device " +
+			"are single objects, so the old node's unstage cannot close the mapping the new holder is using (EBUSY). " +
+			"A cluster with two kernels is where criterion 6's old-node cleanup (refuses to publish, unstage succeeds " +
+			"and discards) runs in full; the volume item's fenced-unstage tests cover it here.")
+	})
 }
 
 func takeover(t *testing.T, e *env, mode string) {
@@ -57,6 +63,7 @@ func takeover(t *testing.T, e *env, mode string) {
 
 	// A generation, so that there is something to mount from on the other node.
 	cur0 := e.waitStoreCurrent(t, vol, "", "the first generation (current)")
+	cur0ID, _ := parseManifest(cur0)
 	ctx, cancel := e.withDeadline()
 	held, err := e.holder(ctx, vol)
 	cancel()
@@ -74,10 +81,7 @@ func takeover(t *testing.T, e *env, mode string) {
 	// (downTheNode also deletes the VolumeAttachment: that stands in for the attach-detach controller's six-minute forced detach, or the out-of-service taint's immediate one. It is cluster behaviour, not something the driver does.)
 	n.downTheNode(t, a, "a", vol)
 	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
-	e.waitFor(t, fmt.Sprintf("the node plugin on %s to report holder-contended for the waiting pod", b), func(ctx context.Context) (string, bool, error) {
-		v, err := e.volumeCondition(ctx, b, reconcile.ConditionHolderContended)
-		return fmt.Sprintf("%s=%v", reconcile.ConditionHolderContended, v), v >= 1, err
-	})
+	n.waitHolderContended(t, "b", vol)
 	deadline := time.Now().Add(holdWait)
 	for time.Now().Before(deadline) {
 		ctx, cancel := e.withDeadline()
@@ -157,7 +161,9 @@ func takeover(t *testing.T, e *env, mode string) {
 		e.clearOutOfService(t, a)
 	}
 	e.pluginOn(t, a)
-	// The fenced node's side is watched, not waited for: the kind nodes share
+	// A cluster with two kernels is where criterion 6's old-node cleanup runs in
+	// full (see the skipped subtest). The fenced node's side is watched, not
+	// waited for: the kind nodes share
 	// one kernel, and a device-mapper name and an nbd device are one object in
 	// it. The old node's unstage of the volume (which the fence turns into a
 	// discard that succeeds, covered by the volume item's tests) closes the
@@ -167,6 +173,19 @@ func takeover(t *testing.T, e *env, mode string) {
 	// nothing of the new holder's: the holder file, the pod, and the data.
 	for end := time.Now().Add(holdWait); time.Now().Before(end); time.Sleep(5 * time.Second) {
 		ctx, cancel := e.withDeadline()
+		ms, merr := e.manifests(ctx, vol)
+		if merr != nil {
+			cancel()
+			t.Fatalf("listing the manifests: %v", merr)
+		}
+		// The fenced node publishes nothing: no manifest of its epoch appears
+		// beyond the last one it published before the crash.
+		for _, m := range ms {
+			if m.Epoch == held.Epoch && m.after(cur0ID) {
+				cancel()
+				t.Fatalf("manifest %d.%d, of the old holder's epoch, appeared after its last generation %d.%d: the fenced node published", m.Epoch, m.Seq, cur0ID.Epoch, cur0ID.Seq)
+			}
+		}
 		h, herr := e.holder(ctx, vol)
 		p, perr := e.Client.CoreV1().Pods(n.Name).Get(ctx, "b", metav1.GetOptions{})
 		cancel()
@@ -196,13 +215,19 @@ func takeover(t *testing.T, e *env, mode string) {
 }
 
 // Exit criterion 6a (decision 52): a holder node whose pod moved while it was
-// down returns and drains the volume on its own. The holder's plugin is
-// stopped and its pod deleted; the pod recreated on the other worker waits
-// holder-contended. The holder node is then restarted (every mount and process
-// in it is gone, the cache is not) and loses its record of the volume: the
-// state a node comes back in "after a crash, then the pod moved". When its
-// plugin returns it publishes its dirty chunks, verifies, releases, and the
-// waiting pod mounts with them.
+// down returns and releases the volume on its own, with no operator act. The
+// holder's plugin is kept off, its pod deleted and the node restarted (every
+// mount and process in it is gone, the cache and the node's record of the
+// volume are not: a real crash and reboot keeps both under /var/lib/kubelet);
+// the pod recreated on the other worker waits holder-contended. When the
+// holder's plugin returns, the kubelet's reconstruction and the reconciler
+// publish its dirty chunks, verify, release, and the waiting pod mounts with
+// them. If the driver did not release the volume in this case it is a product
+// question, and this test fails on the waiting pod.
+//
+// Unlike TestVolumeTakeover, the holder's plugin returns BEFORE any operator
+// act, and nothing is taken over: the waiting pod gets the volume because the
+// holder let go of it.
 func TestVolumeOrphanDrain(t *testing.T) {
 	e := loadEnv(t)
 	e.needVolumeKind(t)
@@ -212,43 +237,52 @@ func TestVolumeOrphanDrain(t *testing.T) {
 	long := n.with(takeoverWait)
 
 	n.createVolumePVC(t, class, "data", "1Gi")
-	n.createPod(t, podSpec{Name: "a", Claim: "data", Node: a, Run: syncLoop})
+	n.createPod(t, podSpec{Name: "a", Claim: "data", Node: a, Run: fsyncLoop})
 	podA := n.waitPodReady(t, "a", "")
 	vol := n.volumeVol(t, "data")
 	e.waitVolumeStack(t, a, vol, podA.UID)
 
-	// A generation, then synced writes that only the cache holds.
+	// A generation, then synced writes that only the cache holds: five more
+	// than the generation had.
 	cur0 := e.waitStoreCurrent(t, vol, "", "the first generation (current)")
-	n.waitLog(t, "a", "ten synced writes", func(l string) bool { return lastWrote(l) >= 10 })
+	cur0ID, _ := parseManifest(cur0)
 	ctx, cancel := e.withDeadline()
-	log, err := e.logs(ctx, n.Name, "a")
-	held, herr := e.holder(ctx, vol)
-	cancel()
-	if err != nil || herr != nil {
-		t.Fatalf("reading the writer and the holder: %v %v", err, herr)
-	}
-	synced := lastWrote(log)
-	t.Logf("%s is held by %s; current %q; %d lines synced", vol.PV, held, cur0, synced)
-
-	// The holder node goes down and forgets the volume: its record of it is
-	// gone, its cache is not.
-	// (downTheNode also deletes the VolumeAttachment: that stands in for the attach-detach controller's six-minute forced detach, or the out-of-service taint's immediate one. It is cluster behaviour, not something the driver does.)
-	n.downTheNode(t, a, "a", vol)
-	ctx, cancel = e.withDeadline()
-	_, err = nodeExec(ctx, a, "rm", "-f", intentPath(vol.ID))
-	hasCache, cacheErr := nodeDirExists(ctx, a, cachePath(vol.PV))
-	cancel()
-	if err != nil || cacheErr != nil {
-		t.Fatalf("removing the intent record on %s: %v %v", a, err, cacheErr)
-	}
-	if !hasCache {
-		t.Fatalf("the cache of %s is gone from %s after the restart; there is nothing to drain", vol.PV, a)
-	}
-	ctx, cancel = e.withDeadline()
-	pending, err := e.holder(ctx, vol)
+	log0, err := e.logs(ctx, n.Name, "a")
 	cancel()
 	if err != nil {
 		t.Fatal(err)
+	}
+	atGeneration := lastWrote(log0)
+	var synced int
+	n.waitLog(t, "a", "five synced writes after the generation", func(l string) bool {
+		synced = lastWrote(l)
+		return synced >= atGeneration+5
+	})
+	ctx, cancel = e.withDeadline()
+	held, herr := e.holder(ctx, vol)
+	cancel()
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	t.Logf("%s is held by %s; current %q; %d lines synced, %d at the generation", vol.PV, held, cur0, synced, atGeneration)
+
+	// The holder node goes down under the volume with its plugin off and its
+	// record of the volume kept.
+	// (downTheNode also deletes the VolumeAttachment: that stands in for the attach-detach controller's six-minute forced detach, or the out-of-service taint's immediate one. It is cluster behaviour, not something the driver does.)
+	n.downTheNode(t, a, "a", vol)
+	ctx, cancel = e.withDeadline()
+	hasCache, cacheErr := nodeDirExists(ctx, a, cachePath(vol.PV))
+	hasIntent, intentErr := existsOn(ctx, func(argv ...string) (string, error) { return nodeExec(ctx, a, argv...) }, "-f", intentPath(vol.ID))
+	pending, holdErr := e.holder(ctx, vol)
+	cancel()
+	if cacheErr != nil || holdErr != nil || intentErr != nil {
+		t.Fatalf("reading %s after the restart: %v %v %v", a, cacheErr, holdErr, intentErr)
+	}
+	if !hasIntent {
+		t.Fatalf("the intent record of %s is gone from %s after the restart; a real crash keeps it", vol.PV, a)
+	}
+	if !hasCache {
+		t.Fatalf("the cache of %s is gone from %s after the restart; there is nothing to drain", vol.PV, a)
 	}
 	if pending != held {
 		t.Fatalf("the holder of %s is %s while its node restarted, want %s: no one may take it", vol.PV, pending, held)
@@ -256,32 +290,51 @@ func TestVolumeOrphanDrain(t *testing.T) {
 
 	// The pod on the other worker reaches the driver and waits.
 	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
-	e.waitFor(t, fmt.Sprintf("the node plugin on %s to report holder-contended for the waiting pod", b), func(ctx context.Context) (string, bool, error) {
-		v, err := e.volumeCondition(ctx, b, reconcile.ConditionHolderContended)
-		return fmt.Sprintf("%s=%v", reconcile.ConditionHolderContended, v), v >= 1, err
-	})
+	n.waitHolderContended(t, "b", vol)
 
-	// Its plugin returns and drains.
+	// Its plugin returns; no operator acts.
 	e.pluginOn(t, a)
 	podB := long.waitPodReady(t, "b", "")
 	t.Logf("pod b is Ready on %s", b)
 	got := n.runOnce(t, "data", b, "cat /data/loop.log")
 	if err := checkSequence(got, synced); err != nil {
-		t.Errorf("on %s after %s drained %s: %v", b, a, vol.PV, err)
+		t.Errorf("on %s after %s released %s: %v", b, a, vol.PV, err)
 	}
 	ctx, cancel = e.withDeadline()
 	now, err := e.holder(ctx, vol)
+	ms, msErr := e.manifests(ctx, vol)
+	lost, lostErr := e.pvEvents(ctx, vol.PV, kube.ReasonGenerationLost)
+	detach, detachErr := e.pvEvents(ctx, vol.PV, reconcile.ReasonEmergencyDetach)
 	cancel()
-	if err != nil {
-		t.Fatal(err)
+	for _, err := range []error{err, msErr, lostErr, detachErr} {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if !now.Present || now.Node != b || now.Epoch <= held.Epoch {
-		t.Errorf("after the drain the holder is %s, want %s at an epoch above %d", now, b, held.Epoch)
+		t.Errorf("after the release the holder is %s, want %s at an epoch above %d", now, b, held.Epoch)
 	}
-	// The old holder released its volume; its nbd device is not checked,
+	// The old holder published what only its cache had, under its own epoch,
+	// before it let go; nothing was discarded; and nothing was taken over.
+	published := false
+	for _, m := range ms {
+		if m.Epoch == held.Epoch && m.after(cur0ID) {
+			published = true
+		}
+	}
+	if !published {
+		t.Errorf("no manifest of the old holder's epoch %d newer than its first generation %d.%d: it released without publishing the dirty chunks (manifests %v)", held.Epoch, cur0ID.Epoch, cur0ID.Seq, ms)
+	}
+	if len(lost) != 0 {
+		t.Errorf("%d GenerationLost events on %s: the old holder discarded unpublished writes: %s", len(lost), vol.PV, lost[0].Message)
+	}
+	if len(detach) != 0 {
+		t.Errorf("%d EmergencyDetach events on %s: the volume was taken over, not released", len(detach), vol.PV)
+	}
+	// The old holder kept nothing of its own; its nbd device is not checked,
 	// since the new holder's device carries the same backend name in the
 	// kernel the nodes share.
 	e.waitVolumeGoneExceptDevice(t, a, vol)
 	e.waitVolumeStack(t, b, vol, podB.UID)
-	t.Logf("%s drained %s; pod b on %s found %d lines (%d were synced on the holder)", a, vol.PV, b, len(strings.Fields(got)), synced)
+	t.Logf("%s released %s; pod b on %s found %d lines (%d were synced on the holder)", a, vol.PV, b, len(strings.Fields(got)), synced)
 }

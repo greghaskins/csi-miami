@@ -117,6 +117,13 @@ if [ "$transport" = nfs3 ]; then
       exit 1
     fi
   done
+  # The hung-task detector is what the NAS outage test reads: it must be on,
+  # report every stuck task, and check often enough to see one within the
+  # outage. The threshold stays at the kernel's usual 120 seconds.
+  if ! sysctl -w kernel.hung_task_timeout_secs=120 kernel.hung_task_check_interval_secs=10 kernel.hung_task_warnings=-1; then
+    echo "e2e: the runner's kernel has no hung-task detector; the NAS outage test would be blind" >&2
+    exit 1
+  fi
   go build -o "$kind_work/miami" ./cmd/miami
 fi
 
@@ -227,6 +234,13 @@ done
 for name in "${volume_tests[@]}"; do
   if ! grep -Eq "^--- PASS: ${name} " "$log"; then
     echo "e2e: ${name} did not pass" >&2
+    exit 1
+  fi
+done
+# Both modes of the takeover test, not only the parent.
+for sub in out-of-service-taint force-detach-annotation; do
+  if [ "${#volume_tests[@]}" -gt 0 ] && ! grep -Eq "^    --- PASS: TestVolumeTakeover/${sub} " "$log"; then
+    echo "e2e: TestVolumeTakeover/${sub} did not pass" >&2
     exit 1
   fi
 done

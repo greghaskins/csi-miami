@@ -48,7 +48,7 @@ func TestVolumeExpandOnline(t *testing.T) {
 	n.createPod(t, podSpec{Name: "watcher", Claim: "data", Node: node, Run: sizeLoop})
 	pod := n.waitPodReady(t, "watcher", "")
 	vol := n.volumeVol(t, "data")
-	e.waitVolumeStack(t, node, vol, pod.UID)
+	stackBefore := e.waitVolumeStack(t, node, vol, pod.UID)
 	log := n.waitLog(t, "watcher", "a size", func(l string) bool { return lastSize(l) > 0 })
 	before := lastSize(log)
 	if before < 800*1024 || before > 1024*1024 {
@@ -82,6 +82,11 @@ func TestVolumeExpandOnline(t *testing.T) {
 	})
 
 	same := e.waitVolumeStack(t, node, vol, pod.UID)
+	// Grown in place: the same device, the same block server and the same
+	// mounts, not a restage.
+	if same != stackBefore {
+		t.Errorf("the stack changed across the expansion: before %+v, after %+v", stackBefore, same)
+	}
 	ctx, cancel = e.withDeadline()
 	cur, err := e.Client.CoreV1().Pods(n.Name).Get(ctx, "watcher", metav1.GetOptions{})
 	cancel()

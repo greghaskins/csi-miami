@@ -546,8 +546,13 @@ func (e *env) rebootNode(t *testing.T, node string, pvs ...string) {
 	}
 	k := nbd.Real("/sys")
 	for _, pv := range pvs {
-		if out, err := run(ctx, "cryptsetup", "close", "miami-"+pv); err != nil {
-			t.Logf("removing the mapping of %s from the kernel (it may be gone already): %v: %s", pv, err, out)
+		// The mapping must go unless it is gone already (cryptsetup status
+		// fails for a name that is not active): a close that fails on a live
+		// mapping would leave the stale kernel state this exists to remove.
+		if _, err := run(ctx, "cryptsetup", "status", "miami-"+pv); err == nil {
+			if out, err := run(ctx, "cryptsetup", "close", "miami-"+pv); err != nil {
+				t.Fatalf("removing the mapping of %s from the kernel: %v: %s", pv, err, out)
+			}
 		}
 		devs, err := k.Devices()
 		if err != nil {
@@ -981,4 +986,131 @@ func (e *env) checkStoreLayout(t *testing.T, vol volumeInfo) {
 		}
 	}
 	t.Logf("the directory of %s holds %d chunks (every one named by its SHA-256, %d wrong), %d manifests and current", vol.PV, chunks, bad, manifests)
+}
+
+// fsyncLoop writes the next number to /data/loop.log every second, and prints
+// "wrote N" once that write has reached the device: it fsyncs the file (and
+// nothing else: a node-wide sync would wait on the transport, which an outage
+// test holds down).
+const fsyncLoop = `i=0
+if [ -f /data/loop.log ]; then i=$(wc -l < /data/loop.log); fi
+touch /tmp/ready
+while true; do
+  i=$((i+1))
+  if echo $i | dd of=/data/loop.log oflag=append conv=notrunc,fsync bs=16 2>/dev/null; then echo "wrote $i"; fi
+  sleep 1
+done
+`
+
+// boundedLoop is fsyncLoop that stops at 40 lines: a pod whose last line is
+// known, which then waits.
+const boundedLoop = `i=0
+if [ -f /data/loop.log ]; then i=$(wc -l < /data/loop.log); fi
+while [ $i -lt 40 ]; do
+  i=$((i+1))
+  echo $i | dd of=/data/loop.log oflag=append conv=notrunc,fsync bs=16 2>/dev/null && echo "wrote $i"
+  sleep 1
+done
+echo "bounded done"
+touch /tmp/ready
+exec sleep 36000
+`
+
+// dropCaches empties the page cache of the node's kernel (shared with the
+// runner), after a sync of the one volume's files, so that what a later read
+// returns came from the device and not from memory.
+func dropCaches(ctx context.Context, node string) error {
+	_, err := nodeExec(ctx, node, "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches")
+	return err
+}
+
+// manifestID is a manifest's name, <epoch>.<sequence>.
+type manifestID struct{ Epoch, Seq uint64 }
+
+func parseManifest(name string) (manifestID, bool) {
+	e, s, ok := strings.Cut(strings.TrimSpace(name), ".")
+	if !ok {
+		return manifestID{}, false
+	}
+	ev, err1 := strconv.ParseUint(e, 10, 64)
+	sv, err2 := strconv.ParseUint(s, 10, 64)
+	if err1 != nil || err2 != nil {
+		return manifestID{}, false
+	}
+	return manifestID{ev, sv}, true
+}
+
+// after reports whether m was made after o: a higher epoch, or the same epoch
+// and a higher sequence.
+func (m manifestID) after(o manifestID) bool {
+	return m.Epoch > o.Epoch || (m.Epoch == o.Epoch && m.Seq > o.Seq)
+}
+
+// manifests lists the manifests in the volume's directory on the server.
+func (e *env) manifests(ctx context.Context, vol volumeInfo) ([]manifestID, error) {
+	out, err := e.nfsExec(ctx, "ls", vol.itemDir()+"/manifests")
+	if err != nil {
+		return nil, err
+	}
+	var ms []manifestID
+	for _, n := range strings.Fields(out) {
+		if m, ok := parseManifest(n); ok {
+			ms = append(ms, m)
+		}
+	}
+	return ms, nil
+}
+
+// currentID is the manifest `current` names, zero while there is none.
+func (e *env) currentID(ctx context.Context, vol volumeInfo) (manifestID, error) {
+	name, ok, err := e.storeCurrent(ctx, vol)
+	if err != nil || !ok {
+		return manifestID{}, err
+	}
+	m, _ := parseManifest(name)
+	return m, nil
+}
+
+// waitHolderContended waits for the pod's FailedMount events to say that this
+// volume is held by another node: the driver refused the stage because of the
+// holder file, not for another reason or for another volume.
+func (n *testNS) waitHolderContended(t *testing.T, pod string, vol volumeInfo) {
+	t.Helper()
+	n.e.waitFor(t, fmt.Sprintf("pod %s/%s to be refused %s because it is held by another node", n.Name, pod, vol.PV), func(ctx context.Context) (string, bool, error) {
+		evs, err := n.e.Client.CoreV1().Events(n.Name).List(ctx, metav1.ListOptions{FieldSelector: "involvedObject.name=" + pod})
+		if err != nil {
+			return "", false, err
+		}
+		for _, ev := range evs.Items {
+			if ev.Reason == "FailedMount" && strings.Contains(ev.Message, vol.PV) && strings.Contains(ev.Message, "held by") {
+				return tail(ev.Message, 200), true, nil
+			}
+		}
+		return fmt.Sprintf("%d events, none a FailedMount naming %s and its holder", len(evs.Items), vol.PV), false, nil
+	})
+}
+
+// hungTask is the runner's hung-task detector: it must be on, check often and
+// warn without a limit, or a stuck task would not be reported and the outage
+// test would pass blind.
+type hungTask struct{ Timeout, Interval, Warnings int }
+
+func readHungTask() (hungTask, error) {
+	read := func(name string) (int, error) {
+		b, err := os.ReadFile("/proc/sys/kernel/" + name) //nolint:gosec // a fixed proc path
+		if err != nil {
+			return 0, err
+		}
+		return strconv.Atoi(strings.TrimSpace(string(b)))
+	}
+	var h hungTask
+	var err error
+	if h.Timeout, err = read("hung_task_timeout_secs"); err != nil {
+		return h, err
+	}
+	if h.Interval, err = read("hung_task_check_interval_secs"); err != nil {
+		return h, err
+	}
+	h.Warnings, err = read("hung_task_warnings")
+	return h, err
 }

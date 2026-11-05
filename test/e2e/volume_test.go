@@ -215,17 +215,18 @@ func TestVolumeSurvivesReschedule(t *testing.T) {
 	class := e.volumeClass(t, volumeClassEncrypted)
 
 	n.createVolumePVC(t, class, "data", "1Gi")
-	n.createPod(t, podSpec{Name: "a", Claim: "data", Node: a, Run: loop})
+	// The writer stops at line 40, so what the move must carry is known exactly.
+	n.createPod(t, podSpec{Name: "a", Claim: "data", Node: a, Run: boundedLoop})
 	n.waitPodReady(t, "a", "")
 	vol := n.volumeVol(t, "data")
-	n.waitLog(t, "a", "ten writes", func(l string) bool { return lastWrote(l) >= 10 })
+	n.waitLog(t, "a", "all 40 lines written and synced", func(l string) bool { return strings.Contains(l, "bounded done") })
+	const wroteOnA = 40
 
 	ctx, cancel := e.withDeadline()
 	held, err := e.holder(ctx, vol)
-	cur0, had0, curErr := e.storeCurrent(ctx, vol)
-	log, logErr := e.logs(ctx, n.Name, "a")
+	curBefore, curErr := e.currentID(ctx, vol)
 	cancel()
-	for _, err := range []error{err, curErr, logErr} {
+	for _, err := range []error{err, curErr} {
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -233,17 +234,23 @@ func TestVolumeSurvivesReschedule(t *testing.T) {
 	if !held.Present || held.Node != a {
 		t.Fatalf("the holder of %s is %s, want %s", vol.PV, held, a)
 	}
-	wroteOnA := lastWrote(log)
-	t.Logf("pod a on %s has written %d lines; holder %s; current %q (present %v)", a, wroteOnA, held, cur0, had0)
+	t.Logf("pod a on %s has written %d lines; holder %s; current %+v", a, wroteOnA, held, curBefore)
 
 	n.deletePod(t, "a")
 	e.waitVolumeGone(t, a, vol)
-	cur1 := e.waitStoreCurrent(t, vol, cur0, "the final generation to move current")
+	// The final generation: current is newer than any there was before the pod
+	// was deleted.
+	var cur1 manifestID
+	e.waitFor(t, fmt.Sprintf("the final generation: current newer than %+v", curBefore), func(ctx context.Context) (string, bool, error) {
+		c, err := e.currentID(ctx, vol)
+		cur1 = c
+		return fmt.Sprintf("current %+v", c), err == nil && c.after(curBefore), err
+	})
 	e.waitFor(t, "the holder file to be released", func(ctx context.Context) (string, bool, error) {
 		h, err := e.holder(ctx, vol)
 		return h.String(), err == nil && !h.Present, err
 	})
-	t.Logf("after the unstage on %s: current %q, no holder", a, cur1)
+	t.Logf("after the unstage on %s: current %+v, no holder", a, cur1)
 
 	// The store alone holds the whole sequence, and its file system is clean.
 	img := e.restoreImage(t, vol)
@@ -336,7 +343,7 @@ func TestVolumeServerKill(t *testing.T) {
 	class := e.volumeClass(t, volumeClassEncrypted)
 
 	n.createVolumePVC(t, class, "data", "1Gi")
-	n.createPod(t, podSpec{Name: "writer", Claim: "data", Node: node, Run: loop})
+	n.createPod(t, podSpec{Name: "writer", Claim: "data", Node: node, Run: fsyncLoop})
 	pod := n.waitPodReady(t, "writer", "")
 	vol := n.volumeVol(t, "data")
 	before := e.waitVolumeStack(t, node, vol, pod.UID)
@@ -344,8 +351,13 @@ func TestVolumeServerKill(t *testing.T) {
 	wroteBefore := lastWrote(log)
 
 	ctx, cancel := e.withDeadline()
+	unitBefore, unitErr := blockdUnit(ctx, node, vol.PV)
+	startsBefore, startsErr := blockdStarts(ctx, node, vol.PV)
 	_, err := nodeExec(ctx, node, "kill", "-9", fmt.Sprint(before.MainPID))
 	cancel()
+	if unitErr != nil || startsErr != nil {
+		t.Fatalf("reading the unit before the kill: %v %v", unitErr, startsErr)
+	}
 	if err != nil {
 		t.Fatalf("killing the block server (pid %d) on %s: %v", before.MainPID, node, err)
 	}
@@ -373,6 +385,28 @@ func TestVolumeServerKill(t *testing.T) {
 	}
 	if p.UID != pod.UID || containerID(p) != containerID(pod) || p.Status.ContainerStatuses[0].RestartCount != 0 || p.DeletionTimestamp != nil {
 		t.Errorf("the pod was disturbed by the block server's restart: %s", describePod(p))
+	}
+	// Exactly one restart, and by re-pointing the device left in place: not a
+	// new device, and not a second crash.
+	ctx, cancel = e.withDeadline()
+	unitAfter, unitErr := blockdUnit(ctx, node, vol.PV)
+	startsAfter, startsErr := blockdStarts(ctx, node, vol.PV)
+	cancel()
+	if unitErr != nil || startsErr != nil {
+		t.Fatalf("reading the unit after the kill: %v %v", unitErr, startsErr)
+	}
+	if unitAfter.NRestart != unitBefore.NRestart+1 {
+		t.Errorf("the unit restarted %d times (NRestarts %d -> %d), want exactly 1", unitAfter.NRestart-unitBefore.NRestart, unitBefore.NRestart, unitAfter.NRestart)
+	}
+	if len(startsAfter) != len(startsBefore)+1 || !strings.Contains(startsAfter[len(startsAfter)-1], "path=reconfigure") {
+		t.Errorf("the block server's starts: %d before the kill, %d after, the last %q; want one more, with path=reconfigure", len(startsBefore), len(startsAfter), startsAfter)
+	}
+	// Read back from the device, not from memory.
+	ctx, cancel = e.withDeadline()
+	err = dropCaches(ctx, node)
+	cancel()
+	if err != nil {
+		t.Fatalf("dropping the page cache: %v", err)
 	}
 	got := n.runOnce(t, "data", node, "cat /data/loop.log")
 	if err := checkSequence(got, wroteBefore+10); err != nil {
@@ -414,18 +448,20 @@ func TestVolumeNodeRebootReusesCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("placing a file in the cache directory: %v", err)
 	}
-	var wrote int
-	n.waitLog(t, "app", "five synced writes after the first generation", func(l string) bool {
-		wrote = lastWrote(l)
-		return wrote >= 5
-	})
+	// Lines synced after the generation: only the cache holds them, and enough
+	// of them that "published after the restart" means something.
 	ctx, cancel = e.withDeadline()
-	log, err := e.logs(ctx, n.Name, "app")
+	log0, err := e.logs(ctx, n.Name, "app")
 	cancel()
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrote = lastWrote(log)
+	atGeneration := lastWrote(log0)
+	var wrote int
+	n.waitLog(t, "app", "ten synced writes after the first generation", func(l string) bool {
+		wrote = lastWrote(l)
+		return wrote >= atGeneration+10
+	})
 
 	ctx, cancel = e.withDeadline()
 	plugin, err := e.nodePluginPod(ctx, node)
