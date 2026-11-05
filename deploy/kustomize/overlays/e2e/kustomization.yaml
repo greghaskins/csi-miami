@@ -87,3 +87,22 @@ patches:
         value:
           key: miami-e2e/plugin-off
           operator: DoesNotExist
+  # EXPERIMENT: does cryptsetup need a writable /run/cryptsetup (its lock
+  # directory) under the node container's read-only root file system?
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: miami-node
+        namespace: miami-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: miami
+                volumeMounts:
+                  - name: cryptsetup-lock
+                    mountPath: /run/cryptsetup
+            volumes:
+              - name: cryptsetup-lock
+                emptyDir: {}
