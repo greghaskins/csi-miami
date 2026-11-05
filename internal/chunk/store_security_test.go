@@ -491,3 +491,42 @@ func TestManifestAtTheLineCapRoundTrips(t *testing.T) {
 		t.Fatalf("ReadManifest at the cap = %d chunks, %v", len(got.Chunks), err)
 	}
 }
+
+// Prune sweeps stale temporary files out of manifests/ through the directory
+// descriptor: an old one goes (a link is removed as a link), a young one and a
+// real manifest stay.
+func TestPruneSweepsStaleManifestTempFilesThroughTheDescriptor(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v, _, old := victim(t)
+	s := openStore(t)
+	m := writeM(t, s, 1, 1, ZeroHash(mib))
+	dir := filepath.Join(s.root, "manifests")
+	stale, young, staleLink := filepath.Join(dir, ".tmp-1.2-old"), filepath.Join(dir, ".tmp-1.2-young"), filepath.Join(dir, ".tmp-1.3-link")
+	for _, p := range []string{stale, young} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(v, "alice", ".bashrc"), staleLink); err != nil {
+		t.Fatal(err)
+	}
+	aged := time.Now().Add(-2 * staleTemp)
+	if err := os.Chtimes(stale, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+	if err := unixLchtimes(staleLink, aged); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Prune(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{stale, staleLink} {
+		if _, err := os.Lstat(p); err == nil {
+			t.Errorf("stale temp %s kept", filepath.Base(p))
+		}
+	}
+	mustExist(t, young)
+	mustExist(t, filepath.Join(dir, m.Name()))
+	mustExist(t, old)
+}

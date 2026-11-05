@@ -64,6 +64,15 @@ func (s *Store) Prune(ctx context.Context, keep int) (removedManifests, removedC
 		}
 		removedManifests++
 	}
+	// A manifest write that died leaves its temporary file beside the
+	// manifests; it is not a manifest, so nothing above looked at it.
+	if ents, err := mdir.ReadDir(); err == nil {
+		for _, e := range ents {
+			if !e.IsDir() {
+				removeStaleTemp(mdir, e.Name())
+			}
+		}
+	}
 	chunks, err := s.dir.Sub("chunks")
 	if err != nil {
 		return removedManifests, 0, err
@@ -123,6 +132,9 @@ func (s *Store) pruneFan(chunks *safefs.Dir, fanName string, live map[Hash]struc
 	return removed, nil
 }
 
+// removeStaleTemp removes a leftover temporary file older than staleTemp. It
+// is best effort: a file that cannot be removed is tried again at the next
+// prune, and a failure here must not stop the prune of what is garbage.
 func removeStaleTemp(dir *safefs.Dir, name string) {
 	if len(name) == 0 || name[0] != '.' {
 		return
