@@ -1280,6 +1280,7 @@ func TestE2EOverlay(t *testing.T) {
 				if ob.kind == "DaemonSet" {
 					spec := v["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
 					spec["volumes"] = without(spec["volumes"], localExport)
+					dropPluginOff(spec)
 				}
 			}
 			out[ob.kind+"/"+ob.name] = v
@@ -1297,6 +1298,26 @@ func TestE2EOverlay(t *testing.T) {
 		if !strings.HasPrefix(c.Image, driverImage+":") {
 			t.Errorf("%s: image = %q", role, c.Image)
 		}
+	}
+}
+
+// pluginOffKey is the node label whose presence keeps the node plugin off a
+// node in the e2e overlay (the volume tests stop one plugin with it).
+const pluginOffKey = "miami-e2e/plugin-off"
+
+// dropPluginOff removes the e2e overlay's one extra node affinity expression
+// from a pod spec, and fails the comparison by leaving anything else.
+func dropPluginOff(spec map[string]any) {
+	terms, _, _ := nestedSlice(spec, "affinity", "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution", "nodeSelectorTerms")
+	for _, tm := range terms {
+		term := tm.(map[string]any)
+		var keep []any
+		for _, ex := range term["matchExpressions"].([]any) {
+			if ex.(map[string]any)["key"] != pluginOffKey {
+				keep = append(keep, ex)
+			}
+		}
+		term["matchExpressions"] = keep
 	}
 }
 

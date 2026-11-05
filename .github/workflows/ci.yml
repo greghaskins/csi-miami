@@ -489,7 +489,7 @@ jobs:
   # The driver on kind, end to end (hack/e2e-kind.sh, test/e2e): a cluster of
   # one control plane and two workers, the image the build job pushed for this
   # architecture (the content tag, pulled and loaded into the nodes, never
-  # pulled by them), and exit criteria 1 to 6 of the plan as Go tests driven
+  # pulled by them), and exit criteria 1 to 6 of the M1 plan as Go tests driven
   # through the API: two pods on two nodes share an nfs3 volume, a local volume
   # lives on one node, delete removes (nfs3) or leaves (local) the directory,
   # also across a controller restart, a node plugin restart changes nothing, a
@@ -505,7 +505,7 @@ jobs:
     needs: [changes, build]
     if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: read
@@ -551,11 +551,19 @@ jobs:
           printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
           docker pull "$image"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
+      # The volume tests restore a volume on the runner and check it there
+      # (hack/e2e-kind.sh checks for the tools; the nfs3 legs need these two).
+      - name: Install cryptsetup and e2fsprogs
+        if: matrix.transport == 'nfs3'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cryptsetup-bin e2fsprogs
       - name: Run the kind end-to-end tests
         env:
           E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-kind
           TRANSPORT: ${{ matrix.transport }}
           E2E_IMAGE: ${{ steps.image.outputs.image }}
+          E2E_FAILFAST: "0"
         run: sudo -E env "PATH=$PATH" make e2e E2E_MODE=kind E2E_TRANSPORT="$TRANSPORT" E2E_IMAGE="$E2E_IMAGE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
