@@ -243,6 +243,12 @@ type vstate struct {
 	// a guess about how full the file system looks.
 	resizedTo int64
 
+	// manName and manSize memoise the size of the manifest `current` names,
+	// so that a pass reads the (large) manifest once per generation, not once
+	// per pass. Loop goroutine only.
+	manName string
+	manSize int64
+
 	// pid is the main process of the volume's unit when it was last seen
 	// active, 0 when never seen by this process: a restart is a different pid
 	// under the same unit. blk is the block device the file system is on (the

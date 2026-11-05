@@ -8,7 +8,13 @@
 # csi-attacher (v4.13.0): PersistentVolumes patch (its finalizer);
 # VolumeAttachments (no update: neither sidecar's own RBAC grants it) and their
 # status; CSINodes; Nodes.
-# Both sidecars' leader election needs Leases only in the driver's own
+# csi-resizer (v2.3.0): PersistentVolumes get, list, watch, patch;
+# PersistentVolumeClaims get, list, watch (the provisioner's rule covers them)
+# and their status patch; events (covered). Upstream also lists pods and
+# VolumeAttributesClass: the deployment turns off the two features that read
+# them (--handle-volume-inuse-error, the VolumeAttributesClass gate), so the
+# sidecar needs neither.
+# All three sidecars' leader election needs Leases only in the driver's own
 # namespace; that grant is the Role in role-controller.yaml, not a cluster-wide
 # one.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -22,6 +28,9 @@ rules:
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
     verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims/status]
+    verbs: [patch]
   - apiGroups: [storage.k8s.io]
     resources: [storageclasses]
     verbs: [get, list, watch]

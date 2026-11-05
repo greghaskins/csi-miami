@@ -66,6 +66,7 @@ func TestControllerGetCapabilities(t *testing.T) {
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME:     true,
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME: true,
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES:             true,
+		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME:            true,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("capabilities = %v, want %v", got, want)
@@ -86,9 +87,6 @@ func TestUnadvertisedCallsAreUnimplemented(t *testing.T) {
 	}
 	if _, err := e.ctrl.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{}); codeOf(err) != codes.Unimplemented {
 		t.Errorf("CreateSnapshot code = %v, want Unimplemented", codeOf(err))
-	}
-	if _, err := e.ctrl.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{}); codeOf(err) != codes.Unimplemented {
-		t.Errorf("ControllerExpandVolume code = %v, want Unimplemented", codeOf(err))
 	}
 }
 

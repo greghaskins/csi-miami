@@ -1,4 +1,4 @@
-# Leader election for csi-provisioner and csi-attacher. Both take
+# Leader election for csi-provisioner, csi-attacher and csi-resizer. All take
 # --leader-election-namespace=$(POD_NAMESPACE), so Leases are needed in the
 # driver's namespace only; a cluster-wide grant would let a compromised
 # controller container rewrite or delete any other component's leader lease.

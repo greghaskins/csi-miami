@@ -149,3 +149,26 @@ func TestVolumeIntentWithALegacyTakeoverTimeoutLoads(t *testing.T) {
 	}
 	_ = dir
 }
+
+func TestGrownSizeRoundTripsAndIsAbsentWhenZero(t *testing.T) {
+	t.Parallel()
+	s, dir := openStore(t)
+	in := volumeIntent()
+	in.GrownSize = 2 << 30
+	mustSave(t, s, in)
+	got, ok, err := s.Get(in.VolumeID)
+	if err != nil || !ok || got.GrownSize != 2<<30 {
+		t.Fatalf("Get = %+v, %v, %v; want GrownSize %d", got, ok, err, int64(2<<30))
+	}
+	// A volume that was never grown writes the bytes it always did.
+	s2, dir2 := openStore(t)
+	mustSave(t, s2, volumeIntent())
+	b, err := os.ReadFile(filepath.Join(dir2, Escape(in.VolumeID)+".json")) // #nosec G304 -- test file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "grownSize") {
+		t.Errorf("a never-grown record mentions grownSize:\n%s", b)
+	}
+	_ = dir
+}

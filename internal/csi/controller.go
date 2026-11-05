@@ -51,8 +51,8 @@ const DefaultListDeadline = 10 * time.Second
 
 // Controller is the CSI controller service for directory volumes.
 //
-// Everything it does not list in its capabilities (GetCapacity, snapshots,
-// expansion and the rest) is Unimplemented.
+// Everything it does not list in its capabilities (GetCapacity, snapshots
+// and the rest) is Unimplemented.
 type Controller struct {
 	csi.UnimplementedControllerServer
 
@@ -120,7 +120,7 @@ func NewController(o ControllerOptions) (*Controller, error) {
 }
 
 // ControllerGetCapabilities reports CREATE_DELETE_VOLUME,
-// PUBLISH_UNPUBLISH_VOLUME, and LIST_VOLUMES.
+// PUBLISH_UNPUBLISH_VOLUME, LIST_VOLUMES and EXPAND_VOLUME.
 func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	rpc := func(t csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
 		return &csi.ControllerServiceCapability{Type: &csi.ControllerServiceCapability_Rpc{
@@ -131,6 +131,7 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 		rpc(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME),
 		rpc(csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME),
 		rpc(csi.ControllerServiceCapability_RPC_LIST_VOLUMES),
+		rpc(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME),
 	}}, nil
 }
 
