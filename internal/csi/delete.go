@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -109,7 +108,7 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 	}
 
 	if vctx.Kind == volume.KindVolume {
-		if err := c.refuseLiveHolder(ctx, id, dir, vctx.Volume.Takeover()); err != nil {
+		if err := c.refuseHeldVolume(ctx, id, dir, pv); err != nil {
 			return nil, err
 		}
 	}
@@ -131,13 +130,20 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
-// refuseLiveHolder returns Unavailable while a node holds the volume of kind
-// volume: a holder file beside the directory that is younger than the takeover
-// timeout (its age is on the transport's clock, see holder.Read). A holder
-// that has gone quiet for longer is a dead node's, and the delete goes on.
-// Deleting under a live holder would pull the chunks out from under a mounted
-// volume.
-func (c *Controller) refuseLiveHolder(ctx context.Context, id volume.ID, dir string, takeover time.Duration) error {
+// refuseHeldVolume returns Unavailable while any holder file exists beside the
+// directory of the volume of kind volume, however old it is (decision 52): a
+// holder file means a node still owns unsynced data, and that node, even if
+// it is down, drains it when it returns. Deleting the volume would remove
+// chunks it still owns. The provisioner retries until the node unstages or
+// drains the volume.
+//
+// The emergency detach is the way through: the PV's annotation
+// kube.AnnotationForceDetach, when its value is exactly "<node>@<epoch>" of
+// the holder file read now. A value that does not match (a stale epoch,
+// another node, empty) is ignored and the delete is refused. The abandonment
+// is logged before anything is removed, so it is on record if the removal
+// fails half way.
+func (c *Controller) refuseHeldVolume(ctx context.Context, id volume.ID, dir string, pv *kube.PV) error {
 	info, err := holder.Read(ctx, filepath.Dir(dir), id.Name)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -145,10 +151,20 @@ func (c *Controller) refuseLiveHolder(ctx context.Context, id volume.ID, dir str
 		}
 		return unavailable("cannot read the holder of volume %q, so nothing is deleted: %v", id.Name, reason(err))
 	}
-	if info.Present && info.Age < takeover {
-		return unavailable("volume %q is held by node %q (renewed %s ago); nothing is deleted until the node unstages it", id.Name, info.Node, info.Age.Round(time.Second))
+	if !info.Present {
+		return nil
 	}
-	return nil
+	want := fmt.Sprintf("%s@%d", info.Node, info.Epoch)
+	if got, ok := pv.Annotations[kube.AnnotationForceDetach]; ok && got == want {
+		c.log.Warn("emergency detach: the unsynced data of the holder is abandoned and the volume is deleted", "volume_id", id.String(), "node", info.Node, "epoch", info.Epoch)
+		return nil
+	}
+	note := ""
+	if _, ok := pv.Annotations[kube.AnnotationForceDetach]; ok {
+		note = fmt.Sprintf(" (the %s annotation did not match %q)", kube.AnnotationForceDetach, want)
+	}
+	return unavailable("volume %q is held by node %q at epoch %d%s; it is deleted only after that node unstages or drains it, or after an operator force-detaches it by setting the PV annotation %s to %q",
+		id.Name, info.Node, info.Epoch, note, kube.AnnotationForceDetach, want)
 }
 
 // removeHolderFiles removes what a holder leaves beside a deleted volume's

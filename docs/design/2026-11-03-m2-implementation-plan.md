@@ -379,10 +379,15 @@ at the first error, which maps to a condition:
 | 6 | filesystem and mount | mountinfo at the stage path, source the mapper (or the nbd device when plain) | `Fsck`; `Mkfs` when the device has no superblock (first stage); mount `ext4` with `MountOptions`, `nosuid,nodev` | `failed` on fsck >= 4 |
 | 7 | size | `BLKGETSIZE64` of the mapper vs `in.Volume.Size` | `Client.Grow`, `crypt.Resize`, `ext4.Resize` | internal |
 
-`PublishSource` returns the stage path. `Teardown`: `Client.Publish("unstage")`
-under the deadline (a refusal or a transport error is logged and the
-discarded bytes go in the `PublishRefused` or `GenerationLost` event, never a
-failure), unmount, `Close`, `Stop` the unit, `cache.Remove`, `Release`.
+`PublishSource` returns the stage path. `Teardown` (decision 52): thaw
+(EINVAL is fine), unmount, `Close`, wait out any publish in flight, then the
+final generation (`Publish("unstage")`), re-read `current` and require it to
+name that manifest (or the cache's base when nothing was dirty) with
+`Status` showing nothing dirty; only then the Stop RPC (the only call that
+disconnects the device), `Stop` the unit, `cache.Remove`, `Release`. Any
+failure before the Stop RPC is a retryable error and leaves the server and
+cache serving. A refused publish (fenced: the operator abandoned this holder)
+discards, reports `GenerationLost` with the bytes, and succeeds.
 Generation timers (4.5 of the spec) live in the reconciler per staged volume
 (T12) and call layers 6 and 4's clients: `Freeze` → `Boundary` → `Thaw` →
 `Publish`.
@@ -781,19 +786,57 @@ the item; `Options.Generations` (interval floor 1 m); the PV annotation
       runs in its own goroutine under a deadline and never blocks the pass.
 - [ ] Commit.
 
-### Task T13: Takeover
+### Task T13: Emergency detach and orphan drain (decision 52)
+
+Decision 52 removes the timed takeover: no node takes over a holder because
+it is old or its node is NotReady.
 
 **Files:** modify `internal/kube/kube.go` (+`NodeStatus(ctx, name) (NodeInfo,
-error)` with `Ready bool; VolumesInUse []string; OutOfService bool`),
-`internal/reconcile/holderjudge.go` (new), tests, `internal/csi/envtest_test.go`.
+error)` with `Ready bool; OutOfService bool` and a PV annotation read),
+`internal/reconcile/holderjudge.go` (new), `internal/reconcile` orphan drain,
+tests, `internal/csi/envtest_test.go`.
 
-**Interfaces:** produces the `Judge` func for `volume.Config`; consumes
-`holder.Judgement`.
+**Interfaces:** produces the `Judge` func for `volume.Config` (the item keeps
+its own self-fenced rule); consumes `holder.Judgement`.
 
-- [ ] Tests: `TestJudgeOutOfServiceTaint`, `TestJudgeReadyNotInUseStale30s`,
-      `TestJudgeNotReadyOlderThanTWithTwoClocks`, `TestJudgeNeverOnFreshHolder`,
-      `TestJudgeNodeReadErrorIsNoTakeover`; envtest `TestNodeStatusReads`.
-- [ ] RBAC: node ClusterRole gains `nodes` `get` (own node and the holder's).
+- [ ] Judge: Takeover only on (a) the PV annotation
+      `miami.csi.greghaskins.com/force-detach` equal to the holder file's
+      `<node>@<epoch>`, or (b) the `node.kubernetes.io/out-of-service` taint
+      on the holder's node; never on age or readiness. An event names the
+      abandoned epoch. Tests: `TestJudgeAnnotationMatchingHolder`,
+      `TestJudgeAnnotationStaleEpochIgnored`, `TestJudgeOutOfServiceTaint`,
+      `TestJudgeNeverOnAgeOrNotReady`, `TestJudgeNodeReadErrorIsNoTakeover`;
+      envtest `TestNodeStatusReads`.
+- [ ] Orphan drain: at start and on every pass, a holder file naming this
+      node for a volume with a surviving cache that is not staged here is
+      drained: start the server (no key, no mount), publish, verify as in
+      decision 52, stop, delete the cache, release. Failure retries next
+      pass. Tests with the item fakes, including a drain refused by the
+      fence (abandoned by the operator: discard and release nothing).
+- [ ] Holder renewal by touching, not rename-over: `Renew` keeps its
+      read-and-check, then `futimens` (`UTIME_NOW`, so the NFS server sets
+      the time) on the descriptor opened when the holder was loaded; ESTALE
+      or a changed inode is `ErrLost`. A takeover renames a new inode in, so
+      a stale node's late renewal can no longer regress the file to its own
+      `<node>@<epoch>`. A forced detach aims at a live, renewing node, which
+      made that race routine. Test: a renewal racing a takeover leaves the
+      taker's file intact.
+- [ ] The force-detach annotation is never removed by the driver; the judge
+      re-applies it idempotently while it matches the holder file.
+- [ ] The drain takes the stage's cache-reuse decision (`current`'s epoch ==
+      the index epoch, or `current` names the index base, or no `current` and
+      no base) before it serves the cache; otherwise it discards and
+      releases nothing. A drained generation is a crash image (flushed writes,
+      no freeze): restore replays the journal.
+- [x] `DeleteVolume` refuses while any holder file exists (the timed
+      `refuseLiveHolder` rule goes); the emergency detach is the way through.
+      Landed in branch `m2/delete-refuses-any-holder`.
+- [ ] The `takeoverTimeout` StorageClass parameter and the node's
+      `-takeover-timeout` flag no longer mean anything: reject the parameter
+      for new classes with a message naming decision 52 and remove the flag
+      (T22 documents that a NotReady node is never taken over).
+- [ ] RBAC: node ClusterRole gains `nodes` `get` and `persistentvolumes`
+      `get` (annotation read).
 - [ ] Commit.
 
 ### Task T14: Probe and conditions for volumes
