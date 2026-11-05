@@ -247,7 +247,7 @@ func Read(ctx context.Context, dir, name string) (Info, error) {
 	}
 	// The probe is taken after the stat: a renewal landing in between can only
 	// make the age smaller, never larger.
-	now, err := step(ctx, Path(dir, name)+":probe", "read the server's clock", func() (time.Time, error) { return probe(dir) })
+	now, err := step(ctx, Path(dir, name)+"\x00probe", "read the server's clock", func() (time.Time, error) { return probe(dir) })
 	if err != nil {
 		return Info{}, err
 	}
@@ -323,7 +323,7 @@ func claimPrefix(name string) string { return name + ".holder.epoch-" }
 // dir, or 0 when none has. Unparsable names are ignored.
 func maxClaimedEpoch(ctx context.Context, dir, name string) (uint64, error) {
 	prefix := claimPrefix(name)
-	return step(ctx, Path(dir, name)+":claims", "list the epoch claims", func() (uint64, error) {
+	return step(ctx, Path(dir, name)+"\x00claims", "list the epoch claims", func() (uint64, error) {
 		ents, err := os.ReadDir(dir)
 		if err != nil {
 			return 0, err
@@ -350,7 +350,7 @@ func maxClaimedEpoch(ctx context.Context, dir, name string) (uint64, error) {
 // is already ours, so a failure to prune is not a failure to acquire.
 func pruneClaims(ctx context.Context, dir, name string, keepFrom uint64) {
 	prefix := claimPrefix(name)
-	_, _ = step(ctx, Path(dir, name)+":prune", "prune old epoch claims", func() (struct{}, error) {
+	_, _ = step(ctx, Path(dir, name)+"\x00prune", "prune old epoch claims", func() (struct{}, error) {
 		ents, err := os.ReadDir(dir)
 		if err != nil {
 			return struct{}{}, nil
