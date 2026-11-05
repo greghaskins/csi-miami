@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -63,7 +65,7 @@ func runRestore(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	m, err := restoreVolume(ctx, store, dest, manifest)
+	m, err := restoreVolume(ctx, store, dest, manifest, restoreHooks{})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "miami restore: %v\n", err)
 		return 1
@@ -103,11 +105,21 @@ func within(dir, root string) (bool, error) {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
 }
 
+// restoreHooks let a test observe the steps of restoreVolume; every field may
+// be nil.
+type restoreHooks struct {
+	beforeCreate  func()           // called just before the temporary file is created
+	afterAssemble func(tmp string) // called once the temporary file is complete and synced
+}
+
 // restoreVolume writes the named manifest of the store (the one current names
 // when name is empty) to a new file at dest. Every chunk is verified before
-// dest is created, and dest is removed again if assembling fails after that,
-// so a damaged store leaves no image behind. It never writes to the store.
-func restoreVolume(ctx context.Context, store, dest, name string) (chunk.Manifest, error) {
+// anything is created. The image is assembled into a hidden temporary file
+// beside dest and linked to dest only when complete, so dest either does not
+// exist or is the whole image, whatever kills the process; the link fails if
+// dest exists, so an existing file is never replaced. It never writes to the
+// store.
+func restoreVolume(ctx context.Context, store, dest, name string, h restoreHooks) (chunk.Manifest, error) {
 	s, err := chunk.OpenReadOnly(store)
 	if err != nil {
 		return chunk.Manifest{}, err
@@ -116,6 +128,9 @@ func restoreVolume(ctx context.Context, store, dest, name string) (chunk.Manifes
 		return chunk.Manifest{}, fmt.Errorf("output directory: %w", err)
 	} else if inside {
 		return chunk.Manifest{}, errors.New("the output file must not be inside the store")
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		return chunk.Manifest{}, fmt.Errorf("%s already exists", dest)
 	}
 	if name == "" {
 		cur, ok, err := s.Current(ctx)
@@ -135,17 +150,33 @@ func restoreVolume(ctx context.Context, store, dest, name string) (chunk.Manifes
 		return chunk.Manifest{}, fmt.Errorf("nothing written: %w", err)
 	}
 
-	f, err := os.OpenFile(dest, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // dest is a validated absolute path
+	if h.beforeCreate != nil {
+		h.beforeCreate()
+	}
+	tmp := filepath.Join(filepath.Dir(dest), "."+filepath.Base(dest)+".tmp-"+randHex())
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // dest is a validated absolute path
 	if err != nil {
 		return chunk.Manifest{}, err
 	}
+	defer func() { _ = os.Remove(tmp) }() // also on panic; after a successful link it removes the second name
 	err = s.Assemble(ctx, m, f)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		_ = os.Remove(dest)
+		return chunk.Manifest{}, err
+	}
+	if h.afterAssemble != nil {
+		h.afterAssemble(tmp)
+	}
+	if err := os.Link(tmp, dest); err != nil {
 		return chunk.Manifest{}, err
 	}
 	return m, nil
+}
+
+func randHex() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:]) // crypto/rand does not fail on supported platforms
+	return hex.EncodeToString(b[:])
 }

@@ -11,9 +11,8 @@ cd "$dir"
 
 # drill-begin
 m=manifests/$(cat current)
-c=$(sed -n 's/^# chunk //p' "$m"); z=$(head -c "$c" /dev/zero | sha256sum | cut -d' ' -f1)
-grep -v '^#' "$m" | grep -vx "$z" | sed 's|^\(..\)\(.*\)|\1\2  chunks/\1/\1\2|' | sha256sum -c --quiet
-grep -v '^#' "$m" | while read -r h; do if [ "$h" = "$z" ]; then head -c "$c" /dev/zero; else cat "chunks/${h%"${h#??}"}/$h"; fi; done > volume.img
+grep -v '^#' "$m" | sed 's|^\(..\)\(.*\)|\1\2  chunks/\1/\1\2|' | sha256sum -c --quiet
+grep -v '^#' "$m" | sed 's|^\(..\)|chunks/\1/&|' | xargs cat > volume.img
 # drill-end
 
 if [ -n "$out" ]; then

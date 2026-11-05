@@ -274,7 +274,9 @@ A `volume` has one directory on its transport, at decision 20's path
   capacity is reported, on create and on expand. A chunk is written to a temporary
   name beside its final name and renamed into place; a chunk that already
   exists is never rewritten. The all-zero chunk has one well-known name and is
-  stored once per volume, so unwritten and discarded regions cost nothing.
+  stored once per volume, so unwritten and discarded regions cost nothing; every
+  writer stores it (as a sparse file) before any manifest that names it, so the
+  restore drill of 5.1 finds it like any other chunk.
   The two-character fan-out keeps directories small for a terabyte volume.
 - **A manifest** is plain text: `#`-prefixed header lines (`volume`, `generation`,
   `size` in bytes, `chunk` size, `holder` epoch, `time`, `format 1`), then
@@ -559,23 +561,19 @@ Linux machine with coreutils and cryptsetup:
 ```sh
 cd pvc-<uuid>
 m=manifests/$(cat current)
-c=$(sed -n 's/^# chunk //p' "$m"); z=$(head -c "$c" /dev/zero | sha256sum | cut -d' ' -f1)
-grep -v '^#' "$m" | grep -vx "$z" | sed 's|^\(..\)\(.*\)|\1\2  chunks/\1/\1\2|' | sha256sum -c --quiet
-grep -v '^#' "$m" | while read -r h; do if [ "$h" = "$z" ]; then head -c "$c" /dev/zero; else cat "chunks/${h%"${h#??}"}/$h"; fi; done > volume.img
+grep -v '^#' "$m" | sed 's|^\(..\)\(.*\)|\1\2  chunks/\1/\1\2|' | sha256sum -c --quiet
+grep -v '^#' "$m" | sed 's|^\(..\)|chunks/\1/&|' | xargs cat > volume.img
 cryptsetup open volume.img vol      # the namespace's key
 mount /dev/mapper/vol /mnt
 ```
 
-The all-zero chunk is named in a manifest for every region never written or
-since discarded, but its file exists only if some generation happened to
-upload one, so the drill computes its name from the chunk size in the header
-and writes zeros in its place instead of looking for a file. Line four
-verifies every other chunk against its name. If a chunk is missing from an
-offsite copy taken mid-publish, use the previous manifest in `manifests/`.
+Line three verifies every chunk against its name, the all-zero chunk included:
+every writer stores it before a manifest that names it (4.2). If a chunk is
+missing from an offsite copy taken mid-publish, use the previous manifest in `manifests/`.
 The driver ships `miami restore` doing the same with a bounded cache, for a
 volume larger than the restoring machine's disk; the drill does not depend on
 it. `docs/restore.md` carries the drill and `hack/restore-drill.sh` runs it; a
-test keeps the two identical.
+test keeps the three identical.
 
 ### 5.2 Layout and backup membership
 
@@ -595,8 +593,8 @@ From an existing file-backed driver's images: `miami import` reads a raw block
 image file (the transport mounted, the workload scaled to zero) and writes it
 as-is as manifest `0.1` of a new `volume` (epoch 0, below the epoch 1 of the
 first holder; padded with zeros to a whole number of chunks; refused if the
-volume already has a `current`, a manifest or a holder file), then the static-PV dance of decision
-4. The image's own format decides the class: a LUKS2 image whose keyslot opens
+volume already has a `current`, a manifest or a holder file), then the
+static-PV dance of decision 4. The image's own format decides the class: a LUKS2 image whose keyslot opens
 with the namespace's key imports into an encrypted class and keeps its header;
 a plain ext4 image imports into a `-plain` class. Re-encrypting a plain image
 is a copy through a staged volume, not an import. From a hard-mounted NFS

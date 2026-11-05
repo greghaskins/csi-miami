@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -106,5 +108,74 @@ func TestVerifyRefusesAChunkOfTheWrongLength(t *testing.T) {
 	m := writeM(t, s, 0, 1, h)
 	if err := s.Verify(context.Background(), m); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("err = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestEnsureZeroCreatesASparseVerifiableChunk(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	ctx := context.Background()
+	zero := ZeroHash(mib)
+	if ok, _ := s.Has(zero); ok {
+		t.Fatal("the zero chunk exists in a fresh store")
+	}
+	if err := s.EnsureZero(ctx, mib); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(s.ChunkPath(zero))
+	if err != nil || fi.Size() != mib {
+		t.Fatalf("zero chunk: %v, %v", fi, err)
+	}
+	if err := s.Get(ctx, zero, io.Discard); err != nil {
+		t.Fatalf("the zero chunk does not verify: %v", err)
+	}
+	// Present: left alone, not rewritten.
+	before, _ := os.Stat(s.ChunkPath(zero))
+	if err := s.EnsureZero(ctx, mib); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.Stat(s.ChunkPath(zero))
+	if !os.SameFile(before, after) {
+		t.Fatal("EnsureZero replaced a present zero chunk")
+	}
+	// Removed (as Prune may): recreated.
+	if err := os.Remove(s.ChunkPath(zero)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureZero(ctx, mib); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Get(ctx, zero, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	ents, _ := os.ReadDir(filepath.Dir(s.ChunkPath(zero)))
+	if len(ents) != 1 {
+		t.Fatalf("temporary files left behind: %v", ents)
+	}
+}
+
+func TestPublishFirstRefusesAnExistingCurrent(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	ctx := context.Background()
+	writeM(t, s, 1, 1, ZeroHash(mib))
+	writeM(t, s, 0, 1, ZeroHash(mib))
+	if err := s.PublishFirst(ctx, "1.1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublishFirst(ctx, "0.1"); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("second PublishFirst = %v, want ErrExist", err)
+	}
+	if cur, _, _ := s.Current(ctx); cur != "1.1" {
+		t.Fatalf("current = %q, want 1.1", cur)
+	}
+	ents, _ := os.ReadDir(s.root)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), ".current-") {
+			t.Fatalf("temporary file left: %s", e.Name())
+		}
+	}
+	if err := s.PublishFirst(ctx, "9.9"); err == nil {
+		t.Fatal("PublishFirst of a missing manifest succeeded")
 	}
 }

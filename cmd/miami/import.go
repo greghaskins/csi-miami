@@ -79,6 +79,7 @@ type importFlags struct {
 	store     string
 	volume    string
 	chunkSize int64
+	capacity  int64
 }
 
 // runImport parses the flags of `miami import` and writes a raw image file as
@@ -92,7 +93,8 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	fl.StringVar(&f.image, "image", "", "the raw block image file to import, an absolute path (required)")
 	fl.StringVar(&f.store, "store", "", "the new volume's directory on the transport, an absolute path; its parent must exist (required)")
 	fl.StringVar(&f.volume, "volume", "", "the volume name recorded in the manifest (default: the store directory's name)")
-	fl.Int64Var(&f.chunkSize, "chunk-size", 0, "chunk size in bytes, a power of two (default: derived from the image size)")
+	fl.Int64Var(&f.chunkSize, "chunk-size", 0, "chunk size in bytes, a power of two: the class's chunkSize (default: derived from the capacity, as the controller does for a class without one)")
+	fl.Int64Var(&f.capacity, "capacity", 0, "the PV's capacity in bytes (requests.storage); the device is the capacity rounded up to whole chunks, zero padded (default: the image size)")
 
 	if err := fl.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -139,7 +141,8 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	_, _ = fmt.Fprintf(stdout, "imported %s as manifest %s of %s\n", f.image, r.manifest, f.volume)
 	_, _ = fmt.Fprintf(stdout, "class: %s; the image's own format decided it, no key was needed or read\n", r.class)
 	_, _ = fmt.Fprintf(stdout, "image %d bytes, device %d bytes (%d zero bytes of padding to a whole number of %d byte chunks)\n", r.imageSize, r.deviceSize, r.deviceSize-r.imageSize, r.chunk)
-	_, _ = fmt.Fprintf(stdout, "%d chunks: %d stored, %d all-zero and not stored; the PV capacity must be at least %d bytes and the class chunkSize %d\n", r.chunks, r.stored, r.zero, r.deviceSize, r.chunk)
+	_, _ = fmt.Fprintf(stdout, "%d chunks: %d stored, %d all-zero (stored once as the zero chunk)\n", r.chunks, r.stored, r.zero)
+	_, _ = fmt.Fprintf(stdout, "the class needs chunkSize %d (or none, with requests.storage %d); the PV capacity must be %d bytes\n", r.chunk, r.capacity, r.deviceSize)
 	return 0
 }
 
@@ -151,7 +154,7 @@ type importResult struct {
 	manifest              string
 	class                 imageClass
 	imageSize, deviceSize int64
-	chunk                 int64
+	chunk, capacity       int64
 	chunks, stored, zero  int
 }
 
@@ -193,14 +196,25 @@ func importImage(ctx context.Context, f importFlags) (importResult, error) {
 		return r, errors.New("the image is neither a LUKS2 image nor an ext4 filesystem; refusing to import it")
 	}
 
+	// Size the device as the controller does for the PV: the chunk size comes
+	// from the class, or is derived from the capacity, and the device is the
+	// capacity rounded up to whole chunks. Without -capacity the image size
+	// stands in for it.
+	r.capacity = f.capacity
+	if r.capacity == 0 {
+		r.capacity = r.imageSize
+	}
+	if r.capacity < r.imageSize {
+		return r, fmt.Errorf("-capacity %d is smaller than the image (%d bytes)", r.capacity, r.imageSize)
+	}
 	r.chunk = f.chunkSize
 	if r.chunk == 0 {
-		r.chunk = chunk.DefaultChunkSize(r.imageSize)
+		r.chunk = chunk.DefaultChunkSize(r.capacity)
 	}
-	r.deviceSize = chunk.RoundUp(r.imageSize, r.chunk)
-	if err := chunk.CheckChunkSize(r.deviceSize, r.chunk); err != nil {
+	if err := chunk.CheckChunkSize(r.capacity, r.chunk); err != nil {
 		return r, err
 	}
+	r.deviceSize = chunk.RoundUp(r.capacity, r.chunk)
 
 	if err := requireNewVolume(f.store); err != nil {
 		return r, err
@@ -230,15 +244,26 @@ func importImage(ctx context.Context, f importFlags) (importResult, error) {
 		Volume: f.volume, Epoch: importEpoch, Sequence: importSequence,
 		Size: r.deviceSize, Chunk: r.chunk, Time: time.Now(), Chunks: hashes,
 	}
+	// A manifest that names the zero chunk finds it stored, as a publisher
+	// guarantees (the restore drill relies on it).
+	if r.zero > 0 {
+		if err := s.EnsureZero(ctx, r.chunk); err != nil {
+			return r, err
+		}
+	}
 	// The volume was new when we looked; look again before the two writes
-	// that make it live, so a volume that appeared meanwhile is not replaced.
+	// that make it live. The second is create-only, so a volume that went live
+	// in the remaining window is never rolled back to the import.
 	if err := requireNewVolume(f.store); err != nil {
 		return r, err
 	}
 	if err := s.WriteManifest(ctx, m); err != nil {
 		return r, err
 	}
-	if err := s.Publish(ctx, m.Name()); err != nil {
+	if err := s.PublishFirst(ctx, m.Name()); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return r, fmt.Errorf("%s went live while the import ran (current exists); manifests/%s is the import's and may be removed", f.store, m.Name())
+		}
 		return r, err
 	}
 	r.manifest = m.Name()
@@ -247,13 +272,18 @@ func importImage(ctx context.Context, f importFlags) (importResult, error) {
 
 // putImage stores the image's chunks, one chunk of memory at a time, and
 // returns the hash of each of the n chunks of the device. The image is padded
-// with zeros to n whole chunks; an all-zero chunk is named, never stored.
+// with zeros to n whole chunks; an all-zero chunk is named here and stored once
+// by the caller (EnsureZero).
 func putImage(ctx context.Context, s *chunk.Store, img *os.File, imageSize, size int64, n int) ([]chunk.Hash, error) {
 	zero := chunk.ZeroHash(size)
 	buf := make([]byte, size)
 	hashes := make([]chunk.Hash, 0, n)
 	var off int64
 	for range n {
+		if off >= imageSize { // padding: a whole chunk past the image is the zero chunk
+			hashes = append(hashes, zero)
+			continue
+		}
 		got, err := io.ReadFull(io.NewSectionReader(img, off, min(size, max(imageSize-off, 0))), buf)
 		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 			return nil, err
@@ -288,7 +318,8 @@ func requireNewVolume(store string) error {
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	if len(ents) > 0 {
+	interrupted := len(ents) == 1 && ents[0].Name() == fmt.Sprintf("%d.%d", importEpoch, importSequence)
+	if len(ents) > 0 && !interrupted {
 		return fmt.Errorf("%s already has manifests; refusing to import over a volume", store)
 	}
 	dir, name := filepath.Dir(store), filepath.Base(store)
@@ -305,6 +336,11 @@ func requireNewVolume(store string) error {
 		if strings.HasPrefix(e.Name(), name+".holder.epoch-") {
 			return fmt.Errorf("%s already has a holder epoch claim; refusing to import over a volume", store)
 		}
+	}
+	if interrupted {
+		name := fmt.Sprintf("%d.%d", importEpoch, importSequence)
+		return fmt.Errorf("%s holds only manifests/%s, with no current and no holder: an earlier import was interrupted and is not resumed; remove %s and import again",
+			store, name, filepath.Join(store, "manifests", name))
 	}
 	return nil
 }

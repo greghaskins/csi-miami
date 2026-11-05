@@ -11,19 +11,22 @@ import (
 	"github.com/greghaskins/csi-miami/internal/chunk"
 )
 
-// docDrill is the shell block of docs/restore.md without the lines that need a
-// key and a mount: the lines the script runs.
-func docDrill(t *testing.T) []string {
+// shellBlock is the drill's shell block of a markdown file, without the lines
+// that need a key and a mount: the lines the script runs.
+func shellBlock(t *testing.T, path string) []string {
 	t.Helper()
-	b, err := os.ReadFile("../../docs/restore.md")
+	b, err := os.ReadFile(path) //nolint:gosec // test fixture
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rest, _ := strings.Cut(string(b), "```sh\n")
+	_, rest, ok := strings.Cut(string(b), "```sh\ncd pvc-<uuid>\n")
+	if !ok {
+		t.Fatalf("%s has no drill block", path)
+	}
 	block, _, _ := strings.Cut(rest, "```")
 	var out []string
 	for _, l := range strings.Split(strings.TrimSpace(block), "\n") {
-		if strings.HasPrefix(l, "cd ") || strings.HasPrefix(l, "cryptsetup ") || strings.HasPrefix(l, "mount ") {
+		if strings.HasPrefix(l, "cryptsetup ") || strings.HasPrefix(l, "mount ") {
 			continue
 		}
 		out = append(out, l)
@@ -44,61 +47,81 @@ func scriptDrill(t *testing.T) []string {
 
 func TestDrillScriptRunsTheDocumentedDrill(t *testing.T) {
 	t.Parallel()
-	doc, script := docDrill(t), scriptDrill(t)
-	if len(doc) != 4 {
-		t.Fatalf("the documented drill has %d runnable lines, want 4: %q", len(doc), doc)
+	doc := shellBlock(t, "../../docs/restore.md")
+	spec := shellBlock(t, "../../docs/design/2026-11-03-chunk-backed-volumes-design.md")
+	script := scriptDrill(t)
+	if len(doc) != 3 {
+		t.Fatalf("the documented drill has %d runnable lines, want 3: %q", len(doc), doc)
+	}
+	if strings.Join(doc, "\n") != strings.Join(spec, "\n") {
+		t.Fatalf("docs/restore.md differs from the design's 5.1:\ndoc:\n%s\nspec:\n%s", strings.Join(doc, "\n"), strings.Join(spec, "\n"))
 	}
 	if strings.Join(doc, "\n") != strings.Join(script, "\n") {
 		t.Fatalf("hack/restore-drill.sh differs from docs/restore.md:\ndoc:\n%s\nscript:\n%s", strings.Join(doc, "\n"), strings.Join(script, "\n"))
 	}
 }
 
-func TestDrillScriptMatchesRestore(t *testing.T) {
-	t.Parallel()
-	for _, tool := range []string{"bash", "sha256sum", "sed", "grep", "head", "cat"} {
+func requireDrillTools(t *testing.T) {
+	t.Helper()
+	for _, tool := range []string{"bash", "sha256sum", "sed", "grep", "xargs", "cat"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s is not installed", tool)
 		}
 	}
-	// Build a store whose zero chunks are not files (as a first generation of
-	// a sparse volume leaves them) next to one where the zero chunk is stored.
-	for _, storeZero := range []bool{false, true} {
-		ts := newTestStore(t)
-		a, b := ts.put(t, 'a'), ts.put(t, 'b')
-		zero := chunk.ZeroHash(testMiB)
-		if storeZero {
-			if err := ts.s.Put(t.Context(), zero, bytes.NewReader(make([]byte, testMiB)), testMiB); err != nil {
-				t.Fatal(err)
-			}
-		}
-		ts.manifest(t, 1, 1, false, a, zero, zero)
-		ts.manifest(t, 1, 2, true, a, zero, b, zero, a)
+}
 
-		work := t.TempDir()
-		drillOut := filepath.Join(work, "drill.img")
-		cmd := exec.Command("../../hack/restore-drill.sh", ts.dir, drillOut) //nolint:gosec // test fixture
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("storeZero=%v: drill: %v\n%s", storeZero, err, out)
-		}
-		miamiOut := filepath.Join(work, "miami.img")
-		if code, _, stderr := runMiami("restore", "-store", ts.dir, "-out", miamiOut); code != 0 {
-			t.Fatalf("storeZero=%v: restore exit %d: %s", storeZero, code, stderr)
-		}
-		d, err := os.ReadFile(drillOut) //nolint:gosec // test fixture
-		if err != nil {
-			t.Fatal(err)
-		}
-		m, err := os.ReadFile(miamiOut) //nolint:gosec // test fixture
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(d) != 5*int(testMiB) || !bytes.Equal(d, m) {
-			t.Fatalf("storeZero=%v: drill and restore differ (%d and %d bytes)", storeZero, len(d), len(m))
-		}
-		if ents, _ := os.ReadDir(ts.dir); hasEntry(ents, "volume.img") {
-			t.Errorf("storeZero=%v: the drill left volume.img in the store", storeZero)
-		}
+// drillAndRestore runs the drill script and `miami restore` on the store and
+// requires the same bytes, of the given length.
+func drillAndRestore(t *testing.T, dir string, wantLen int) {
+	t.Helper()
+	work := t.TempDir()
+	drillOut := filepath.Join(work, "drill.img")
+	if out, err := exec.Command("../../hack/restore-drill.sh", dir, drillOut).CombinedOutput(); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("drill: %v\n%s", err, out)
 	}
+	miamiOut := filepath.Join(work, "miami.img")
+	if code, _, stderr := runMiami("restore", "-store", dir, "-out", miamiOut); code != 0 {
+		t.Fatalf("restore exit %d: %s", code, stderr)
+	}
+	d, err := os.ReadFile(drillOut) //nolint:gosec // test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := os.ReadFile(miamiOut) //nolint:gosec // test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d) != wantLen || !bytes.Equal(d, m) {
+		t.Fatalf("drill and restore differ (%d and %d bytes, want %d)", len(d), len(m), wantLen)
+	}
+	if ents, _ := os.ReadDir(dir); hasEntry(ents, "volume.img") {
+		t.Error("the drill left volume.img in the store")
+	}
+}
+
+func TestDrillScriptMatchesRestore(t *testing.T) {
+	t.Parallel()
+	requireDrillTools(t)
+	ts := newTestStore(t)
+	a, b := ts.put(t, 'a'), ts.put(t, 'b')
+	zero := chunk.ZeroHash(testMiB)
+	if err := ts.s.EnsureZero(t.Context(), testMiB); err != nil { // as every writer does
+		t.Fatal(err)
+	}
+	ts.manifest(t, 1, 1, false, a, zero, zero)
+	ts.manifest(t, 1, 2, true, a, zero, b, zero, a)
+	drillAndRestore(t, ts.dir, 5*int(testMiB))
+}
+
+func TestDrillRunsOnAnImportedStore(t *testing.T) {
+	t.Parallel()
+	requireDrillTools(t)
+	img := luks2Image(int(4 * testMiB)) // one data chunk, three zero chunks
+	vol := volumeDir(t)
+	if code, _, stderr := runMiami("import", "-image", writeImage(t, img), "-store", vol, "-chunk-size", "1048576"); code != 0 {
+		t.Fatalf("import exit %d: %s", code, stderr)
+	}
+	drillAndRestore(t, vol, 4*int(testMiB))
 }
 
 func TestDrillStopsOnACorruptChunk(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,7 +117,7 @@ func TestImportChunksImageAndPublishesEpochZero(t *testing.T) {
 	}
 }
 
-func TestImportSkipsZeroChunks(t *testing.T) {
+func TestImportStoresTheZeroChunkOnceAndSparse(t *testing.T) {
 	t.Parallel()
 	img := luks2Image(int(4 * testMiB)) // chunk 0 has the header, 1 to 3 are zero
 	vol := volumeDir(t)
@@ -136,8 +137,8 @@ func TestImportSkipsZeroChunks(t *testing.T) {
 	if m.Chunks[0] == zero || m.Chunks[1] != zero || m.Chunks[2] != zero || m.Chunks[3] != zero {
 		t.Fatalf("manifest chunks = %v", m.Chunks)
 	}
-	if ok, _ := s.Has(zero); ok {
-		t.Fatal("the zero chunk was stored")
+	if err := s.Get(context.Background(), zero, io.Discard); err != nil {
+		t.Fatalf("the manifest names the zero chunk but it does not verify in the store: %v", err)
 	}
 	var files int
 	_ = filepath.WalkDir(filepath.Join(vol, "chunks"), func(_ string, d os.DirEntry, _ error) error {
@@ -146,8 +147,8 @@ func TestImportSkipsZeroChunks(t *testing.T) {
 		}
 		return nil
 	})
-	if files != 1 {
-		t.Fatalf("%d chunk files, want 1", files)
+	if files != 2 { // the header chunk, and the zero chunk once for three regions
+		t.Fatalf("%d chunk files, want 2", files)
 	}
 }
 
@@ -234,4 +235,85 @@ func dirNames(t *testing.T, dir string) string {
 		return nil
 	})
 	return strings.Join(names, ",")
+}
+
+func TestImportWithNoZeroRegionStoresNoZeroChunk(t *testing.T) {
+	t.Parallel()
+	img := ext4Image(int(testMiB))
+	for i := 2048; i < len(img); i++ {
+		img[i] = 7
+	}
+	vol := volumeDir(t)
+	if code, _, stderr := runMiami("import", "-image", writeImage(t, img), "-store", vol, "-chunk-size", "1048576"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	s, _ := chunk.Open(vol)
+	if ok, _ := s.Has(chunk.ZeroHash(testMiB)); ok {
+		t.Fatal("a zero chunk was stored for a manifest that does not name one")
+	}
+}
+
+// A holder that stages the volume and publishes between import's checks and
+// its publish must not be rolled back to the import.
+func TestImportPublishCannotOverwriteALiveCurrent(t *testing.T) {
+	t.Parallel()
+	vol := volumeDir(t)
+	s, err := chunk.Open(vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	live := chunk.Manifest{Volume: "pvc-1234", Epoch: 1, Sequence: 1, Size: testMiB, Chunk: testMiB, Chunks: []chunk.Hash{chunk.ZeroHash(testMiB)}}
+	must(t, s.WriteManifest(ctx, live))
+	must(t, s.Publish(ctx, "1.1"))
+	imp := live
+	imp.Epoch = 0
+	must(t, s.WriteManifest(ctx, imp))
+	if err := s.PublishFirst(ctx, "0.1"); err == nil {
+		t.Fatal("the import's publish replaced a live current")
+	}
+	if b, _ := os.ReadFile(filepath.Join(vol, "current")); string(b) != "1.1\n" { //nolint:gosec // test fixture
+		t.Fatalf("current = %q, want 1.1", b)
+	}
+}
+
+func TestImportInterruptedIsRefusedWithTheWayOut(t *testing.T) {
+	t.Parallel()
+	vol := volumeDir(t)
+	s, _ := chunk.Open(vol)
+	must(t, s.WriteManifest(context.Background(), chunk.Manifest{Volume: "pvc-1234", Size: testMiB, Chunk: testMiB, Chunks: []chunk.Hash{chunk.ZeroHash(testMiB)}, Sequence: 1}))
+	code, _, stderr := runMiami("import", "-image", writeImage(t, ext4Image(int(testMiB))), "-store", vol, "-chunk-size", "1048576")
+	if code != 1 || !strings.Contains(stderr, "interrupted") || !strings.Contains(stderr, filepath.Join(vol, "manifests", "0.1")) {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	must(t, os.Remove(filepath.Join(vol, "manifests", "0.1")))
+	if code, _, stderr := runMiami("import", "-image", writeImage(t, ext4Image(int(testMiB))), "-store", vol, "-chunk-size", "1048576"); code != 0 {
+		t.Fatalf("retry after removing the manifest: exit %d: %s", code, stderr)
+	}
+}
+
+func TestImportCapacityDerivesTheChunkSizeAndSizesTheDevice(t *testing.T) {
+	t.Parallel()
+	vol := volumeDir(t)
+	img := writeImage(t, ext4Image(int(testMiB)))
+	// 300 GiB needs chunks of 8 MiB to stay within 65536 lines (4 MiB up to 256).
+	const capacity = 300 << 30
+	code, stdout, stderr := runMiami("import", "-image", img, "-store", vol, "-capacity", "322122547200")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	s, _ := chunk.Open(vol)
+	m, err := s.ReadManifest(context.Background(), "0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Chunk != chunk.DefaultChunkSize(capacity) || m.Chunk != 8<<20 || m.Size != chunk.RoundUp(capacity, m.Chunk) {
+		t.Fatalf("chunk %d size %d", m.Chunk, m.Chunk)
+	}
+	if !strings.Contains(stdout, "chunkSize 8388608") {
+		t.Errorf("report does not name the chunkSize: %q", stdout)
+	}
+	if code, _, _ := runMiami("import", "-image", img, "-store", volumeDir(t), "-capacity", "1000"); code == 0 {
+		t.Error("a capacity below the image size was accepted")
+	}
 }
