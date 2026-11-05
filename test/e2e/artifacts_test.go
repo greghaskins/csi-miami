@@ -87,6 +87,14 @@ func (e *env) dump(t *testing.T, ns string) {
 	add("PersistentVolumeClaims in "+ns, pvcs, err)
 	testPods, err := e.Client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 	add("Pods in "+ns, testPods, err)
+	if err == nil {
+		for _, p := range testPods.Items {
+			b, lerr := e.Client.CoreV1().Pods(ns).GetLogs(p.Name, &corev1.PodLogOptions{}).DoRaw(ctx)
+			if lerr == nil {
+				write("pod-"+p.Name+".log", b)
+			}
+		}
+	}
 	pvs, err := e.Client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	add("PersistentVolumes", pvs, err)
 	vas, err := e.Client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
