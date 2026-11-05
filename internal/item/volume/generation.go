@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -42,34 +42,27 @@ func (it *Item) GenerationFor(ctx context.Context, in intent.Intent, trigger str
 	return it.generate(ctx, v, it.state(in.VolumeID), trigger)
 }
 
-// generate is the generation under the volume's freeze lock: one at a time,
-// and never while an adopted mount is being thawed.
+// generate is one generation. Only the freeze and the boundary run under the
+// volume's freeze lock (one freeze at a time, and never a thaw of an adopted
+// mount inside one); the upload does not, because it takes as long as the
+// transport likes and the reconciler's loop, an unstage and every other
+// pass must not wait behind it. The server serialises publishes itself. The
+// upload runs under its own deadline, PublishTimeout.
 func (it *Item) generate(ctx context.Context, v vol, st *vstate, trigger string) error {
-	st.fz.Lock()
-	defer st.fz.Unlock()
-
-	cctx, cancel := context.WithTimeout(ctx, it.cfg.Timeout)
-	c, err := it.cfg.Dial(cctx, v.socket)
-	cancel()
+	c, err := it.freezeSection(ctx, v, st)
 	if err != nil {
-		return fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+		return err
 	}
 	defer func() { _ = c.Close() }()
 
-	sctx, scancel := context.WithTimeout(ctx, it.cfg.Timeout)
-	status, err := c.Status(sctx)
-	scancel()
-	if err != nil {
-		return fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
-	}
-	if status.PublishInFlight {
-		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, ErrGenerationSkipped)
-	}
+	pctx, cancel := context.WithTimeout(ctx, it.cfg.PublishTimeout)
+	defer cancel()
+	return it.publish(pctx, v, c, trigger)
+}
 
-	if err := it.freezeAndMark(ctx, v, c); err != nil {
-		return err
-	}
-
+// publish asks the server to upload the boundary generation and maps a
+// refusal to the item's condition.
+func (it *Item) publish(ctx context.Context, v vol, c Control, trigger string) error {
 	reply, err := c.Publish(ctx, trigger)
 	switch {
 	case errors.Is(err, blockd.ErrRefused) || (err == nil && reply.Refused):
@@ -80,11 +73,55 @@ func (it *Item) generate(ctx context.Context, v vol, st *vstate, trigger string)
 	return nil
 }
 
+// freezeSection dials the server, refuses when a publish is in flight or the
+// volume is leaving, and freezes, marks the boundary and thaws, all under the
+// freeze lock. It returns the open control connection for the upload.
+func (it *Item) freezeSection(ctx context.Context, v vol, st *vstate) (Control, error) {
+	st.fz.Lock()
+	defer st.fz.Unlock()
+	if st.tearingDown || st.gone {
+		return nil, fmt.Errorf("volume item %s: %w: the volume is being unstaged", v.in.VolumeID, ErrGenerationSkipped)
+	}
+	c, err := it.markBoundary(ctx, v)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// markBoundary is the freeze and boundary for a generation, the caller holding
+// the freeze lock. It returns the control connection with the boundary set.
+func (it *Item) markBoundary(ctx context.Context, v vol) (Control, error) {
+	cctx, cancel := context.WithTimeout(ctx, it.cfg.Timeout)
+	c, err := it.cfg.Dial(cctx, v.socket)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
+	sctx, scancel := context.WithTimeout(ctx, it.cfg.Timeout)
+	status, err := c.Status(sctx)
+	scancel()
+	if err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
+	if status.PublishInFlight {
+		_ = c.Close()
+		return nil, fmt.Errorf("volume item %s: %w", v.in.VolumeID, ErrGenerationSkipped)
+	}
+	if err := it.freezeAndMark(ctx, v, c); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
 // freezeAndMark freezes the stage mount, has the server mark the boundary and
 // thaws, in a function of its own so the thaw is a defer: it runs when the
 // boundary fails, when it panics, and, through the watchdog, when it hangs.
-// A volume with no mount (an unstage that finds it gone) marks the boundary
-// with nothing to freeze.
+// A volume with no mount (an unstage that finds it unmounted) marks the
+// boundary with nothing to freeze. A boundary that returns after the watchdog
+// thawed was taken while writes ran, and is not published.
 func (it *Item) freezeAndMark(ctx context.Context, v vol, c Control) error {
 	thaw := func() error { return nil }
 	if mounted, err := it.mounted(ctx, v); err != nil {
@@ -101,7 +138,9 @@ func (it *Item) freezeAndMark(ctx context.Context, v vol, c Control) error {
 			return terr
 		}
 	}
+	var fired atomic.Bool
 	watchdog := time.AfterFunc(it.cfg.FreezeBound, func() {
+		fired.Store(true)
 		if err := thaw(); err != nil {
 			it.log.Error("the watchdog could not thaw the file system", "volume", v.in.VolumeID, "error", err)
 		}
@@ -120,6 +159,8 @@ func (it *Item) freezeAndMark(ctx context.Context, v vol, c Control) error {
 		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, ErrGenerationSkipped)
 	case err != nil:
 		return fmt.Errorf("volume item %s: marking the boundary: %w", v.in.VolumeID, err)
+	case fired.Load():
+		return fmt.Errorf("volume item %s: the file system was thawed by the watchdog before the boundary was marked; not publishing it", v.in.VolumeID)
 	}
 	return nil
 }
@@ -167,18 +208,4 @@ func realThaw(path string) error {
 		return err
 	}
 	return nil
-}
-
-// blockSize is Config.DeviceSize: BLKGETSIZE64.
-func blockSize(path string) (int64, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = unix.Close(fd) }()
-	var n uint64
-	if _, _, e := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.BLKGETSIZE64, uintptr(unsafe.Pointer(&n))); e != 0 { //nolint:gosec // the ioctl's out parameter
-		return 0, e
-	}
-	return int64(n), nil //nolint:gosec // a device size fits int64
 }

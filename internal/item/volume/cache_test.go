@@ -276,6 +276,7 @@ func TestReuseTable(t *testing.T) {
 		{"current at an older epoch", 3, "3.2", current{ok: true, epoch: 2}, false},
 		{"no current, no base", 3, "", current{}, true},
 		{"no current, a base", 3, "3.2", current{}, false},
+		{"current is still the base the cache was built from", 2, "1.3", current{name: "1.3", ok: true, epoch: 1}, true},
 	} {
 		idx := cacheIndex(tc.epoch, tc.base)
 		if got := reuse(idx, tc.cur); got != tc.want {

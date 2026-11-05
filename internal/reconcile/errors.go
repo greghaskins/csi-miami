@@ -47,6 +47,7 @@ import (
 //	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
 //	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
 //	    ErrHolderContended, ErrServerDown,
+//	    ErrUnstageIncomplete,
 //	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, mount.ErrChanged
 //	    (a mount replaced between judgement and unmount), ErrStopped, EBUSY,
 //	    ESTALE (a stale NFS handle: the server restarted)
@@ -125,7 +126,7 @@ func Classify(err error) Class {
 		return ClassAborted
 	case errors.Is(err, mount.ErrTimeout):
 		return ClassDeadlineExceeded
-	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrHolderContended), errors.Is(err, ErrServerDown), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy), errors.Is(err, mount.ErrChanged),
+	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrHolderContended), errors.Is(err, ErrServerDown), errors.Is(err, ErrUnstageIncomplete), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy), errors.Is(err, mount.ErrChanged),
 		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY), errors.Is(err, syscall.ESTALE):
 		return ClassUnavailable
 	default:
@@ -189,6 +190,10 @@ var (
 
 	// ErrBadKey is returned when the key does not open the volume.
 	ErrBadKey = item.ErrBadKey
+
+	// ErrUnstageIncomplete is returned by an unstage that cannot yet prove the
+	// volume's last writes are in the store; it is retryable.
+	ErrUnstageIncomplete = item.ErrUnstageIncomplete
 
 	// ErrGenerationOverdue is the condition of a volume whose newest
 	// generation is older than its maximum age; it is reported, not returned.

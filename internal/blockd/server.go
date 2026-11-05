@@ -245,6 +245,7 @@ func (s *server) status() Status {
 		Refused:          s.refused,
 		PublishInFlight:  s.publishInFlight,
 		BinaryHash:       s.binaryHash,
+		Epoch:            s.cfg.Epoch,
 	}
 	s.mu.Unlock()
 	return st

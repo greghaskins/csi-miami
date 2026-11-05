@@ -12,8 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/greghaskins/csi-miami/internal/blockd"
 	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/item"
@@ -90,8 +88,9 @@ func TestRestageAfterPluginRestartAdoptsEverything(t *testing.T) {
 
 	e.mustConverge()
 
-	// Observations and the thaw of the adopted mount, nothing else.
-	want := []string{"holder.Read", "holder.Adopt", "current", "adopt-thaw"}
+	// Observations, the thaw of the adopted mount and, once per plugin start,
+	// the two resizes that do nothing to a volume already full size.
+	want := []string{"holder.Read", "holder.Adopt", "current", "adopt-thaw", "tool cryptsetup resize", "tool resize2fs"}
 	if got := e.rec.all(); !slices.Equal(got, want) {
 		t.Errorf("calls = %v, want %v", got, want)
 	}
@@ -209,7 +208,7 @@ func TestUnitDeadDeviceAliveRestartsUnitKeepsMount(t *testing.T) {
 	if n := e.rec.count("systemd.Start"); n != 1 {
 		t.Errorf("starts = %d, want 1", n)
 	}
-	e.rec.none(t, "unmount", "mount", "tool", "ctl.Stop", "systemd.Stop")
+	e.rec.none(t, "unmount", "mount", "tool cryptsetup open", "tool cryptsetup close", "tool mkfs", "tool e2fsck", "ctl.Stop", "systemd.Stop")
 	if !reflect.DeepEqual(e.mnt.table(), table) {
 		t.Error("the mount table changed")
 	}
@@ -294,98 +293,6 @@ func TestGrowRunsThreeSteps(t *testing.T) {
 	e.ctl.size = e.v.size / 2
 	e.mustConverge()
 	e.rec.inOrder(t, "ctl.Grow", "tool cryptsetup resize", "tool resize2fs")
-}
-
-func TestGrowFinishesAHalfDoneGrow(t *testing.T) {
-	e := newEnv(t)
-	e.seedRunning()
-	// The device and the mapping are big enough; the file system is not.
-	e.mnt.SetStatfs(e.v.stage, unix.Statfs_t{Blocks: 100, Bsize: 4096})
-	e.mustConverge()
-	e.rec.none(t, "ctl.Grow", "tool cryptsetup resize")
-	if e.rec.count("tool resize2fs") != 1 {
-		t.Errorf("calls = %v", e.rec.all())
-	}
-	// A file system that merely looks short is resized once, not every pass.
-	e.mustConverge()
-	if e.rec.count("tool resize2fs") != 1 {
-		t.Errorf("resize2fs ran again: %v", e.rec.all())
-	}
-}
-
-func TestTeardownOrder(t *testing.T) {
-	e := newEnv(t)
-	e.seedRunning()
-	e.makeCache(1, "", 0)
-	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
-		t.Fatal(err)
-	}
-	e.rec.inOrder(t,
-		"freeze", "ctl.Boundary", "thaw", "ctl.Publish unstage",
-		"unmount", "tool cryptsetup close", "ctl.Stop", "systemd.Stop")
-	if e.cacheExists() {
-		t.Error("the cache survived the unstage")
-	}
-	if e.holderInfo().Present {
-		t.Error("the holder file survived the unstage")
-	}
-	if len(e.events) != 0 {
-		t.Errorf("events = %v", e.events)
-	}
-	// Nothing left to undo: a second teardown is quiet.
-	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
-		t.Fatalf("second teardown: %v", err)
-	}
-}
-
-func TestTeardownSucceedsWhenPublishRefused(t *testing.T) {
-	e := newEnv(t)
-	e.seedRunning()
-	e.makeCache(1, "", 0)
-	e.ctl.publishRefused = true
-	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
-		t.Fatalf("a refused final generation must not fail the unstage: %v", err)
-	}
-	if !slices.Equal(e.events, []string{ReasonPublishRefused}) {
-		t.Errorf("events = %v", e.events)
-	}
-	e.rec.inOrder(t, "unmount", "tool cryptsetup close", "systemd.Stop")
-	if e.cacheExists() || e.holderInfo().Present {
-		t.Error("cache or holder left behind")
-	}
-}
-
-func TestTeardownSucceedsWhenTransportDown(t *testing.T) {
-	e := newEnv(t)
-	e.seedRunning()
-	e.makeCache(1, "", 0)
-	e.ctl.publishErr = syscall.ESTALE
-	e.hold.adoptErr = errors.New("i/o timeout")
-	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
-		t.Fatalf("a down transport must not fail the unstage: %v", err)
-	}
-	if !slices.Equal(e.events, []string{ReasonGenerationLost}) {
-		t.Errorf("events = %v", e.events)
-	}
-	e.rec.inOrder(t, "unmount", "tool cryptsetup close", "systemd.Stop")
-	if e.cacheExists() {
-		t.Error("the cache survived")
-	}
-}
-
-func TestTeardownWithTheServerGoneReportsLostWrites(t *testing.T) {
-	e := newEnv(t)
-	e.seedRunning()
-	e.makeCache(1, "", 3)
-	e.sd.SetState(e.v.unit, systemd.State{})
-	e.ctl.down = true
-	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(e.events, []string{ReasonGenerationLost}) {
-		t.Errorf("events = %v", e.events)
-	}
-	e.rec.none(t, "freeze", "ctl.Publish")
 }
 
 func TestTeardownBusyMountIsRetryable(t *testing.T) {

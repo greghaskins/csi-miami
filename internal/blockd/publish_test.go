@@ -172,3 +172,11 @@ func TestStatusReportsBinaryHash(t *testing.T) {
 		t.Fatalf("status binary hash = %q, want %q", got, want)
 	}
 }
+
+func TestStatusReportsTheEpochItPublishesUnder(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	if got := s.status().Epoch; got != cfg.Epoch || got == 0 {
+		t.Fatalf("status epoch = %d, want %d", got, cfg.Epoch)
+	}
+}

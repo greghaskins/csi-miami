@@ -51,7 +51,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/blockd"
@@ -171,8 +173,6 @@ type Config struct {
 
 	// Current reads the name in the store's `current` file, fresh each call.
 	Current func(ctx context.Context, storeDir string) (name string, ok bool, err error)
-	// DeviceSize is BLKGETSIZE64 of a block device.
-	DeviceSize func(path string) (int64, error)
 	// Freeze freezes the file system mounted at path and returns the function
 	// that thaws it, which may be called more than once. Thaw thaws the file
 	// system at path; EINVAL, "not frozen", is not an error.
@@ -189,6 +189,10 @@ type Item struct {
 
 	mu   sync.Mutex
 	vols map[string]*vstate
+
+	// bin remembers what ensureBinary has verified, so the running binary is
+	// hashed once and not on every pass.
+	bin binMemo
 }
 
 var _ item.Item = (*Item)(nil)
@@ -201,11 +205,21 @@ type vstate struct {
 	// fz serialises everything that freezes or thaws the volume's file
 	// system, so that the thaw of an adopted mount cannot cut a generation's
 	// freeze short, and two generations never overlap.
-	fz     sync.Mutex
-	thawed bool // a re-adopted mount has been thawed once since this process began
+	fz sync.Mutex
+	// tearingDown is set by an unstage under fz, and gone once it succeeded:
+	// a generation that was waiting on fz then finds the volume is leaving and
+	// does nothing. A Converge (a restage) clears both.
+	tearingDown, gone bool
 
-	// resizedTo is the device size the file system was last resized to by
-	// this process, so a file system that merely looks short is resized once.
+	// thawed says a re-adopted mount has been thawed once since this process
+	// began. It is atomic so that the pass that checks it never waits on fz,
+	// which a generation holds for a freeze.
+	thawed atomic.Bool
+
+	// resizedTo is the size the mapping and the file system were last brought
+	// to by this process. Both resizes are no-ops on something already full
+	// size, so they are run once per size per process and never decided from
+	// a guess about how full the file system looks.
 	resizedTo int64
 }
 
@@ -252,9 +266,6 @@ func New(cfg Config) (*Item, error) {
 	}
 	if cfg.Current == nil {
 		cfg.Current = storeCurrent
-	}
-	if cfg.DeviceSize == nil {
-		cfg.DeviceSize = blockSize
 	}
 	if cfg.Freeze == nil {
 		cfg.Freeze = realFreeze
@@ -348,12 +359,6 @@ func (it *Item) state(volumeID string) *vstate {
 	return s
 }
 
-func (it *Item) forget(volumeID string) {
-	it.mu.Lock()
-	defer it.mu.Unlock()
-	delete(it.vols, volumeID)
-}
-
 func (it *Item) event(volumeID, reason string) {
 	if it.cfg.Event != nil {
 		it.cfg.Event(volumeID, reason)
@@ -365,13 +370,29 @@ func (it *Item) devPath(idx int) string {
 	return filepath.Join(it.cfg.DevDir, "nbd"+strconv.Itoa(idx))
 }
 
-// storeCurrent is Config.Current over the real store.
+// storeCurrent is Config.Current over the real store: the name in the
+// `current` file. It only reads: a store directory that is missing is an
+// error (the controller makes it), and nothing is created in it, because this
+// runs on every pass.
 func storeCurrent(ctx context.Context, storeDir string) (string, bool, error) {
-	s, err := chunk.Open(storeDir)
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if _, err := os.Stat(storeDir); err != nil {
+		return "", false, err
+	}
+	b, err := os.ReadFile(filepath.Join(storeDir, "current")) //nolint:gosec // the volume's own store directory
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
 	if err != nil {
 		return "", false, err
 	}
-	return s.Current(ctx)
+	name := strings.TrimSpace(string(b))
+	if _, _, err := chunk.ParseManifestName(name); err != nil {
+		return "", false, err
+	}
+	return name, true, nil
 }
 
 // current is what the store's `current` says, read afresh: the epoch of the

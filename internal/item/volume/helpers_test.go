@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -128,8 +130,9 @@ type env struct {
 	freezeE error
 	thawE   error
 	thaws   int
-	sizes   map[string]int64
 	judge   func(string) holder.Judgement
+	atStop  [2]bool // cache and holder file present when the unit was stopped
+	logs    bytes.Buffer
 }
 
 func newEnv(t *testing.T) *env {
@@ -138,7 +141,7 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, rec: &recorder{}, sizes: map[string]int64{}}
+	e := &env{t: t, rec: &recorder{}}
 	e.root = filepath.Join(base, "miami")
 	e.binDir = filepath.Join(base, "bin")
 	e.cacheDir = filepath.Join(base, "cache")
@@ -209,16 +212,8 @@ func (e *env) newItem() {
 		StartTimeout: 300 * time.Millisecond, PollEvery: time.Millisecond, FreezeBound: 200 * time.Millisecond,
 		Timeout: time.Second,
 		Event:   func(_, reason string) { e.events = append(e.events, reason) },
+		Logger:  slog.New(slog.NewTextHandler(&e.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Current: e.current,
-		DeviceSize: func(p string) (int64, error) {
-			if n, ok := e.sizes[p]; ok {
-				return n, nil
-			}
-			if strings.Contains(p, "/mapper/") {
-				return testSize - 1<<20, nil
-			}
-			return testSize, nil
-		},
 		Freeze: func(string) (func() error, error) {
 			e.rec.add("freeze")
 			if e.freezeE != nil {
@@ -377,6 +372,7 @@ func (e *env) seedRunning() {
 // started (or re-pointing) block server does. The index is kept when the
 // device is already there.
 func (e *env) attach() {
+	e.ctl.epoch = e.holderInfo().Epoch
 	idx := 0
 	for _, d := range e.nbd.devs {
 		if d.Backend == e.v.name {
@@ -450,21 +446,31 @@ type fakeSystemd struct {
 	e        *env
 	startErr error
 	units    []systemd.Unit
+	// activeOnErr makes a failed Start leave the unit active, as when it was
+	// already running with another ExecStart.
+	activeOnErr bool
 }
 
 func (s *fakeSystemd) Start(_ context.Context, u systemd.Unit) error {
 	s.e.rec.add("systemd.Start")
 	s.units = append(s.units, u)
 	if s.startErr != nil {
+		if s.activeOnErr {
+			s.SetState(u.Name, systemd.State{Active: "active", Sub: "running", MainPID: 42, Present: true})
+		}
 		return s.startErr
 	}
 	s.SetState(u.Name, systemd.State{Active: "active", Sub: "running", MainPID: 42, Present: true})
 	s.e.attach()
+	if i := slices.Index(u.ExecStart, "-epoch"); i >= 0 {
+		s.e.ctl.epoch, _ = strconv.ParseUint(u.ExecStart[i+1], 10, 64)
+	}
 	return nil
 }
 
 func (s *fakeSystemd) Stop(ctx context.Context, name string) error {
 	s.e.rec.add("systemd.Stop")
+	s.e.atStop = [2]bool{s.e.cacheExists(), s.e.holderInfo().Present}
 	s.e.nbd.remove(s.e.v.name)
 	return s.Manager.Stop(ctx, name)
 }
@@ -500,14 +506,22 @@ type fakeCtl struct {
 	e              *env
 	down           bool
 	index          int
+	epoch          uint64
 	size           int64
 	inFlight       bool
+	inFlightPolls  int // Status reports a publish in flight for this many calls, then clears
 	boundaryErr    error
 	publishErr     error
 	publishRefused bool
 	growErr        error
+	stopErr        error
 	boundaryHang   chan struct{}
+	boundaryDelay  time.Duration // Boundary sleeps this long, ignoring its context
 	dirty          int64
+	base           string
+	nextName       string // the manifest a publish with dirty chunks makes current
+	stickyDirty    bool   // a publish leaves the dirty count as it was
+	wrongName      bool   // a publish succeeds but current does not move
 }
 
 func (c *fakeCtl) up() {
@@ -518,11 +532,19 @@ func (c *fakeCtl) up() {
 }
 
 func (c *fakeCtl) Status(context.Context) (blockd.Status, error) {
-	return blockd.Status{Index: c.index, Size: c.size, Dirty: c.dirty, PublishInFlight: c.inFlight}, nil
+	fl := c.inFlight
+	if c.inFlightPolls > 0 {
+		c.inFlightPolls--
+		fl = true
+	}
+	return blockd.Status{Index: c.index, Size: c.size, Dirty: c.dirty, Base: c.base, Epoch: c.epoch, PublishInFlight: fl}, nil
 }
 
 func (c *fakeCtl) Boundary(ctx context.Context) error {
 	c.e.rec.add("ctl.Boundary")
+	if c.boundaryDelay > 0 {
+		time.Sleep(c.boundaryDelay)
+	}
 	if c.boundaryHang != nil {
 		select {
 		case <-c.boundaryHang:
@@ -541,7 +563,21 @@ func (c *fakeCtl) Publish(_ context.Context, trigger string) (blockd.PublishRepl
 	if c.publishRefused {
 		return blockd.PublishReply{Refused: true}, blockd.ErrRefused
 	}
-	return blockd.PublishReply{Name: "1.1"}, nil
+	if c.dirty == 0 {
+		return blockd.PublishReply{}, nil
+	}
+	name := c.nextName
+	if name == "" {
+		name = "1.1"
+	}
+	if !c.wrongName {
+		c.e.curName = name
+	}
+	c.base = name
+	if !c.stickyDirty {
+		c.dirty = 0
+	}
+	return blockd.PublishReply{Name: name, Uploaded: 1}, nil
 }
 
 func (c *fakeCtl) Grow(_ context.Context, size int64) error {
@@ -555,6 +591,9 @@ func (c *fakeCtl) Grow(_ context.Context, size int64) error {
 
 func (c *fakeCtl) Stop(context.Context) error {
 	c.e.rec.add("ctl.Stop")
+	if c.stopErr != nil {
+		return c.stopErr
+	}
 	c.down = true
 	return nil
 }
@@ -581,6 +620,27 @@ func (m *simMounter) add(target, fstype, source string) {
 	defer m.mu.Unlock()
 	m.nextID++
 	m.entries = append(m.entries, observe.Mount{ID: 100 + m.nextID, ParentID: 1, MountPoint: target, Root: "/", FSType: fstype, Source: source})
+	m.SetTable(append(observe.Table(nil), m.entries...))
+}
+
+// addDev is add with the device numbers a bind of the same device shares.
+func (m *simMounter) addDev(target, fstype, source string, major, minor int) {
+	m.add(target, fstype, source)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.entries[len(m.entries)-1].Major, m.entries[len(m.entries)-1].Minor = major, minor
+	m.SetTable(append(observe.Table(nil), m.entries...))
+}
+
+// setDev sets the device numbers of the mount at target.
+func (m *simMounter) setDev(target string, major, minor int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.entries {
+		if m.entries[i].MountPoint == target {
+			m.entries[i].Major, m.entries[i].Minor = major, minor
+		}
+	}
 	m.SetTable(append(observe.Table(nil), m.entries...))
 }
 

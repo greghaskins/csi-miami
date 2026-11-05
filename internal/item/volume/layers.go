@@ -2,6 +2,7 @@ package volume
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -25,10 +26,6 @@ import (
 	"github.com/greghaskins/csi-miami/internal/systemd"
 )
 
-// luksSlack is how far a LUKS mapping may be smaller than the device under it
-// (the header) before the mapping counts as not yet resized.
-const luksSlack = 64 << 20
-
 // fencedReason is the judgement's reason for a holder file that names this
 // node while the store has moved on to a newer epoch.
 const fencedReason = "own ownership fenced by a newer generation"
@@ -43,6 +40,9 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 		return err
 	}
 	st := it.state(in.VolumeID)
+	st.fz.Lock()
+	st.tearingDown, st.gone = false, false // a restage after an unstage that failed or finished
+	st.fz.Unlock()
 
 	// Layer 2, first half: the holder. It comes before anything is read from
 	// the store that decides what to mount and at which epoch.
@@ -59,7 +59,27 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 		return err
 	}
 	if cur.ok && cur.epoch > h.Epoch() {
+		if err := it.refuseIfBound(v, obs.Mounts); err != nil {
+			return err
+		}
 		if h, err = it.refence(ctx, v, st, cur); err != nil {
+			return err
+		}
+		if obs.Mounts, err = it.cfg.Mounter.Mounts(ctx); err != nil {
+			return fmt.Errorf("volume item %s: %w: %w", in.VolumeID, item.ErrObserve, err)
+		}
+	}
+
+	// The other direction of the same fence: a server that runs under an epoch
+	// other than the one we hold (we lost the volume, and took it back at a
+	// higher epoch) refuses every publish and serves a cache of another
+	// lineage. It is stopped and restarted at the held epoch, and its cache is
+	// dropped, exactly as for a fenced ownership.
+	if it.serverEpochStale(ctx, v, h) {
+		if err := it.refuseIfBound(v, obs.Mounts); err != nil {
+			return err
+		}
+		if err := it.stopAndDiscard(ctx, v, st, "the running server publishes under another epoch"); err != nil {
 			return err
 		}
 		if obs.Mounts, err = it.cfg.Mounter.Mounts(ctx); err != nil {
@@ -70,7 +90,7 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 	if err := it.ensureBinary(); err != nil {
 		return fmt.Errorf("volume item %s: %w", in.VolumeID, err)
 	}
-	dev, err := it.ensureServer(ctx, v, h, cur)
+	dev, err := it.ensureServer(ctx, v, st, h, cur)
 	if err != nil {
 		return err
 	}
@@ -189,10 +209,7 @@ func (it *Item) judge(v vol, info holder.Info, cur current) holder.Judgement {
 // volume is acquired afresh at an epoch above `current`'s, to be started at.
 func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*holder.Holder, error) {
 	it.log.Warn("our ownership is fenced by a newer generation; starting over at a new epoch", "volume", v.in.VolumeID, "currentEpoch", cur.epoch)
-	if err := it.stopStack(ctx, v); err != nil {
-		return nil, err
-	}
-	if err := it.discardCache(v, "the ownership was fenced"); err != nil {
+	if err := it.stopAndDiscard(ctx, v, st, "the ownership was fenced"); err != nil {
 		return nil, err
 	}
 	st.h = nil
@@ -207,6 +224,48 @@ func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*h
 	return h, nil
 }
 
+// stopAndDiscard stops everything raised above the store and removes the
+// cache, for an ownership that is over: the next start is a fresh one.
+func (it *Item) stopAndDiscard(ctx context.Context, v vol, st *vstate, why string) error {
+	if err := it.unmountAndClose(ctx, v, st); err != nil {
+		return err
+	}
+	if err := it.stopServerAndUnit(ctx, v); err != nil {
+		return err
+	}
+	return it.discardCache(v, why)
+}
+
+// refuseIfBound refuses to tear the stage down while it is still bound into
+// pods (another mount of the same device): the fence is real, but unmounting
+// under a running pod is for the operator and the pod's end, not for a
+// reconcile pass. The condition is publish-refused; the next pass looks again,
+// and the teardown happens once the binds are gone.
+func (it *Item) refuseIfBound(v vol, mounts observe.Table) error {
+	top, ok := mounts.At(v.stage)
+	if !ok {
+		return nil
+	}
+	for _, m := range mounts {
+		if m.ID != top.ID && m.FSType == top.FSType && m.Major == top.Major && m.Minor == top.Minor && m.MountPoint != v.stage {
+			return fmt.Errorf("volume item %s: %w: the ownership is fenced but the stage is still bound into a pod; leaving it until the binds are gone", v.in.VolumeID, item.ErrPublishRefused)
+		}
+	}
+	return nil
+}
+
+// serverEpochStale reports whether the volume's unit is running and its server
+// says it publishes under an epoch other than h's. A server that does not
+// answer is not stale: layer 4 reports it.
+func (it *Item) serverEpochStale(ctx context.Context, v vol, h *holder.Holder) bool {
+	us, err := it.cfg.Systemd.State(ctx, v.unit)
+	if err != nil || !us.Present || us.Active != "active" {
+		return false
+	}
+	st, err := it.status(ctx, v)
+	return err == nil && st.Epoch != h.Epoch()
+}
+
 // ---- layer 3: binary ----
 
 // binPath is the host copy of the binary the units execute.
@@ -214,10 +273,41 @@ func (it *Item) binPath() string {
 	return filepath.Join(it.cfg.BinDir, "miami-"+it.cfg.BinaryHash)
 }
 
-// ensureBinary makes the host copy: present with the size of the running
+// binMemo is what ensureBinary has verified: the running binary's hash, keyed
+// by the file it was computed from, and the host copy's identity once it was
+// found to match.
+type binMemo struct {
+	srcKey, dstKey fileKey
+	srcSum         [sha256.Size]byte
+	haveSrc, dstOK bool
+}
+
+// fileKey identifies a file's content cheaply: stat fields only.
+type fileKey struct {
+	size int64
+	mod  time.Time
+}
+
+func keyOf(fi os.FileInfo) fileKey { return fileKey{fi.Size(), fi.ModTime()} }
+
+// hashFile is the SHA-256 of a file.
+func hashFile(f *os.File) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
+// ensureBinary makes the host copy: present with the content of the running
 // binary, else copied to a temporary name and renamed into place with mode
-// 0755. A copy that exists is never rewritten, so a running unit's binary is
-// never changed under it.
+// 0755. The comparison is by content hash, not by name and size: two builds
+// can be the same size, and a unit must run the binary that is staging it. The
+// hashes are computed once per file identity, not on every pass. A copy that
+// matches is never rewritten, so a running unit's binary is never changed
+// under it.
 func (it *Item) ensureBinary() error {
 	dst := it.binPath()
 	src, err := os.Open(it.cfg.Exe)
@@ -229,8 +319,28 @@ func (it *Item) ensureBinary() error {
 	if err != nil {
 		return fmt.Errorf("the running binary: %w", err)
 	}
-	if di, err := os.Stat(dst); err == nil && di.Mode().IsRegular() && di.Size() == si.Size() && di.Mode().Perm()&0o111 != 0 {
-		return nil
+	m := &it.bin
+	if !m.haveSrc || m.srcKey != keyOf(si) {
+		if m.srcSum, err = hashFile(src); err != nil {
+			return fmt.Errorf("hashing the running binary: %w", err)
+		}
+		m.srcKey, m.haveSrc, m.dstOK = keyOf(si), true, false
+		if _, err := src.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("the running binary: %w", err)
+		}
+	}
+	if di, err := os.Stat(dst); err == nil && di.Mode().IsRegular() && di.Mode().Perm()&0o111 != 0 {
+		if m.dstOK && m.dstKey == keyOf(di) {
+			return nil
+		}
+		if f, err := os.Open(dst); err == nil { //nolint:gosec // the item's own host copy
+			sum, herr := hashFile(f)
+			_ = f.Close()
+			if herr == nil && sum == m.srcSum {
+				m.dstKey, m.dstOK = keyOf(di), true
+				return nil
+			}
+		}
 	}
 	if err := os.MkdirAll(it.cfg.BinDir, 0o755); err != nil { //nolint:gosec // the host directory the units execute from
 		return fmt.Errorf("making the binary directory: %w", err)
@@ -257,6 +367,9 @@ func (it *Item) ensureBinary() error {
 	}
 	if err := os.Rename(tmp.Name(), dst); err != nil {
 		return fmt.Errorf("installing the binary: %w", err)
+	}
+	if di, err := os.Stat(dst); err == nil {
+		m.dstKey, m.dstOK = keyOf(di), true
 	}
 	return nil
 }
@@ -289,7 +402,7 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 // there the new server re-points it (decision 51), so the mapping and the
 // mount above are never touched. Only a start with no device in the kernel
 // decides what to do with a node-local cache.
-func (it *Item) ensureServer(ctx context.Context, v vol, h *holder.Holder, cur current) (nbd.Device, error) {
+func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.Holder, cur current) (nbd.Device, error) {
 	us, err := it.cfg.Systemd.State(ctx, v.unit)
 	if err != nil {
 		return nbd.Device{}, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
@@ -302,12 +415,12 @@ func (it *Item) ensureServer(ctx context.Context, v vol, h *holder.Holder, cur c
 		switch us.Active {
 		case "active":
 			if haveDev {
-				st, serr := it.status(ctx, v)
+				ss, serr := it.status(ctx, v)
 				switch {
 				case serr != nil:
 					return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit is active and its control socket does not answer: %w", v.in.VolumeID, item.ErrServerDown, serr)
-				case st.Index != dev.Index:
-					return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit serves device %d, the volume's device is %d", v.in.VolumeID, item.ErrServerDown, st.Index, dev.Index)
+				case ss.Index != dev.Index:
+					return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit serves device %d, the volume's device is %d", v.in.VolumeID, item.ErrServerDown, ss.Index, dev.Index)
 				}
 				return dev, nil
 			}
@@ -322,6 +435,11 @@ func (it *Item) ensureServer(ctx context.Context, v vol, h *holder.Holder, cur c
 		if err := it.decideCache(v, cur); err != nil {
 			return nbd.Device{}, err
 		}
+	} else if _, ierr := cache.ReadIndex(v.cacheDir); errors.Is(ierr, cache.ErrNoIndex) {
+		// A device is still there but the cache that served it is not. A
+		// server cannot re-point it without its cache, and this item never
+		// builds one for a device that exists: the volume waits for a person.
+		return nbd.Device{}, fmt.Errorf("volume item %s: %w: the volume's device exists but its cache does not", v.in.VolumeID, item.ErrServerDown)
 	}
 	err = it.cfg.Systemd.Start(ctx, it.unitFor(v, h))
 	switch {
@@ -330,6 +448,15 @@ func (it *Item) ensureServer(ctx context.Context, v vol, h *holder.Holder, cur c
 		// raced this start). The running unit is the volume's server; the new
 		// binary is used at the next stage.
 		it.log.Info("the unit runs a different binary; adopting it", "volume", v.in.VolumeID)
+		if it.serverEpochStale(ctx, v, h) {
+			// Adopting is for a different binary; a different epoch is a
+			// fenced server. Stop it so that the next pass starts one at the
+			// held epoch.
+			if serr := it.stopAndDiscard(ctx, v, st, "the running server publishes under another epoch"); serr != nil {
+				return nbd.Device{}, serr
+			}
+			return nbd.Device{}, fmt.Errorf("volume item %s: %w: the running unit published under another epoch and was stopped", v.in.VolumeID, item.ErrServerDown)
+		}
 	case err != nil:
 		return nbd.Device{}, fmt.Errorf("volume item %s: %w: starting the unit: %w", v.in.VolumeID, item.ErrServerDown, err)
 	}
@@ -402,6 +529,11 @@ func (it *Item) waitServing(ctx context.Context, v vol, want int) (nbd.Device, e
 // reuse says whether a cache that survived (a reboot, a crashed server) may be
 // served again, with the store's `current` as the witness:
 //
+//   - `current` exists and is still the manifest the cache was built from
+//     (its base): a manifest name is never reused and `current` only ever
+//     takes a new name, so nothing has been published since the cache began,
+//     whoever's epoch it was built under. This is a reboot inside the first
+//     interval after a stage.
 //   - `current` exists and its epoch is the cache's: an epoch is issued to one
 //     node only, so a generation at that epoch was published from this very
 //     cache directory (the directory is per volume and per node, and removed at
@@ -418,7 +550,7 @@ func (it *Item) waitServing(ctx context.Context, v vol, want int) (nbd.Device, e
 // the base it descends from.
 func reuse(idx cache.Index, cur current) bool {
 	if cur.ok {
-		return cur.epoch == idx.Epoch
+		return cur.epoch == idx.Epoch || cur.name == idx.Base
 	}
 	return idx.Base == ""
 }
@@ -581,15 +713,14 @@ func (it *Item) ensureMounted(ctx context.Context, v vol, st *vstate, blk string
 		if err := ext4.Mkfs(ctx, it.cfg.Tools, blk); err != nil {
 			return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
 		}
+		st.resizedTo = v.size // a file system just made fills its device
 	} else if err := ext4.Fsck(ctx, it.cfg.Tools, blk); err != nil {
 		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
 	}
 	if err := it.cfg.Mounter.Mount(ctx, blk, v.stage, "ext4", unix.MS_NOSUID|unix.MS_NODEV, ext4.MountOptions); err != nil {
 		return fmt.Errorf("volume item %s: mounting the file system: %w", v.in.VolumeID, err)
 	}
-	st.fz.Lock()
-	st.thawed = true
-	st.fz.Unlock()
+	st.thawed.Store(true)
 	return nil
 }
 
@@ -597,65 +728,53 @@ func (it *Item) ensureMounted(ctx context.Context, v vol, st *vstate, blk string
 // EINVAL, "not frozen", is the normal answer and is the reason the call is
 // harmless; it is made once so that it can never end a generation's freeze.
 func (it *Item) thawOnce(v vol, st *vstate) error {
+	if st.thawed.Load() {
+		return nil // checked outside fz: a generation's freeze must not stall a pass
+	}
 	st.fz.Lock()
 	defer st.fz.Unlock()
-	if st.thawed {
+	if st.thawed.Load() {
 		return nil
 	}
 	if err := it.cfg.Thaw(v.stage); err != nil {
 		return fmt.Errorf("volume item %s: thawing the adopted mount: %w", v.in.VolumeID, err)
 	}
-	st.thawed = true
+	st.thawed.Store(true)
 	return nil
 }
 
 // ---- layer 7: size ----
 
-// ensureSize grows what is smaller than the record says, in order: the block
-// server's device, the LUKS mapping, the file system. Each step is taken when
-// its own layer is short, so a pass that finds a half-done grow finishes it.
-// (A grown device and mapping with a file system not yet grown is told by the
-// file system being well under its device; see below.)
+// ensureSize brings the volume to the size the record says, in order: the
+// block server's device, the LUKS mapping, the file system. The device is
+// grown when the server reports it smaller. The mapping and the file system
+// are resized whenever this process has not yet brought them to this size;
+// cryptsetup resize and resize2fs both do nothing to something already full
+// size, so this finishes a grow that was interrupted at any step (and the
+// price of not guessing from how full the file system looks is one call each
+// per size per plugin start).
 func (it *Item) ensureSize(ctx context.Context, v vol, vs *vstate, blk string) error {
 	st, err := it.status(ctx, v)
 	if err != nil {
 		return fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
 	}
-	grew := false
 	if st.Size < v.size {
 		if err := it.grow(ctx, v); err != nil {
 			return err
 		}
-		grew = true
 	}
-	size, err := it.cfg.DeviceSize(blk)
-	if err != nil {
-		return fmt.Errorf("volume item %s: the size of %s: %w", v.in.VolumeID, blk, err)
+	if vs.resizedTo == v.size {
+		return nil
 	}
-	if v.params.Encryption && (grew || size+luksSlack < v.size) {
+	if v.params.Encryption {
 		if err := crypt.Resize(ctx, it.cfg.Tools, crypt.Name(v.name)); err != nil {
 			return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
 		}
-		if size, err = it.cfg.DeviceSize(blk); err != nil {
-			return fmt.Errorf("volume item %s: the size of %s: %w", v.in.VolumeID, blk, err)
-		}
 	}
-	fsBytes, known, err := it.fsSize(ctx, v.stage)
-	if err != nil {
+	if err := ext4.Resize(ctx, it.cfg.Tools, blk); err != nil {
 		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
 	}
-	// statfs counts a file system's blocks net of its own overhead (journal,
-	// inode tables), so "smaller than the device" is only a safe test when the
-	// shortfall is large: a file system under four fifths of its device is a
-	// grow that was not finished. resize2fs on a file system that fills its
-	// device does nothing, so a false alarm costs one call, made once per size.
-	short := known && fsBytes*100 < size*80
-	if grew || (short && vs.resizedTo != size) {
-		if err := ext4.Resize(ctx, it.cfg.Tools, blk); err != nil {
-			return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
-		}
-		vs.resizedTo = size
-	}
+	vs.resizedTo = v.size
 	return nil
 }
 
@@ -672,17 +791,4 @@ func (it *Item) grow(ctx context.Context, v vol) error {
 		return fmt.Errorf("volume item %s: growing the device: %w", v.in.VolumeID, err)
 	}
 	return nil
-}
-
-// fsSize is the mounted file system's size in bytes; known is false when the
-// kernel reports none.
-func (it *Item) fsSize(ctx context.Context, stage string) (int64, bool, error) {
-	sf, err := it.cfg.Mounter.Statfs(ctx, stage)
-	if err != nil {
-		return 0, false, err
-	}
-	if sf.Blocks == 0 || sf.Bsize <= 0 {
-		return 0, false, nil
-	}
-	return int64(sf.Blocks) * int64(sf.Bsize), true, nil //nolint:gosec // block counts fit int64
 }

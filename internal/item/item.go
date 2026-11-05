@@ -137,6 +137,13 @@ var (
 	// not open the volume.
 	ErrBadKey = errors.New("the encryption key does not open the volume")
 
+	// ErrUnstageIncomplete is returned by Teardown when the volume's last
+	// writes are not verifiably in the store yet: a publish still in flight,
+	// the final generation failed, the store does not name it, or the server
+	// still holds dirty chunks. The server, the cache and the holder are left
+	// as they were so the unstage can be retried (decision 52). Retryable.
+	ErrUnstageIncomplete = errors.New("the unstage cannot yet prove the volume's last writes are in the store")
+
 	// ErrGenerationOverdue is the condition of a volume whose newest published
 	// generation is older than generations.maxAge. It is reported, not an error
 	// of Converge.

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/blockd"
 	"github.com/greghaskins/csi-miami/internal/cache"
@@ -16,51 +16,93 @@ import (
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
 
-var nbdSource = regexp.MustCompile(`^/dev/nbd[0-9]+$`)
-
 // ownsStage is the item.Owned test for the stage mount: an ext4 file system on
-// this volume's mapper or on an nbd device. A bind or anything else at the
-// stage path is not the volume's, and is left alone.
+// this volume's mapper or on this volume's own nbd device. A bind, another
+// volume's device or anything else at the stage path is not the volume's, and
+// is left alone.
 func (it *Item) ownsStage(v vol) item.Owned {
 	mapper := crypt.MapperPath(crypt.Name(v.name))
+	own := ""
+	if dev, ok, err := it.findDevice(v); err == nil && ok {
+		own = it.devPath(dev.Index)
+	}
 	return func(_ observe.Table, top observe.Mount) (bool, error) {
-		return top.FSType == "ext4" && (sameDevice(top.Source, mapper) || nbdSource.MatchString(top.Source)), nil
+		return top.FSType == "ext4" && (sameDevice(top.Source, mapper) || (own != "" && sameDevice(top.Source, own))), nil
 	}
 }
 
-// Teardown undoes Converge in the order of the spec: the final generation,
-// unmount, close the mapping, stop the server and its unit, remove the cache,
-// release the holder. A final generation that is refused or cannot be made
-// does not fail the unstage: the writes it would have published are discarded
-// with the cache, and the loss is logged and reported as an event. The
-// holder's release is likewise best effort, because a transport that is down
-// must not keep a volume from unstaging; the holder then ages out and is taken
-// over by the usual conditions. A busy mount is an error, retried by the
-// caller, before anything past it is touched.
+// Teardown is a verified clean release of the volume (decision 52). In order:
+// thaw (a plugin that died inside a freeze must not wedge the unmount),
+// unmount, close the mapping, wait out any publish already in flight, then the
+// final generation, then a check against the store itself: `current` is read
+// afresh and must name what the server just published (or, when nothing was
+// to publish, the manifest the cache descends from), and the server must
+// report no publish running. Only then are the server stopped (the one call
+// that disconnects the device), its unit stopped, the cache removed and the
+// holder released.
+//
+// Anything short of that, before the server is stopped, is an
+// item.ErrUnstageIncomplete: retryable, and the server, the cache and the
+// holder file are left exactly as they were, so the volume stays with the node
+// that holds the unsynced data. A retry skips every step already done; an
+// earlier attempt's publish that kept running inside the server is accepted by
+// the next attempt, whose own publish then finds nothing to add and whose
+// verification finds `current` at the cache's base.
+//
+// A publish the store refuses means the holder was abandoned by an operator
+// and the epoch fence has already given its data up: the cache is discarded,
+// the loss is reported, and the unstage succeeds. So does an unstage whose
+// holder file now names another node.
+//
+// A busy mount is an error, retried by the caller, before anything past it is
+// touched.
 func (it *Item) Teardown(ctx context.Context, in intent.Intent, _ item.Observed) error {
 	v, err := it.volOf(in)
 	if err != nil {
 		return err
 	}
 	st := it.state(in.VolumeID)
+	// Wait out a freeze in progress, then keep generations from starting.
+	st.fz.Lock()
+	st.tearingDown = true
+	st.fz.Unlock()
 
-	it.finalGeneration(ctx, v, st)
-	if err := it.stopStack(ctx, v); err != nil {
+	if err := it.unmountAndClose(ctx, v, st); err != nil {
+		return err
+	}
+	if err := it.syncOut(ctx, v, st); err != nil {
+		return err
+	}
+	if err := it.stopServerAndUnit(ctx, v); err != nil {
 		return err
 	}
 	if err := it.discardCache(v, "the volume is unstaged"); err != nil {
 		return err
 	}
 	it.release(ctx, v, st)
-	it.forget(in.VolumeID)
+	st.fz.Lock()
+	st.gone = true
+	st.fz.Unlock()
 	return nil
 }
 
-// stopStack takes down what the item raised above the store and below the
-// holder: the mount, the mapping and the block server. It is the shared body
-// of an unstage and of a re-fence. Each step is skipped when its layer is
-// already gone, so it can be repeated after a partial failure.
-func (it *Item) stopStack(ctx context.Context, v vol) error {
+// unmountAndClose takes the mount and the mapping down: it thaws the file
+// system first (EINVAL, "not frozen", is the normal answer), then unmounts
+// once, never lazily, and closes the mapping. Each step is skipped when its
+// layer is already gone, so it can be repeated after a partial failure.
+func (it *Item) unmountAndClose(ctx context.Context, v vol, st *vstate) error {
+	mounted, err := it.mounted(ctx, v)
+	if err != nil {
+		return err
+	}
+	if mounted {
+		st.fz.Lock()
+		terr := it.cfg.Thaw(v.stage)
+		st.fz.Unlock()
+		if terr != nil {
+			return fmt.Errorf("volume item %s: thawing before the unmount: %w", v.in.VolumeID, terr)
+		}
+	}
 	if err := item.UnmountIf(ctx, it.cfg.Mounter, v.stage, it.ownsStage(v), "an ext4 mount of the volume's device", item.ErrStageConflict); err != nil {
 		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
 	}
@@ -76,9 +118,14 @@ func (it *Item) stopStack(ctx context.Context, v vol) error {
 			}
 		}
 	}
-	// Ask the server to stop first, so that it disconnects its device and
-	// syncs its cache; whether it answers or not, the unit is then stopped,
-	// which also stops a server that was restarting.
+	return nil
+}
+
+// stopServerAndUnit stops the block server, by its Stop request first so that
+// it syncs its cache and disconnects its device, and then its unit, which also
+// stops a server that was restarting. The request is best effort and its
+// failure is logged with the device; the unit's stop is not.
+func (it *Item) stopServerAndUnit(ctx context.Context, v vol) error {
 	it.stopServer(ctx, v)
 	if err := it.cfg.Systemd.Stop(ctx, v.unit); err != nil {
 		return fmt.Errorf("volume item %s: %w: stopping the unit: %w", v.in.VolumeID, item.ErrServerDown, err)
@@ -87,58 +134,177 @@ func (it *Item) stopStack(ctx context.Context, v vol) error {
 	return nil
 }
 
-// stopServer sends the server its Stop request, best effort.
+// stopServer sends the server its Stop request. A dial or a request that
+// fails is a Warn naming the device, because the device is what stays behind
+// if the unit stop does not take it down.
 func (it *Item) stopServer(ctx context.Context, v vol) {
+	device := -1
+	if dev, ok, err := it.findDevice(v); err == nil && ok {
+		device = dev.Index
+	}
 	cctx, cancel := context.WithTimeout(ctx, it.cfg.Timeout)
 	defer cancel()
 	c, err := it.cfg.Dial(cctx, v.socket)
 	if err != nil {
+		it.log.Warn("could not reach the block server to stop it", "volume", v.in.VolumeID, "device", device, "error", err)
 		return
 	}
 	defer func() { _ = c.Close() }()
 	if err := c.Stop(cctx); err != nil {
-		it.log.Debug("the block server did not take the stop request", "volume", v.in.VolumeID, "error", err)
+		it.log.Warn("the block server did not take the stop request", "volume", v.in.VolumeID, "device", device, "error", err)
 	}
 }
 
-// finalGeneration attempts the last generation of a volume once, under its
-// own deadline, while the file system is still mounted. Whatever happens it
-// returns: a refusal and a failure only decide which event reports the
-// unpublished writes that the unstage is about to discard.
-func (it *Item) finalGeneration(ctx context.Context, v vol, st *vstate) {
-	us, err := it.cfg.Systemd.State(ctx, v.unit)
-	if err != nil || !us.Present || us.Active != "active" {
-		it.reportDiscard(v, "the block server is not running; its cache is discarded unpublished")
-		return
+// incomplete wraps a cause as the retryable unstage error.
+func (it *Item) incomplete(v vol, format string, args ...any) error {
+	return fmt.Errorf("volume item %s: %w: %s", v.in.VolumeID, item.ErrUnstageIncomplete, fmt.Sprintf(format, args...))
+}
+
+// syncOut gets the volume's last writes into the store and proves it, or
+// returns the retryable error. It returns nil when they are there, and when
+// the holder was abandoned (the data is given up and reported).
+func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
+	up, err := it.serverUp(ctx, v, st)
+	if err != nil {
+		return err
 	}
-	gctx, cancel := context.WithTimeout(ctx, it.cfg.PublishTimeout)
+	if !up {
+		return nil // nothing of ours to sync, or abandoned: serverUp said which
+	}
+	pctx, cancel := context.WithTimeout(ctx, it.cfg.PublishTimeout)
 	defer cancel()
-	err = it.generate(gctx, v, st, "unstage")
+
+	cctx, ccancel := context.WithTimeout(ctx, it.cfg.Timeout)
+	c, err := it.cfg.Dial(cctx, v.socket)
+	ccancel()
+	if err != nil {
+		return it.incomplete(v, "the block server does not answer: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Wait for any publish already running, then mark the boundary: always,
+	// even with nothing dirty, since the dirty byte count leaves out trimmed
+	// chunks. The file system is unmounted, so there is nothing to freeze.
+	for {
+		if err := it.waitNoPublish(pctx, v, c); err != nil {
+			return err
+		}
+		st.fz.Lock()
+		err := it.freezeAndMark(pctx, v, c)
+		st.fz.Unlock()
+		if errors.Is(err, ErrGenerationSkipped) {
+			continue // a publish began between the status and the boundary
+		}
+		if err != nil {
+			return it.incomplete(v, "marking the final boundary: %v", err)
+		}
+		break
+	}
+
+	reply, err := c.Publish(pctx, "unstage")
 	switch {
-	case err == nil, errors.Is(err, ErrGenerationSkipped):
-		return
-	case errors.Is(err, item.ErrPublishRefused):
-		it.log.Warn("the final generation was refused; the unpublished writes are discarded", "volume", v.in.VolumeID, "error", err)
-		it.event(v.in.VolumeID, ReasonPublishRefused)
-	default:
-		it.log.Warn("the final generation failed; the unpublished writes are discarded", "volume", v.in.VolumeID, "error", err)
-		it.event(v.in.VolumeID, ReasonGenerationLost)
+	case errors.Is(err, blockd.ErrRefused) || (err == nil && reply.Refused):
+		// Fenced: an operator gave this holder's data up.
+		ss, _ := c.Status(pctx)
+		it.lost(v, ss.Dirty, "the final generation was refused; the holder was abandoned")
+		return nil
+	case err != nil:
+		return it.incomplete(v, "the final generation failed: %v", err)
+	}
+
+	// Verify against the store itself, fresh, and then against the server.
+	ss, err := c.Status(pctx)
+	if err != nil {
+		return it.incomplete(v, "the block server does not answer after the final generation: %v", err)
+	}
+	want := reply.Name
+	if want == "" {
+		want = ss.Base // nothing to add: the store must already name what the cache descends from
+	}
+	cur, err := it.readCurrent(pctx, v)
+	if err != nil {
+		return it.incomplete(v, "reading the store after the final generation: %v", err)
+	}
+	if got := cur.name; got != want {
+		return it.incomplete(v, "the store names %q, the final generation is %q", got, want)
+	}
+	if ss.PublishInFlight {
+		return it.incomplete(v, "a publish is still running")
+	}
+	it.log.Info("the final generation is in the store", "volume", v.in.VolumeID, "manifest", want, "dirtyBytes", ss.Dirty)
+	return nil
+}
+
+// waitNoPublish polls the server until no publish is running, within the
+// context's deadline.
+func (it *Item) waitNoPublish(ctx context.Context, v vol, c Control) error {
+	for {
+		ss, err := c.Status(ctx)
+		if err != nil {
+			return it.incomplete(v, "the block server does not answer: %v", err)
+		}
+		if !ss.PublishInFlight {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return it.incomplete(v, "a publish is still in flight after %s", it.cfg.PublishTimeout)
+		case <-time.After(it.cfg.PollEvery):
+		}
 	}
 }
 
-// reportDiscard reports unpublished writes in a cache about to be removed,
-// when there are any.
-func (it *Item) reportDiscard(v vol, msg string) {
-	idx, err := cache.ReadIndex(v.cacheDir)
-	if err != nil || len(idx.Dirty) == 0 {
-		return
+// serverUp makes sure a server is running to publish from, when the cache
+// holds anything to publish. It returns false, nil when there is nothing to
+// sync: no cache, or the holder is no longer ours (abandoned, or fenced), in
+// which case the loss is reported. A server that is gone while the holder is
+// still ours is started again, as a drain, and a failure to start it is
+// retryable.
+func (it *Item) serverUp(ctx context.Context, v vol, st *vstate) (bool, error) {
+	us, err := it.cfg.Systemd.State(ctx, v.unit)
+	if err == nil && us.Present && us.Active == "active" {
+		return true, nil
 	}
-	it.log.Warn(msg, "volume", v.in.VolumeID, "chunks", len(idx.Dirty))
+	idx, ierr := cache.ReadIndex(v.cacheDir)
+	if errors.Is(ierr, cache.ErrNoIndex) {
+		return false, nil
+	}
+	dirty := int64(len(idx.Dirty)) * v.chunk
+	h := st.h
+	if h == nil {
+		var aerr error
+		if h, aerr = it.cfg.Holder.Adopt(ctx, v.holdDir, v.name, it.cfg.Node); aerr != nil {
+			if errors.Is(aerr, holder.ErrHeld) || errors.Is(aerr, holder.ErrLost) {
+				it.lost(v, dirty, "the holder is no longer ours; its data was given up")
+				return false, nil
+			}
+			return false, it.incomplete(v, "reading the holder file: %v", aerr)
+		}
+		st.h = h
+	}
+	cur, cerr := it.readCurrent(ctx, v)
+	if cerr != nil {
+		return false, it.incomplete(v, "reading the store: %v", cerr)
+	}
+	if cur.ok && cur.epoch > h.Epoch() {
+		it.lost(v, dirty, "our ownership was fenced by a newer generation; its data was given up")
+		return false, nil
+	}
+	if _, serr := it.ensureServer(ctx, v, st, h, cur); serr != nil {
+		return false, it.incomplete(v, "the block server is not running and cannot be started to sync: %v", serr)
+	}
+	return true, nil
+}
+
+// lost reports unpublished writes that are being discarded: an event of fixed
+// text and a log line with the byte count.
+func (it *Item) lost(v vol, bytes int64, why string) {
+	it.log.Warn(why+"; unpublished writes are discarded", "volume", v.in.VolumeID, "bytes", bytes)
 	it.event(v.in.VolumeID, ReasonGenerationLost)
 }
 
-// release gives the holder file up, best effort: the file is removed only if
-// it is still ours, and a transport that does not answer leaves it to age out.
+// release gives the holder file up: it is removed only if it is still ours. A
+// failure is logged; the file then ages out under the usual conditions.
 func (it *Item) release(ctx context.Context, v vol, st *vstate) {
 	h := st.h
 	if h == nil {
