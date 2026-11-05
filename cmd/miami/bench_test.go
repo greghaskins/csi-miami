@@ -90,7 +90,8 @@ func TestBenchOutRefusesExistingFile(t *testing.T) {
 	if code := run(args, &o, &e); code != 1 || !strings.Contains(e.String(), "refusing to overwrite") {
 		t.Errorf("exit %d, stderr %q", code, e.String())
 	}
-	if b, _ := os.ReadFile(out); string(b) != "mine" {
+	b, _ := os.ReadFile(out) //nolint:gosec // the test's own temp path
+	if string(b) != "mine" {
 		t.Error("the existing file was changed")
 	}
 }
