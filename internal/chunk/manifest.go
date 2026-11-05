@@ -39,7 +39,7 @@ func (m Manifest) Name() string {
 func parseCanonicalUint(s string) (uint64, error) {
 	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil || strconv.FormatUint(v, 10) != s {
-		return 0, fmt.Errorf("%w: %q is not a canonical decimal number", ErrManifestFormat, s)
+		return 0, fmt.Errorf("%w: a %d byte value is not a canonical decimal number", ErrManifestFormat, len(s))
 	}
 	return v, nil
 }
@@ -48,7 +48,7 @@ func parseCanonicalUint(s string) (uint64, error) {
 func ParseManifestName(s string) (epoch, seq uint64, err error) {
 	e, q, ok := strings.Cut(s, ".")
 	if !ok {
-		return 0, 0, fmt.Errorf("%w: name %q is not <epoch>.<sequence>", ErrManifestFormat, s)
+		return 0, 0, fmt.Errorf("%w: a %d byte name is not <epoch>.<sequence>", ErrManifestFormat, len(s))
 	}
 	if epoch, err = parseCanonicalUint(e); err != nil {
 		return 0, 0, err
@@ -101,7 +101,7 @@ func ParseManifest(r io.Reader) (Manifest, error) {
 		if rest, ok := strings.CutPrefix(line, "#"); ok {
 			key, val, _ := strings.Cut(strings.TrimPrefix(rest, " "), " ")
 			if first && (key != "format" || val != strconv.Itoa(FormatVersion)) {
-				return Manifest{}, bad("unknown format %q", strings.TrimSpace(rest))
+				return Manifest{}, bad("the first line is not the format line this driver reads")
 			}
 			first = false
 			if len(m.Chunks) > 0 {
@@ -151,7 +151,7 @@ func (m *Manifest) setHeader(seen map[string]bool, key, val string) error {
 	switch key {
 	case "format":
 		if seen[key] || val != strconv.Itoa(FormatVersion) {
-			return bad("unknown format %q", val)
+			return bad("unknown format")
 		}
 	case "volume", "epoch", "sequence", "size", "chunk", "time":
 		if seen[key] {
@@ -177,7 +177,7 @@ func (m *Manifest) setHeader(seen map[string]bool, key, val string) error {
 		m.Time, err = time.Parse(time.RFC3339, val)
 	}
 	if err != nil {
-		return bad("header %q: %q", key, val)
+		return bad("header %q has an unusable value (%d bytes)", key, len(val))
 	}
 	return nil
 }

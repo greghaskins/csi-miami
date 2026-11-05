@@ -125,6 +125,7 @@ func restoreVolume(ctx context.Context, store, dest, name string, h restoreHooks
 	if err != nil {
 		return chunk.Manifest{}, err
 	}
+	defer func() { _ = s.Close() }()
 	if inside, err := within(filepath.Dir(dest), store); err != nil {
 		return chunk.Manifest{}, fmt.Errorf("output directory: %w", err)
 	} else if inside {

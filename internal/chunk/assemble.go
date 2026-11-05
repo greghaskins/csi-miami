@@ -5,29 +5,27 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
+
+	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
 // OpenReadOnly opens the store at root for reading only: unlike Open it
-// creates nothing, and refuses a directory that is not already a store.
+// creates nothing, and refuses a directory that is not already a store. A
+// symlink at root, chunks or manifests is refused.
 func OpenReadOnly(root string) (*Store, error) {
-	fi, err := os.Stat(root)
+	dir, err := safefs.OpenRoot(root)
 	if err != nil {
 		return nil, fmt.Errorf("chunk: open store: %w", err)
 	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("chunk: open store: %s is not a directory", root)
-	}
 	for _, d := range []string{"chunks", "manifests"} {
-		fi, err := os.Stat(filepath.Join(root, d))
+		sub, err := dir.Sub(d)
 		if err != nil {
+			_ = dir.Close()
 			return nil, fmt.Errorf("chunk: open store: %w", err)
 		}
-		if !fi.IsDir() {
-			return nil, fmt.Errorf("chunk: open store: %s/%s is not a directory", root, d)
-		}
+		_ = sub.Close()
 	}
-	return &Store{root: root}, nil
+	return &Store{root: root, dir: dir}, nil
 }
 
 // Verify reads every distinct stored chunk the manifest names and checks it
@@ -45,10 +43,7 @@ func (s *Store) Verify(ctx context.Context, m Manifest) error {
 			continue
 		}
 		seen[h] = struct{}{}
-		if err := s.checkSize(h, m.Chunk); err != nil {
-			return fmt.Errorf("chunk %d of %s: %w", i, m.Name(), err)
-		}
-		if err := s.Get(ctx, h, io.Discard); err != nil {
+		if err := s.GetExact(ctx, h, m.Chunk, io.Discard); err != nil {
 			return fmt.Errorf("chunk %d of %s: %w", i, m.Name(), err)
 		}
 	}
@@ -76,25 +71,9 @@ func (s *Store) Assemble(ctx context.Context, m Manifest, f *os.File) error {
 		if h == zero {
 			continue
 		}
-		if err := s.checkSize(h, m.Chunk); err != nil {
-			return fmt.Errorf("chunk %d of %s: %w", i, m.Name(), err)
-		}
-		if err := s.Get(ctx, h, io.NewOffsetWriter(f, int64(i)*m.Chunk)); err != nil {
+		if err := s.GetExact(ctx, h, m.Chunk, io.NewOffsetWriter(f, int64(i)*m.Chunk)); err != nil {
 			return fmt.Errorf("chunk %d of %s: %w", i, m.Name(), err)
 		}
 	}
 	return f.Sync()
-}
-
-// checkSize refuses a stored chunk whose length is not the manifest's chunk
-// size: its hash may be genuine, but it would not fill its slot.
-func (s *Store) checkSize(h Hash, size int64) error {
-	fi, err := os.Stat(s.ChunkPath(h))
-	if err != nil {
-		return err
-	}
-	if fi.Size() != size {
-		return fmt.Errorf("%w: %s is %d bytes, the manifest's chunks are %d", ErrCorrupt, h, fi.Size(), size)
-	}
-	return nil
 }

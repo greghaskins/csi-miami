@@ -226,6 +226,7 @@ func importImage(ctx context.Context, f importFlags) (importResult, error) {
 	if err != nil {
 		return r, err
 	}
+	defer func() { _ = s.Close() }()
 	hashes, err := putImage(ctx, s, img, r.imageSize, r.chunk, int(r.deviceSize/r.chunk))
 	if err != nil {
 		return r, err

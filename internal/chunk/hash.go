@@ -42,16 +42,16 @@ func (h Hash) String() string { return hex.EncodeToString(h[:]) }
 func ParseHash(s string) (Hash, error) {
 	var h Hash
 	if len(s) != 2*len(h) {
-		return h, fmt.Errorf("chunk: hash %q is not 64 hex characters", s)
+		return h, fmt.Errorf("chunk: a %d character hash is not 64 hex characters", len(s))
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return Hash{}, fmt.Errorf("chunk: hash %q is not lower-case hex", s)
+			return Hash{}, errors.New("chunk: hash is not lower-case hex")
 		}
 	}
 	if _, err := hex.Decode(h[:], []byte(s)); err != nil {
-		return Hash{}, fmt.Errorf("chunk: hash %q: %w", s, err)
+		return Hash{}, fmt.Errorf("chunk: hash: %w", err)
 	}
 	return h, nil
 }

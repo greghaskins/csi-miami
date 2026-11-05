@@ -51,7 +51,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -426,21 +425,7 @@ func storeCurrent(ctx context.Context, storeDir string) (string, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
-	if _, err := os.Stat(storeDir); err != nil {
-		return "", false, err
-	}
-	b, err := os.ReadFile(filepath.Join(storeDir, "current")) //nolint:gosec // the volume's own store directory
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	name := strings.TrimSpace(string(b))
-	if _, _, err := chunk.ParseManifestName(name); err != nil {
-		return "", false, err
-	}
-	return name, true, nil
+	return chunk.CurrentAt(ctx, storeDir)
 }
 
 // current is what the store's `current` says, read afresh: the epoch of the

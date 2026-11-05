@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
-	"path/filepath"
 	"time"
+
+	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
 // staleTemp is how old a leftover temporary file must be before Prune removes
@@ -53,13 +53,23 @@ func (s *Store) Prune(ctx context.Context, keep int) (removedManifests, removedC
 			live[h] = struct{}{}
 		}
 	}
+	mdir, err := s.dir.Sub("manifests")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = mdir.Close() }()
 	for _, name := range drop {
-		if err := os.Remove(s.manifestPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := mdir.Unlink(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return removedManifests, 0, err
 		}
 		removedManifests++
 	}
-	fans, err := os.ReadDir(filepath.Join(s.root, "chunks"))
+	chunks, err := s.dir.Sub("chunks")
+	if err != nil {
+		return removedManifests, 0, err
+	}
+	defer func() { _ = chunks.Close() }()
+	fans, err := chunks.ReadDir()
 	if err != nil {
 		return removedManifests, 0, err
 	}
@@ -68,40 +78,56 @@ func (s *Store) Prune(ctx context.Context, keep int) (removedManifests, removedC
 			return removedManifests, removedChunks, err
 		}
 		if !fan.IsDir() {
-			continue
+			continue // a symlink named like a fan directory is not followed, nor removed
 		}
-		dir := filepath.Join(s.root, "chunks", fan.Name())
-		ents, err := os.ReadDir(dir)
+		n, err := s.pruneFan(chunks, fan.Name(), live)
+		removedChunks += n
 		if err != nil {
 			return removedManifests, removedChunks, err
-		}
-		for _, e := range ents {
-			if e.IsDir() {
-				continue
-			}
-			p := filepath.Join(dir, e.Name())
-			h, perr := ParseHash(e.Name())
-			if perr != nil {
-				s.removeStaleTemp(e, p)
-				continue
-			}
-			if _, ok := live[h]; ok {
-				continue
-			}
-			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return removedManifests, removedChunks, err
-			}
-			removedChunks++
 		}
 	}
 	return removedManifests, removedChunks, nil
 }
 
-func (s *Store) removeStaleTemp(e fs.DirEntry, path string) {
-	if len(e.Name()) == 0 || e.Name()[0] != '.' {
+// pruneFan removes the unreferenced chunks (and stale temporary files) of one
+// chunks/<aa> directory. Everything is relative to descriptors that were
+// opened without following a symlink, so a name swapped for a link while the
+// walk runs is refused, never removed through.
+func (s *Store) pruneFan(chunks *safefs.Dir, fanName string, live map[Hash]struct{}) (removed int, err error) {
+	dir, err := chunks.Sub(fanName)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = dir.Close() }()
+	ents, err := dir.ReadDir()
+	if err != nil {
+		return 0, err
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		h, perr := ParseHash(e.Name())
+		if perr != nil {
+			removeStaleTemp(dir, e.Name())
+			continue
+		}
+		if _, ok := live[h]; ok {
+			continue
+		}
+		if err := dir.Unlink(e.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func removeStaleTemp(dir *safefs.Dir, name string) {
+	if len(name) == 0 || name[0] != '.' {
 		return
 	}
-	if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > staleTemp {
-		_ = os.Remove(path)
+	if fi, err := dir.Lstat(name); err == nil && time.Since(fi.ModTime()) > staleTemp {
+		_ = dir.Unlink(name)
 	}
 }
