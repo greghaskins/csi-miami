@@ -887,8 +887,15 @@ examples `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rwo-plain.yaml`
 `allowVolumeExpansion: true`), `deploy/policy_test.go`, `deploy/testdata/base.golden.yaml`,
 `overlays/e2e`.
 
+- [ ] The example `volume` classes set `csi.storage.k8s.io/fstype: ext4`:
+      under `fsGroupPolicy: ReadWriteOnceWithFSType` kubelet applies a pod's
+      `fsGroup` only when the PV carries an fsType, and the provisioner sets
+      it only from that parameter (I4 makes the driver accept it). The
+      `directory` classes must not set it. Test it, and have the e2e assert a
+      pod's `fsGroup` owns the mounted root of a `volume`.
 - [ ] Tests: `TestNodeHostPaths`, `TestNodeRBACExact`, `TestRemediationPolicyPresent`,
-      `TestExampleVolClassesSetBothSecretRefs`, golden regenerated.
+      `TestExampleVolClassesSetBothSecretRefs`, `TestExampleVolClassesSetExt4FsType`,
+      golden regenerated.
 - [ ] `make deploy-check` on kind: both pods Ready; `hack/kind.sh` asserts
       the node pod sees `/run/systemd/private`.
 - [ ] Commit.

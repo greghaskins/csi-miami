@@ -28,16 +28,19 @@ var volumeAccessModes = map[csi.VolumeCapability_AccessMode_Mode]bool{
 	csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER: true,
 }
 
+// volumeFsType is the file system of a volume of kind volume.
+const volumeFsType = "ext4"
+
 // capabilityProblem is capabilityProblemFor a directory volume.
 func capabilityProblem(c *csi.VolumeCapability) string {
 	return capabilityProblemFor(volume.KindDirectory, c)
 }
 
 // capabilityProblemFor returns why c is not a capability a volume of the
-// kind has, or "" if it is. A capability must be a mount capability (a directory is not
-// a block device), with no file system type (a directory is not formatted; the
-// transport's file system is what it is), and with an access mode from
-// acceptedAccessModes.
+// kind has, or "" if it is. A capability must be a mount capability (neither
+// kind is a block device) and have an access mode the kind supports. A
+// directory has no file system type (it is not formatted; the transport's file
+// system is what it is). A volume is ext4, so its fsType is "" or "ext4".
 //
 // Mount flags are not examined: the driver owns the mount options (the
 // transport's profile), so what a StorageClass puts there has no effect.
@@ -47,7 +50,14 @@ func capabilityProblemFor(kind volume.Kind, c *csi.VolumeCapability) string {
 	}
 	switch at := c.GetAccessType().(type) {
 	case *csi.VolumeCapability_Mount:
-		if fs := at.Mount.GetFsType(); fs != "" {
+		fs := at.Mount.GetFsType()
+		if kind == volume.KindVolume {
+			// "" is the CO's "no preference"; the volume is ext4 either way.
+			// Reporting the fsType is what makes the kubelet apply fsGroup.
+			if fs != "" && fs != volumeFsType {
+				return fmt.Sprintf("fsType %q is not supported: a volume of kind volume is %s", fs, volumeFsType)
+			}
+		} else if fs != "" {
 			return "fsType is not supported: a directory volume is not formatted"
 		}
 	case *csi.VolumeCapability_Block:
@@ -69,13 +79,8 @@ func capabilityProblemFor(kind volume.Kind, c *csi.VolumeCapability) string {
 	return ""
 }
 
-// checkCapabilities returns InvalidArgument naming the first capability that
-// a directory volume does not have.
-func checkCapabilities(caps []*csi.VolumeCapability) error {
-	return checkCapabilitiesFor(volume.KindDirectory, caps)
-}
-
-// checkCapabilitiesFor is checkCapabilities for a volume of the kind.
+// checkCapabilitiesFor returns InvalidArgument naming the first capability that
+// a volume of the kind does not have.
 func checkCapabilitiesFor(kind volume.Kind, caps []*csi.VolumeCapability) error {
 	if len(caps) == 0 {
 		return status.Error(codes.InvalidArgument, "volume capabilities are required")

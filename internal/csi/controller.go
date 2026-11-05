@@ -140,7 +140,7 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 // The volume ID is <kind>:<name> with the name the provisioner chose
 // (pvc-<uuid>, which is also the PV's name). The request is validated before
 // anything is touched: StorageClass parameters (volume.NewContext), the
-// capabilities (mount access only, no fsType, an accepted access mode), the
+// capabilities (mount access only, an accepted access mode, and the kind's fsType), the
 // capacity range and, for a local transport, the node. For an nfs3 transport
 // the transport is then mounted under the controller's root and the directory
 // made with mkdir -p semantics, never through a symlink, with the StorageClass's
@@ -166,9 +166,6 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	if req.GetName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
-	}
-	if err := checkCapabilities(req.GetVolumeCapabilities()); err != nil {
-		return nil, err
 	}
 	if req.GetVolumeContentSource() != nil {
 		return nil, status.Error(codes.InvalidArgument, "creating a volume from a snapshot or another volume is not supported")
@@ -290,7 +287,7 @@ func requestedNode(r *csi.TopologyRequirement) (string, error) {
 }
 
 // ValidateVolumeCapabilities confirms the requested capabilities when every
-// one is a mount capability with an accepted access mode and no fsType, and
+// one is a mount capability with an accepted access mode and the kind's fsType, and
 // otherwise says which is not in the message. A volume ID that this driver
 // could not have issued is NotFound. The controller keeps no record of the
 // volumes it made, so a well-formed ID is not looked up.
