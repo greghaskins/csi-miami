@@ -187,6 +187,9 @@ type volumeResult struct {
 	// row (probes.go). Like overdue it is a condition, not an error of the
 	// stage.
 	probeFailed bool
+	// refused says the store refuses the volume's scheduled generations
+	// (generation.go): this node no longer holds it. A condition as well.
+	refused bool
 }
 
 // errTargetGone marks a publish whose target's parent directory no longer
@@ -588,6 +591,9 @@ func (res *volumeResult) condition() string {
 		if err := res.publish[t]; err != nil && !errors.Is(err, errTargetGone) {
 			return conditionOf(err)
 		}
+	}
+	if res.refused {
+		return ConditionPublishRefused
 	}
 	if res.probeFailed {
 		return ConditionProbeFailed

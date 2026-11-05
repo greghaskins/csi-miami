@@ -78,6 +78,9 @@ type genState struct {
 	// overdue is the verdict of the latest status read; reported is what the
 	// loop last told the world.
 	overdue, reported bool
+	// refused is whether the latest generation was refused by the store;
+	// refusedReported is what the loop last told the world.
+	refused, refusedReported bool
 	// served is the state of the volume's block server at the latest status
 	// read ("" before the first); it is what the volumes-served metric counts.
 	served string
@@ -122,12 +125,28 @@ func (r *Reconciler) genSettingsOf(in intent.Intent) genSettings {
 	return s
 }
 
+// stackUp is the first half of "the volume's stack is up": the item has a
+// device for the volume, from memory. Whether the block server answers is the
+// other half, which the generation goroutine reads (genState.served). The
+// stage may have failed in this pass (a store that does not answer, a holder
+// that moved, a key that is gone) with the server, device, mapping and mount
+// untouched and the pod writing, and that is when the timers and the probe
+// matter most. An item that cannot say is judged by its stage.
+func (p *pass) stackUp(in intent.Intent, res *volumeResult) bool {
+	if pr, ok := p.r.items[in.Kind].(Probed); ok {
+		_, _, up := pr.ProbeDevice(in)
+		return up
+	}
+	return res.stage == nil
+}
+
 // generationTick is the generation half of a pass, after the volumes were
-// converged: each volume that converged and whose item can make generations
-// gets a goroutine unless one runs, and the verdict the goroutines reached
-// about overdue volumes is reported. A volume being unstaged (a request in
-// this batch, or the mark on its record) has none: the item refuses too, but
-// nothing should be asked of it.
+// converged: each volume whose stack is up (whether or not its stage
+// converged in this pass) and whose item can make generations gets a
+// goroutine unless one runs, and the verdicts the goroutines reached about
+// overdue and refused volumes are reported. A volume being unstaged (a
+// request in this batch, or the mark on its record) has none: the item
+// refuses too, but nothing should be asked of it.
 func (p *pass) generationTick() {
 	r := p.r
 	g := r.gens
@@ -165,7 +184,10 @@ func (p *pass) generationTick() {
 	for _, id := range sortedIDs(p.intents) {
 		in := p.intents[id]
 		res, ok := p.results[id]
-		if !ok || res.stage != nil || in.Kind != volume.KindVolume {
+		if !ok || in.Kind != volume.KindVolume || in.Unstaging || !p.stackUp(in, res) {
+			continue
+		}
+		if _, leaving := p.unstaging[id]; leaving {
 			continue
 		}
 		gen, ok := r.items[in.Kind].(Generator)
@@ -179,6 +201,7 @@ func (p *pass) generationTick() {
 			g.vols[id] = st
 		}
 		p.reportOverdue(id, res, st)
+		p.reportRefused(id, res, st)
 		if st.running {
 			continue
 		}
@@ -203,6 +226,24 @@ func (p *pass) reportOverdue(id string, res *volumeResult, st *genState) {
 		return
 	}
 	r.log.Info("a volume's generations are current again", "volume", id)
+}
+
+// reportRefused copies the goroutines' verdict on the store's refusal into the
+// volume's result, and raises the event and a log line when it changes: once
+// when the refusals begin, not on every tick.
+func (p *pass) reportRefused(id string, res *volumeResult, st *genState) {
+	r := p.r
+	res.refused = st.refused
+	if st.refused == st.refusedReported || p.ctx.Err() != nil {
+		return
+	}
+	st.refusedReported = st.refused
+	if st.refused {
+		r.log.Warn("the store refuses the generations of a volume: it is no longer held by this node; its unpublished writes are kept", "volume", id)
+		r.events.Event(id, ReasonPublishRefused)
+		return
+	}
+	r.log.Info("a volume's generations are accepted again", "volume", id)
 }
 
 // runGeneration is a volume's goroutine: read the server's status, decide, and
@@ -293,12 +334,18 @@ func (r *Reconciler) runGeneration(parent context.Context, gen Generator, in int
 		st.due = r.opts.Now().Add(set.interval)
 		st.requested = false
 		st.overdue = false
+		st.refused = false
 		st.lastErr = ""
 	case errors.Is(err, item.ErrGenerationSkipped):
 		// A publish is in flight (or the volume is leaving): not a failure,
 		// and the next tick tries again.
 		r.log.Debug("a generation was skipped", "volume", in.VolumeID, "trigger", trigger)
 	default:
+		// A cut-short generation says nothing about the store; any other
+		// outcome replaces the last verdict on refusals.
+		if parent.Err() == nil {
+			st.refused = errors.Is(err, item.ErrPublishRefused)
+		}
 		text := err.Error()
 		if text != st.lastErr {
 			st.lastErr = text

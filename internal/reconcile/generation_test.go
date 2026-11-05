@@ -499,7 +499,8 @@ func TestNoGenerationWhenTheStageFailed(t *testing.T) {
 
 type failingGen struct{ genItem }
 
-func (*failingGen) Kind() volume.Kind { return volume.KindVolume }
+func (*failingGen) Kind() volume.Kind                                { return volume.KindVolume }
+func (*failingGen) ProbeDevice(intent.Intent) (string, uint64, bool) { return "", 0, false }
 func (*failingGen) Converge(context.Context, intent.Intent, item.Observed) error {
 	return errors.New("nope")
 }
