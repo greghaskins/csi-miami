@@ -94,22 +94,6 @@ func decodeNode(obj *unstructured.Unstructured) (NodeInfo, error) {
 	return info, nil
 }
 
-// ForceDetach returns the value of the force-detach annotation on the PV
-// called name (AnnotationForceDetach) and whether it is set. A PV that does
-// not exist has no annotation: ("", false, nil). Any other failure to read it
-// is an error.
-func (c *Client) ForceDetach(ctx context.Context, name string) (string, bool, error) {
-	pv, err := c.GetPV(ctx, name)
-	switch {
-	case errors.Is(err, ErrNotFound):
-		return "", false, nil
-	case err != nil:
-		return "", false, err
-	}
-	v, ok := pv.Annotations[AnnotationForceDetach]
-	return v, ok, nil
-}
-
 // NodeOutOfService reports whether the node carries OutOfServiceTaint.
 func (c *Client) NodeOutOfService(ctx context.Context, name string) (bool, error) {
 	info, err := c.NodeStatus(ctx, name)

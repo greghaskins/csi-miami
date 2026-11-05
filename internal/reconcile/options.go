@@ -34,6 +34,9 @@ const (
 	// ReasonGarbageUnmounted is a mount the reconciler removed because no
 	// intent claims it.
 	ReasonGarbageUnmounted = "GarbageUnmounted"
+	// ReasonGenerationOverdue is a volume whose newest published generation
+	// is older than its maximum age while it holds unpublished writes.
+	ReasonGenerationOverdue = "GenerationOverdue"
 )
 
 // Metrics is the seam to the metrics registry (plan section 10). The
@@ -98,6 +101,31 @@ func (noopMetrics) SetIntentLoadFailures(int)           {}
 type noopEvents struct{}
 
 func (noopEvents) Event(string, string) {}
+
+// AnnotationPublish is the PV annotation that asks for a generation now: any
+// value the node has not seen for the volume requests exactly one.
+const AnnotationPublish = "miami.csi.greghaskins.com/publish"
+
+// GenerationOptions are the generation timers' settings for a volume whose own
+// parameters leave them unset (a volume's record carries its StorageClass's
+// values, which win).
+type GenerationOptions struct {
+	// Interval is how often a volume with unpublished writes publishes a
+	// generation. Zero means volume.DefaultGenerationEvery; anything under
+	// volume.MinGenerationInterval is refused by New.
+	Interval time.Duration
+	// MaxAge is how old the newest published generation of a volume with
+	// unpublished writes may get before the volume is reported overdue. Zero
+	// means volume.DefaultGenerationMaxAge; it must not be under Interval.
+	MaxAge time.Duration
+	// Timeout is the deadline of one generation, freeze to upload. Zero means
+	// DefaultGenerationTimeout.
+	Timeout time.Duration
+}
+
+// DefaultGenerationTimeout bounds one generation goroutine: more than the
+// volume item's own publish deadline.
+const DefaultGenerationTimeout = 5 * time.Minute
 
 // Options configure a Reconciler. TransportsRoot and StageRoot are required;
 // everything else has a usable zero value.
@@ -174,6 +202,15 @@ type Options struct {
 	// only.
 	Remediate bool
 
-	// Now is the clock for the idle timeout. Nil means time.Now.
+	// Generations are the defaults of the generation timers.
+	Generations GenerationOptions
+
+	// PVAnnotation reads one annotation of the PV named pv ("" when it has
+	// none), for AnnotationPublish. Nil means no volume can request a
+	// generation. An error is not a request. The node's role needs only get on
+	// persistentvolumes for it.
+	PVAnnotation func(ctx context.Context, pv, key string) (string, error)
+
+	// Now is the clock for the idle timeout and the generation timers. Nil means time.Now.
 	Now func() time.Time
 }

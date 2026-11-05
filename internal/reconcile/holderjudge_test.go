@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/holder"
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 const (
@@ -30,11 +31,17 @@ type fakeCluster struct {
 	asked      []string
 }
 
-func (c *fakeCluster) ForceDetach(_ context.Context, pv string) (string, bool, error) {
+func (c *fakeCluster) PVAnnotation(_ context.Context, pv, key string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.asked = append(c.asked, "pv:"+pv)
-	return c.annotation, c.annotated, c.annErr
+	if key != volume.ForceDetachAnnotation {
+		return "", errors.New("the judge asked for another annotation: " + key)
+	}
+	if !c.annotated {
+		return "", c.annErr
+	}
+	return c.annotation, c.annErr
 }
 
 func (c *fakeCluster) NodeOutOfService(_ context.Context, node string) (bool, error) {

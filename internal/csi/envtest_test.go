@@ -247,15 +247,15 @@ func TestNodeStatusReads(t *testing.T) {
 	pv := apiPV(name, "volume:"+name, map[string]string{"miami/kind": "volume"})
 	pv.Annotations = map[string]string{kube.AnnotationForceDetach: "node-a@3"}
 	createPV(t, cfg, pv)
-	if v, set, err := c.ForceDetach(ctx, name); err != nil || !set || v != "node-a@3" {
-		t.Errorf("ForceDetach = %q, %t, %v", v, set, err)
+	if v, err := c.PVAnnotation(ctx, name, kube.AnnotationForceDetach); err != nil || v != "node-a@3" {
+		t.Errorf("PVAnnotation = %q, %v", v, err)
 	}
 	createPV(t, cfg, apiPV("pvc-00000000-0000-4000-8000-0000000000a2", "volume:pvc-00000000-0000-4000-8000-0000000000a2", map[string]string{"miami/kind": "volume"}))
-	if v, set, err := c.ForceDetach(ctx, "pvc-00000000-0000-4000-8000-0000000000a2"); err != nil || set || v != "" {
-		t.Errorf("ForceDetach of an unannotated PV = %q, %t, %v", v, set, err)
+	if v, err := c.PVAnnotation(ctx, "pvc-00000000-0000-4000-8000-0000000000a2", kube.AnnotationForceDetach); err != nil || v != "" {
+		t.Errorf("PVAnnotation of an unannotated PV = %q, %v", v, err)
 	}
-	if v, set, err := c.ForceDetach(ctx, "pvc-00000000-0000-4000-8000-0000000000a3"); err != nil || set || v != "" {
-		t.Errorf("ForceDetach of a missing PV = %q, %t, %v", v, set, err)
+	if _, err := c.PVAnnotation(ctx, "pvc-00000000-0000-4000-8000-0000000000a3", kube.AnnotationForceDetach); !errors.Is(err, kube.ErrNotFound) {
+		t.Errorf("PVAnnotation of a missing PV = %v, want not found", err)
 	}
 }
 

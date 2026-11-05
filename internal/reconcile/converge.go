@@ -179,6 +179,10 @@ type volumeResult struct {
 	// publish is the outcome of each publish, by target path. A pruned
 	// publish (errTargetGone) is recorded here too.
 	publish map[string]error
+	// overdue says the volume's newest generation is older than its maximum
+	// age while it holds unpublished writes (generation.go). The volume still
+	// works, so it is a condition and not an error of the stage.
+	overdue bool
 }
 
 // errTargetGone marks a publish whose target's parent directory no longer
@@ -577,6 +581,9 @@ func (res *volumeResult) condition() string {
 		if err := res.publish[t]; err != nil && !errors.Is(err, errTargetGone) {
 			return conditionOf(err)
 		}
+	}
+	if res.overdue {
+		return ConditionGenerationOverdue
 	}
 	return ConditionOK
 }

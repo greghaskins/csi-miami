@@ -26,10 +26,11 @@ const (
 // the driver never removes the annotation or the taint. *kube.Client
 // implements it.
 type Cluster interface {
-	// ForceDetach returns the value of the force-detach annotation on the PV
-	// called pv and whether it is set. A PV that does not exist has no
-	// annotation and is not an error.
-	ForceDetach(ctx context.Context, pv string) (value string, set bool, err error)
+	// PVAnnotation returns the value of one annotation of the PV called pv, ""
+	// when it has none; the judge reads the force-detach annotation with it. An
+	// error (no such PV, an API server that cannot be reached) is not an empty
+	// value.
+	PVAnnotation(ctx context.Context, pv, key string) (string, error)
 	// NodeOutOfService reports whether the node carries the out-of-service
 	// taint, with any effect. A node that cannot be read is an error.
 	NodeOutOfService(ctx context.Context, node string) (bool, error)
@@ -99,13 +100,13 @@ func (j *EmergencyJudge) Judge(ctx context.Context, volumeID string, info holder
 	}
 	var problems []string
 
-	value, set, err := j.c.ForceDetach(ctx, id.Name)
+	value, err := j.c.PVAnnotation(ctx, id.Name, volume.ForceDetachAnnotation)
 	switch {
 	case err != nil:
 		problems = append(problems, fmt.Sprintf("the PV could not be read: %v", err))
-	case set && info.DetachMatches(value):
+	case value != "" && info.DetachMatches(value):
 		return holder.Judgement{Takeover: true, Reason: TriggerAnnotation, Info: info}
-	case set:
+	case value != "":
 		problems = append(problems, fmt.Sprintf("the annotation is %q, which does not name this holder", value))
 	}
 

@@ -410,6 +410,28 @@ func TestGenerationSequence(t *testing.T) {
 	}
 }
 
+// Status is what the reconciler's generation timers read: the server's own
+// status, with nothing frozen and nothing changed.
+func TestStatusReadsTheServerWithoutFreezing(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.ctl.dirty = 4096
+	st, err := e.it.Status(bg, e.in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Dirty != 4096 {
+		t.Errorf("Dirty = %d, want 4096", st.Dirty)
+	}
+	if got := e.rec.all(); len(got) != 0 {
+		t.Errorf("Status changed something: %v", got)
+	}
+	e.ctl.down = true
+	if _, err := e.it.Status(bg, e.in); !errors.Is(err, item.ErrServerDown) {
+		t.Errorf("err = %v, want ErrServerDown", err)
+	}
+}
+
 func TestGenerationSkipsWhenPublishInFlight(t *testing.T) {
 	e := newEnv(t)
 	e.seedRunning()

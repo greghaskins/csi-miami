@@ -1,13 +1,16 @@
 # What the node binary reads from the API server, cluster-wide because both
 # objects are cluster-scoped:
 #   - PersistentVolumes: the event recorder (internal/kube/events.go) reads the
-#     PV an event is about, and the emergency-detach judge reads the PV's
+#     PV an event is about; the generation timers (internal/reconcile/
+#     generation.go) read its miami.csi.greghaskins.com/publish annotation, one
+#     `get` per staged volume per pass; and the emergency-detach judge reads its
 #     force-detach annotation (decision 52).
 #   - Nodes: the judge reads a holder node's taints, to see the
-#     node.kubernetes.io/out-of-service taint. Both are `get` only; the driver
-#     never writes the annotation or the taint, which are the operator's.
-# The events it writes are namespaced (the `default` namespace) and have their
-# own Role, role-node.yaml. The registrar and the liveness probe call no API.
+#     node.kubernetes.io/out-of-service taint.
+# Both are `get` only; the node never writes an annotation or a taint, which
+# are the operator's. The events it writes are namespaced (the `default`
+# namespace) and have their own Role, role-node.yaml. The registrar and the
+# liveness probe call no API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

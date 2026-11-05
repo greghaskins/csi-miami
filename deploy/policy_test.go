@@ -167,6 +167,25 @@ type rule struct {
 	verbs           []string
 }
 
+// The generation timers read the publish annotation of a PV with a get, and
+// that is all the node may do to PVs: no list or watch (it asks for one
+// by name) and no write (an annotation is the operator's request, never the
+// node's).
+func TestNodeRoleReadsPVAnnotationsOnly(t *testing.T) {
+	t.Parallel()
+	var cr rbacv1.ClusterRole
+	base(t).get(t, "ClusterRole", "miami-node", &cr)
+	got := ruleSet(cr.Rules)
+	if !got["/persistentvolumes:get"] {
+		t.Error("the node cannot get PVs, so it cannot read the publish annotation")
+	}
+	for _, verb := range []string{"list", "watch", "create", "update", "patch", "delete", "*"} {
+		if got["/persistentvolumes:"+verb] {
+			t.Errorf("the node may %s PVs", verb)
+		}
+	}
+}
+
 func TestRBACRuleSets(t *testing.T) {
 	t.Parallel()
 	// The lists below are plan section 12. A change to either side must change
