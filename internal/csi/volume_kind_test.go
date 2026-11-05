@@ -290,3 +290,80 @@ func TestDeleteVolumeWithoutHolder(t *testing.T) {
 	}
 	mustNotExist(t, filepath.Join(parent, nameA))
 }
+
+func fsCapOf(fs string) *csi.VolumeCapability {
+	c := mountCap(csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER)
+	c.GetMount().FsType = fs
+	return c
+}
+
+func TestVolumeKindFsType(t *testing.T) {
+	t.Parallel()
+	for _, fs := range []string{"", "ext4"} {
+		if p := capabilityProblemFor(volume.KindVolume, fsCapOf(fs)); p != "" {
+			t.Errorf("fsType %q: %s", fs, p)
+		}
+		// The node RPCs check through singleCapability.
+		if err := singleCapability(volume.KindVolume, fsCapOf(fs)); err != nil {
+			t.Errorf("node, fsType %q: %v", fs, err)
+		}
+	}
+	p := capabilityProblemFor(volume.KindVolume, fsCapOf("xfs"))
+	if !strings.Contains(p, "xfs") || !strings.Contains(p, "kind volume") || strings.Contains(p, "directory") {
+		t.Errorf("message = %q, want it to name fsType xfs and the volume kind", p)
+	}
+	if err := singleCapability(volume.KindVolume, fsCapOf("xfs")); codeOf(err) != codes.InvalidArgument {
+		t.Errorf("node, xfs: code = %v, want InvalidArgument", codeOf(err))
+	}
+	if p := capabilityProblemFor(volume.KindDirectory, fsCapOf("ext4")); !strings.Contains(p, "directory volume") {
+		t.Errorf("directory, ext4: message = %q, want a directory volume rejection", p)
+	}
+}
+
+func TestCreateVolumeFsTypeByKind(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	for i, fs := range []string{"", "ext4"} {
+		r := e.volumeReq([]string{nameA, nameB}[i], 1<<30)
+		r.VolumeCapabilities = []*csi.VolumeCapability{fsCapOf(fs)}
+		if _, err := e.ctrl.CreateVolume(context.Background(), r); err != nil {
+			t.Errorf("volume, fsType %q: %v", fs, err)
+		}
+	}
+	r := e.volumeReq(nameC, 1<<30)
+	r.VolumeCapabilities = []*csi.VolumeCapability{fsCapOf("xfs")}
+	_, err := e.ctrl.CreateVolume(context.Background(), r)
+	if codeOf(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "kind volume") {
+		t.Errorf("volume, xfs: %v, want InvalidArgument naming the volume kind", err)
+	}
+
+	// A directory request with the volume-only capability is rejected once
+	// the kind is known, and a bad parameter is reported before it: nothing
+	// looks at the capabilities until the kind is.
+	d := e.createReq(nameC)
+	d.VolumeCapabilities = []*csi.VolumeCapability{fsCapOf("ext4")}
+	_, err = e.ctrl.CreateVolume(context.Background(), d)
+	if codeOf(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "directory volume") {
+		t.Errorf("directory, ext4: %v, want InvalidArgument naming the directory kind", err)
+	}
+	d.Parameters["typo"] = "x"
+	if _, err = e.ctrl.CreateVolume(context.Background(), d); !strings.Contains(err.Error(), "unknown parameter") {
+		t.Errorf("directory, bad parameter: %v, want the parameter error first", err)
+	}
+}
+
+func TestValidateVolumeCapabilitiesFsTypeByKind(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	for id, want := range map[string]bool{"volume:" + nameA: true, "directory:" + nameA: false} {
+		resp, err := e.ctrl.ValidateVolumeCapabilities(context.Background(), &csi.ValidateVolumeCapabilitiesRequest{
+			VolumeId: id, VolumeCapabilities: []*csi.VolumeCapability{fsCapOf("ext4")},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := resp.GetConfirmed() != nil; got != want {
+			t.Errorf("%s: confirmed = %v, want %v (%s)", id, got, want, resp.GetMessage())
+		}
+	}
+}
