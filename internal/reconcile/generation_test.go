@@ -40,6 +40,7 @@ type genItem struct {
 	maxRun      int
 	stack       uint64 // the stack number ProbeDevice reports
 	clock       *fakeClock
+	outdated    bool // what ServerOutdated reports
 }
 
 func (g *genItem) Kind() volume.Kind                              { return volume.KindVolume }
@@ -50,6 +51,12 @@ func (g *genItem) Converge(context.Context, intent.Intent, item.Observed) error 
 func (g *genItem) Teardown(context.Context, intent.Intent, item.Observed) error { return nil }
 
 func (g *genItem) FreezeBound() time.Duration { return g.freezeBound }
+
+func (g *genItem) ServerOutdated(blockd.Status) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.outdated
+}
 
 func (g *genItem) Status(context.Context, intent.Intent) (blockd.Status, error) {
 	g.mu.Lock()

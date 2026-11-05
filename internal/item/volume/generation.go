@@ -62,6 +62,16 @@ func (it *Item) Status(ctx context.Context, in intent.Intent) (blockd.Status, er
 	return st, nil
 }
 
+// ServerOutdated reports whether the block server that produced st runs a
+// binary other than the one the node is running now (a plugin upgrade leaves
+// a running server on its old binary until the volume is unstaged). It says
+// false until a converge has hashed the running binary, and for a status that
+// carries no hash.
+func (it *Item) ServerOutdated(st blockd.Status) bool {
+	want := it.srcHex.Load()
+	return want != nil && st.BinaryHash != "" && st.BinaryHash != *want
+}
+
 // ProbeDevice is the block device the volume's file system is on, which the
 // reconciler's active probe reads the first sector of: the mapper for an
 // encrypted volume, the nbd device otherwise. It is what the last Converge

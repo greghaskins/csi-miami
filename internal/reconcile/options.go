@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/greghaskins/csi-miami/internal/blockd"
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/transport"
@@ -102,6 +103,65 @@ type ProbeMetrics interface {
 	// DeleteVolumeProbe removes the volume's series, for a volume that is no
 	// longer staged.
 	DeleteVolumeProbe(volumeID string)
+}
+
+// The states of a volume's block server, as GenerationMetrics.SetVolumesServed
+// counts them.
+const (
+	// ServedServing is a server that answers its status and runs the binary
+	// the node would start now.
+	ServedServing = "serving"
+	// ServedOutdatedBinary is a server that answers but runs an older binary
+	// (it keeps serving until the volume is unstaged; see decision 51).
+	ServedOutdatedBinary = "outdated-binary"
+	// ServedDown is a server that does not answer its status.
+	ServedDown = "down"
+)
+
+// ServedStates lists the states, so that a metric can create them at zero.
+var ServedStates = []string{ServedServing, ServedOutdatedBinary, ServedDown}
+
+// The outcomes of a generation, as GenerationMetrics.ObservePublish takes
+// them. A generation skipped because another publish is running is not one:
+// that publish is counted when it finishes.
+const (
+	PublishOK      = "ok"
+	PublishRefused = "refused"
+	PublishFailed  = "failed"
+)
+
+// PublishResults lists the outcomes, so that a metric can create them at zero.
+var PublishResults = []string{PublishOK, PublishRefused, PublishFailed}
+
+// VolumeGeneration is what the generation timers know of one volume's
+// unpublished writes and cache, from its block server's status.
+type VolumeGeneration struct {
+	// Age is the time since the newest successful publish, or since the timers
+	// first saw the volume when the server has not published yet.
+	Age time.Duration
+	// DirtyBytes are the unpublished writes; CleanBytes the cached copies of
+	// chunks the store already holds.
+	DirtyBytes, CleanBytes int64
+	// Fetch is the server's account of its fetches from the store.
+	Fetch blockd.FetchStats
+}
+
+// GenerationMetrics is implemented by a Metrics that also exposes the volume
+// kind's generations. The reconciler uses it when it is there. Every volume
+// argument is a volume ID (volume:<PV name>).
+type GenerationMetrics interface {
+	// SetVolumeGeneration sets the volume's figures from its latest status.
+	SetVolumeGeneration(volumeID string, g VolumeGeneration)
+	// DeleteVolumeGeneration removes the volume's figures, for a volume that
+	// is no longer staged or whose server does not answer.
+	DeleteVolumeGeneration(volumeID string)
+	// ObservePublish counts one finished generation by outcome (PublishOK,
+	// PublishRefused or PublishFailed); d is how long it took, freeze to
+	// upload.
+	ObservePublish(result string, d time.Duration)
+	// SetVolumesServed sets the number of staged volumes in each state of
+	// ServedStates, zero included.
+	SetVolumesServed(counts map[string]int)
 }
 
 type noopMetrics struct{}
