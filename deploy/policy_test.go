@@ -205,7 +205,10 @@ func TestRBACRuleSets(t *testing.T) {
 			{"", "events", []string{"list", "watch", "create", "update", "patch"}},
 		}},
 		{"miami-node", []rule{
+			// The events' PV lookup, and the emergency detach's annotation read.
 			{"", "persistentvolumes", []string{"get"}},
+			// The taint of a holder's node (decision 52): read, never written.
+			{"", "nodes", []string{"get"}},
 		}},
 	}
 	r := base(t)

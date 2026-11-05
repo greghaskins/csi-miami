@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,20 +62,14 @@ func TestE2ENFS3HolderTwoClients(t *testing.T) {
 
 	// The second client sees the first's file and is refused.
 	info, err := holder.Read(ctx, dirs[1], vol)
-	if err != nil || !info.Present || info.Node != "kind-worker" || info.Renewals != 1 {
+	if err != nil || !info.Present || info.Node != "kind-worker" {
 		t.Fatalf("Read through the second mount = %+v, %v", info, err)
 	}
 	t.Logf("age on the server's clock: %s", info.Age)
 	if info.Age > 30*time.Second {
 		t.Errorf("a holder renewed just now is %s old on the server's clock", info.Age)
 	}
-	live, err := holder.Judge(info, holder.NodeState{Ready: true, InUse: true}, 5*time.Minute, holder.Observation{})
-	if err != nil {
-		t.Fatalf("Judge: %v", err)
-	}
-	if live.Takeover {
-		t.Fatalf("a live holder was judged stale: %s", live.Reason)
-	}
+	live := holder.Judgement{Reason: "no emergency detach", Info: info}
 	if _, err := holder.Acquire(ctx, dirs[1], vol, "kind-worker2", live); !errors.Is(err, holder.ErrHeld) {
 		t.Fatalf("second Acquire = %v, want ErrHeld", err)
 	}
@@ -82,16 +77,9 @@ func TestE2ENFS3HolderTwoClients(t *testing.T) {
 		t.Fatalf("first Mine = %v, %v", ok, err)
 	}
 
-	// The first stops renewing; the judgement says stale (the node is gone
-	// from the cluster: the out-of-service taint stands in for the timed
-	// conditions, whose clocks the unit tests drive).
-	stale, err := holder.Judge(info, holder.NodeState{OutOfService: true}, 5*time.Minute, holder.Observation{})
-	if err != nil {
-		t.Fatalf("Judge: %v", err)
-	}
-	if !stale.Takeover {
-		t.Fatalf("out-of-service holder not judged stale: %s", stale.Reason)
-	}
+	// An operator abandons the first holder (the emergency detach); the
+	// judgement is the reconciler's, whose rules its own tests drive.
+	stale := holder.Judgement{Takeover: true, Reason: "emergency detach", Info: info}
 	second, err := holder.Acquire(ctx, dirs[1], vol, "kind-worker2", stale)
 	if err != nil {
 		t.Fatalf("takeover: %v", err)
@@ -116,5 +104,64 @@ func TestE2ENFS3HolderTwoClients(t *testing.T) {
 	}
 	if info, err := holder.Read(ctx, dirs[0], vol); err != nil || info.Present {
 		t.Errorf("after Release, Read = %+v, %v", info, err)
+	}
+	noSillyRename(t, dirs[0])
+
+	// A takeover landing between Renew's checks and its touch: the touch is
+	// answered for the inode the takeover replaced (ESTALE on a real server),
+	// and the late renewer is told it lost, leaving the taker's file as it is.
+	const vol2 = "vol2"
+	a, err := holder.Acquire(ctx, dirs[0], vol2, "kind-worker", holder.Judgement{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taker *holder.Holder
+	restore := holder.SetHook(func(point string) {
+		if point != "renew-checked" {
+			return
+		}
+		info, err := holder.Read(ctx, dirs[1], vol2)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		taker, err = holder.Acquire(ctx, dirs[1], vol2, "kind-worker2", holder.Judgement{Takeover: true, Reason: "e2e", Info: info})
+		if err != nil {
+			t.Error(err)
+		}
+	})
+	err = a.Renew(ctx)
+	restore()
+	if !errors.Is(err, holder.ErrLost) {
+		t.Fatalf("a Renew that raced a takeover = %v, want ErrLost", err)
+	}
+	if taker == nil {
+		t.Fatal("the takeover did not happen")
+	}
+	if info, err := holder.Read(ctx, dirs[1], vol2); err != nil || info.Node != "kind-worker2" || info.Epoch != 2 {
+		t.Errorf("the taker's file after the late renewal = %+v, %v", info, err)
+	}
+	if err := a.Release(ctx); err != nil && !errors.Is(err, holder.ErrLost) {
+		t.Errorf("late Release = %v", err)
+	}
+	if err := taker.Release(ctx); err != nil {
+		t.Errorf("taker Release = %v", err)
+	}
+	noSillyRename(t, dirs[0])
+	noSillyRename(t, dirs[1])
+}
+
+// noSillyRename fails if an NFS client left a .nfsXXXX file in dir: what it
+// does when a file is unlinked while the same client still has it open.
+func noSillyRename(t *testing.T, dir string) {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), ".nfs") {
+			t.Errorf("a silly-renamed file %q is left in %s", e.Name(), dir)
+		}
 	}
 }

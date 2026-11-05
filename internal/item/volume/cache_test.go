@@ -238,26 +238,36 @@ func TestCurrentIsReadAfterTheHolderCall(t *testing.T) {
 
 func TestFenceRuleIsTheItemsNotTheReconcilers(t *testing.T) {
 	e := newEnv(t)
-	e.judge = func(string) holder.Judgement {
+	e.judge = func(string, holder.Info) holder.Judgement {
 		t.Error("the reconciler's judge was consulted for our own fenced file")
 		return holder.Judgement{}
 	}
 	info := holder.Info{Node: testNode, Epoch: 3, Present: true}
-	j := e.it.judge(e.v, info, current{name: "5.1", ok: true, epoch: 5})
+	j := e.it.judge(bg, e.v, info, current{name: "5.1", ok: true, epoch: 5})
 	if !j.Takeover || j.Reason != "own ownership fenced by a newer generation" || j.Info != info {
 		t.Errorf("judgement = %+v", j)
 	}
-	// Not fenced, or someone else's: the reconciler decides.
-	e.judge = func(string) holder.Judgement { return holder.Judgement{Reason: "reconciler"} }
+	// Someone else's file: the reconciler decides.
+	e.judge = func(string, holder.Info) holder.Judgement { return holder.Judgement{Reason: "reconciler"} }
+	other := holder.Info{Node: otherNode, Epoch: 3, Present: true}
+	if j := e.it.judge(bg, e.v, other, current{ok: true, epoch: 5}); j.Takeover || j.Reason != "reconciler" {
+		t.Errorf("another node's file: judgement = %+v", j)
+	}
+	// Our own file that is not fenced, or no file: nothing to judge, so the
+	// reconciler is not asked.
+	e.judge = func(string, holder.Info) holder.Judgement {
+		t.Error("the reconciler's judge was consulted")
+		return holder.Judgement{}
+	}
 	for name, tc := range map[string]struct {
 		info holder.Info
 		cur  current
 	}{
 		"current at our epoch": {info, current{ok: true, epoch: 3}},
 		"no current":           {info, current{}},
-		"another node's file":  {holder.Info{Node: otherNode, Epoch: 3, Present: true}, current{ok: true, epoch: 5}},
+		"no file":              {holder.Info{}, current{ok: true, epoch: 5}},
 	} {
-		if j := e.it.judge(e.v, tc.info, tc.cur); j.Takeover || j.Reason != "reconciler" {
+		if j := e.it.judge(bg, e.v, tc.info, tc.cur); j.Takeover || j.Reason != "" {
 			t.Errorf("%s: judgement = %+v", name, j)
 		}
 	}

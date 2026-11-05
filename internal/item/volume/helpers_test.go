@@ -124,15 +124,16 @@ type env struct {
 	mnt   *simMounter
 	hold  *recHolder
 
-	curName string // what the store's current says; "" for none
-	keys    item.Keys
-	events  []string
-	freezeE error
-	thawE   error
-	thaws   int
-	judge   func(string) holder.Judgement
-	atStop  [2]bool // cache and holder file present when the unit was stopped
-	logs    bytes.Buffer
+	curName   string // what the store's current says; "" for none
+	keys      item.Keys
+	events    []string
+	freezeE   error
+	thawE     error
+	thaws     int
+	judge     func(volumeID string, info holder.Info) holder.Judgement
+	takeovers []holder.Judgement // the takeovers Config.Takeover reported
+	atStop    [2]bool            // cache and holder file present when the unit was stopped
+	logs      bytes.Buffer
 }
 
 func newEnv(t *testing.T) *env {
@@ -203,12 +204,13 @@ func (e *env) newItem() {
 			return e.ctl, nil
 		},
 		Node: testNode, BinaryHash: "test", Exe: e.exe,
-		Judge: func(id string) holder.Judgement {
+		Judge: func(_ context.Context, id string, info holder.Info) holder.Judgement {
 			if e.judge != nil {
-				return e.judge(id)
+				return e.judge(id, info)
 			}
 			return holder.Judgement{Reason: "test: no takeover"}
 		},
+		Takeover:     func(_ string, j holder.Judgement) { e.takeovers = append(e.takeovers, j) },
 		StartTimeout: 300 * time.Millisecond, PollEvery: time.Millisecond, FreezeBound: 200 * time.Millisecond,
 		Timeout: time.Second,
 		Event:   func(_, reason string) { e.events = append(e.events, reason) },
@@ -545,6 +547,7 @@ type fakeCtl struct {
 	nextName       string // the manifest a publish with dirty chunks makes current
 	stickyDirty    bool   // a publish leaves the dirty count as it was
 	wrongName      bool   // a publish succeeds but current does not move
+	onPublish      func() // runs as a publish begins, before it answers
 }
 
 func (c *fakeCtl) up() {
@@ -580,6 +583,9 @@ func (c *fakeCtl) Boundary(ctx context.Context) error {
 
 func (c *fakeCtl) Publish(_ context.Context, trigger string) (blockd.PublishReply, error) {
 	c.e.rec.add("ctl.Publish %s", trigger)
+	if c.onPublish != nil {
+		c.onPublish()
+	}
 	if c.publishErr != nil {
 		return blockd.PublishReply{}, c.publishErr
 	}

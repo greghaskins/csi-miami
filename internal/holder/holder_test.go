@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -114,7 +115,7 @@ func TestAcquireCreatesWithEpochOne(t *testing.T) {
 	if h.Epoch() != 1 {
 		t.Errorf("Epoch = %d, want 1", h.Epoch())
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":0}`+"\n"; got != want {
+	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1}`+"\n"; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
 	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
@@ -180,7 +181,7 @@ func TestTakeoverIncrementsEpoch(t *testing.T) {
 	if second.Epoch() != 2 {
 		t.Errorf("Epoch = %d, want 2", second.Epoch())
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2,"renewals":0}`+"\n"; got != want {
+	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2}`+"\n"; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
 	if ok, _ := first.Mine(ctx); ok {
@@ -194,35 +195,35 @@ func TestTakeoverIncrementsEpoch(t *testing.T) {
 	}
 }
 
-func TestRenewRewritesAtomically(t *testing.T) {
+func TestRenewTouchesInPlace(t *testing.T) {
 	e := newEnv(t)
 	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.age("vol", time.Minute)
-	seen := ""
-	hook = func(point string) {
-		if point == "renew-written" {
-			// Between the write and the rename, a reader sees the old whole file.
-			seen = e.raw("vol")
-		}
+	before, err := os.Stat(Path(e.dir, "vol"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	e.age("vol", time.Minute)
 	if err := h.Renew(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if want := `{"node":"kind-worker","epoch":1,"renewals":0}` + "\n"; seen != want {
-		t.Errorf("a reader mid-renewal saw %q, want the old content %q", seen, want)
+	after, err := os.Stat(Path(e.dir, "vol"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":1}`+"\n"; got != want {
-		t.Errorf("content = %q, want %q", got, want)
+	if !os.SameFile(before, after) {
+		t.Error("a renewal replaced the file; it must touch it in place")
+	}
+	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1}`+"\n"; got != want {
+		t.Errorf("a renewal changed the content: %q, want %q", got, want)
 	}
 	if got := e.holderFiles(); !slices.Equal(got, []string{"vol.holder"}) {
 		t.Errorf("directory holds %v", got)
 	}
-	st, err := os.Stat(Path(e.dir, "vol"))
-	if err != nil || time.Since(st.ModTime()) > time.Hour*24 || st.ModTime().Equal(e.now.Add(-time.Minute)) {
-		t.Errorf("the renewal did not refresh the modification time: %v, %v", st, err)
+	if time.Since(after.ModTime()) > time.Hour*24 || after.ModTime().Equal(e.now.Add(-time.Minute)) {
+		t.Errorf("the renewal did not refresh the modification time: %v", after.ModTime())
 	}
 }
 
@@ -242,7 +243,7 @@ func TestRenewDetectsLoss(t *testing.T) {
 		t.Errorf("the loser overwrote the winner: %q", e.raw("vol"))
 	}
 	// Lost stays lost, even if the file would look ours again.
-	if err := os.WriteFile(Path(e.dir, "vol"), []byte(`{"node":"kind-worker","epoch":1,"renewals":0}`+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(Path(e.dir, "vol"), []byte(`{"node":"kind-worker","epoch":1}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
@@ -253,80 +254,199 @@ func TestRenewDetectsLoss(t *testing.T) {
 	}
 }
 
-func TestRenewDetectsATakeoverRacingTheRename(t *testing.T) {
+// A takeover is a new inode renamed over the name. A renewal that has checked
+// the file and is about to touch it must leave the taker's file as it is, and
+// is told it lost.
+func TestRenewRacingATakeoverLeavesTheTakersFileIntact(t *testing.T) {
 	e := newEnv(t)
 	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hook = func(point string) {
-		if point == "renew-renamed" {
+		if point == "renew-checked" {
 			hook = func(string) {}
-			// A taker's rename lands right after ours.
-			if err := os.WriteFile(Path(e.dir, "vol"), []byte(`{"node":"kind-worker2","epoch":2,"renewals":0}`+"\n"), 0o600); err != nil {
+			if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", e.judgeTakeover("vol")); err != nil {
 				t.Error(err)
 			}
+			e.age("vol", time.Hour) // the taker's file is old, so a touch of it would show
 		}
 	}
 	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
 		t.Fatalf("Renew = %v, want ErrLost", err)
+	}
+	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2}`+"\n"; got != want {
+		t.Errorf("the taker's file changed: %q, want %q", got, want)
+	}
+	if st, err := os.Stat(Path(e.dir, "vol")); err != nil || time.Since(st.ModTime()) < 30*time.Minute {
+		t.Errorf("the late renewal touched the taker's file: %v, %v", st, err)
 	}
 	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
 		t.Errorf("second Renew = %v, want ErrLost", err)
 	}
+	if ok, _ := h.Mine(ctx); ok {
+		t.Error("Mine is true on a lost holder")
+	}
 }
 
-// I2: a takeover that lands between writing the new content and the rename
-// must stop the losing holder before it renames, so it never overwrites the
-// new owner's file.
-func TestRenewDetectsLossBeforeTheRename(t *testing.T) {
+// The name is another inode with our very content: not ours to touch.
+func TestRenewFindsTheNameOnAnotherInode(t *testing.T) {
 	e := newEnv(t)
 	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hook = func(point string) {
-		if point == "renew-written" {
-			hook = func(string) {}
-			// A taker's rename lands after we wrote our temp but before our own
-			// rename.
-			if err := os.WriteFile(Path(e.dir, "vol"), []byte(`{"node":"kind-worker2","epoch":2,"renewals":0}`+"\n"), 0o600); err != nil {
-				t.Error(err)
-			}
-		}
+	f := h.fd
+	tmp := filepath.Join(e.dir, "copy")
+	if err := os.WriteFile(tmp, []byte(e.raw("vol")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, Path(e.dir, "vol")); err != nil {
+		t.Fatal(err)
 	}
 	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
 		t.Fatalf("Renew = %v, want ErrLost", err)
 	}
-	// The loser did not overwrite the new owner: the file still names kind-worker2.
-	if got := e.raw("vol"); !strings.Contains(got, `"kind-worker2"`) || strings.Contains(got, `"renewals":1`) {
-		t.Errorf("the loser overwrote the new owner at the rename: %q", got)
+	if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("the descriptor of a lost holder is still open: %v", err)
 	}
 }
 
-// I1: the judgement is bound to the holder it judged. A renewal landing
-// between the judge read and the break means the holder is no longer the one
-// judged stale, so Acquire must refuse rather than break a now-live holder.
+// ESTALE on the touch is what an NFS client says of a replaced inode.
+func TestRenewEstaleIsLost(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := touch
+	t.Cleanup(func() { touch = old })
+	touch = func(*os.File) error { return syscall.ESTALE }
+	f := h.fd
+	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
+		t.Fatalf("Renew = %v, want ErrLost", err)
+	}
+	if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("the descriptor of a lost holder is still open: %v", err)
+	}
+	touch = old
+	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
+		t.Errorf("Renew after ESTALE = %v, want ErrLost (lost stays lost)", err)
+	}
+}
+
+// Any other failure of the touch is the transport's, not a loss.
+func TestRenewOtherTouchErrorIsNotLoss(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := touch
+	t.Cleanup(func() { touch = old })
+	touch = func(*os.File) error { return syscall.EIO }
+	if err := h.Renew(ctx); !errors.Is(err, syscall.EIO) || errors.Is(err, ErrLost) {
+		t.Fatalf("Renew = %v, want EIO", err)
+	}
+	touch = old
+	if err := h.Renew(ctx); err != nil {
+		t.Errorf("Renew after a transient error = %v", err)
+	}
+}
+
+func TestDescriptorClosedOnReleaseAndClose(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := h.fd
+	if f == nil {
+		t.Fatal("an acquired holder keeps no descriptor")
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("Release left the descriptor open: %v", err)
+	}
+	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
+		t.Errorf("Renew after Release = %v", err)
+	}
+
+	a, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad, err := Adopt(ctx, e.dir, "vol", "kind-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	af := ad.fd
+	if err := ad.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ad.Close(); err != nil {
+		t.Errorf("second Close = %v", err)
+	}
+	if _, err := af.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("Close left the descriptor open: %v", err)
+	}
+	// Closing an adopter's descriptor leaves the ownership in the store.
+	if ok, _ := a.Mine(ctx); !ok {
+		t.Error("Close gave the ownership up")
+	}
+	// A takeover closes nothing of the loser's until it finds out; a failed
+	// acquire holds no descriptor.
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", keep); !errors.Is(err, ErrHeld) {
+		t.Fatal(err)
+	}
+}
+
+// A loser's late renewal can no longer put its own claim back: the whole
+// regression the rename-over renewal had.
+func TestLateRenewalCannotRegressTheFile(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", e.judgeTakeover("vol")); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
+			t.Fatalf("Renew = %v, want ErrLost", err)
+		}
+	}
+	if got, want := e.raw("vol"), `{"node":"kind-worker2","epoch":2}`+"\n"; got != want {
+		t.Errorf("content = %q, want %q", got, want)
+	}
+}
+
+// I1: the judgement is bound to the holder it judged. A takeover by a third
+// node between the judge read and the break means the holder is no longer the
+// one judged, so Acquire must refuse rather than break the new owner.
 func TestAcquireRefusesWhenTheJudgedHolderChanged(t *testing.T) {
 	e := newEnv(t)
 	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The reconciler judged the holder as it was before this renewal.
+	// Two nodes judged the holder as it was.
 	stale := e.judgeTakeover("vol")
-	if err := h.Renew(ctx); err != nil {
+	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", stale); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Acquire(ctx, e.dir, "vol", "kind-worker2", stale)
+	_, err = Acquire(ctx, e.dir, "vol", "kind-worker3", stale)
 	if !errors.Is(err, ErrHeld) {
 		t.Fatalf("Acquire against a stale judgement = %v, want ErrHeld", err)
 	}
-	if got := e.raw("vol"); !strings.Contains(got, `"kind-worker"`) || !strings.Contains(got, `"renewals":1`) {
-		t.Errorf("the live holder was altered: %q", got)
+	if got := e.raw("vol"); !strings.Contains(got, `"kind-worker2"`) {
+		t.Errorf("the new owner was altered: %q", got)
 	}
-	if ok, err := h.Mine(ctx); err != nil || !ok {
-		t.Errorf("the live holder lost its volume: Mine = %v, %v", ok, err)
+	if ok, _ := h.Mine(ctx); ok {
+		t.Error("the first holder still reports the file as its own")
 	}
 	// A takeover judgement with no holder recorded is also refused.
 	if _, err := Acquire(ctx, e.dir, "vol", "kind-worker2", Judgement{Takeover: true, Reason: "no info"}); !errors.Is(err, ErrHeld) {
@@ -590,7 +710,7 @@ func TestAdoptContinuesTheExistingEpoch(t *testing.T) {
 	if err := h.Renew(ctx); err != nil {
 		t.Fatalf("Renew: %v", err)
 	}
-	if got, want := e.raw("vol"), `{"node":"kind-worker","epoch":1,"renewals":2}`+"\n"; got != want {
+	if got, want := e.raw("vol"), before; got != want {
 		t.Errorf("content = %q, want %q", got, want)
 	}
 	if err := h.Release(ctx); err != nil {
@@ -671,5 +791,79 @@ func TestSiblingVolumesDoNotShareDeadlineKeys(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Errorf("Read of a: %v", err)
+	}
+}
+
+// A-I1: on NFS, unlinking a file this client still has open renames it to
+// .nfsXXXX, which a crash then leaves behind for good. The descriptor is
+// closed before the unlink.
+func TestReleaseClosesTheDescriptorBeforeTheRemove(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := h.fd
+	old := removeFile
+	t.Cleanup(func() { removeFile = old })
+	var closedAtRemove bool
+	removeFile = func(path string) error {
+		_, err := f.Stat()
+		closedAtRemove = errors.Is(err, os.ErrClosed)
+		return old(path)
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !closedAtRemove {
+		t.Error("the file was removed while the holder's descriptor was still open")
+	}
+	if _, err := os.Stat(Path(e.dir, "vol")); !os.IsNotExist(err) {
+		t.Errorf("holder file after Release: %v", err)
+	}
+}
+
+// B-M6: the name is another inode (a taker's file) that happens to say what
+// ours says: not ours to remove.
+func TestReleaseLeavesAnotherInodeAlone(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(e.dir, "copy")
+	if err := os.WriteFile(tmp, []byte(e.raw("vol")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, Path(e.dir, "vol")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(ctx); !errors.Is(err, ErrLost) {
+		t.Fatalf("Release = %v, want ErrLost", err)
+	}
+	if _, err := os.Stat(Path(e.dir, "vol")); err != nil {
+		t.Errorf("another inode's file was removed: %v", err)
+	}
+}
+
+// A-m3: ESTALE from the final stat of the kept descriptor is a loss.
+func TestRenewEstaleOnTheFinalStatIsLost(t *testing.T) {
+	e := newEnv(t)
+	h, err := Acquire(ctx, e.dir, "vol", "kind-worker", keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := statFile
+	t.Cleanup(func() { statFile = old })
+	calls := 0
+	statFile = func(f *os.File) (os.FileInfo, error) {
+		calls++
+		if calls == 2 { // the first is the inode comparison, the second the final look
+			return nil, syscall.ESTALE
+		}
+		return old(f)
+	}
+	if err := h.Renew(ctx); !errors.Is(err, ErrLost) {
+		t.Fatalf("Renew = %v, want ErrLost", err)
 	}
 }

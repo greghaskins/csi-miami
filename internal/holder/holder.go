@@ -19,6 +19,13 @@
 //
 // Clocks differ between nodes, so a holder's age is the server's own: the
 // modification time of a probe file made now, minus the holder file's.
+//
+// A holder renews by touching, not by rewriting: futimens(UTIME_NOW) on a
+// descriptor opened when the holder was loaded, so the NFS server stamps the
+// time. The descriptor names the very inode we installed. A takeover renames
+// a new inode over the name, so a stale holder's late renewal reaches only the
+// inode that was replaced (ESTALE, or an inode that no longer is the name's)
+// and can never put its own node and epoch back into the file.
 package holder
 
 import (
@@ -34,8 +41,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/lock"
@@ -55,9 +67,8 @@ const CallTimeout = 30 * time.Second
 
 // Info is what the holder file says, and how old it is.
 type Info struct {
-	Node     string
-	Epoch    uint64
-	Renewals uint64
+	Node  string
+	Epoch uint64
 	// Age is on the server's clock: a probe file's modification time minus the
 	// holder file's. Zero when not Present.
 	Age     time.Duration
@@ -93,10 +104,12 @@ func (Real) Adopt(ctx context.Context, dir, name, node string) (*Holder, error) 
 }
 
 // file is the JSON content of the holder file.
+//
+// Files written before renewal became a touch also carry a "renewals" count;
+// it is ignored on read and no longer written.
 type file struct {
-	Node     string `json:"node"`
-	Epoch    uint64 `json:"epoch"`
-	Renewals uint64 `json:"renewals"`
+	Node  string `json:"node"`
+	Epoch uint64 `json:"epoch"`
 }
 
 // Seams for tests: the server's clock, and a point between the steps of an
@@ -104,10 +117,41 @@ type file struct {
 var (
 	probe = lock.ProbeClock
 	hook  = func(string) {}
+	// touch sets the holder file's modification time to the server's now
+	// (UTIME_NOW: the NFS client sends SET_TO_SERVER_TIME, so the stamp stays
+	// on the server's clock) through the descriptor kept since the file was
+	// loaded.
+	touch = futimensNow
+	// statFile stats the kept descriptor, and removeFile unlinks the holder
+	// file: seams for tests of the failures and of the order Release works in.
+	statFile   = func(f *os.File) (os.FileInfo, error) { return f.Stat() }
+	removeFile = os.Remove
 )
+
+// SetHook installs fn as the hook called between the steps of Renew (point
+// "renew-checked" is after the checks and before the touch) and returns the
+// function that removes it. It exists for the end-to-end tests against a real
+// NFS server, which must take the volume over at exactly that point; nothing
+// else uses it, and it is not safe for concurrent use with a running Renew.
+func SetHook(fn func(point string)) (restore func()) {
+	old := hook
+	hook = fn
+	return func() { hook = old }
+}
 
 // calls tracks the file system calls that hung: one outstanding per file.
 var calls deadline.Set
+
+// futimensNow is futimens(f, UTIME_NOW, UTIME_NOW): utimensat(2) on the
+// descriptor with a NULL path, which x/sys/unix has no wrapper for.
+func futimensNow(f *os.File) error {
+	ts := [2]unix.Timespec{{Nsec: unix.UTIME_NOW}, {Nsec: unix.UTIME_NOW}}
+	_, _, errno := unix.Syscall6(unix.SYS_UTIMENSAT, f.Fd(), 0, uintptr(unsafe.Pointer(&ts[0])), 0, 0, 0) //nolint:gosec // fixed-size timespec pair, valid for the call
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
 
 // Path is the holder file of the volume name in dir: beside the volume's
 // directory, not inside it.
@@ -135,36 +179,63 @@ type snapshot struct {
 // load opens the file afresh (so that the client revalidates), stats and
 // reads it. A missing file is ok == false with a nil error.
 func load(ctx context.Context, dir, name string) (snapshot, error) {
+	s, f, err := loadFile(ctx, dir, name)
+	if f != nil {
+		_ = f.Close()
+	}
+	return s, err
+}
+
+// loadFile is load that keeps the descriptor it read from open, for the caller
+// to close: a caller that takes the file as its own keeps it to touch. The
+// descriptor is returned (non-nil) only with ok == true and a nil error.
+func loadFile(ctx context.Context, dir, name string) (snapshot, *os.File, error) {
 	path := Path(dir, name)
-	return step(ctx, path, "read the holder file", func() (snapshot, error) {
+	type result struct {
+		s snapshot
+		f *os.File
+	}
+	r, err := step(ctx, path, "read the holder file", func() (result, error) {
 		f, err := os.Open(path) //nolint:gosec // built from a validated volume name
 		if errors.Is(err, fs.ErrNotExist) {
-			return snapshot{}, nil
+			return result{}, nil
 		}
 		if err != nil {
-			return snapshot{}, err
+			return result{}, err
 		}
-		defer func() { _ = f.Close() }()
+		keep := false
+		defer func() {
+			if !keep {
+				_ = f.Close()
+			}
+		}()
 		st, err := f.Stat()
 		if err != nil {
-			return snapshot{}, err
+			return result{}, err
 		}
 		b, err := io.ReadAll(io.LimitReader(f, 4096))
 		if err != nil {
-			return snapshot{}, err
+			return result{}, err
 		}
 		s := snapshot{mtime: st.ModTime(), ok: true}
 		if err := json.Unmarshal(b, &s.file); err != nil {
-			return snapshot{}, fmt.Errorf("the holder file is not valid: %w", err)
+			return result{}, fmt.Errorf("the holder file is not valid: %w", err)
 		}
 		// A holder file names a node at an epoch that starts at 1; an empty
 		// node or a zero epoch is corruption, not a usable holder and not an
 		// absence.
 		if s.Node == "" || s.Epoch == 0 {
-			return snapshot{}, fmt.Errorf("the holder file is corrupt: node %q, epoch %d", s.Node, s.Epoch)
+			return result{}, fmt.Errorf("the holder file is corrupt: node %q, epoch %d", s.Node, s.Epoch)
 		}
-		return s, nil
+		keep = true
+		return result{s, f}, nil
 	})
+	if err != nil {
+		// A call that timed out may still return later with a descriptor
+		// nobody will close; os.File's finalizer closes it.
+		return snapshot{}, nil, err
+	}
+	return r.s, r.f, nil
 }
 
 // Read reads the holder file afresh. Present is false, with a nil error, when
@@ -181,7 +252,7 @@ func Read(ctx context.Context, dir, name string) (Info, error) {
 		return Info{}, err
 	}
 	age := max(now.Sub(s.mtime), 0)
-	return Info{Node: s.Node, Epoch: s.Epoch, Renewals: s.Renewals, Age: age, Present: true}, nil
+	return Info{Node: s.Node, Epoch: s.Epoch, Age: age, Present: true}, nil
 }
 
 // writeTemp writes content to a new temporary file beside the holder file and
@@ -336,6 +407,35 @@ type Holder struct {
 	dir, name, node string
 	epoch           uint64
 	lost            atomic.Bool
+
+	// fmu guards fd, the descriptor on the inode this holder installed (or
+	// adopted), which Renew touches. It is closed by Release, by Close and
+	// when Renew finds the holder lost.
+	fmu sync.Mutex
+	fd  *os.File
+}
+
+// setFile keeps f as the descriptor to touch, closing any earlier one.
+func (h *Holder) setFile(f *os.File) {
+	h.fmu.Lock()
+	defer h.fmu.Unlock()
+	if h.fd != nil {
+		_ = h.fd.Close()
+	}
+	h.fd = f
+}
+
+// Close closes the descriptor Renew touches. It is idempotent and does not
+// release the holder file: the ownership stays in the store.
+func (h *Holder) Close() error {
+	h.fmu.Lock()
+	defer h.fmu.Unlock()
+	if h.fd == nil {
+		return nil
+	}
+	err := h.fd.Close()
+	h.fd = nil
+	return err
 }
 
 // Epoch is the epoch of this ownership, the fencing token.
@@ -346,9 +446,9 @@ func (h *Holder) mine(s snapshot) bool {
 }
 
 // sameHolderAs reports whether this fresh snapshot is the very holder info
-// describes: same node, epoch and renewal count.
+// describes: same node and epoch.
 func (s snapshot) sameHolderAs(info Info) bool {
-	return s.ok && s.Node == info.Node && s.Epoch == info.Epoch && s.Renewals == info.Renewals
+	return s.ok && s.Node == info.Node && s.Epoch == info.Epoch
 }
 
 // Acquire takes the holder file of name in dir for node. With no holder it
@@ -378,7 +478,7 @@ func Acquire(ctx context.Context, dir, name, node string, judge Judgement) (*Hol
 	// the one that was judged stale, so we refuse rather than break a holder
 	// that may now be live.
 	if !judge.Info.Present || !cur.sameHolderAs(judge.Info) {
-		return nil, fmt.Errorf("%w: the holder changed since it was judged (now %s at epoch %d, %d renewals); re-judge", ErrHeld, cur.Node, cur.Epoch, cur.Renewals)
+		return nil, fmt.Errorf("%w: the holder changed since it was judged (now %s at epoch %d); re-judge", ErrHeld, cur.Node, cur.Epoch)
 	}
 	return h.takeOver(ctx, judge.Info)
 }
@@ -394,7 +494,7 @@ func Adopt(ctx context.Context, dir, name, node string) (*Holder, error) {
 	if node == "" || strings.ContainsAny(name, "/\x00") || name == "" {
 		return nil, errors.New("holder: node and name are required, and the name is one path element")
 	}
-	cur, err := load(ctx, dir, name)
+	cur, f, err := loadFile(ctx, dir, name)
 	if err != nil {
 		return nil, err
 	}
@@ -402,9 +502,10 @@ func Adopt(ctx context.Context, dir, name, node string) (*Holder, error) {
 		return nil, fmt.Errorf("%w: there is no holder file to adopt", ErrLost)
 	}
 	if cur.Node != node {
+		_ = f.Close()
 		return nil, fmt.Errorf("%w: %s at epoch %d", ErrHeld, cur.Node, cur.Epoch)
 	}
-	return &Holder{dir: dir, name: name, node: node, epoch: cur.Epoch}, nil
+	return &Holder{dir: dir, name: name, node: node, epoch: cur.Epoch, fd: f}, nil
 }
 
 func (h *Holder) create(ctx context.Context) (*Holder, error) {
@@ -462,8 +563,8 @@ func (h *Holder) takeOver(ctx context.Context, judged Info) (*Holder, error) {
 		return nil, fmt.Errorf("%w: the holder file vanished while it was being taken over; try again", ErrHeld)
 	case now.Epoch > judged.Epoch:
 		return nil, fmt.Errorf("%w: epoch %d was taken by %s after the judgement at epoch %d; the epoch never decreases", ErrHeld, now.Epoch, now.Node, judged.Epoch)
-	case now.Node != judged.Node || now.Renewals != judged.Renewals:
-		return nil, fmt.Errorf("%w: %s renewed at epoch %d after the judgement", ErrHeld, now.Node, now.Epoch)
+	case now.Node != judged.Node:
+		return nil, fmt.Errorf("%w: %s holds epoch %d after the judgement", ErrHeld, now.Node, now.Epoch)
 	}
 	if err := rename(ctx, h.dir, h.name, tmp); err != nil {
 		return nil, err
@@ -477,14 +578,22 @@ func (h *Holder) takeOver(ctx context.Context, judged Info) (*Holder, error) {
 
 // confirm re-reads the file after we replaced or created it and checks that it
 // is ours, which it is not if a taker replaced it right after us.
+//
+// The file read is kept open as the descriptor Renew touches. It is the inode
+// the name has now; one that replaces it after this read is a taker's, and
+// Renew finds that by comparing inodes.
 func (h *Holder) confirm(ctx context.Context) error {
-	s, err := load(ctx, h.dir, h.name)
+	s, f, err := loadFile(ctx, h.dir, h.name)
 	if err != nil {
 		return err
 	}
 	if !h.mine(s) {
+		if f != nil {
+			_ = f.Close()
+		}
 		return h.heldBy(ctx)
 	}
+	h.setFile(f)
 	return nil
 }
 
@@ -496,59 +605,102 @@ func (h *Holder) heldBy(ctx context.Context) error {
 	return fmt.Errorf("%w: %s at epoch %d", ErrHeld, s.Node, s.Epoch)
 }
 
-// Renew rewrites the holder file with one more renewal: a temporary file
-// renamed over it. It confirms ownership immediately before the rename, not
-// only when it starts, so a takeover that lands while the new content is being
-// written cannot be overwritten by the losing holder; it confirms again after
-// the rename to catch a takeover that raced the rename itself. ErrLost
-// whenever the file is no longer ours; the Holder then stays lost.
+// Renew refreshes the holder file's modification time. It reads the file
+// afresh and requires it to still name this node at this epoch, requires the
+// name to still be the inode this holder installed (a fresh read of the path
+// against the descriptor kept from the load), and then sets the time through
+// that descriptor with futimens(UTIME_NOW), so the NFS server stamps it, and
+// looks at the name once more. It writes no content and renames nothing.
 //
-// NFSv3 has no conditional rename, so a one round-trip window remains between
-// the pre-rename check and the rename. The design accepts that overlap: a
-// rename that lands on a newer owner is caught by the post-rename check, and
-// the fencing token stops a lost holder from publishing regardless.
+// A takeover renames a new inode over the name, so a holder that lost the
+// volume can only touch the inode that was replaced: the taker's file is never
+// altered, whatever the order of the two. ESTALE on the touch (the replaced
+// inode is gone on the server), an inode that is not the name's, or content
+// that is not ours is ErrLost, and the Holder then stays lost with its
+// descriptor closed. Any other error is returned as it is and the ownership
+// is as it was.
 func (h *Holder) Renew(ctx context.Context) error {
 	if h.lost.Load() {
 		return ErrLost
 	}
-	s, err := load(ctx, h.dir, h.name)
+	h.fmu.Lock()
+	defer h.fmu.Unlock()
+	if h.fd == nil {
+		// Nothing was installed or adopted by this value: it cannot renew.
+		return ErrLost
+	}
+	lose := func() error {
+		h.lost.Store(true)
+		_ = h.fd.Close()
+		h.fd = nil
+		return ErrLost
+	}
+	s, f, err := loadFile(ctx, h.dir, h.name)
 	if err != nil {
 		return err
+	}
+	if f != nil {
+		defer func() { _ = f.Close() }()
 	}
 	if !h.mine(s) {
-		h.lost.Store(true)
-		return ErrLost
+		return lose()
 	}
-	tmp, err := writeTemp(ctx, h.dir, h.name, file{Node: h.node, Epoch: h.epoch, Renewals: s.Renewals + 1})
+	same, err := sameInode(h.fd, f)
 	if err != nil {
 		return err
 	}
-	defer removeTemp(tmp)
-	hook("renew-written")
-	// Re-confirm ownership in the same step as the rename: a takeover between
-	// the first read and here means the file is no longer ours and we must not
-	// install our content over the new owner's.
-	before, err := load(ctx, h.dir, h.name)
+	if !same {
+		return lose()
+	}
+	hook("renew-checked")
+	_, err = step(ctx, Path(h.dir, h.name), "touch the holder file", func() (struct{}, error) {
+		return struct{}{}, touch(h.fd)
+	})
+	switch {
+	case errors.Is(err, syscall.ESTALE):
+		return lose()
+	case err != nil:
+		return err
+	}
+	// A takeover that renamed its inode in after the check leaves the touch on
+	// the inode it replaced (which a local file system still accepts): the name
+	// must still be ours after it.
+	after, err := step(ctx, Path(h.dir, h.name), "stat the holder file", func() (os.FileInfo, error) {
+		return os.Stat(Path(h.dir, h.name))
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return lose()
+	}
 	if err != nil {
 		return err
 	}
-	if !h.mine(before) {
-		h.lost.Store(true)
-		return ErrLost
+	mine, err := statFile(h.fd)
+	if errors.Is(err, syscall.ESTALE) {
+		return lose()
 	}
-	if err := rename(ctx, h.dir, h.name, tmp); err != nil {
-		return err
-	}
-	hook("renew-renamed")
-	after, err := load(ctx, h.dir, h.name)
 	if err != nil {
 		return err
 	}
-	if !h.mine(after) {
-		h.lost.Store(true)
-		return ErrLost
+	if !os.SameFile(mine, after) {
+		return lose()
 	}
 	return nil
+}
+
+// sameInode reports whether a and b are descriptors on the same file.
+func sameInode(a, b *os.File) (bool, error) {
+	sa, err := statFile(a)
+	if err != nil {
+		if errors.Is(err, syscall.ESTALE) {
+			return false, nil
+		}
+		return false, err
+	}
+	sb, err := b.Stat()
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(sa, sb), nil
 }
 
 // Mine re-reads the file, every call, and reports whether it names our node
@@ -566,14 +718,53 @@ func (h *Holder) Mine(ctx context.Context) (bool, error) {
 
 // Release removes the holder file only if it is still ours; otherwise, and
 // when it is already gone, it does nothing. The Holder is finished either way.
+//
+// Ours means the content names this node at this epoch and the name is still
+// the inode this holder installed (a fresh read against the kept descriptor).
+// The descriptor is then closed BEFORE the file is unlinked: unlinking a file
+// this client holds open makes the NFS client rename it to .nfsXXXX and delete
+// it only at close, and a process killed in between would leave that file in
+// the export for good. A name that is another inode is a taker's file saying
+// what ours said, and is left alone (ErrLost).
+//
+// The window that remains: a force-detach takeover renaming its file in after
+// the check above and before the unlink below makes the unlink remove the
+// taker's file. NFSv3 has no conditional unlink, so this cannot be closed, and
+// a rename-aside-then-unlink scheme has the same window: do not "fix" it that
+// way. It takes an operator's detach landing in the same round trip as a clean
+// release of a fully synced volume. The consequence is bounded: the taker's
+// next publish check finds no holder file and refuses, and its Renew loses; its
+// data is NOT discarded, because an absent holder is never proof under decision
+// 52, so its unstage stays incomplete and keeps the cache until an operator
+// acts; and a third node acquiring fresh starts from `current`.
 func (h *Holder) Release(ctx context.Context) error {
 	defer h.lost.Store(true)
-	s, err := load(ctx, h.dir, h.name)
+	h.fmu.Lock()
+	kept := h.fd
+	h.fmu.Unlock()
+	s, f, err := loadFile(ctx, h.dir, h.name)
+	if f != nil {
+		defer func() { _ = f.Close() }()
+	}
 	if err != nil || !h.mine(s) {
+		_ = h.Close()
 		return err
 	}
+	if kept != nil {
+		same, err := sameInode(kept, f)
+		if err != nil {
+			_ = h.Close()
+			return err
+		}
+		if !same {
+			_ = h.Close()
+			return ErrLost
+		}
+	}
+	_ = f.Close()
+	_ = h.Close()
 	_, err = step(ctx, Path(h.dir, h.name), "remove the holder file", func() (struct{}, error) {
-		err := os.Remove(Path(h.dir, h.name))
+		err := removeFile(Path(h.dir, h.name))
 		if errors.Is(err, fs.ErrNotExist) {
 			err = nil
 		}

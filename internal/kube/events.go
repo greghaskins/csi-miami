@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,6 +29,7 @@ import (
 var warningReasons = map[string]bool{
 	reconcile.ReasonMountFailed:          true,
 	reconcile.ReasonTransportUnavailable: true,
+	reconcile.ReasonEmergencyDetach:      true,
 }
 
 var eventResource = schema.GroupVersionResource{Version: "v1", Resource: "events"}
@@ -77,9 +81,15 @@ type EventRecorder struct {
 	queue  chan queued
 }
 
-var _ reconcile.Events = (*EventRecorder)(nil)
+var (
+	_ reconcile.Events       = (*EventRecorder)(nil)
+	_ reconcile.DetailEvents = (*EventRecorder)(nil)
+)
 
-type queued struct{ pv, reason string }
+// maxDetail bounds the detail of an event.
+const maxDetail = 300
+
+type queued struct{ pv, reason, detail string }
 
 // NewEventRecorder returns an EventRecorder for the API server at cfg. cfg is
 // not modified.
@@ -133,13 +143,20 @@ func NewEventRecorderFor(dyn dynamic.Interface, o RecorderOptions) *EventRecorde
 // Event implements reconcile.Events. An event for no volume (a stray mount) or
 // for a volume ID this driver could not have issued has no PV to attach to
 // and is dropped. It never blocks.
-func (r *EventRecorder) Event(volumeID, reason string) {
+func (r *EventRecorder) Event(volumeID, reason string) { r.EventDetail(volumeID, reason, "") }
+
+// EventDetail is Event with a line of detail that the event's message carries
+// after the fixed text: the driver's own words (a node, an epoch, a trigger),
+// never an error. It is cleaned of control characters and bounded, and each
+// distinct detail is an event of its own, so two abandonments of one volume
+// are not counted as one.
+func (r *EventRecorder) EventDetail(volumeID, reason, detail string) {
 	id, err := volume.ParseID(volumeID)
 	if err != nil {
 		return
 	}
 	select {
-	case r.queue <- queued{pv: id.Name, reason: reason}:
+	case r.queue <- queued{pv: id.Name, reason: reason, detail: cleanDetail(detail)}:
 	default:
 		r.log.Warn("event dropped: the queue is full", "reason", reason)
 	}
@@ -172,7 +189,7 @@ func (r *EventRecorder) send(ctx context.Context, q queued) {
 		return
 	}
 	now := metav1.NewTime(r.now())
-	msg := eventMessage(q.reason, r.opts.Node)
+	msg := eventMessage(q.reason, r.opts.Node, q.detail)
 	ev := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Event",
@@ -223,6 +240,24 @@ func (r *EventRecorder) bump(ctx context.Context, name string, now metav1.Time) 
 	}
 }
 
+// cleanDetail drops control characters and cuts the text to maxDetail bytes
+// (on a rune boundary).
+func cleanDetail(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+	if len(s) > maxDetail {
+		s = s[:maxDetail]
+		for !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
+
 func eventType(reason string) string {
 	if warningReasons[reason] {
 		return "Warning"
@@ -235,8 +270,18 @@ func eventType(reason string) string {
 // it never carries an error, which can name an NFS server and export, a host
 // path or a kubelet pod path; those stay in the node's log. Because the text
 // is constant per reason, a repeat of a condition bumps the count of one event.
-func eventMessage(reason, node string) string {
+func eventMessage(reason, node, detail string) string {
+	msg := fixedMessage(reason, node)
+	if detail != "" {
+		msg += ": " + detail
+	}
+	return msg
+}
+
+func fixedMessage(reason, node string) string {
 	switch reason {
+	case reconcile.ReasonEmergencyDetach:
+		return "an emergency detach was carried out by node " + node
 	case reconcile.ReasonMountFailed:
 		return "the volume could not be mounted on node " + node + "; see the node plugin's log"
 	case reconcile.ReasonTransportUnavailable:

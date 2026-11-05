@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"k8s.io/client-go/rest"
+
+	"github.com/greghaskins/csi-miami/internal/reconcile"
 )
 
 const (
@@ -199,7 +201,7 @@ func TestEventMessagesAreFixedPerReason(t *testing.T) {
 		}
 		a.mu.Unlock()
 	}
-	if got := eventMessage("Surprise", "node-a"); !strings.Contains(got, "Surprise") || !strings.Contains(got, "node-a") {
+	if got := eventMessage("Surprise", "node-a", ""); !strings.Contains(got, "Surprise") || !strings.Contains(got, "node-a") {
 		t.Errorf("an unknown reason gives %q", got)
 	}
 }
@@ -303,5 +305,48 @@ func TestNewEventRecorderNeedsAConfig(t *testing.T) {
 	t.Parallel()
 	if _, err := NewEventRecorder(nil, RecorderOptions{}); err == nil {
 		t.Error("no error for a nil config")
+	}
+}
+
+// An emergency detach is a Warning that names what was abandoned, and two
+// abandonments of the same volume are two events.
+func TestEmergencyDetachEventCarriesTheDetail(t *testing.T) {
+	a := newEventsAPI()
+	r := newRecorder(t, a, 8)
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, "abandoned node-b@3: the PV's force-detach annotation names the holder")
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, "abandoned node-c@5: the holder's node carries the taint\n\x00")
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, "abandoned node-b@3: the PV's force-detach annotation names the holder")
+	drain(r)
+	if len(a.events) != 2 {
+		t.Fatalf("%d events stored, want 2 (a repeat bumps the count)", len(a.events))
+	}
+	var seen []string
+	for _, ev := range a.events {
+		if ev["type"] != "Warning" || ev["reason"] != reconcile.ReasonEmergencyDetach {
+			t.Errorf("event = %v", ev)
+		}
+		msg, _ := ev["message"].(string)
+		if strings.ContainsAny(msg, "\n\x00") {
+			t.Errorf("control characters in %q", msg)
+		}
+		seen = append(seen, msg)
+	}
+	joined := strings.Join(seen, "|")
+	for _, want := range []string{"node-b@3", "node-c@5", "force-detach annotation", "node-a"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("messages %q lack %q", joined, want)
+		}
+	}
+}
+
+func TestEventDetailIsBounded(t *testing.T) {
+	a := newEventsAPI()
+	r := newRecorder(t, a, 8)
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, strings.Repeat("x", 5000))
+	drain(r)
+	for _, ev := range a.events {
+		if msg, _ := ev["message"].(string); len(msg) > 600 {
+			t.Errorf("message is %d bytes", len(msg))
+		}
 	}
 }

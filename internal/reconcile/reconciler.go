@@ -125,18 +125,20 @@ type Reconciler struct {
 
 	// Loop-only state: touched by runPass and Run, never by a request.
 	transports  map[transport.Spec]transport.Transport
-	lastTargets map[string]targetInfo // publish targets of the previous pass
-	drops       map[string]dropped    // targets to unmount once they are no longer claimed
-	idleSince   map[string]time.Time  // unreferenced transport dir → first pass that saw it
-	lastErr     map[string]string     // volume → text of its last error, for dedup
-	marked      map[string]*markState // volume → retry state of an unstage that has not finished
-	gens        *generations          // the generation timers (generation.go)
-	stopMargin  time.Duration         // added to the items' freeze bound when Run waits for generations
-	reported    map[string]string     // transport dir → kind, for the metrics seam
-	up          map[string]bool       // transport dir → whether it answered its last probe, to log changes
-	kinds       map[string]struct{}   // intent kinds reported, so a kind that empties reads 0
-	failedLoad  map[string]struct{}   // load-failure paths already logged
-	warned      map[string]string     // path → kind of the failure last logged at warn level
+	lastTargets map[string]targetInfo  // publish targets of the previous pass
+	drops       map[string]dropped     // targets to unmount once they are no longer claimed
+	idleSince   map[string]time.Time   // unreferenced transport dir → first pass that saw it
+	lastErr     map[string]string      // volume → text of its last error, for dedup
+	marked      map[string]*markState  // volume → retry state of an unstage that has not finished
+	orphans     map[string]*drainState // volume → retry state of a drain that has not finished (drain.go)
+	drainDue    bool                   // the next pass drains orphans: the start pass and the timer passes
+	gens        *generations           // the generation timers (generation.go)
+	stopMargin  time.Duration          // added to the items' freeze bound when Run waits for generations
+	reported    map[string]string      // transport dir → kind, for the metrics seam
+	up          map[string]bool        // transport dir → whether it answered its last probe, to log changes
+	kinds       map[string]struct{}    // intent kinds reported, so a kind that empties reads 0
+	failedLoad  map[string]struct{}    // load-failure paths already logged
+	warned      map[string]string      // path → kind of the failure last logged at warn level
 	// starts and ends count the passes begun and finished. Nothing in the loop
 	// reads them; tests use them to wait for a pass that began after a point,
 	// which the metrics seam cannot say.
@@ -227,6 +229,7 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		idleSince:   map[string]time.Time{},
 		lastErr:     map[string]string{},
 		marked:      map[string]*markState{},
+		orphans:     map[string]*drainState{},
 		gens:        newGenerations(),
 		stopMargin:  defaultStopMargin,
 		reported:    map[string]string{},
@@ -752,6 +755,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 
 	ticks, stopTicks := r.newTicker(r.opts.Interval)
 	defer stopTicks()
+	r.drainDue = true
 	for {
 		r.runPass(ctx, r.take())
 		select {
@@ -759,6 +763,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			return nil
 		case <-r.wake:
 		case <-ticks:
+			r.drainDue = true
 		}
 		if ctx.Err() != nil {
 			return nil

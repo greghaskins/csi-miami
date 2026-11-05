@@ -144,6 +144,12 @@ var (
 	// as they were so the unstage can be retried (decision 52). Retryable.
 	ErrUnstageIncomplete = errors.New("the unstage cannot yet prove the volume's last writes are in the store")
 
+	// ErrReleasePending is returned when the volume's data is settled (in the
+	// store, or given up) and its cache is gone, and only the removal of the
+	// holder file failed. It is retried by itself and nothing is unproven: it
+	// is Unavailable, like ErrUnstageIncomplete, but says nothing about writes.
+	ErrReleasePending = errors.New("the holder file could not be released yet")
+
 	// ErrGenerationOverdue is the condition of a volume whose newest published
 	// generation is older than generations.maxAge. It is reported, not an error
 	// of Converge.
@@ -252,4 +258,20 @@ func UnmountIf(ctx context.Context, m mount.Mounter, mountPoint string, owned Ow
 		return fmt.Errorf("%w: another mount is stacked at %s and is left in place", conflict, mountPoint)
 	}
 	return nil
+}
+
+// Drainer is implemented by an item kind whose node-local state can outlive
+// its intent record: a crash, then the volume's pod moves, leaves a cache that
+// holds writes no one else has. The reconciler drains such a volume itself
+// (decision 52), because the holder file keeps every other node off it.
+//
+// Orphans lists the intents the kind recorded for volumes with surviving
+// node-local state; the reconciler drops those that have an intent record
+// and calls Drain, with the volume's transport mounted, for the rest. Drain
+// either finishes the volume (nil), leaves it exactly as it is and says why
+// (an error, to be retried), or finds it is not this node's to drain (nil with
+// nothing touched). Both run on the reconciler's loop.
+type Drainer interface {
+	Orphans(ctx context.Context) ([]intent.Intent, error)
+	Drain(ctx context.Context, in intent.Intent) error
 }

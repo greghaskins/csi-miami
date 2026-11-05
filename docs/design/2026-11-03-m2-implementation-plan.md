@@ -710,7 +710,7 @@ hot path (`ReadAt`/`WriteAt`) allocates nothing per request in a benchmark
 Options{Sysfs, SystemdSocket, CacheDir}) Report` with `Report.Missing()
 []string`; node flags `--cache-dir` (default `/var/lib/miami/cache`),
 `--bin-dir` (default `<kubelet>/plugins/<driver>/bin`), `--systemd-socket`
-(default `/run/systemd/private`), `--takeover-timeout` (5m), `--holder-renew`
+(default `/run/systemd/private`), `--holder-renew`
 (15s), `--remediate` (false until T15).
 
 - [ ] Tests: `TestNodeStageReadsKeyFromSecrets`, `TestNodePublishCarriesKeyForRestage`,
@@ -799,7 +799,7 @@ tests, `internal/csi/envtest_test.go`.
 **Interfaces:** produces the `Judge` func for `volume.Config` (the item keeps
 its own self-fenced rule); consumes `holder.Judgement`.
 
-- [ ] Judge: Takeover only on (a) the PV annotation
+- [x] Judge: Takeover only on (a) the PV annotation
       `miami.csi.greghaskins.com/force-detach` equal to the holder file's
       `<node>@<epoch>`, or (b) the `node.kubernetes.io/out-of-service` taint
       on the holder's node; never on age or readiness. An event names the
@@ -807,13 +807,13 @@ its own self-fenced rule); consumes `holder.Judgement`.
       `TestJudgeAnnotationStaleEpochIgnored`, `TestJudgeOutOfServiceTaint`,
       `TestJudgeNeverOnAgeOrNotReady`, `TestJudgeNodeReadErrorIsNoTakeover`;
       envtest `TestNodeStatusReads`.
-- [ ] Orphan drain: at start and on every pass, a holder file naming this
+- [x] Orphan drain: at start and on every pass, a holder file naming this
       node for a volume with a surviving cache that is not staged here is
       drained: start the server (no key, no mount), publish, verify as in
       decision 52, stop, delete the cache, release. Failure retries next
       pass. Tests with the item fakes, including a drain refused by the
       fence (abandoned by the operator: discard and release nothing).
-- [ ] Holder renewal by touching, not rename-over: `Renew` keeps its
+- [x] Holder renewal by touching, not rename-over: `Renew` keeps its
       read-and-check, then `futimens` (`UTIME_NOW`, so the NFS server sets
       the time) on the descriptor opened when the holder was loaded; ESTALE
       or a changed inode is `ErrLost`. A takeover renames a new inode in, so
@@ -821,9 +821,9 @@ its own self-fenced rule); consumes `holder.Judgement`.
       `<node>@<epoch>`. A forced detach aims at a live, renewing node, which
       made that race routine. Test: a renewal racing a takeover leaves the
       taker's file intact.
-- [ ] The force-detach annotation is never removed by the driver; the judge
+- [x] The force-detach annotation is never removed by the driver; the judge
       re-applies it idempotently while it matches the holder file.
-- [ ] The drain takes the stage's cache-reuse decision (`current`'s epoch ==
+- [x] The drain takes the stage's cache-reuse decision (`current`'s epoch ==
       the index epoch, or `current` names the index base, or no `current` and
       no base) before it serves the cache; otherwise it discards and
       releases nothing. A drained generation is a crash image (flushed writes,
@@ -831,13 +831,27 @@ its own self-fenced rule); consumes `holder.Judgement`.
 - [x] `DeleteVolume` refuses while any holder file exists (the timed
       `refuseLiveHolder` rule goes); the emergency detach is the way through.
       Landed in branch `m2/delete-refuses-any-holder`.
-- [ ] The `takeoverTimeout` StorageClass parameter and the node's
+- [x] The `takeoverTimeout` StorageClass parameter and the node's
       `-takeover-timeout` flag no longer mean anything: reject the parameter
       for new classes with a message naming decision 52 and remove the flag
       (T22 documents that a NotReady node is never taken over).
-- [ ] RBAC: node ClusterRole gains `nodes` `get` and `persistentvolumes`
+- [x] RBAC: node ClusterRole gains `nodes` `get` and `persistentvolumes`
       `get` (annotation read).
-- [ ] Commit.
+- [x] Commit.
+
+Landed in T13 (the node's wiring is T13w): `reconcile.NewEmergencyJudge`
+(`Judge` is `volume.Config.Judge`, `TookOver` is `volume.Config.Takeover`; both
+take the holder the item read, so the judge needs no path); `item.Drainer`
+(`Orphans`, `Drain`), implemented by the volume item over a drain record it
+keeps beside each cache (`<cache dir>/<name>.drain.json`: the intent without
+its publishes, written before a server starts) because the cache directory
+alone does not say where the volume is; the reconciler drains at its start
+pass and on timer passes. `holder.Judge` (the timed rules) is removed. A cache
+left by a build from before this change has no drain record and is not drained
+until it is restaged (nothing is deployed yet). The drain applies decision 52's
+proof rule: a holder file naming another node, a store that moved past the
+cache, or a deleted volume (the PV is NotFound; a missing store directory alone is not proof) discards with `GenerationLost`; an absent holder
+without proof keeps the cache and warns once.
 
 ### Task T13w: Node wiring of the volume kind
 
@@ -852,6 +866,7 @@ generation timers, the judge and the orphan drain, all behind seams.
       the systemd private-socket manager, nbd, `blockd.Dial`, the holder,
       the mounter, `BinDir`, `CacheDir`, `Root`, `Sysfs`, the node name,
       the timeouts; register it for the `volume` kind.
+- [ ] `Config.VolumeExists` = `kube.Client.PVExists` (T13; the drain's only proof of a deleted volume).
 - [ ] `Config.Judge` = T13's judge (node + PV reads); `Config.Event` = the
       reconciler's event recorder; T12's PV annotation reader; T13's orphan
       drain enabled.
@@ -1018,7 +1033,12 @@ decision a task amended; never rewrite), this plan's status.
       next unstage retry finds the holder taken, reports `GenerationLost`
       and finishes. The out-of-service taint does the same for every
       volume of a dead node. State plainly what is lost: whatever the old
-      holder had not published.
+      holder had not published. Also: a surviving cache with no holder file
+      and no proof it was given up is kept and logged once per process; the
+      removing the cache directory by hand gives it up (the force-detach annotation
+      acts on a holder file, and there is none); and a cache
+      from a build before the drain record existed is not drained until
+      restaged.
 - [ ] Reviewed by the orchestrator; commit.
 
 ## 7. Risks and the check that retires each

@@ -43,12 +43,11 @@ type nodeConfig struct {
 	noEvents       bool
 
 	// For the volume kind.
-	cacheDir        string
-	binDir          string
-	systemdSocket   string
-	takeoverTimeout time.Duration
-	holderRenew     time.Duration
-	remediate       bool
+	cacheDir      string
+	binDir        string
+	systemdSocket string
+	holderRenew   time.Duration
+	remediate     bool
 }
 
 // withDefaults fills the paths that default to places under the kubelet
@@ -99,7 +98,6 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.cacheDir, "cache-dir", "/var/lib/miami/cache", "directory the volume caches live under on the host; must be writable")
 	fs.StringVar(&cfg.binDir, "bin-dir", "", "directory the per-hash copies of the miami binary are kept in (default <kubelet-dir>/plugins/"+csi.DriverName+"/bin)")
 	fs.StringVar(&cfg.systemdSocket, "systemd-socket", "/run/systemd/private", "systemd's private socket, used to run each volume's block server as a unit")
-	fs.DurationVar(&cfg.takeoverTimeout, "takeover-timeout", 5*time.Minute, "how long a volume's holder must be silent before another node may take it over")
 	fs.DurationVar(&cfg.holderRenew, "holder-renew", 15*time.Second, "how often the node renews the holder file of each volume it serves")
 	fs.BoolVar(&cfg.remediate, "remediate", false, "let the reconciler repair what it finds wrong beyond converging intent (off until remediation ships)")
 
@@ -127,9 +125,7 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		{"-cache-dir must be an absolute path", !filepath.IsAbs(cfg.cacheDir)},
 		{"-bin-dir must be an absolute path", cfg.binDir != "" && !filepath.IsAbs(cfg.binDir)},
 		{"-systemd-socket must be an absolute path", !filepath.IsAbs(cfg.systemdSocket)},
-		{"-takeover-timeout must be positive", cfg.takeoverTimeout <= 0},
 		{"-holder-renew must be positive", cfg.holderRenew <= 0},
-		{"-holder-renew must be shorter than -takeover-timeout", cfg.holderRenew >= cfg.takeoverTimeout},
 	} {
 		if p.bad {
 			_, _ = fmt.Fprintf(stderr, "miami node: %s\n", p.name)
@@ -205,7 +201,7 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		opts.Events = events
 	}
 	opts.CacheDir, opts.BinDir, opts.SystemdSocket = cfg.cacheDir, cfg.binDir, cfg.systemdSocket
-	opts.TakeoverTimeout, opts.HolderRenew, opts.Remediate = cfg.takeoverTimeout, cfg.holderRenew, cfg.remediate
+	opts.HolderRenew, opts.Remediate = cfg.holderRenew, cfg.remediate
 	// The prerequisites of the volume kind are probed now and on every pass;
 	// a node without them still serves directory volumes.
 	probe := newProber(prereq.Options{SystemdSocket: cfg.systemdSocket, CacheDir: cfg.cacheDir}, reg, log)

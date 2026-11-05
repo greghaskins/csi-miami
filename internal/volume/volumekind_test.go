@@ -2,6 +2,7 @@ package volume
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,17 +31,8 @@ func TestVolumeParamsDefaults(t *testing.T) {
 	if !reflect.DeepEqual(c.Volume, want) {
 		t.Errorf("defaults = %+v, want %+v", c.Volume, want)
 	}
-	if c.Volume.Takeover() != DefaultTakeoverTimeout {
-		t.Errorf("default takeover = %v", c.Volume.Takeover())
-	}
-	tc, err := NewContext(volParams(map[string]string{"takeoverTimeout": "10m"}))
-	if err != nil || tc.Volume.TakeoverTimeout != 10*time.Minute {
-		t.Fatalf("takeoverTimeout = %+v, %v", tc.Volume, err)
-	}
-	sz, _ := tc.WithSize(1 << 30)
-	got, err := DecodeContext(sz.Encode())
-	if err != nil || got.Volume.TakeoverTimeout != 10*time.Minute || sz.Encode()["miami/takeoverTimeout"] != "10m0s" {
-		t.Errorf("takeoverTimeout does not round trip: %+v, %v", got.Volume, err)
+	if _, has := mustSize(t, c).Encode()["miami/takeoverTimeout"]; has {
+		t.Error("a new volume's context carries a takeoverTimeout")
 	}
 
 	sized, err := c.WithSize(1 << 30)
@@ -130,7 +122,9 @@ func TestVolumeParamsRejects(t *testing.T) {
 		{"xts with 128 bits", map[string]string{"cipher": "aes-xts-plain64", "keySize": "128"}},
 		{"encryption maybe", map[string]string{"encryption": "maybe"}},
 		{"watermark over cache", map[string]string{"cacheSize": "64Mi", "generations.dirtyWatermark": "128Mi"}},
+		{"takeoverTimeout, whatever its value", map[string]string{"takeoverTimeout": "10m"}},
 		{"takeoverTimeout under 1m", map[string]string{"takeoverTimeout": "10s"}},
+		{"takeoverTimeout empty", map[string]string{"takeoverTimeout": ""}},
 		{"local transport", map[string]string{"transport.kind": "local", "transport.path": "/mnt/data", "transport.server": del, "transport.export": del}},
 		{"volume parameter on a directory", map[string]string{"kind": "directory", "chunkSize": "4Mi"}},
 	}
@@ -225,5 +219,49 @@ func TestIDKindVolume(t *testing.T) {
 	}
 	if !KindVolume.Valid() {
 		t.Error("KindVolume is not valid")
+	}
+}
+
+func mustSize(t *testing.T, c Context) Context {
+	t.Helper()
+	sz, err := c.WithSize(1 << 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sz
+}
+
+// Decision 52 removed the timed takeover: a new volume cannot ask for one, and
+// the message says why. A PV made before that still carries the key in its
+// context and must still stage; the key means nothing there.
+func TestTakeoverTimeoutIsRejectedForNewVolumesAndIgnoredOnOld(t *testing.T) {
+	t.Parallel()
+	_, err := NewContext(volParams(map[string]string{"takeoverTimeout": "10m"}))
+	if code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "decision 52") || !strings.Contains(err.Error(), "takeoverTimeout") {
+		t.Fatalf("NewContext = %v, want InvalidArgument naming decision 52", err)
+	}
+
+	c, err := NewContext(volParams(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := mustSize(t, c).Encode()
+	for name, val := range map[string]string{"a duration": "10m0s", "junk": "soon", "zero": "0s"} {
+		old := map[string]string{}
+		for k, v := range enc {
+			old[k] = v
+		}
+		old["miami/takeoverTimeout"] = val
+		got, err := DecodeContext(old)
+		if err != nil {
+			t.Errorf("%s: a PV carrying takeoverTimeout does not decode: %v", name, err)
+			continue
+		}
+		if got.Volume == nil || got.Volume.Size != 1<<30 {
+			t.Errorf("%s: decoded = %+v", name, got.Volume)
+		}
+		if _, has := got.Encode()["miami/takeoverTimeout"]; has {
+			t.Errorf("%s: the ignored key is carried forward", name)
+		}
 	}
 }

@@ -54,8 +54,6 @@ type volumeRecord struct {
 	MaxAge         int64  `json:"maxAge"`
 	Keep           int    `json:"keep"`
 	DirtyWatermark int64  `json:"dirtyWatermark"`
-	// TakeoverTimeout is nanoseconds; absent means the default.
-	TakeoverTimeout int64 `json:"takeoverTimeout,omitempty"`
 }
 
 // transportRecord is the on-disk form of a transport.Spec, with its own
@@ -75,7 +73,6 @@ func toWire(in Intent) wireIntent {
 			ChunkSize: v.ChunkSize, CacheSize: v.CacheSize, Size: v.Size, Encryption: v.Encryption,
 			Cipher: v.Cipher, KeySize: v.KeySize, Interval: int64(v.Generations.Interval),
 			MaxAge: int64(v.Generations.MaxAge), Keep: v.Generations.Keep, DirtyWatermark: v.Generations.DirtyWatermark,
-			TakeoverTimeout: int64(v.TakeoverTimeout),
 		}
 	}
 	var since int64
@@ -112,7 +109,7 @@ func fromWire(w wireIntent) Intent {
 	if r := w.Volume; r != nil {
 		vp = &volume.VolumeParams{
 			ChunkSize: r.ChunkSize, CacheSize: r.CacheSize, Size: r.Size, Encryption: r.Encryption,
-			Cipher: r.Cipher, KeySize: r.KeySize, TakeoverTimeout: time.Duration(r.TakeoverTimeout),
+			Cipher: r.Cipher, KeySize: r.KeySize,
 			Generations: volume.GenerationParams{
 				Interval: time.Duration(r.Interval), MaxAge: time.Duration(r.MaxAge),
 				Keep: r.Keep, DirtyWatermark: r.DirtyWatermark,

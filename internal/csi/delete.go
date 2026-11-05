@@ -154,8 +154,8 @@ func (c *Controller) refuseHeldVolume(ctx context.Context, id volume.ID, dir str
 	if !info.Present {
 		return nil
 	}
-	want := fmt.Sprintf("%s@%d", info.Node, info.Epoch)
-	if got, ok := pv.Annotations[kube.AnnotationForceDetach]; ok && got == want {
+	want := info.DetachValue()
+	if got, ok := pv.Annotations[kube.AnnotationForceDetach]; ok && info.DetachMatches(got) {
 		c.log.Warn("emergency detach: the unsynced data of the holder is abandoned and the volume is deleted", "volume_id", id.String(), "node", info.Node, "epoch", info.Epoch)
 		return nil
 	}

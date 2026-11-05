@@ -147,10 +147,22 @@ type Config struct {
 	// Node is this node's name, the holder's identity.
 	Node string
 
-	// Judge is the reconciler's takeover verdict on a holder of the volume
-	// that names another node; nil never takes over. The item adds one rule of
-	// its own on top, for a holder file that names this node (see ensureHolder).
-	Judge func(volumeID string) holder.Judgement
+	// Judge is the reconciler's takeover verdict on the holder file it is given
+	// (the one the item just read, which names another node); nil never takes
+	// over. It is consulted for no other holder: the item has one rule of its
+	// own, for a holder file that names this node, and decides it first (see
+	// judge). Takeover is called, when not nil, after a takeover of another
+	// node's holder succeeded, with the judgement that allowed it: Info names
+	// the abandoned node and epoch and Reason the trigger.
+	Judge    func(ctx context.Context, volumeID string, info holder.Info) holder.Judgement
+	Takeover func(volumeID string, j holder.Judgement)
+
+	// VolumeExists says whether the volume's PV exists: (false, nil) only when
+	// the API server answered that it does not (NotFound). It is the one proof
+	// of a deleted volume the drain accepts, because a store directory that is
+	// missing proves nothing (a mounted but empty export looks the same). Nil,
+	// an error and "exists" all keep a surviving cache.
+	VolumeExists func(ctx context.Context, name string) (bool, error)
 
 	// BinaryHash names the host copy of the binary, <BinDir>/miami-<hash>: the
 	// build's version string. Exe is the file copied, /proc/self/exe by
@@ -187,8 +199,9 @@ type Item struct {
 	log  *slog.Logger
 	busy deadline.Set // store reads and device sizes that have not returned
 
-	mu   sync.Mutex
-	vols map[string]*vstate
+	mu     sync.Mutex
+	vols   map[string]*vstate
+	warned map[string]struct{} // volumes warned about once (drain.go)
 
 	// bin remembers what ensureBinary has verified, so the running binary is
 	// hashed once and not on every pass.
@@ -277,7 +290,7 @@ func New(cfg Config) (*Item, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Item{cfg: cfg, log: log, vols: map[string]*vstate{}}, nil
+	return &Item{cfg: cfg, log: log, vols: map[string]*vstate{}, warned: map[string]struct{}{}}, nil
 }
 
 // statusT is the block server's status.

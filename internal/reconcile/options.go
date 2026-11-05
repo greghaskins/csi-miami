@@ -185,11 +185,10 @@ type Options struct {
 	BinDir        string
 	SystemdSocket string
 
-	// TakeoverTimeout is how long a holder must be silent before another node
-	// may take a volume over, and HolderRenew how often a holder renews. Zero
-	// means the volume item's defaults (5m and 15s).
-	TakeoverTimeout time.Duration
-	HolderRenew     time.Duration
+	// HolderRenew is how often a holder renews. Zero means the volume item's
+	// default (15s). There is no takeover timeout: a holder is replaced only by
+	// the emergency detach (decision 52).
+	HolderRenew time.Duration
 
 	// MarkRetry is the delay before the reconciler first retries the teardown
 	// of a volume whose unstage began and has not finished, MarkRetryMax the
