@@ -271,7 +271,7 @@ func TestSmokeOrphanDrain(t *testing.T) {
 	stage := filepath.Join(base, "stage", "globalmount")
 	params := kinds.VolumeParams{
 		ChunkSize: smokeChunk, CacheSize: smokeSize, Size: smokeSize,
-		Encryption:  false,
+		Encryption: false, Cipher: "aes-xts-plain64", KeySize: 512,
 		Generations: kinds.GenerationParams{Interval: 5 * time.Minute, MaxAge: time.Hour, Keep: 3},
 	}
 	in := intent.Intent{
