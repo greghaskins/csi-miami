@@ -149,3 +149,24 @@ func TestNames(t *testing.T) {
 		t.Fatal("names")
 	}
 }
+
+func TestErrorCarriesStdoutWhenStderrIsEmpty(t *testing.T) {
+	t.Parallel()
+	f := &fake.Runner{Replies: []fake.Reply{
+		{Stdout: "lock failed\n", Code: 5},
+		{Stdout: "ignored", Stderr: "from stderr\n", Code: 5},
+		{Stdout: "open said this\n", Code: 5},
+	}}
+	_, err := crypt.IsLUKS(ctx, f, "/dev/x")
+	if err == nil || !strings.Contains(err.Error(), "exit 5: lock failed") {
+		t.Fatalf("isLuks error = %v, want the standard output in it", err)
+	}
+	_, err = crypt.IsLUKS(ctx, f, "/dev/x")
+	if err == nil || !strings.Contains(err.Error(), "exit 5: from stderr") || strings.Contains(err.Error(), "ignored") {
+		t.Fatalf("isLuks error = %v, want the standard error alone", err)
+	}
+	err = crypt.Open(ctx, f, "/dev/x", "name", []byte("key"))
+	if err == nil || !strings.Contains(err.Error(), "exit 5: open said this") {
+		t.Fatalf("open error = %v", err)
+	}
+}

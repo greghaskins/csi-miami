@@ -107,7 +107,7 @@ func Rotate(ctx context.Context, r tool.Runner, dev string, oldKey, newKey []byt
 
 // IsLUKS reports whether dev carries a LUKS header. Exit code 1 is "no".
 func IsLUKS(ctx context.Context, r tool.Runner, dev string) (bool, error) {
-	_, stderr, code, err := r.Run(ctx, []string{"cryptsetup", "isLuks", dev}, nil)
+	stdout, stderr, code, err := r.Run(ctx, []string{"cryptsetup", "isLuks", dev}, nil)
 	if err != nil {
 		return false, fmt.Errorf("crypt: isLuks: %w", err)
 	}
@@ -117,7 +117,17 @@ func IsLUKS(ctx context.Context, r tool.Runner, dev string) (bool, error) {
 	case 1:
 		return false, nil
 	}
-	return false, fmt.Errorf("crypt: isLuks: exit %d: %s", code, strings.TrimSpace(string(stderr)))
+	return false, fmt.Errorf("crypt: isLuks: exit %d: %s", code, output(stdout, stderr))
+}
+
+// output is what a failed cryptsetup said: its standard error, or its standard
+// output when the error stream is empty (cryptsetup reports some failures on
+// the latter). Neither carries a key: keys travel on file descriptors.
+func output(stdout, stderr []byte) string {
+	if s := strings.TrimSpace(string(stderr)); s != "" {
+		return s
+	}
+	return strings.TrimSpace(string(stdout))
 }
 
 func run(ctx context.Context, r tool.Runner, op string, argv []string, keys ...[]byte) error {
@@ -126,7 +136,7 @@ func run(ctx context.Context, r tool.Runner, op string, argv []string, keys ...[
 		return fmt.Errorf("crypt: %s: %w", op, err)
 	}
 	defer closeAll()
-	_, stderr, code, err := r.Run(ctx, argv, files)
+	stdout, stderr, code, err := r.Run(ctx, argv, files)
 	if err != nil {
 		return fmt.Errorf("crypt: %s: %w", op, err)
 	}
@@ -136,7 +146,7 @@ func run(ctx context.Context, r tool.Runner, op string, argv []string, keys ...[
 	case 2:
 		return fmt.Errorf("crypt: %s: %w", op, ErrBadKey)
 	}
-	return fmt.Errorf("crypt: %s: exit %d: %s", op, code, strings.TrimSpace(string(stderr)))
+	return fmt.Errorf("crypt: %s: exit %d: %s", op, code, output(stdout, stderr))
 }
 
 // keyFiles makes one pipe per key, already holding the key with its write end
