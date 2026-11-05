@@ -101,21 +101,29 @@ M2 is done when, on the kind e2e cluster over the nfs3 transport:
    bit, `flock` exclusive across two processes, `mmap`, a 100755 blob from
    git), and the NAS directory holds only chunks whose names are their
    hashes, manifests and `current`.
-2. A pod writes a numbered sequence; the generation interval elapses; the
-   pod is deleted and rescheduled to the other worker; it finds the sequence
-   with at most one interval missing and `e2fsck` clean.
+2. A pod writes a numbered sequence; the pod is deleted and rescheduled to
+   the other worker; the old node's unstage publishes and verifies a final
+   generation before releasing (decision 52); the new pod finds the whole
+   sequence and `e2fsck` clean.
 3. The node plugin is deleted under a served volume; the pod's writes
    continue with no error; the new plugin adopts the unit, the device, the
    mapping and the mount with no change in mount IDs.
-4. The block server is killed; the pod's writes fail; the plugin restarts
-   the server from the cache index; after the pod is deleted and recreated
-   its unpublished writes are present.
+4. The block server is killed (`SIGKILL`) under a served volume; systemd
+   restarts it, it re-points the same nbd device (decision 51), and the
+   pod's writes continue with no error, no pod deletion and no change in the
+   device index or mount ID; its unpublished writes are present.
 5. The NFS server is held down for longer than the major timeout while the
    pod writes: no `blocked for more than` message in the node's kernel log,
    the writes succeed throughout, generations resume when the server returns.
-6. The holder node's plugin is stopped and its node marked out of service;
-   the pod is recreated on the other worker; it mounts from `current`; the
-   old node, resumed, refuses to publish and its unstage succeeds.
+6. The holder node's plugin is stopped; the pod, recreated on the other
+   worker, is NOT given the volume (it waits `holder-contended`) until an
+   operator acts (decision 52). The node is then marked out of service (and,
+   in a second run, the PV annotated with the holder instead); the pod mounts
+   from `current` on the other worker; the old node, resumed, refuses to
+   publish and its unstage succeeds, discarding.
+6a. A holder node whose pod moved while it was down returns and drains the
+   volume on its own: it publishes its dirty chunks, verifies, releases, and
+   the waiting pod on the other worker then mounts with them.
 7. A node is restarted (`docker restart`) with a served volume: the cache
    survives; the next stage on that node reuses it because `current` still
    names its base; the dirty chunks are published.
@@ -996,11 +1004,12 @@ write and read; rm -rf), two rounds, prints a table and the ratio
 modify `hack/e2e-kind.sh` (`modprobe nbd`, the cache dir on kind nodes,
 the Secret for the key in the test namespace), `overlays/e2e`, `ci.yml`.
 
-- [ ] Tests, one per exit criterion 1 to 9 (`TestVolumeExt4Semantics`,
+- [ ] Tests, one per exit criterion 1 to 9 and 6a (`TestVolumeExt4Semantics`,
       `TestVolumeSurvivesReschedule`, `TestVolumePluginRestart`,
       `TestVolumeServerKill`, `TestVolumeNASOutageNoHungTask` (gate G2:
       server stopped for major timeout + 30 s; assert no `blocked for more
       than` in `docker exec <node> dmesg`), `TestVolumeTakeover`,
+      `TestVolumeOrphanDrain`,
       `TestVolumeNodeRebootReusesCache`, `TestVolumeRestoreDrill`,
       `TestVolumeExpandOnline`), all in the nfs3 variant; the `local`
       variant skips them with a reason.
