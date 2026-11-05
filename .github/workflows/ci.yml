@@ -224,6 +224,12 @@ jobs:
           SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/smoke
           SMOKE_REQUIRE_TOOLS: "1"
         run: sudo -E env "PATH=$PATH" make smoke
+      # Gate G1's harness on the real kernel: the nbd and the loop stack at a
+      # small scale, tables logged, no threshold (the gate is the owner's run on
+      # a Raspberry Pi, see docs/bench.md).
+      - name: Log the gate G1 bench
+        if: matrix.arch == 'amd64'
+        run: sudo -E env "PATH=$PATH" hack/bench.sh --scale small --size 2Gi --no-threshold
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:

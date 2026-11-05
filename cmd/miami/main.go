@@ -24,6 +24,7 @@ commands:
   controller  run the controller plugin
   blockd      run the per-volume block server
   lock        run the lock helper
+  bench       measure a device stack (gate G1)
   restore     assemble a volume's image from its chunk store
   import      write a raw image file as a new volume's first generation
   version     print the build version
@@ -56,6 +57,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runBlockd(args[1:], stdout, stderr)
 	case "lock":
 		return runLock(args[1:], stdout, stderr)
+	case "bench":
+		return runBench(args[1:], stdout, stderr)
 	case "restore":
 		return runRestore(args[1:], stdout, stderr)
 	case "import":
