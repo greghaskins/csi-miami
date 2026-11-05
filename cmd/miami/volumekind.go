@@ -95,6 +95,7 @@ func wireItems(opts *reconcile.Options, cfg nodeConfig, root string, d nodeDeps,
 		return err
 	}
 	opts.Items = []item.Item{dir, vol}
+	opts.Probe = &reconcile.ProbeOptions{}
 	opts.Generations = reconcile.GenerationOptions{Interval: cfg.genInterval, MaxAge: cfg.genMaxAge, Timeout: cfg.genTimeout}
 	if cluster != nil {
 		opts.PVAnnotation = cluster.PVAnnotation

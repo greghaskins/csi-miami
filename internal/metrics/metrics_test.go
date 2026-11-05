@@ -151,7 +151,7 @@ func TestVolumeConditionHasEveryConditionAtZeroAndNoOtherLabel(t *testing.T) {
 	}
 	want := []string{"ok", "unresponsive", "transport-unavailable", "transport-conflict", "stage-conflict",
 		"publish-conflict", "item-missing", "item-not-directory", "failed",
-		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused"}
+		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused", "probe-failed"}
 	if len(got) != len(want) {
 		t.Errorf("series = %v, want exactly %v", got, want)
 	}
@@ -407,5 +407,34 @@ func TestCapabilityGauges(t *testing.T) {
 	// Without the reconciler's family the gauge is not exposed.
 	if family(t, New(), NameNodeCapability) != nil {
 		t.Error("the controller registry serves the capability family")
+	}
+}
+
+// The probe gauge is per volume, one series each, and a volume that is no
+// longer staged loses its series. It is not in NodeFamilies: a node with no
+// volume of kind volume has no series, and a family list means "served on every
+// node".
+func TestVolumeProbeOKGauge(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	const a, b = "volume:pvc-00000000-0000-4000-8000-00000000000a", "volume:pvc-00000000-0000-4000-8000-00000000000b"
+	r.SetVolumeProbe(a, true)
+	r.SetVolumeProbe(b, false)
+	want := func(vol string, v float64) {
+		t.Helper()
+		m := sample(t, r, NameVolumeProbeOK, map[string]string{"volume": vol})
+		if got := m.GetGauge().GetValue(); got != v {
+			t.Errorf("%s = %v, want %v", vol, got, v)
+		}
+	}
+	want("pvc-00000000-0000-4000-8000-00000000000a", 1)
+	want("pvc-00000000-0000-4000-8000-00000000000b", 0)
+	r.DeleteVolumeProbe(b)
+	if n := len(family(t, r, NameVolumeProbeOK).GetMetric()); n != 1 {
+		t.Errorf("%d series after a delete, want 1", n)
+	}
+	r.SetVolumeProbe("not a volume id", true) // dropped: the label is a PV name or nothing
+	if n := len(family(t, r, NameVolumeProbeOK).GetMetric()); n != 1 {
+		t.Errorf("%d series after a bad ID, want 1", n)
 	}
 }

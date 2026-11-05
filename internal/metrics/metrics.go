@@ -19,6 +19,7 @@ import (
 
 	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 // shutdownTimeout bounds the close of the HTTP server.
@@ -38,6 +39,7 @@ const (
 	NameTransports          = "miami_transports"
 	NameTransportUp         = "miami_transport_up"
 	NameVolumeCondition     = "miami_volume_condition"
+	NameVolumeProbeOK       = "miami_volume_probe_ok"
 	NameReconcileDuration   = "miami_reconcile_duration_seconds"
 	NameReconcileErrors     = "miami_reconcile_errors_total"
 	NameObservationTimeouts = "miami_observation_timeouts_total"
@@ -74,6 +76,7 @@ type Registry struct {
 	transports      *prometheus.GaugeVec
 	transportUp     *prometheus.GaugeVec
 	volumeCondition *prometheus.GaugeVec
+	volumeProbeOK   *prometheus.GaugeVec
 	reconcileDur    prometheus.Histogram
 	reconcileErrs   *prometheus.CounterVec
 	obsTimeouts     *prometheus.CounterVec
@@ -84,7 +87,10 @@ type Registry struct {
 	requestDuration *prometheus.HistogramVec
 }
 
-var _ reconcile.Metrics = (*Registry)(nil)
+var (
+	_ reconcile.Metrics      = (*Registry)(nil)
+	_ reconcile.ProbeMetrics = (*Registry)(nil)
+)
 
 // Option configures New.
 type Option func(*options)
@@ -121,6 +127,9 @@ func New(opts ...Option) *Registry {
 	r.volumeCondition = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: NameVolumeCondition, Help: "Volumes staged on this node in each condition after the latest pass (ok, or what is wrong).",
 	}, []string{"condition"})
+	r.volumeProbeOK = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameVolumeProbeOK, Help: "Whether the volume's device answered its active probe (a direct read of its first sector): 1 it did, 0 it failed twice in a row. Volumes of kind volume only.",
+	}, []string{"volume"})
 	r.reconcileDur = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: NameReconcileDuration, Help: "Duration of one converge pass.", Buckets: reconcileBuckets,
 	})
@@ -165,7 +174,7 @@ func New(opts ...Option) *Registry {
 	)
 	if o.reconciler {
 		r.reg.MustRegister(
-			r.intents, r.transports, r.transportUp, r.volumeCondition, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
+			r.intents, r.transports, r.transportUp, r.volumeCondition, r.volumeProbeOK, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
 			r.garbage, r.loadFailures, r.capability,
 		)
 	}
@@ -203,6 +212,28 @@ func (r *Registry) SetTransportUp(kind, id string, up bool) {
 func (r *Registry) SetVolumeConditions(counts map[string]int) {
 	for _, c := range reconcile.Conditions {
 		r.volumeCondition.WithLabelValues(c).Set(float64(counts[c]))
+	}
+}
+
+// SetVolumeProbe implements reconcile.ProbeMetrics: 1 for a volume whose
+// device answers its probe, 0 for one that does not. The label is the PV name;
+// an ID that does not name a volume is dropped, so the label is never a path.
+func (r *Registry) SetVolumeProbe(volumeID string, ok bool) {
+	id, err := volume.ParseID(volumeID)
+	if err != nil {
+		return
+	}
+	v := 0.0
+	if ok {
+		v = 1
+	}
+	r.volumeProbeOK.WithLabelValues(id.Name).Set(v)
+}
+
+// DeleteVolumeProbe implements reconcile.ProbeMetrics.
+func (r *Registry) DeleteVolumeProbe(volumeID string) {
+	if id, err := volume.ParseID(volumeID); err == nil {
+		r.volumeProbeOK.DeleteLabelValues(id.Name)
 	}
 }
 

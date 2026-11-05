@@ -25,11 +25,24 @@ import (
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
+// The event reasons the volume item raises. They are defined here, and the
+// item's own constants are these, because the item imports this package.
+const (
+	ReasonPublishRefused  = "PublishRefused"
+	ReasonGenerationLost  = "GenerationLost"
+	ReasonServerRestarted = "ServerRestarted"
+)
+
 // Event reasons that are Warning events; every other reason is Normal.
 var warningReasons = map[string]bool{
 	reconcile.ReasonMountFailed:          true,
 	reconcile.ReasonTransportUnavailable: true,
 	reconcile.ReasonEmergencyDetach:      true,
+	reconcile.ReasonVolumeUnhealthy:      true,
+	reconcile.ReasonKeyRequired:          true,
+	reconcile.ReasonGenerationOverdue:    true,
+	ReasonPublishRefused:                 true,
+	ReasonGenerationLost:                 true,
 }
 
 var eventResource = schema.GroupVersionResource{Version: "v1", Resource: "events"}
@@ -286,6 +299,18 @@ func fixedMessage(reason, node string) string {
 		return "the volume could not be mounted on node " + node + "; see the node plugin's log"
 	case reconcile.ReasonTransportUnavailable:
 		return "the volume's transport did not answer on node " + node + "; see the node plugin's log"
+	case reconcile.ReasonVolumeUnhealthy:
+		return "the volume's device on node " + node + " did not answer two reads of its first sector; the volume is reported abnormal"
+	case reconcile.ReasonKeyRequired:
+		return "the volume on node " + node + " needs an encryption key that the stage request did not carry"
+	case reconcile.ReasonGenerationOverdue:
+		return "the volume's newest generation is older than its maximum age and node " + node + " holds unpublished writes"
+	case ReasonPublishRefused:
+		return "the store refused a generation of this volume from node " + node + " because the volume is no longer held by that node; see the node plugin's log"
+	case ReasonGenerationLost:
+		return "unpublished writes of this volume were discarded on node " + node + "; see the node plugin's log"
+	case ReasonServerRestarted:
+		return "the volume's block server was restarted on node " + node + "; its device and mounts were kept"
 	case reconcile.ReasonGarbageUnmounted:
 		return "a mount of this volume that no intent claimed was removed on node " + node
 	default:

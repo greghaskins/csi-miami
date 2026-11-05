@@ -62,6 +62,20 @@ func (it *Item) Status(ctx context.Context, in intent.Intent) (blockd.Status, er
 	return st, nil
 }
 
+// ProbeDevice is the block device the volume's file system is on, which the
+// reconciler's active probe reads the first sector of: the mapper for an
+// encrypted volume, the nbd device otherwise. It is what the last Converge
+// that reached the mapping layer found, from memory; false before any.
+func (it *Item) ProbeDevice(in intent.Intent) (string, bool) {
+	it.mu.Lock()
+	s := it.vols[in.VolumeID]
+	it.mu.Unlock()
+	if s == nil || s.blk == "" {
+		return "", false
+	}
+	return s.blk, true
+}
+
 // generate is one generation. Only the freeze and the boundary run under the
 // volume's freeze lock (one freeze at a time, and never a thaw of an adopted
 // mount inside one); the upload does not, because it takes as long as the

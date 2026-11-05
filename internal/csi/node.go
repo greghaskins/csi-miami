@@ -180,7 +180,8 @@ func requireID(s string) (volume.ID, error) {
 	return id, nil
 }
 
-// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME and GET_VOLUME_STATS.
+// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME, GET_VOLUME_STATS and
+// VOLUME_CONDITION (see condition.go).
 func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	rpc := func(t csi.NodeServiceCapability_RPC_Type) *csi.NodeServiceCapability {
 		return &csi.NodeServiceCapability{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: t}}}
@@ -188,6 +189,7 @@ func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequ
 	return &csi.NodeGetCapabilitiesResponse{Capabilities: []*csi.NodeServiceCapability{
 		rpc(csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME),
 		rpc(csi.NodeServiceCapability_RPC_GET_VOLUME_STATS),
+		rpc(volumeConditionCapability),
 	}}, nil
 }
 
@@ -424,7 +426,15 @@ func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeSta
 		n.log.Warn("volume stats: the file system could not be read", "volume_id", id.String(), "reason", reason(err), "error", err.Error())
 		return nil, nodeStatus(fmt.Errorf("volume stats of %s: %w", id, err))
 	}
-	return &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}, nil
+	resp := &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}
+	// The condition is the active probe's verdict on the volume's device. A
+	// directory volume has no probe and reports normal.
+	if c, ok := n.rec.(conditioner); ok {
+		if abnormal, msg := c.VolumeCondition(id.String()); abnormal {
+			withCondition(resp, true, msg)
+		}
+	}
+	return resp, nil
 }
 
 // hasPath reports whether p is one of the volume's publish targets.

@@ -42,8 +42,12 @@ type fakeRec struct {
 	stageKeys, publishKeys []fakeKeys
 	record                 *intent.Intent
 	getErr                 error
+	abnormal               bool // answered by VolumeCondition
+	abnormalMsg            string
 	err                    error // returned by every request
 }
+
+func (f *fakeRec) VolumeCondition(string) (bool, string) { return f.abnormal, f.abnormalMsg }
 
 func (f *fakeRec) note(s string) {
 	f.mu.Lock()
@@ -175,7 +179,7 @@ func TestNodeGetInfoAndCapabilities(t *testing.T) {
 	for _, c := range caps.GetCapabilities() {
 		got = append(got, c.GetRpc().GetType())
 	}
-	want := []csi.NodeServiceCapability_RPC_Type{csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS}
+	want := []csi.NodeServiceCapability_RPC_Type{csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS, volumeConditionCapability}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("capabilities = %v, want %v", got, want)
 	}

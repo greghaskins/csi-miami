@@ -37,6 +37,13 @@ const (
 	// ReasonGenerationOverdue is a volume whose newest published generation
 	// is older than its maximum age while it holds unpublished writes.
 	ReasonGenerationOverdue = "GenerationOverdue"
+	// ReasonVolumeUnhealthy is a volume whose device failed its active probe
+	// twice in a row (probe.go). It is raised when the volume turns
+	// unhealthy, not on every pass.
+	ReasonVolumeUnhealthy = "VolumeUnhealthy"
+	// ReasonKeyRequired is a volume that must be formatted or opened and was
+	// not given a key.
+	ReasonKeyRequired = "KeyRequired"
 )
 
 // Metrics is the seam to the metrics registry (plan section 10). The
@@ -84,6 +91,17 @@ type Metrics interface {
 // export or a host path) goes to the node's log only.
 type Events interface {
 	Event(volumeID, reason string)
+}
+
+// ProbeMetrics is implemented by a Metrics that also exposes the result of
+// the active probe, by volume. The reconciler uses it when it is there.
+type ProbeMetrics interface {
+	// SetVolumeProbe sets whether the volume's latest finished probes were
+	// healthy.
+	SetVolumeProbe(volumeID string, ok bool)
+	// DeleteVolumeProbe removes the volume's series, for a volume that is no
+	// longer staged.
+	DeleteVolumeProbe(volumeID string)
 }
 
 type noopMetrics struct{}
@@ -199,6 +217,10 @@ type Options struct {
 
 	// Generations are the defaults of the generation timers.
 	Generations GenerationOptions
+
+	// Probe, when set, turns on the active probe of volumes whose item can
+	// name a device to read (see Probed); nil probes nothing.
+	Probe *ProbeOptions
 
 	// PVAnnotation reads one annotation of the PV named pv ("" when it has
 	// none), for AnnotationPublish. Nil means no volume can request a

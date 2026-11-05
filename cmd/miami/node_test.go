@@ -173,7 +173,7 @@ func TestServeNodeWithServesUntilTheContextEnds(t *testing.T) {
 		t.Errorf("GetPluginInfo = %v, %v", pi, err)
 	}
 	caps, err := csi.NewNodeClient(conn).NodeGetCapabilities(callCtx, &csi.NodeGetCapabilitiesRequest{})
-	if err != nil || len(caps.GetCapabilities()) != 2 {
+	if err != nil || len(caps.GetCapabilities()) != 3 {
 		t.Errorf("NodeGetCapabilities = %v, %v", caps, err)
 	}
 

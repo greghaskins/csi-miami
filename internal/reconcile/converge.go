@@ -183,6 +183,10 @@ type volumeResult struct {
 	// age while it holds unpublished writes (generation.go). The volume still
 	// works, so it is a condition and not an error of the stage.
 	overdue bool
+	// probeFailed says the volume's device failed its active probe twice in a
+	// row (probes.go). Like overdue it is a condition, not an error of the
+	// stage.
+	probeFailed bool
 }
 
 // errTargetGone marks a publish whose target's parent directory no longer
@@ -514,6 +518,9 @@ const (
 	ConditionBadKey              = "bad-key"
 	ConditionGenerationOverdue   = "generation-overdue"
 	ConditionPublishRefused      = "publish-refused"
+	// ConditionProbeFailed is a volume whose device failed its active probe
+	// twice in a row; the stack looks converged but does not answer reads.
+	ConditionProbeFailed = "probe-failed"
 )
 
 // Conditions lists every condition, so that a metric can create them all at
@@ -523,7 +530,7 @@ var Conditions = []string{
 	ConditionStageConflict, ConditionPublishConflict, ConditionItemMissing, ConditionItemNotDirectory,
 	ConditionFailed,
 	ConditionPrerequisiteMissing, ConditionHolderContended, ConditionServerDown, ConditionKeyRequired,
-	ConditionBadKey, ConditionGenerationOverdue, ConditionPublishRefused,
+	ConditionBadKey, ConditionGenerationOverdue, ConditionPublishRefused, ConditionProbeFailed,
 }
 
 // conditionOf classifies an error by the sentinel it wraps. A transport that
@@ -582,6 +589,9 @@ func (res *volumeResult) condition() string {
 			return conditionOf(err)
 		}
 	}
+	if res.probeFailed {
+		return ConditionProbeFailed
+	}
 	if res.overdue {
 		return ConditionGenerationOverdue
 	}
@@ -615,8 +625,11 @@ func (res *volumeResult) problem() (string, error) {
 	var errs []error
 	if res.stage != nil {
 		errs = append(errs, res.stage)
-		if errors.Is(res.stage, ErrTransportUnavailable) || errors.Is(res.stage, ErrTransportConflict) {
+		switch {
+		case errors.Is(res.stage, ErrTransportUnavailable) || errors.Is(res.stage, ErrTransportConflict):
 			reason = ReasonTransportUnavailable
+		case errors.Is(res.stage, ErrKeyRequired):
+			reason = ReasonKeyRequired
 		}
 	}
 	targets := make([]string, 0, len(res.publish))
