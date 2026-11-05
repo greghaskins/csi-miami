@@ -608,6 +608,37 @@ func TestLockCacheIsExclusiveUntilReleased(t *testing.T) {
 	b.release(nil)
 }
 
+// The lock is beside the cache directory, so discarding the directory neither
+// removes nor replaces it: exclusion survives a discard.
+func TestLockSurvivesRemovalOfTheCacheDirectory(t *testing.T) {
+	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
+	a, err := lockCache(cfg.CacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(cfg.CacheDir + lockSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(cfg.CacheDir); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(cfg.CacheDir + lockSuffix)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("the lock file was removed or replaced by discarding the cache: %v", err)
+	}
+	if _, err := lockCache(cfg.CacheDir); err == nil {
+		t.Fatal("the cache directory could be locked again after it was discarded under a held lock")
+	}
+	a.release(nil)
+	b, err := lockCache(cfg.CacheDir)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	b.release(nil)
+}
+
 // The lock goes last: by then the serve loop has returned, the control service
 // is closed and the cache is closed, on every way out.
 func TestLockIsReleasedAfterServeAndCacheAreDone(t *testing.T) {

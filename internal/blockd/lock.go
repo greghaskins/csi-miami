@@ -9,15 +9,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// lockName is the lock file in the cache directory.
-const lockName = "lock"
+// lockSuffix names the lock file: the cache directory's path plus this. It is
+// beside the directory, not in it, because the directory is removed whole at
+// unstage and a lock inside would go with it; the next server would then lock
+// a new file while this one still ran.
+const lockSuffix = ".lock"
 
 // onUnlock, when set, runs just before the lock is released, with the server
 // the process ran (nil if it never got that far). Tests use it to check what
 // has been shut down by then.
 var onUnlock func(*server)
 
-// cacheLock is an exclusive lock on a cache directory, held for as long as the
+// cacheLock is an exclusive lock on a cache directory (on a file beside it), held for as long as the
 // process may touch the cache. A flock belongs to the open file description,
 // so closing it releases the lock whatever else the process is still doing; a
 // held lock also proves the previous server's descriptors, its nbd socket
@@ -30,10 +33,11 @@ func lockCache(dir string) (*cacheLock, error) {
 	if dir == "" {
 		return nil, errors.New("blockd: cache directory is required")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	path := filepath.Clean(dir) + lockSuffix
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("blockd: cache directory: %w", err)
 	}
-	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_CREATE|os.O_RDWR|unix.O_CLOEXEC, 0o600) //nolint:gosec // our cache directory
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|unix.O_CLOEXEC, 0o600) //nolint:gosec // beside our cache directory
 	if err != nil {
 		return nil, fmt.Errorf("blockd: cache lock: %w", err)
 	}
