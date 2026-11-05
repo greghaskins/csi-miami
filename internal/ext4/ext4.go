@@ -14,6 +14,10 @@ import (
 // MountOptions are the options every ext4 stage mount uses.
 const MountOptions = "discard,errors=remount-ro"
 
+// ErrDataWithoutSignature is HasFilesystem's error for a device whose start
+// reads as data though blkid finds no file system: not blank, so not formatted.
+var ErrDataWithoutSignature = errors.New("ext4: the device holds data but no file system signature")
+
 // ErrFsck is returned when e2fsck leaves errors uncorrected or fails.
 var ErrFsck = errors.New("ext4: filesystem check failed")
 
@@ -23,20 +27,49 @@ func Mkfs(ctx context.Context, r tool.Runner, dev string) error {
 	return run(ctx, r, "mkfs", []string{"mkfs.ext4", "-q", "-F", "-E", "lazy_itable_init=0,lazy_journal_init=0", dev})
 }
 
+// Area is a part of a raw block device that reads as zeros until the volume's
+// file system is first made: the start of a plain device, or the start of the
+// payload of a LUKS2 volume. It is read from the raw device, never from a
+// mapping: what a mapping shows over zeros is ciphertext, which is not zeros.
+type Area struct {
+	Dev    string
+	Offset int64
+}
+
 // HasFilesystem reports whether dev carries a file system signature, by
-// blkid's low-level probe (exit 2 is "nothing found"). A blank device is the
-// one case where Mkfs is right; a device with any signature is Fsck's. Any
-// other failure is an error, never "no file system", so a probe that cannot
-// run does not lead to a mkfs over data.
-func HasFilesystem(ctx context.Context, r tool.Runner, dev string) (bool, error) {
+// blkid's low-level probe (exit 2 is "nothing found"). dev is the device the
+// file system lives on (the mapping, for an encrypted volume). A blank device
+// is the one case where Mkfs is right; a device with any signature is Fsck's.
+//
+// blkid exits 2 for a device that is not there or cannot be read as it does
+// for a blank one, so dev is looked at first: it must exist, be a block device
+// and read, or the answer is an error. "Nothing found" counts as no file system
+// only if blank, the area of the raw device that is zero before the first
+// format, also reads as zeros; with data there and no signature the answer is
+// an error, left for a person. A format in an earlier pass that died before
+// mkfs leaves the area zero, so the next pass makes the file system. Any other
+// failure is an error too, so a probe that cannot run does not lead to a mkfs
+// over data.
+func HasFilesystem(ctx context.Context, r tool.Runner, dev string, blank Area) (bool, error) {
+	if _, err := tool.ProbeDevice(r, dev, 0); err != nil {
+		return false, fmt.Errorf("ext4: %w", err)
+	}
 	stdout, stderr, code, err := r.Run(ctx, []string{"blkid", "-p", "-o", "value", "-s", "TYPE", dev}, nil)
 	if err != nil {
 		return false, fmt.Errorf("ext4: blkid: %w", err)
 	}
 	switch {
 	case code == 0 && strings.TrimSpace(string(stdout)) != "":
+		// A signature: Fsck's, and the raw area is not looked at.
 		return true, nil
 	case code == 2 || code == 0:
+		raw, err := tool.ProbeDevice(r, blank.Dev, blank.Offset)
+		if err != nil {
+			return false, fmt.Errorf("ext4: %w", err)
+		}
+		if !raw.Blank {
+			return false, fmt.Errorf("%w: %s", ErrDataWithoutSignature, dev)
+		}
 		return false, nil
 	}
 	return false, fmt.Errorf("ext4: blkid: exit %d: %s", code, strings.TrimSpace(string(stderr)))

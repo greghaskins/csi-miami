@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,6 +21,20 @@ import (
 	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/systemd"
 )
+
+// A device that is not there, or cannot be read, is not a blank device: the
+// stage fails, and nothing is formatted, whether or not the volume has
+// published generations (a volume staged and written to but not yet published
+// has none, and a blank device would be mkfs'd over its dirty cache).
+func TestMissingDeviceIsNeverFormatted(t *testing.T) {
+	e := newEnv(t)
+	e.tools.probeErr = fs.ErrNotExist
+	err := e.converge()
+	if err == nil || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Converge = %v, want the missing device", err)
+	}
+	e.rec.none(t, "tool cryptsetup luksFormat", "tool mkfs.ext4", "mount ext4")
+}
 
 func TestFirstStageFormatsAndMounts(t *testing.T) {
 	e := newEnv(t)
@@ -70,6 +85,33 @@ func TestFirstStageFormatsAndMounts(t *testing.T) {
 	if got := e.rec.all(); !slices.Equal(got, []string{"current"}) {
 		t.Errorf("a converged volume made calls: %v", got)
 	}
+}
+
+// A format that died before the mkfs (the plugin crashed, or the pass was
+// abandoned) leaves a LUKS header and a zero payload: the mapping reads as
+// ciphertext, which is not zeros, but the raw payload is, and the next pass
+// makes the file system.
+func TestCrashBetweenFormatAndMkfsIsFinishedByTheNextPass(t *testing.T) {
+	e := newEnv(t)
+	e.tools.luks = true
+	e.tools.luksKey = e.keys.Key
+	e.mustConverge()
+	e.rec.inOrder(t, "tool cryptsetup open", "tool cryptsetup luksDump", "tool blkid", "tool mkfs.ext4", "mount ext4 /dev/mapper/miami-"+e.v.name)
+	e.rec.none(t, "tool cryptsetup luksFormat")
+}
+
+// Data on the payload with no file system signature is not blank, whatever the
+// volume's history: nothing is formatted, and a person is left the error.
+func TestNonZeroPayloadWithoutASignatureIsNeverFormatted(t *testing.T) {
+	e := newEnv(t)
+	e.tools.luks = true
+	e.tools.luksKey = e.keys.Key
+	e.tools.payloadDirty = true
+	err := e.converge()
+	if err == nil || !strings.Contains(err.Error(), "the encrypted volume holds data but no file system signature; if this volume was never used, delete the claim and recreate it") {
+		t.Fatalf("Converge = %v, want the refusal", err)
+	}
+	e.rec.none(t, "tool mkfs.ext4", "mount ext4")
 }
 
 func TestPlainVolumeHasNoMapping(t *testing.T) {
@@ -430,6 +472,19 @@ func TestTeardownLeavesAForeignMountAlone(t *testing.T) {
 		t.Fatalf("err = %v, want ErrStageConflict", err)
 	}
 	e.rec.none(t, "unmount", "systemd.Stop")
+}
+
+func TestPublishRootIsStagePath(t *testing.T) {
+	e := newEnv(t)
+	got, err := e.it.PublishRoot(e.in)
+	if err != nil || got != e.in.StagePath || got == "" {
+		t.Fatalf("PublishRoot = %q, %v, want the stage path %q", got, err, e.in.StagePath)
+	}
+	none := e.in
+	none.StagePath = ""
+	if got, err := e.it.PublishRoot(none); err == nil {
+		t.Errorf("an intent with no stage path gave root %q", got)
+	}
 }
 
 func TestPublishSourceIsStagePath(t *testing.T) {

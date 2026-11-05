@@ -188,6 +188,12 @@ type volumeInfo struct {
 // volume named like the PV, which is a provisioner name (pvc-<uuid>).
 func (n *testNS) volumeOf(t *testing.T, claim string) volumeInfo {
 	t.Helper()
+	return n.volumeOfKind(t, claim, volume.KindDirectory, n.e.Transport)
+}
+
+// volumeOfKind is volumeOf for a volume of a given kind on a given transport.
+func (n *testNS) volumeOfKind(t *testing.T, claim string, kind volume.Kind, transport string) volumeInfo {
+	t.Helper()
 	_, pv := n.waitPVCBound(t, claim)
 	if pv.Spec.CSI == nil {
 		t.Fatalf("PV %s has no CSI source", pv.Name)
@@ -197,8 +203,8 @@ func (n *testNS) volumeOf(t *testing.T, claim string) volumeInfo {
 	if err != nil {
 		t.Fatalf("PV %s: volumeHandle %q does not parse: %v", pv.Name, handle, err)
 	}
-	if id.Kind != volume.KindDirectory {
-		t.Errorf("PV %s: volume kind %q, want %q", pv.Name, id.Kind, volume.KindDirectory)
+	if id.Kind != kind {
+		t.Errorf("PV %s: volume kind %q, want %q", pv.Name, id.Kind, kind)
 	}
 	if id.Name != pv.Name || !volume.IsPVName(id.Name) {
 		t.Errorf("PV %s: volume name %q, want the PV's own pvc-<uuid> name", pv.Name, id.Name)
@@ -210,8 +216,8 @@ func (n *testNS) volumeOf(t *testing.T, claim string) volumeInfo {
 	if err := vc.MatchesID(id); err != nil {
 		t.Errorf("PV %s: the volume context does not match its ID: %v", pv.Name, err)
 	}
-	if got := string(vc.Transport.Kind); got != n.e.Transport {
-		t.Errorf("PV %s: transport kind %q, want %q", pv.Name, got, n.e.Transport)
+	if got := string(vc.Transport.Kind); got != transport {
+		t.Errorf("PV %s: transport kind %q, want %q", pv.Name, got, transport)
 	}
 	return volumeInfo{PV: pv.Name, Handle: handle, ID: id, Context: vc}
 }
@@ -259,6 +265,9 @@ type podSpec struct {
 	Node  string // pinned with a nodeSelector, so the scheduler still binds claims
 	Run   string // the script; a pod that stays up ends with `exec sleep`
 	Once  bool   // run to completion (restartPolicy Never) rather than stay up
+
+	Image   string // testImage when empty
+	FSGroup *int64 // the pod's securityContext.fsGroup, when set
 }
 
 // stay is the script of a pod that stays up and Ready: setup, then the
@@ -292,6 +301,10 @@ func (n *testNS) createPod(t *testing.T, s podSpec) *corev1.Pod {
 			PeriodSeconds: 1,
 		}
 	}
+	image := s.Image
+	if image == "" {
+		image = testImage
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: s.Name},
 		Spec: corev1.PodSpec{
@@ -299,7 +312,7 @@ func (n *testNS) createPod(t *testing.T, s podSpec) *corev1.Pod {
 			TerminationGracePeriodSeconds: &grace,
 			Containers: []corev1.Container{{
 				Name:           "main",
-				Image:          testImage,
+				Image:          image,
 				Command:        []string{"sh", "-c", s.Run},
 				ReadinessProbe: probe,
 				VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
@@ -311,6 +324,9 @@ func (n *testNS) createPod(t *testing.T, s podSpec) *corev1.Pod {
 	}
 	if s.Node != "" {
 		pod.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": s.Node}
+	}
+	if s.FSGroup != nil {
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: s.FSGroup}
 	}
 	ctx, cancel := n.e.withDeadline()
 	defer cancel()
@@ -488,8 +504,16 @@ func tail(s string, n int) string {
 // deleted and waited for, so its mounts are gone when this returns.
 func (n *testNS) runOnce(t *testing.T, claim, node, script string) string {
 	t.Helper()
+	return n.runOncePod(t, podSpec{Claim: claim, Node: node, Run: script})
+}
+
+// runOncePod is runOnce for a pod spec with more in it than a claim, a node
+// and a script (an image, an fsGroup). The name and Once are set here.
+func (n *testNS) runOncePod(t *testing.T, s podSpec) string {
+	t.Helper()
 	name := fmt.Sprintf("once-%d", n.jobs.Add(1))
-	n.createPod(t, podSpec{Name: name, Claim: claim, Node: node, Run: script, Once: true})
+	s.Name, s.Once = name, true
+	n.createPod(t, s)
 	n.e.waitFor(t, fmt.Sprintf("pod %s/%s to finish", n.Name, name), func(ctx context.Context) (string, bool, error) {
 		p, err := n.e.Client.CoreV1().Pods(n.Name).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {

@@ -504,6 +504,8 @@ spec:
         - mountPath: /sys
           name: host-sys
           readOnly: true
+        - mountPath: /run/cryptsetup
+          name: cryptsetup-lock
       - args:
         - --csi-address=/csi/csi.sock
         - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
@@ -589,6 +591,8 @@ spec:
           path: /sys
           type: Directory
         name: host-sys
+      - emptyDir: {}
+        name: cryptsetup-lock
   updateStrategy:
     rollingUpdate:
       maxUnavailable: 1

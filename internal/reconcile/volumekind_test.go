@@ -28,6 +28,7 @@ type keyItem struct {
 
 func (k *keyItem) Kind() volume.Kind                              { return volume.KindDirectory }
 func (k *keyItem) PublishSource(in intent.Intent) (string, error) { return in.StagePath, nil }
+func (k *keyItem) PublishRoot(in intent.Intent) (string, error)   { return in.StagePath, nil }
 func (k *keyItem) Teardown(context.Context, intent.Intent, item.Observed) error {
 	return nil
 }
@@ -129,6 +130,7 @@ func (c *countItem) PublishSource(in intent.Intent) (string, error) {
 	}
 	return in.StagePath, nil
 }
+func (c *countItem) PublishRoot(in intent.Intent) (string, error) { return c.PublishSource(in) }
 func (c *countItem) Converge(context.Context, intent.Intent, item.Observed) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -217,6 +219,7 @@ type volumeKindItem struct{ teardowns int }
 
 func (v *volumeKindItem) Kind() volume.Kind                              { return volume.KindVolume }
 func (v *volumeKindItem) PublishSource(in intent.Intent) (string, error) { return in.StagePath, nil }
+func (v *volumeKindItem) PublishRoot(in intent.Intent) (string, error)   { return in.StagePath, nil }
 func (v *volumeKindItem) Converge(context.Context, intent.Intent, item.Observed) error {
 	return nil
 }
