@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"slices"
 	"testing"
 
 	"github.com/greghaskins/csi-miami/internal/chunk"
@@ -186,5 +189,108 @@ func TestStatusCarriesTheVolume(t *testing.T) {
 	s := newTestServer(t, cfg)
 	if got := s.status().Volume; got != cfg.Volume || got == "" {
 		t.Fatalf("status volume = %q, want %q", got, cfg.Volume)
+	}
+}
+
+// zeroChunkVerifies reports whether the store holds the all-zero chunk and it
+// hashes to its name.
+func zeroChunkVerifies(store *chunk.Store) error {
+	return store.Get(context.Background(), chunk.ZeroHash(testChunk), io.Discard)
+}
+
+func TestPublishStoresTheZeroChunkItNames(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	rs := &recordingStore{storer: s.store}
+	s.store = rs
+
+	// Chunk 0 is written; chunk 1 is unwritten and so named by the zero hash.
+	prepareBoundary(t, s, 1)
+	if _, err := s.publish(context.Background(), "request"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if err := zeroChunkVerifies(openStore(t, cfg)); err != nil {
+		t.Fatalf("the zero chunk the manifest names is not stored: %v", err)
+	}
+	ops := rs.calls()
+	zi, mi := slices.Index(ops, "zero"), slices.Index(ops, "manifest")
+	if zi < 0 || mi < 0 || zi > mi {
+		t.Fatalf("EnsureZero must precede the manifest: %v", ops)
+	}
+}
+
+func TestPublishRecreatesAPrunedZeroChunk(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	store := openStore(t, cfg)
+
+	prepareBoundary(t, s, 1)
+	if _, err := s.publish(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.ChunkPath(chunk.ZeroHash(testChunk))); err != nil {
+		t.Fatal(err)
+	}
+	prepareBoundary(t, s, 2)
+	if _, err := s.publish(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := zeroChunkVerifies(store); err != nil {
+		t.Fatalf("the second publish did not recreate the zero chunk: %v", err)
+	}
+}
+
+func TestPublishEnsureZeroFailureActsLikeAFailedPut(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	rs := &recordingStore{storer: s.store}
+	s.store = rs
+	ctx := context.Background()
+
+	rs.setZeroErr(errors.New("store full"))
+	prepareBoundary(t, s, 1)
+	if _, err := s.publish(ctx, "request"); err == nil {
+		t.Fatal("publish succeeded although the zero chunk could not be stored")
+	}
+	if names := manifestNames(t, openStore(t, cfg)); len(names) != 0 {
+		t.Fatalf("a manifest naming an absent zero chunk was written: %v", names)
+	}
+	if slices.Contains(rs.calls(), "current") {
+		t.Fatalf("current was published: %v", rs.calls())
+	}
+	if idx := s.back.cache.Index(); len(idx.Dirty) != 1 || idx.Dirty[0] != 0 {
+		t.Fatalf("dirty set not kept: %v", idx.Dirty)
+	}
+
+	rs.setZeroErr(nil)
+	if err := s.boundary(); err != nil {
+		t.Fatalf("boundary after the failure: %v", err)
+	}
+	if _, err := s.publish(ctx, "request"); err != nil {
+		t.Fatalf("the next publish: %v", err)
+	}
+	if err := zeroChunkVerifies(openStore(t, cfg)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPublishNamingNoZeroChunkDoesNotEnsureOne(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	rs := &recordingStore{storer: s.store}
+	s.store = rs
+
+	// Write every chunk, so the manifest names no zero chunk.
+	for i := range int64(testSize / testChunk) {
+		writeDevice(t, s, i*testChunk, pattern(byte(10+i), testChunk), false)
+	}
+	if err := s.boundary(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.publish(context.Background(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(rs.calls(), "zero") {
+		t.Fatalf("EnsureZero was called for a manifest with no zero chunk: %v", rs.calls())
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,7 @@ type storer interface {
 	ReadManifest(ctx context.Context, name string) (chunk.Manifest, error)
 	Put(ctx context.Context, h chunk.Hash, r io.Reader, n int64) error
 	WriteManifest(ctx context.Context, m chunk.Manifest) error
+	EnsureZero(ctx context.Context, chunkSize int64) error
 	Publish(ctx context.Context, name string) error
 	Prune(ctx context.Context, keep int) (removedManifests, removedChunks int, err error)
 	Manifests(ctx context.Context) ([]string, error)
@@ -117,6 +119,17 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 	}
 	for k, i := range boundary {
 		chunks[i] = hashes[k]
+	}
+
+	// A manifest that names the all-zero chunk must find it stored (4.2), so
+	// that the restore drill can verify and cat it. Stored with the other
+	// chunks, before the fence and the manifest, and failing like a failed Put;
+	// a Prune can drop it between generations, so this is per publish.
+	if slices.Contains(chunks, s.back.zeroHash) {
+		if err := s.store.EnsureZero(ctx, s.cfg.Chunk); err != nil {
+			s.back.cache.ClearBoundary(false)
+			return PublishReply{}, err
+		}
 	}
 
 	// The next sequence is derived from the store, not from an in-memory
