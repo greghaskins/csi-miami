@@ -559,17 +559,23 @@ Linux machine with coreutils and cryptsetup:
 ```sh
 cd pvc-<uuid>
 m=manifests/$(cat current)
-grep -v '^#' "$m" | sed 's|^\(..\)\(.*\)|\1\2  chunks/\1/\1\2|' | sha256sum -c --quiet
-grep -v '^#' "$m" | sed 's|^\(..\)|chunks/\1/&|' | xargs cat > volume.img
+c=$(sed -n 's/^# chunk //p' "$m"); z=$(head -c "$c" /dev/zero | sha256sum | cut -d' ' -f1)
+grep -v '^#' "$m" | grep -vx "$z" | sed 's|^\(..\)\(.*\)|\1\2  chunks/\1/\1\2|' | sha256sum -c --quiet
+grep -v '^#' "$m" | while read -r h; do if [ "$h" = "$z" ]; then head -c "$c" /dev/zero; else cat "chunks/${h%"${h#??}"}/$h"; fi; done > volume.img
 cryptsetup open volume.img vol      # the namespace's key
 mount /dev/mapper/vol /mnt
 ```
 
-Line three verifies every chunk against its name. If a chunk is missing from
-an offsite copy taken mid-publish, use the previous manifest in `manifests/`.
+The all-zero chunk is named in a manifest for every region never written or
+since discarded, but its file exists only if some generation happened to
+upload one, so the drill computes its name from the chunk size in the header
+and writes zeros in its place instead of looking for a file. Line four
+verifies every other chunk against its name. If a chunk is missing from an
+offsite copy taken mid-publish, use the previous manifest in `manifests/`.
 The driver ships `miami restore` doing the same with a bounded cache, for a
 volume larger than the restoring machine's disk; the drill does not depend on
-it.
+it. `docs/restore.md` carries the drill and `hack/restore-drill.sh` runs it; a
+test keeps the two identical.
 
 ### 5.2 Layout and backup membership
 
@@ -587,7 +593,9 @@ one small object version per RWO volume; accepted (3.3).
 
 From an existing file-backed driver's images: `miami import` reads a raw block
 image file (the transport mounted, the workload scaled to zero) and writes it
-as-is as generation 1 of a new `volume`, then the static-PV dance of decision
+as-is as manifest `0.1` of a new `volume` (epoch 0, below the epoch 1 of the
+first holder; padded with zeros to a whole number of chunks; refused if the
+volume already has a `current`, a manifest or a holder file), then the static-PV dance of decision
 4. The image's own format decides the class: a LUKS2 image whose keyslot opens
 with the namespace's key imports into an encrypted class and keeps its header;
 a plain ext4 image imports into a `-plain` class. Re-encrypting a plain image
