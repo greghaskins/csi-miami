@@ -708,10 +708,14 @@ hot path (`ReadAt`/`WriteAt`) allocates nothing per request in a benchmark
 **Interfaces:** `reconcile.Stage`/`Publish` requests gain
 `Key, PreviousKey []byte` (in memory, zeroed after use); `prereq.Probe(ctx,
 Options{Sysfs, SystemdSocket, CacheDir}) Report` with `Report.Missing()
-[]string`; node flags `--cache-dir` (default `/var/lib/miami/cache`),
-`--bin-dir` (default `<kubelet>/plugins/<driver>/bin`), `--systemd-socket`
-(default `/run/systemd/private`), `--holder-renew`
-(15s), `--remediate` (false until T15).
+[]string`; node flags `--cache-dir` (default `<kubelet>/plugins/<driver>/cache`, so the
+one kubelet hostPath covers it), `--bin-dir` (default
+`<kubelet>/plugins/<driver>/bin`), `--systemd-socket` (default
+`/run/systemd/private`), `--shared-dir` (repeatable; a directory other than
+the kubelet's that the container and host see at one path), `--remediate`
+(false until T15). A cache or bin dir outside those, or a cache dir whose
+control socket path exceeds the 107-byte unix limit, makes the `cache-dir`
+prerequisite missing.
 
 - [ ] Tests: `TestNodeStageReadsKeyFromSecrets`, `TestNodePublishCarriesKeyForRestage`,
       `TestKeyNeverInLogsOrIntent` (a logging interceptor capture and the

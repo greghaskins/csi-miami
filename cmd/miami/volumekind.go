@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/greghaskins/csi-miami/internal/holder"
@@ -153,4 +157,46 @@ func (l *lazySystemd) Close() error {
 		return c.Close()
 	}
 	return nil
+}
+
+// maxSocketPath is the longest path a unix socket can have: sun_path is 108
+// bytes, one of them the terminating NUL.
+const maxSocketPath = 107
+
+// socketName is the control socket of a volume in the cache dir, at its
+// longest (see internal/item/volume); the lock file and the drain record sit
+// beside the cache the same way and are shorter.
+const socketName = "pvc-00000000-0000-0000-0000-000000000000.sock"
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+
+// cacheLayoutErr says why the volume kind cannot work with the configured
+// cache and bin directories, or returns nil. The plugin in its container and
+// the block server on the host must see them at the same absolute path, so
+// each must lie under the kubelet dir (the one directory the DaemonSet shares
+// with the host) or under a -shared-dir; and the control socket in the cache
+// dir must fit the unix socket path limit. Either is a node that looks healthy
+// and never finds its servers, so the node reports the cache dir missing
+// instead.
+func cacheLayoutErr(cfg nodeConfig) error {
+	shared := append([]string{cfg.kubeletDir}, cfg.sharedDirs...)
+	for _, d := range []struct{ flag, path string }{{"-cache-dir", cfg.cacheDir}, {"-bin-dir", cfg.binDir}} {
+		if !slices.ContainsFunc(shared, func(s string) bool { return pathWithin(s, d.path) }) {
+			return fmt.Errorf("%s %s is under neither -kubelet-dir nor a -shared-dir, so the host and the container may see different directories", d.flag, d.path)
+		}
+	}
+	if sock := filepath.Join(cfg.cacheDir, socketName); len(sock) > maxSocketPath {
+		return fmt.Errorf("-cache-dir %s makes a control socket path of %d bytes, over the %d-byte limit; use a shorter -cache-dir", cfg.cacheDir, len(sock), maxSocketPath)
+	}
+	return nil
+}
+
+// pathWithin reports whether path is dir or lies below it; both are cleaned.
+func pathWithin(dir, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
 }

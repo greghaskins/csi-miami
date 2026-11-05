@@ -11,6 +11,7 @@ import (
 	"net"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,7 +48,7 @@ type nodeConfig struct {
 	cacheDir      string
 	binDir        string
 	systemdSocket string
-	holderRenew   time.Duration
+	sharedDirs    stringList
 	remediate     bool
 
 	// The defaults of the generation timers, for a volume whose class sets none.
@@ -65,6 +66,9 @@ func (c nodeConfig) withDefaults() nodeConfig {
 	}
 	if c.stageRoot == "" {
 		c.stageRoot = filepath.Join(c.kubeletDir, "plugins", "kubernetes.io", "csi", csi.DriverName)
+	}
+	if c.cacheDir == "" {
+		c.cacheDir = filepath.Join(c.kubeletDir, "plugins", csi.DriverName, "cache")
 	}
 	if c.binDir == "" {
 		c.binDir = filepath.Join(c.kubeletDir, "plugins", csi.DriverName, "bin")
@@ -93,10 +97,10 @@ func nodeFlags(fs *flag.FlagSet, cfg *nodeConfig) {
 	fs.DurationVar(&cfg.transportIdle, "transport-idle", 0, "unmount a transport that no volume uses after this long; 0 means never")
 	fs.StringVar(&cfg.kubeconfig, "kubeconfig", "", "kubeconfig file, for development outside a cluster; in a cluster the service account is used")
 	fs.BoolVar(&cfg.noEvents, "no-events", false, "do not record Kubernetes events (for tests, where there is no API server)")
-	fs.StringVar(&cfg.cacheDir, "cache-dir", "/var/lib/miami/cache", "directory the volume caches live under on the host; must be writable")
+	fs.StringVar(&cfg.cacheDir, "cache-dir", "", "directory the volume caches live under on the host, writable and seen at the same path by the container and the host (default <kubelet-dir>/plugins/"+csi.DriverName+"/cache)")
 	fs.StringVar(&cfg.binDir, "bin-dir", "", "directory the per-hash copies of the miami binary are kept in (default <kubelet-dir>/plugins/"+csi.DriverName+"/bin)")
 	fs.StringVar(&cfg.systemdSocket, "systemd-socket", "/run/systemd/private", "systemd's private socket, used to run each volume's block server as a unit")
-	fs.DurationVar(&cfg.holderRenew, "holder-renew", 15*time.Second, "how often the node renews the holder file of each volume it serves")
+	fs.Var(&cfg.sharedDirs, "shared-dir", "a directory the node container sees at the same absolute path as the host, besides -kubelet-dir; -cache-dir and -bin-dir must lie under one (repeatable)")
 	fs.DurationVar(&cfg.genInterval, "generation-interval", volkinds.DefaultGenerationEvery, "how often a volume with unpublished writes publishes a generation, unless its class sets generations.interval")
 	fs.DurationVar(&cfg.genMaxAge, "generation-max-age", volkinds.DefaultGenerationMaxAge, "how old the newest generation of a volume with unpublished writes may get before the volume is reported overdue, unless its class sets generations.maxAge")
 	fs.DurationVar(&cfg.genTimeout, "generation-timeout", reconcile.DefaultGenerationTimeout, "deadline of one generation, freeze to upload")
@@ -134,10 +138,10 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		{"-reconcile-interval must be positive", cfg.interval <= 0},
 		{"-transport-idle must not be negative", cfg.transportIdle < 0},
 		{"-kubelet-dir must be an absolute path", !filepath.IsAbs(cfg.kubeletDir)},
-		{"-cache-dir must be an absolute path", !filepath.IsAbs(cfg.cacheDir)},
+		{"-cache-dir must be an absolute path", cfg.cacheDir != "" && !filepath.IsAbs(cfg.cacheDir)},
 		{"-bin-dir must be an absolute path", cfg.binDir != "" && !filepath.IsAbs(cfg.binDir)},
 		{"-systemd-socket must be an absolute path", !filepath.IsAbs(cfg.systemdSocket)},
-		{"-holder-renew must be positive", cfg.holderRenew <= 0},
+		{"-shared-dir must be an absolute path", slices.ContainsFunc(cfg.sharedDirs, func(d string) bool { return !filepath.IsAbs(d) })},
 		{"-generation-interval must be at least " + volkinds.MinGenerationInterval.String(), cfg.genInterval < volkinds.MinGenerationInterval},
 		{"-generation-max-age must not be under -generation-interval", cfg.genMaxAge < cfg.genInterval},
 		{"-generation-timeout must be positive", cfg.genTimeout <= 0},
@@ -222,10 +226,10 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		opts.Events = events
 	}
 	opts.CacheDir, opts.BinDir, opts.SystemdSocket = cfg.cacheDir, cfg.binDir, cfg.systemdSocket
-	opts.HolderRenew, opts.Remediate = cfg.holderRenew, cfg.remediate
+	opts.Remediate = cfg.remediate
 	// The prerequisites of the volume kind are probed now and on every pass;
 	// a node without them still serves directory volumes.
-	probe := newProber(prereq.Options{SystemdSocket: cfg.systemdSocket, CacheDir: cfg.cacheDir}, reg, log)
+	probe := newProber(prereq.Options{SystemdSocket: cfg.systemdSocket, CacheDir: cfg.cacheDir}, cacheLayoutErr(cfg), reg, log)
 	opts.Prereq = probe
 	probe(ctx)
 	deps := realDeps(cfg)
@@ -321,14 +325,22 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 }
 
 // newProber returns the probe of the node's prerequisites: it runs
-// prereq.Probe, sets the capability gauges and logs when the set of missing
+// prereq.Probe, counts a layout the host cannot share (layout, see
+// cacheLayoutErr) as a missing cache dir, sets the capability gauges and logs when the set of missing
 // features changes (not on every pass). It is safe for concurrent use.
-func newProber(o prereq.Options, reg *metrics.Registry, log *slog.Logger) func(context.Context) prereq.Report {
+func newProber(o prereq.Options, layout error, reg *metrics.Registry, log *slog.Logger) func(context.Context) prereq.Report {
 	var mu sync.Mutex
 	var last string
 	first := true
 	return func(ctx context.Context) prereq.Report {
 		rep := prereq.Probe(ctx, o)
+		if layout != nil {
+			for i := range rep.Features {
+				if rep.Features[i].Name == prereq.FeatureCacheDir {
+					rep.Features[i].Err = errors.Join(layout, rep.Features[i].Err)
+				}
+			}
+		}
 		for _, f := range rep.Features {
 			reg.SetCapability(f.Name, f.Err == nil)
 		}

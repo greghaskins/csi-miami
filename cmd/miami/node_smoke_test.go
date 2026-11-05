@@ -100,7 +100,7 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 	cfg := nodeConfig{
 		endpoint: "unix://" + sock, nodeID: "smoke-node", kubeletDir: filepath.Join(base, "kubelet"),
 		transportsRoot: filepath.Join(base, "miami"), metricsAddr: "127.0.0.1:0",
-		interval: time.Hour, deadline: 10 * time.Second, cacheDir: filepath.Join(base, "cache"),
+		interval: time.Hour, deadline: 10 * time.Second, cacheDir: filepath.Join(base, "c"), sharedDirs: []string{base},
 		genInterval: time.Minute, genMaxAge: time.Hour, genTimeout: time.Minute,
 	}.withDefaults()
 
