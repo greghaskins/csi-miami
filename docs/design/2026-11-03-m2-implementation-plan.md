@@ -2,7 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Active
+**Status:** Active. T1 to T20 are merged into `m2/design` (T15 was dropped, decision 53);
+T21 (e2e, PR #71) is merged and T22 (docs) is the PR that carries this edit. Gate G1
+(criterion 10) waits for the owner's Raspberry Pi run. The tables in sections 1
+and 5 say where each criterion and task stands.
 **Created:** 2026-11-03
 **Spec:** `2026-11-03-chunk-backed-volumes-design.md` (the plan argues from
 it; executors read both). **Reads with:** `2026-10-30-architecture-brief.md`
@@ -135,6 +138,37 @@ M2 is done when, on the kind e2e cluster over the nfs3 transport:
     the loop stack on every phase (gate G1, run outside CI by the owner).
 11. The M1 e2e suite, sanity, smoke, envtest and the deploy check still pass;
     directory items are unchanged.
+
+**Where the criteria stand.** Green means `ci-ok` passed with the nfs3 e2e legs on both architectures. The e2e tests are T21's (`test/e2e/volume_*_test.go`),
+run in the nfs3 variant on both architectures; the local variant skips them
+with a reason.
+
+| # | Status | Test |
+|---|---|---|
+| 1 | green | `TestVolumeExt4Semantics` |
+| 2 | green | `TestVolumeSurvivesReschedule` |
+| 3 | green | `TestVolumePluginRestart` |
+| 4 | green | `TestVolumeServerKill` |
+| 5 (G2) | green | `TestVolumeNASOutageNoHungTask` |
+| 6 | green, with a gap in kind (below) | `TestVolumeTakeover`, both modes |
+| 6a | green | `TestVolumeOrphanDrain` |
+| 7 | green | `TestVolumeNodeRebootReusesCache` |
+| 8 | green | `TestVolumeRestoreDrill` |
+| 9 | green | `TestVolumeExpandOnline` |
+| 10 | **pending** the owner's Pi run (gate G1); `miami bench` and `docs/bench.md` are merged (T20) and CI runs the harness as a smoke on amd64 | `miami bench` |
+| 11 | green; covered by CI on every PR: `static`, `unit`, `envtest`, `sanity` and `smoke` on both architectures, `deploy`, and the M1 e2e suite | `ci-ok` |
+
+**The kind gap in criterion 6.** Kind nodes share the runner's kernel, where a
+device-mapper name and an nbd device are single objects, so the old node's
+unstage after a takeover cannot close the mapping the new holder uses (EBUSY).
+The old-node cleanup ("its unstage succeeds, discarding") is therefore a
+skipped subtest in kind (`TestVolumeTakeover/old-node-unstage-discards`), which
+asserts instead that the returning old node changes nothing of the new
+holder's; the volume item's fenced-unstage unit tests cover the cleanup, and a
+cluster with two kernels runs it in full. The attach-detach controller's forced
+detach (about six minutes) is likewise stood in for by deleting the
+VolumeAttachment in the takeover and drain tests; that is cluster behaviour,
+not the driver's.
 
 ## 2. Repository layout
 
@@ -432,6 +466,35 @@ RBAC).
 | T20 | `miami bench` and `hack/bench.sh` (gate G1) | the harness runs on the amd64 runner in CI as a smoke (numbers logged, no threshold); the Pi run is the owner's and its table is attached to the PR |
 | T21 | e2e: criteria 1 to 9 and 11 (gate G2 is criterion 5) | `ci-ok` green with the nfs3 legs on both arches |
 | T22 | README and docs | matrix, class table, prerequisites, limitations, restore drill; decision-log amendments if any task changed a decision |
+
+Where the tasks stand (PR numbers are on `m2/design`; follow-up PRs are listed
+with their task):
+
+| Task | State | PRs |
+|---|---|---|
+| T1 | merged | #43 |
+| T2 | merged | #44 |
+| T3 | merged | #42, follow-ups #47, #48 |
+| T4 | merged | #45 |
+| T5 | merged | #46 |
+| T6 | merged | #50 |
+| T7 | merged | #51 |
+| T8 | merged | #52 |
+| T9 | merged | #49, with #54 (holder `Adopt`) |
+| T10 | merged | #53, with #55 (Adiantum by `AF_ALG` bind) |
+| T11 | merged | #56 (T11a, blockd re-points the device), #57, follow-ups #60 (ext4 `fsType`), #61 |
+| T12 | merged | #62 |
+| T13 | merged | #63 (also #59, `DeleteVolume` refuses while any holder exists) |
+| T13w | merged | #64 |
+| T14 | merged | #65 |
+| T15 | dropped (decision 53) | none |
+| T16 | merged | #67 |
+| T17 | merged | #68 |
+| T18 | merged | #66 |
+| T19 | merged | #69 |
+| T20 | merged; gate G1 run pending | #70 |
+| T21 | merged | #71 |
+| T22 | in review | the PR carrying this table |
 
 Waves (at most three subagents at a time):
 
@@ -1025,10 +1088,12 @@ prerequisites, limitations, the restore drill pointer, the `-plain`
 naming), `docs/design/2026-10-30-architecture-brief.md` (append any
 decision a task amended; never rewrite), this plan's status.
 
-- [ ] Fold decisions 51 and 52 and the `--disable-keyring` note into the
+- [x] Fold decisions 51 and 52 and the `--disable-keyring` note into the
       spec's section 4 (4.4 restart model, 4.6 exclusivity, the failure
-      table: a NotReady node is never taken over).
-- [ ] Operator runbook for a volume that cannot leave its node (a dead
+      table: a NotReady node is never taken over). Done, with 53, the size
+      record, the zero chunk and the drain; decisions 54 to 58 record where
+      the merged code differs from the design's text.
+- [x] Operator runbook (`docs/operating-volumes.md`) for a volume that cannot leave its node (a dead
       node, or an unstage failing permanently, e.g. a corrupt cache index):
       delete the pod (force if needed); set the PV annotation
       `miami.csi.greghaskins.com/force-detach` to the holder's
