@@ -51,6 +51,7 @@ type backend struct {
 	fetchBudget time.Duration
 
 	fetchSem chan struct{}
+	fetches  fetchRecorder
 	bufPool  sync.Pool // *[]byte, each an aligned chunk buffer
 
 	stripes [writeStripes]sync.Mutex
@@ -244,7 +245,10 @@ func (b *backend) fetchInto(ctx context.Context, i uint32, buf []byte) (fetched 
 	defer func() { <-b.fetchSem }()
 
 	w := &sliceWriter{buf: buf}
-	if err := b.store.Get(ctx, h, w); err != nil {
+	began := time.Now()
+	err = b.store.Get(ctx, h, w)
+	b.fetches.record(time.Since(began), err)
+	if err != nil {
 		return false, err
 	}
 	if w.n != len(buf) {
