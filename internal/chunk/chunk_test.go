@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -154,6 +155,8 @@ func TestParseManifestRejectsUnknownFormat(t *testing.T) {
 		"empty":          "",
 		"bad time":       strings.Replace(good, "2026-11-03T10:30:00Z", "yesterday", 1),
 		"header late":    good + "# epoch 7\n",
+		"plus size":      regexp.MustCompile(`# size (\d+)`).ReplaceAllString(good, "# size +$1"),
+		"zero-led chunk": regexp.MustCompile(`# chunk (\d+)`).ReplaceAllString(good, "# chunk 0$1"),
 	} {
 		if _, err := ParseManifest(strings.NewReader(in)); !errors.Is(err, ErrManifestFormat) {
 			t.Errorf("%s: err = %v, want ErrManifestFormat", name, err)
@@ -179,9 +182,7 @@ func FuzzParseManifest(f *testing.F) {
 		}
 		again, err := ParseManifest(bytes.NewReader(m.Marshal()))
 		if err != nil {
-			// A volume name with a carriage return or similar may not survive
-			// Scanner line splitting; the parse itself must still not panic.
-			return
+			t.Fatalf("a manifest that parsed does not parse again after Marshal: %v", err)
 		}
 		if !bytes.Equal(again.Marshal(), m.Marshal()) {
 			t.Fatal("marshal is not stable")
