@@ -40,6 +40,12 @@ const (
 	//                     full-chunk overwrites and avoid read-modify-write
 )
 
+// childVolume is the volume the next child serves. A test that leaves its
+// device configured (the first test's is still being torn down when the next
+// starts) must not share a name with one that follows: a server finding a
+// device already carrying its volume's name takes it over, as it should.
+var childVolume = smokeVol
+
 // TestMain re-executes the binary as the block server when the child
 // environment is set, so the test can SIGKILL a real process.
 func TestMain(m *testing.M) {
@@ -100,7 +106,7 @@ func startChild(t *testing.T, store, cache, control string, epoch uint64) *exec.
 	cmd := exec.Command(os.Args[0]) //nolint:gosec // our own test binary
 	cmd.Env = append(os.Environ(),
 		childEnv+"=1",
-		"BD_VOLUME="+smokeVol,
+		"BD_VOLUME="+childVolume,
 		"BD_STORE="+store,
 		"BD_CACHE="+cache,
 		"BD_CONTROL="+control,
@@ -417,9 +423,11 @@ func (blackHole) Write(p []byte) (int, error) { return len(p), nil }
 // written before the kill reads back from the device afterwards.
 func TestSmokeBlockdRestartKeepsDeviceAndMount(t *testing.T) {
 	smokeEnv(t)
+	childVolume = smokeVol + "-restart"
+	t.Cleanup(func() { childVolume = smokeVol })
 
 	base := t.TempDir()
-	store := filepath.Join(base, smokeVol)
+	store := filepath.Join(base, childVolume)
 	if err := os.MkdirAll(store, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +448,7 @@ func TestSmokeBlockdRestartKeepsDeviceAndMount(t *testing.T) {
 
 	actx, acancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer acancel()
-	h, err := holder.Acquire(actx, base, smokeVol, smokeNode, holder.Judgement{})
+	h, err := holder.Acquire(actx, base, childVolume, smokeNode, holder.Judgement{})
 	if err != nil {
 		t.Fatalf("acquire holder: %v", err)
 	}
