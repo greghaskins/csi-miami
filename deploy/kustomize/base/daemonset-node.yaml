@@ -123,6 +123,15 @@ spec:
             - name: host-sys
               mountPath: /sys
               readOnly: true
+            # cryptsetup keeps its locks for LUKS2 metadata in /run/cryptsetup
+            # and fails a command with exit 5 and no message when it cannot
+            # make that directory. The root file system is read-only, so the
+            # directory is a volume of its own: container-local, not a
+            # hostPath, and not shared with the host's cryptsetup. Only this
+            # container runs cryptsetup (the block server never does), so a
+            # lock directory per container is enough.
+            - name: cryptsetup-lock
+              mountPath: /run/cryptsetup
         - name: csi-node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0@sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
           args:
@@ -213,3 +222,5 @@ spec:
           hostPath:
             path: /sys
             type: Directory
+        - name: cryptsetup-lock
+          emptyDir: {}

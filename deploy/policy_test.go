@@ -530,9 +530,10 @@ func TestNodeDaemonSet(t *testing.T) {
 		t.Errorf("NODE_NAME must come from the downward API field spec.nodeName, got %+v", env)
 	}
 
-	// The host mounts are held exactly by TestNodeHostPaths.
+	// The host mounts, and the one emptyDir, are held exactly by
+	// TestNodeHostPaths.
 	for _, v := range spec.Volumes {
-		if v.HostPath == nil {
+		if v.HostPath == nil && v.Name != cryptsetupLock {
 			t.Errorf("volume %s is not a hostPath; the node needs no other kind", v.Name)
 		}
 	}
@@ -1010,6 +1011,13 @@ func TestNodeHostPaths(t *testing.T) {
 
 	got := map[string]hp{}
 	for _, v := range spec.Volumes {
+		if v.Name == cryptsetupLock {
+			// Not a hostPath: checked below.
+			if v.EmptyDir == nil || v.EmptyDir.Medium != "" || v.EmptyDir.SizeLimit != nil {
+				t.Errorf("volume %s must be a plain emptyDir (container-local, on the node's disk): %+v", v.Name, v.VolumeSource)
+			}
+			continue
+		}
 		if v.HostPath == nil {
 			t.Errorf("volume %s is not a hostPath", v.Name)
 			continue
@@ -1021,7 +1029,15 @@ func TestNodeHostPaths(t *testing.T) {
 		got[v.Name] = hp{path: v.HostPath.Path, typ: typ}
 	}
 	m := container(t, spec, "miami")
+	lockMounts := 0
 	for _, vm := range m.VolumeMounts {
+		if vm.Name == cryptsetupLock {
+			lockMounts++
+			if vm.MountPath != "/run/cryptsetup" || vm.ReadOnly || vm.SubPath != "" || vm.MountPropagation != nil {
+				t.Errorf("miami mounts %s wrongly: %+v (want a plain writable mount at /run/cryptsetup, cryptsetup's lock directory)", vm.Name, vm)
+			}
+			continue
+		}
 		h, ok := got[vm.Name]
 		if !ok {
 			t.Errorf("miami mounts unknown volume %s", vm.Name)
@@ -1035,6 +1051,9 @@ func TestNodeHostPaths(t *testing.T) {
 			t.Errorf("miami mount %s has subPath %q", vm.Name, vm.SubPath)
 		}
 		got[vm.Name] = h
+	}
+	if lockMounts != 1 {
+		t.Errorf("miami mounts %s %d times, want once", cryptsetupLock, lockMounts)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("node host paths:\n got %+v\nwant %+v", got, want)
@@ -1300,6 +1319,10 @@ func TestE2EOverlay(t *testing.T) {
 		}
 	}
 }
+
+// cryptsetupLock is the name of the node plugin's emptyDir for cryptsetup's
+// lock directory.
+const cryptsetupLock = "cryptsetup-lock"
 
 // pluginOffKey is the node label whose presence keeps the node plugin off a
 // node in the e2e overlay (the volume tests stop one plugin with it).
