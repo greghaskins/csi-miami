@@ -108,10 +108,14 @@ func (s *server) growTo(ctx context.Context, size int64) error {
 	case size%s.cfg.Chunk != 0:
 		return fmt.Errorf("blockd: size %d is not a whole number of %d byte chunks", size, s.cfg.Chunk)
 	}
-	if err := s.back.grow(size); err != nil {
+	// The kernel first, then the cache: an interruption between the two leaves
+	// a device larger than the index, which resuming the index heals, where the
+	// other order leaves an index the device cannot match. Nothing reads the
+	// new space until the filesystem is resized, after this returns.
+	if err := s.device().reconfigure(ctx, size); err != nil {
 		return err
 	}
-	return s.device().reconfigure(ctx, size)
+	return s.back.grow(size)
 }
 
 // listenControl opens the control socket at mode 0600, replacing a stale one.

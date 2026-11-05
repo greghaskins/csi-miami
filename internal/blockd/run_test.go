@@ -26,6 +26,7 @@ type fakeKernel struct {
 	drops        int
 	reconnectErr error
 	onTouch      func() // runs in touch before the request is sent
+	resizes      []int64
 	held         []net.Conn
 }
 
@@ -81,6 +82,19 @@ func (k *fakeKernel) disconnect(_ context.Context, idx int) error {
 	return nil
 }
 
+func (k *fakeKernel) resize(_ context.Context, _ int, size int64) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.resizes = append(k.resizes, size)
+	return nil
+}
+
+func (k *fakeKernel) setReconnectErr(err error) {
+	k.mu.Lock()
+	k.reconnectErr = err
+	k.mu.Unlock()
+}
+
 func (k *fakeKernel) touch(ctx context.Context, _ int, b nbd.Backend) error {
 	if k.onTouch != nil {
 		k.onTouch()
@@ -120,6 +134,19 @@ func (k *fakeKernel) cleanup(t *testing.T) *fakeKernel {
 	t.Helper()
 	t.Cleanup(k.close)
 	return k
+}
+
+// seedCache leaves a cache for cfg's volume behind, as a server that crashed
+// would: a device in use is only ever served from one.
+func seedCache(t *testing.T, cfg Config) {
+	t.Helper()
+	s, err := newServer(context.Background(), cfg, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func ourDevice(idx int, size int64) nbd.Device {
@@ -184,13 +211,14 @@ func TestRunConnectsWhenNoDeviceMatches(t *testing.T) {
 	waitIndex(t, cfg.ControlSocket, 5)
 	stopRun(t, cancel, done)
 	c, r, d := k.counts()
-	if c != 1 || r != 0 || len(d) != 1 || d[0] != 5 {
+	if c != 1 || r != 0 || len(d) != 0 {
 		t.Fatalf("connects %d, reconnects %d, disconnects %v", c, r, d)
 	}
 }
 
 func TestRunReconfiguresTheMatchingDevice(t *testing.T) {
 	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
 	k := &fakeKernel{connectIdx: 5, devs: []nbd.Device{ourDevice(3, testSize)}}
 	k.cleanup(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -205,14 +233,15 @@ func TestRunReconfiguresTheMatchingDevice(t *testing.T) {
 	if c != 0 || r != 1 {
 		t.Fatalf("connects %d, reconnects %d; want 0, 1", c, r)
 	}
-	// A stop on request or a signal is an unstage: it disconnects.
-	if len(d) != 1 || d[0] != 3 {
-		t.Fatalf("disconnects %v, want [3]", d)
+	// A signal leaves the device, its mapping and its mount for the next server.
+	if len(d) != 0 {
+		t.Fatalf("disconnects %v after a signal, want none", d)
 	}
 }
 
 func TestRunReportsNoDeviceUntilConfirmed(t *testing.T) {
 	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
 	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
 	k.cleanup(t)
 	seen := make(chan int, 1)
@@ -247,6 +276,7 @@ func TestRunReportsNoDeviceUntilConfirmed(t *testing.T) {
 func TestRunRetriesAReconfigureTheKernelDropped(t *testing.T) {
 	shortConfirm(t)
 	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
 	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}, drops: 2}
 	k.cleanup(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -262,6 +292,7 @@ func TestRunRetriesAReconfigureTheKernelDropped(t *testing.T) {
 func TestRunFailsWithoutDisconnectingWhenNeverConfirmed(t *testing.T) {
 	shortConfirm(t)
 	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
 	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}, drops: 1 << 30}
 	k.cleanup(t)
 	err := runOn(context.Background(), cfg, testLog(), k)
@@ -280,6 +311,7 @@ func TestRunFailsWithoutDisconnectingWhenNeverConfirmed(t *testing.T) {
 func TestRunFailsWithoutDisconnectingWhenReconfigureErrors(t *testing.T) {
 	shortConfirm(t)
 	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
 	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}, reconnectErr: errors.New("EINVAL")}
 	k.cleanup(t)
 	if err := runOn(context.Background(), cfg, testLog(), k); err == nil {
@@ -301,13 +333,14 @@ func TestRunRefusesTwoMatchingDevices(t *testing.T) {
 	if c != 0 || r != 0 || len(d) != 0 {
 		t.Fatalf("touched the kernel: connects %d, reconnects %d, disconnects %v", c, r, d)
 	}
-	if _, err := os.Stat(cfg.CacheDir); err == nil {
+	if _, err := os.Stat(cfg.CacheDir + "/index.json"); err == nil {
 		t.Error("the cache was created before the refusal")
 	}
 }
 
 func TestRunServesAGrownDevicesSize(t *testing.T) {
 	cfg, _ := testConfig(t) // size 2 chunks
+	seedCache(t, cfg)
 	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, 2*testSize)}}
 	k.cleanup(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -320,12 +353,73 @@ func TestRunServesAGrownDevicesSize(t *testing.T) {
 	stopRun(t, cancel, done)
 }
 
-func TestRunRefusesAShrunkDevice(t *testing.T) {
+// Arguments raised for a grow the device never got: finish it, once the
+// device is confirmed to be ours.
+func TestRunFinishesAnInterruptedGrow(t *testing.T) {
 	cfg, _ := testConfig(t)
-	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize/2)}}
+	seedCache(t, cfg)
+	cfg.Size = 2 * testSize
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
 	k.cleanup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	st := waitIndex(t, cfg.ControlSocket, 3)
+	if st.Size != 2*testSize {
+		t.Errorf("served size %d, want %d", st.Size, 2*testSize)
+	}
+	stopRun(t, cancel, done)
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if len(k.resizes) != 1 || k.resizes[0] != 2*testSize {
+		t.Fatalf("resizes %v, want [%d]", k.resizes, 2*testSize)
+	}
+}
+
+// A cache index larger than both the arguments and the device (a grow cut off
+// by an older crash shape) is served at the index's size, and the device is
+// brought up to it.
+func TestRunServesTheLargestOfArgsDeviceAndIndex(t *testing.T) {
+	cfg, _ := testConfig(t)
+	big := cfg
+	big.Size = 2 * testSize
+	seedCache(t, big)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	k.cleanup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k) // args and device are both the smaller size
+	st := waitIndex(t, cfg.ControlSocket, 3)
+	if st.Size != 2*testSize {
+		t.Errorf("served size %d, want %d", st.Size, 2*testSize)
+	}
+	stopRun(t, cancel, done)
+	if len(k.resizes) != 1 || k.resizes[0] != 2*testSize {
+		t.Fatalf("resizes %v", k.resizes)
+	}
+}
+
+func TestRunDoesNotResizeAnEqualDevice(t *testing.T) {
+	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	k.cleanup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+	stopRun(t, cancel, done)
+	if len(k.resizes) != 0 {
+		t.Fatalf("resizes %v, want none", k.resizes)
+	}
+}
+
+func TestRunRefusesADeviceThatIsNotWholeChunks(t *testing.T) {
+	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize+4096)}}
 	if err := runOn(context.Background(), cfg, testLog(), k); err == nil {
-		t.Fatal("run accepted a device smaller than the configured size")
+		t.Fatal("run accepted a device that is not whole chunks")
 	}
 	if _, r, d := k.counts(); r != 0 || len(d) != 0 {
 		t.Fatalf("touched the device: reconnects %d, disconnects %v", r, d)
@@ -342,7 +436,7 @@ func TestAdoptDeviceSize(t *testing.T) {
 	}{
 		{"equal", testSize, testSize, false},
 		{"grown", 3 * testSize, 3 * testSize, false},
-		{"smaller", testSize - testChunk, 0, true},
+		{"smaller keeps the arguments", testSize - testChunk, testSize, false},
 		{"not a whole chunk", testSize + 4096, 0, true},
 	} {
 		got, err := adoptDeviceSize(cfg, nbd.Device{Index: 1, Size: tc.dev})
@@ -355,6 +449,250 @@ func TestAdoptDeviceSize(t *testing.T) {
 		if err != nil || got.Size != tc.want {
 			t.Errorf("%s: size %d, err %v; want %d", tc.name, got.Size, err, tc.want)
 		}
+	}
+}
+
+// Critical 1: the kernel shutting our socket down (a request timed out) is
+// answered by re-pointing the device in process, not by disconnecting it.
+func TestRunRepointsAfterTheServeLoopDies(t *testing.T) {
+	cfg, _ := testConfig(t)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	seedCache(t, cfg)
+	k.cleanup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+	k.close() // the kernel's kernel_sock_shutdown on our socket
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, r, _ := k.counts(); r >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the device was never re-pointed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("run returned %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	st := waitIndex(t, cfg.ControlSocket, 3) // Index never changed
+	_ = st
+	stopRun(t, cancel, done)
+	if _, _, d := k.counts(); len(d) != 0 {
+		t.Fatalf("disconnected %v", d)
+	}
+}
+
+func TestRunExitsNonZeroWithoutDisconnectingWhenRepointFails(t *testing.T) {
+	shortConfirm(t)
+	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	k.cleanup(t)
+	done := runAsync(context.Background(), cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+	k.setReconnectErr(errors.New("EINVAL"))
+	k.close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("run exited zero though it could not take the device back")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return")
+	}
+	if _, _, d := k.counts(); len(d) != 0 {
+		t.Fatalf("disconnected %v, which still carries the mount", d)
+	}
+}
+
+func TestRunDisconnectsOnlyOnStopRequest(t *testing.T) {
+	cfg, _ := testConfig(t)
+	k := &fakeKernel{connectIdx: 5}
+	k.cleanup(t)
+	done := runAsync(context.Background(), cfg, k)
+	waitIndex(t, cfg.ControlSocket, 5)
+	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dcancel()
+	cli, err := Dial(dctx, cfg.ControlSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Stop(dctx); err != nil {
+		t.Fatal(err)
+	}
+	_ = cli.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, d := k.counts(); len(d) != 1 || d[0] != 5 {
+		t.Fatalf("disconnects %v, want [5]", d)
+	}
+}
+
+// Important 3: a device in use is never re-pointed at a cache built from the
+// store.
+func TestRunRefusesALeftDeviceWithNoCacheIndex(t *testing.T) {
+	cfg, _ := testConfig(t) // no cache yet
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	err := runOn(context.Background(), cfg, testLog(), k)
+	if err == nil {
+		t.Fatal("a left device with no cache index was re-pointed at a cache built from the store")
+	}
+	if _, err := os.Stat(cfg.CacheDir + "/index.json"); err == nil {
+		t.Error("a cache index was created")
+	}
+	if _, r, d := k.counts(); r != 0 || len(d) != 0 {
+		t.Fatalf("touched the device: reconnects %d, disconnects %v", r, d)
+	}
+}
+
+func TestRunRefusesALeftDeviceWhoseCacheGeometryDiffers(t *testing.T) {
+	cfg, _ := testConfig(t)
+	other := cfg
+	other.Chunk = 2 * testChunk
+	other.CacheBound = testBound
+	seedCache(t, other)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	if err := runOn(context.Background(), cfg, testLog(), k); err == nil {
+		t.Fatal("served a device from a cache of another geometry")
+	}
+	if _, r, d := k.counts(); r != 0 || len(d) != 0 {
+		t.Fatalf("touched the device: reconnects %d, disconnects %v", r, d)
+	}
+}
+
+// O1: a second server on the same cache directory is refused before it looks
+// at the cache or the device.
+func TestRunRefusesACacheHeldByAnotherServer(t *testing.T) {
+	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
+	held, err := lockCache(cfg.CacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	if err := runOn(context.Background(), cfg, testLog(), k); err == nil {
+		t.Fatal("run started on a locked cache")
+	}
+	if c, r, d := k.counts(); c != 0 || r != 0 || len(d) != 0 {
+		t.Fatalf("touched the kernel: %d %d %v", c, r, d)
+	}
+	held.release(nil)
+	k.cleanup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+	stopRun(t, cancel, done)
+}
+
+func TestLockCacheIsExclusiveUntilReleased(t *testing.T) {
+	dir := t.TempDir()
+	a, err := lockCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockCache(dir); err == nil {
+		t.Fatal("a second lock on the same directory succeeded")
+	}
+	a.release(nil)
+	b, err := lockCache(dir)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	b.release(nil)
+}
+
+// The lock goes last: by then the serve loop has returned, the control service
+// is closed and the cache is closed, on every way out.
+func TestLockIsReleasedAfterServeAndCacheAreDone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T) error
+	}{
+		{"signal", func(t *testing.T) error {
+			cfg, _ := testConfig(t)
+			seedCache(t, cfg)
+			k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+			k.cleanup(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := runAsync(ctx, cfg, k)
+			waitIndex(t, cfg.ControlSocket, 3)
+			cancel()
+			return <-done
+		}},
+		{"never confirmed", func(t *testing.T) error {
+			shortConfirm(t)
+			cfg, _ := testConfig(t)
+			seedCache(t, cfg)
+			k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}, drops: 1 << 30}
+			k.cleanup(t)
+			return runOn(context.Background(), cfg, testLog(), k)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			var closedErr error
+			var ctlGone bool
+			onUnlock = func(s *server) {
+				calls++
+				if s == nil {
+					return
+				}
+				closedErr = s.back.cache.Grow(s.back.Size()) // ErrClosed once closed
+				c, err := net.Dial("unix", s.cfg.ControlSocket)
+				if err == nil {
+					_ = c.Close()
+				}
+				ctlGone = err != nil
+			}
+			t.Cleanup(func() { onUnlock = nil })
+			_ = tc.run(t)
+			if calls != 1 {
+				t.Fatalf("lock released %d times", calls)
+			}
+			if !errors.Is(closedErr, os.ErrClosed) {
+				t.Errorf("the cache was still open when the lock was released (%v)", closedErr)
+			}
+			if !ctlGone {
+				t.Error("the control service was still up when the lock was released")
+			}
+		})
+	}
+}
+
+// Important 2: the kernel grows first, so a failure leaves the cache as it was.
+func TestGrowReconfiguresTheKernelBeforeTheCache(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	s.setDevice(&fakeDevice{idx: 7, reconfigErr: errors.New("netlink failed")})
+	if err := s.growTo(context.Background(), 2*testSize); err == nil {
+		t.Fatal("grow succeeded though the kernel refused")
+	}
+	if s.back.Size() != testSize || s.back.cache.Index().Size != testSize {
+		t.Fatalf("the cache grew to %d (index %d) though the kernel did not", s.back.Size(), s.back.cache.Index().Size)
+	}
+}
+
+// A cache index larger than the arguments is adopted, not refused.
+func TestResumeAdoptsALargerIndex(t *testing.T) {
+	cfg, _ := testConfig(t)
+	big := cfg
+	big.Size = 2 * testSize
+	seedCache(t, big)
+	s, err := newServer(context.Background(), cfg, testLog())
+	if err != nil {
+		t.Fatalf("restart refused after a grow the arguments predate: %v", err)
+	}
+	defer func() { _ = s.close() }()
+	if s.back.Size() != 2*testSize || s.cfg.Size != 2*testSize {
+		t.Fatalf("size %d, want %d", s.back.Size(), 2*testSize)
 	}
 }
 

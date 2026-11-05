@@ -43,6 +43,8 @@ type kernelAPI interface {
 	// reconnect hands sock, already through the handshake, to the device.
 	reconnect(ctx context.Context, idx int, sock *os.File) error
 	disconnect(ctx context.Context, idx int) error
+	// resize sets the device's size, sending no socket.
+	resize(ctx context.Context, idx int, size int64) error
 	// touch sends one request through the device to offset 0 and returns
 	// once it completes. b is the backend that serves the device's socket;
 	// the kernel reaches it over the socket, a fake may call it directly.
@@ -71,6 +73,10 @@ func (realKernel) reconnect(ctx context.Context, idx int, sock *os.File) error {
 }
 
 func (realKernel) disconnect(ctx context.Context, idx int) error { return nbd.Disconnect(ctx, idx) }
+
+func (realKernel) resize(ctx context.Context, idx int, size int64) error {
+	return nbd.Reconfigure(ctx, idx, size)
+}
 
 // touch reads one block at offset 0 of /dev/nbdN with O_DIRECT, so the read
 // goes to the server rather than the page cache. The read blocks while the
@@ -149,6 +155,18 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 
 func runOn(ctx context.Context, cfg Config, log *slog.Logger, k kernelAPI) error {
 	cfg = cfg.withDefaults()
+	// First of all, so that no two incarnations of this volume's server can
+	// both look at the device, let alone re-point it. Released last (deferred
+	// first), after the serve loop has returned and the cache is closed: a
+	// process that lingers past giving up (the probe read below cannot be
+	// interrupted) must not touch the cache once the next one may hold it.
+	var s *server
+	lock, err := lockCache(cfg.CacheDir)
+	if err != nil {
+		return err
+	}
+	defer func() { lock.release(s) }()
+
 	left, err := leftDevice(k, cfg.Volume)
 	if err != nil {
 		return err
@@ -159,8 +177,14 @@ func runOn(ctx context.Context, cfg Config, log *slog.Logger, k kernelAPI) error
 			return err
 		}
 	}
-	s, err := newServer(ctx, cfg, log)
+	// A device that is already carrying a mount is only ever re-pointed at the
+	// cache that served it: one rebuilt from the store would be older than the
+	// filesystem above it.
+	s, err = openServer(ctx, cfg, log, left != nil)
 	if err != nil {
+		if left != nil {
+			err = fmt.Errorf("blockd: nbd%d carries volume %q and is left in place: %w", left.Index, cfg.Volume, err)
+		}
 		return err
 	}
 	defer func() { _ = s.close() }()
@@ -173,47 +197,36 @@ func runOn(ctx context.Context, cfg Config, log *slog.Logger, k kernelAPI) error
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	srvConn, cliFile, err := socketpair()
-	if err != nil {
-		_ = lis.Close()
-		return err
-	}
-	var back nbd.Backend = s.back
-	var notify *notifyBackend
-	if left != nil {
-		notify = newNotifyBackend(s.back)
-		back = notify
-	}
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- nbd.Serve(runCtx, srvConn, back, nbd.ServeOptions{
-			ReadOnly: s.cfg.ReadOnly, BlockSize: blockSize, MaxRequest: maxRequest,
-		})
-	}()
-
 	// The control service answers from here on, with Status.Index -1 until the
 	// device is known to be served by this process.
 	ctlErr := make(chan error, 1)
 	go func() { ctlErr <- s.serveControl(runCtx, lis) }()
 
+	srv, err := startServe(runCtx, s, left != nil)
+	if err != nil {
+		cancel()
+		drainControl(log, s, ctlErr)
+		return err
+	}
+
 	var idx int
 	path := "connect"
 	if left == nil {
-		idx, err = connectDevice(ctx, k, s.cfg, cliFile)
+		idx, err = connectDevice(ctx, k, s.cfg, srv.cli)
 	} else {
 		path = "reconfigure"
 		idx = left.Index
-		err = reconfigureDevice(ctx, k, s.cfg, idx, cliFile, notify)
+		err = reconfigureDevice(ctx, k, s.cfg, idx, srv.cli, srv.notify)
+		if err == nil && left.Size < s.cfg.Size {
+			// Finish a grow that was interrupted before its kernel half.
+			err = k.resize(ctx, idx, s.cfg.Size)
+		}
 	}
-	_ = cliFile.Close() // the kernel holds its own reference
+	_ = srv.cli.Close() // the kernel holds its own reference
 	if err != nil {
 		cancel()
-		if serr := <-serveErr; serr != nil {
-			log.Warn("serve ended", "volume", s.cfg.Volume, "err", serr)
-		}
-		if cerr := <-ctlErr; cerr != nil {
-			log.Warn("control ended", "volume", s.cfg.Volume, "err", cerr)
-		}
+		srv.drain(log, s)
+		drainControl(log, s, ctlErr)
 		return err
 	}
 	s.setDevice(kernelDevice{idx: idx})
@@ -223,41 +236,119 @@ func runOn(ctx context.Context, cfg Config, log *slog.Logger, k kernelAPI) error
 		go s.back.prefetch(runCtx)
 	}
 
-	var serveDied error
-	select {
-	case <-s.stop:
-		log.Info("blockd stopping on request", "volume", s.cfg.Volume)
-	case <-ctx.Done():
-		log.Info("blockd stopping on signal", "volume", s.cfg.Volume)
-	case serveDied = <-serveErr:
-		// Serve returned on its own: the kernel tore the connection down (a
-		// request timed out) or the socket broke. The device is no longer
-		// served, so there is nothing to keep running for.
-		log.Error("serve ended unexpectedly", "volume", s.cfg.Volume, "err", serveDied)
+	// The device is disconnected only on a Stop request, which is unstage: the
+	// mount above it is gone. Every other way out leaves it configured, with
+	// its mapping and mount, for the next incarnation to re-point (decision 51).
+	var stopped bool
+	var fail error
+loop:
+	for {
+		select {
+		case <-s.stop:
+			log.Info("blockd stopping on request", "volume", s.cfg.Volume)
+			stopped = true
+			break loop
+		case <-ctx.Done():
+			log.Info("blockd stopping on signal; the device is left in place", "volume", s.cfg.Volume, "device", idx)
+			break loop
+		case serr := <-srv.err:
+			srv = nil // its result is taken
+			// Serve returned on its own. A request timing out makes the kernel
+			// shut our socket down, and it then holds requests for the
+			// dead-connection timeout waiting for a new one: give it one.
+			if ctx.Err() != nil {
+				break loop
+			}
+			if serr == nil {
+				// A clean NBD_CMD_DISC: someone disconnected the device.
+				log.Warn("device disconnected from outside", "volume", s.cfg.Volume, "device", idx)
+				break loop
+			}
+			log.Error("serve ended unexpectedly; re-pointing the device", "volume", s.cfg.Volume, "device", idx, "err", serr)
+			nsrv, err := repoint(runCtx, ctx, k, s, idx)
+			srv = nsrv
+			if err != nil {
+				fail = err
+				break loop
+			}
+			log.Info("blockd serving", "volume", s.cfg.Volume, "path", "repoint", "device", idx, "size", s.cfg.Size)
+		}
 	}
 
 	cancel() // stops the serve loop and the control loop
 
-	dctx, dcancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer dcancel()
-	if err := k.disconnect(dctx, idx); err != nil {
-		log.Warn("disconnect failed", "volume", s.cfg.Volume, "device", idx, "err", err)
-	}
-	if serveDied == nil {
-		if serr := <-serveErr; serr != nil {
-			log.Warn("serve ended", "volume", s.cfg.Volume, "err", serr)
+	if stopped {
+		dctx, dcancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer dcancel()
+		if err := k.disconnect(dctx, idx); err != nil {
+			log.Warn("disconnect failed", "volume", s.cfg.Volume, "device", idx, "err", err)
 		}
 	}
+	srv.drain(log, s)
+	drainControl(log, s, ctlErr)
+	if err := s.back.cache.Sync(); err != nil && fail == nil {
+		fail = fmt.Errorf("blockd: final sync: %w", err)
+	}
+	// A failure to take the device back after a serve death is returned, so the
+	// unit exits non-zero and systemd restarts it; the device is still there.
+	return fail
+}
+
+// serving is one serve loop and the client end of its socket.
+type serving struct {
+	cli    *os.File
+	err    chan error
+	notify *notifyBackend // nil when the first request is not awaited
+}
+
+// startServe starts a serve loop on a new socketpair; cli is the end for the
+// kernel. With confirm set the backend marks the first request it sees.
+func startServe(ctx context.Context, s *server, confirm bool) (*serving, error) {
+	srvConn, cliFile, err := socketpair()
+	if err != nil {
+		return nil, err
+	}
+	sv := &serving{cli: cliFile, err: make(chan error, 1)}
+	var back nbd.Backend = s.back
+	if confirm {
+		sv.notify = newNotifyBackend(s.back)
+		back = sv.notify
+	}
+	go func() {
+		sv.err <- nbd.Serve(ctx, srvConn, back, nbd.ServeOptions{
+			ReadOnly: s.cfg.ReadOnly, BlockSize: blockSize, MaxRequest: maxRequest,
+		})
+	}()
+	return sv, nil
+}
+
+// drain waits for the serve loop (whose context is cancelled) and logs how it ended.
+func (sv *serving) drain(log *slog.Logger, s *server) {
+	if sv == nil {
+		return
+	}
+	if serr := <-sv.err; serr != nil {
+		log.Warn("serve ended", "volume", s.cfg.Volume, "err", serr)
+	}
+}
+
+func drainControl(log *slog.Logger, s *server, ctlErr <-chan error) {
 	if cerr := <-ctlErr; cerr != nil {
 		log.Warn("control ended", "volume", s.cfg.Volume, "err", cerr)
 	}
-	if err := s.back.cache.Sync(); err != nil {
-		return fmt.Errorf("blockd: final sync: %w", err)
+}
+
+// repoint serves the device again after its serve loop died: a new socket, the
+// handshake, a reconfigure and the same confirmation as at start. On failure
+// the device is left as it is.
+func repoint(runCtx, ctx context.Context, k kernelAPI, s *server, idx int) (*serving, error) {
+	sv, err := startServe(runCtx, s, true)
+	if err != nil {
+		return nil, err
 	}
-	// M8: a serve that died on its own is logged at Error but not returned, so
-	// the transient unit exits clean (inactive, collected) rather than failed;
-	// the reconciler notices the gone device through sysfs and restages.
-	return nil
+	err = reconfigureDevice(ctx, k, s.cfg, idx, sv.cli, sv.notify)
+	_ = sv.cli.Close()
+	return sv, err
 }
 
 // serverFlags are the nbd transmission flags the device advertises.
@@ -298,19 +389,17 @@ func leftDevice(k kernelAPI, volume string) (*nbd.Device, error) {
 }
 
 // adoptDeviceSize returns cfg with the size of a device left by a previous
-// server. A device can have been grown after this unit's arguments were
-// written, so it may be larger than cfg.Size: then the larger size is served,
-// which a cache index that recorded the growth already says (the server grows
-// one that did not). A device smaller than cfg.Size cannot serve it, and a
-// size that is not whole chunks cannot be served at all: both are refused.
+// server taken into account. A size never shrinks, so the size served is the
+// larger of the unit's arguments and the device: the device can have been
+// grown after the arguments were written, or the arguments can have been
+// raised for a grow that never reached the device (Run then finishes it).
+// The cache index is the third party to this; resuming it adopts a larger one.
+// Only a size that is not whole chunks is refused.
 func adoptDeviceSize(cfg Config, d nbd.Device) (Config, error) {
-	switch {
-	case d.Size < cfg.Size:
-		return cfg, fmt.Errorf("blockd: nbd%d is %d bytes, smaller than the configured %d", d.Index, d.Size, cfg.Size)
-	case cfg.Chunk <= 0 || d.Size%cfg.Chunk != 0:
+	if cfg.Chunk <= 0 || d.Size%cfg.Chunk != 0 {
 		return cfg, fmt.Errorf("blockd: nbd%d is %d bytes, not a whole number of %d byte chunks", d.Index, d.Size, cfg.Chunk)
 	}
-	cfg.Size = d.Size
+	cfg.Size = max(cfg.Size, d.Size)
 	return cfg, nil
 }
 

@@ -75,6 +75,13 @@ type server struct {
 // from, and builds the backend. It does not connect an nbd device; Run does
 // that and calls setDevice.
 func newServer(ctx context.Context, cfg Config, log *slog.Logger) (*server, error) {
+	return openServer(ctx, cfg, log, false)
+}
+
+// openServer is newServer; with resumeOnly it refuses to build a cache from the
+// store when there is none to resume, which is what a server about to serve a
+// device that already carries a mount must do.
+func openServer(ctx context.Context, cfg Config, log *slog.Logger, resumeOnly bool) (*server, error) {
 	cfg = cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -83,7 +90,7 @@ func newServer(ctx context.Context, cfg Config, log *slog.Logger) (*server, erro
 	if err != nil {
 		return nil, err
 	}
-	c, base, baseName, baseTime, err := openOrCreateCache(ctx, cfg, store)
+	c, base, baseName, baseTime, err := openOrCreateCache(ctx, &cfg, store, resumeOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +119,7 @@ func newServer(ctx context.Context, cfg Config, log *slog.Logger) (*server, erro
 // otherwise creates it from the store's current manifest (or empty for a new
 // volume). It returns the cache, the base manifest's chunk hashes (nil when
 // there is no base) and the base manifest name.
-func openOrCreateCache(ctx context.Context, cfg Config, store *chunk.Store) (*cache.Cache, []chunk.Hash, string, time.Time, error) {
+func openOrCreateCache(ctx context.Context, cfg *Config, store *chunk.Store, resumeOnly bool) (*cache.Cache, []chunk.Hash, string, time.Time, error) {
 	c, err := cache.Open(cfg.CacheDir, cfg.CacheBound)
 	switch {
 	case err == nil:
@@ -123,7 +130,10 @@ func openOrCreateCache(ctx context.Context, cfg Config, store *chunk.Store) (*ca
 		}
 		return c, base, name, t, nil
 	case errors.Is(err, cache.ErrNoIndex):
-		return createCache(ctx, cfg, store)
+		if resumeOnly {
+			return nil, nil, "", time.Time{}, fmt.Errorf("blockd: no cache index in %s to resume from; a device in use is not served from the store", cfg.CacheDir)
+		}
+		return createCache(ctx, *cfg, store)
 	default:
 		return nil, nil, "", time.Time{}, err
 	}
@@ -136,13 +146,14 @@ func openOrCreateCache(ctx context.Context, cfg Config, store *chunk.Store) (*ca
 // its chunks dirty and drops the frozen copies, so the next generation
 // re-snapshots and publishes with a store-derived sequence, rather than every
 // later Boundary returning ErrBoundaryActive forever.
-func resumeCache(ctx context.Context, c *cache.Cache, cfg Config, store *chunk.Store) ([]chunk.Hash, string, time.Time, error) {
+func resumeCache(ctx context.Context, c *cache.Cache, cfg *Config, store *chunk.Store) ([]chunk.Hash, string, time.Time, error) {
 	idx := c.Index()
 	if idx.Chunk != cfg.Chunk {
 		return nil, "", time.Time{}, fmt.Errorf("blockd: cache chunk size %d, config says %d", idx.Chunk, cfg.Chunk)
 	}
 	if cfg.Size < idx.Size {
-		return nil, "", time.Time{}, fmt.Errorf("blockd: cache size %d is larger than the config's %d", idx.Size, cfg.Size)
+		// A size never shrinks: the index records a grow the arguments predate.
+		cfg.Size = idx.Size
 	}
 	if cfg.Size > idx.Size {
 		if err := c.Grow(cfg.Size); err != nil {
