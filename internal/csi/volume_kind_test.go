@@ -2,8 +2,10 @@ package csi
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	"github.com/greghaskins/csi-miami/internal/holder"
+	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -149,63 +152,133 @@ func createdVolume(t *testing.T, e *env) (id, parent string) {
 	return resp.GetVolume().GetVolumeId(), e.mountDir()
 }
 
-func TestDeleteVolumeRefusesLiveHolder(t *testing.T) {
+// ageHolder sets the holder file's modification time d in the past.
+func ageHolder(t *testing.T, parent string, d time.Duration) {
+	t.Helper()
+	old := time.Now().Add(-d)
+	if err := os.Chtimes(holder.Path(parent, nameA), old, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Decision 52: a holder file means a node still owns unsynced data, however
+// old it is, so the delete is refused for a fresh holder and for one that has
+// not renewed for far longer than the old takeover timeout alike.
+func TestDeleteVolumeRefusesAnyHolder(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+	}{
+		{"fresh holder", 0},
+		{"old holder", 100 * volume.DefaultTakeoverTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := newEnv(t)
+			id, parent := createdVolume(t, e)
+			if _, err := holder.Acquire(context.Background(), parent, nameA, "node-a", holder.Judgement{}); err != nil {
+				t.Fatal(err)
+			}
+			ageHolder(t, parent, tc.age)
+
+			_, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(id))
+			if codeOf(err) != codes.Unavailable {
+				t.Fatalf("code = %v (%v), want Unavailable", codeOf(err), err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "node-a") || !strings.Contains(msg, "force-detach") {
+				t.Errorf("message %q does not name the holder and the way through", msg)
+			}
+			mustExist(t, filepath.Join(parent, nameA))
+			mustExist(t, holder.Path(parent, nameA))
+		})
+	}
+}
+
+// The emergency detach: an annotation naming exactly the holder's node and
+// epoch lets the delete through; anything else is ignored.
+func TestDeleteVolumeForceDetachAnnotation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		value  func(h *holder.Holder) string
+		delete bool
+	}{
+		{"matching", func(h *holder.Holder) string { return fmt.Sprintf("node-a@%d", h.Epoch()) }, true},
+		{"stale epoch", func(h *holder.Holder) string { return fmt.Sprintf("node-a@%d", h.Epoch()+1) }, false},
+		{"other node", func(h *holder.Holder) string { return fmt.Sprintf("node-b@%d", h.Epoch()) }, false},
+		{"empty", func(*holder.Holder) string { return "" }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := newEnv(t)
+			resp, err := e.ctrl.CreateVolume(context.Background(), e.volumeReq(nameA, 1<<30))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent := e.mountDir()
+			h, err := holder.Acquire(context.Background(), parent, nameA, "node-a", holder.Judgement{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pv := pvFor(resp)
+			pv.Annotations = map[string]string{kube.AnnotationForceDetach: tc.value(h)}
+			e.pvs.Add(pv)
+
+			_, err = e.ctrl.DeleteVolume(context.Background(), deleteReq(resp.GetVolume().GetVolumeId()))
+			if tc.delete {
+				if err != nil {
+					t.Fatalf("delete with a matching annotation: %v", err)
+				}
+				mustNotExist(t, filepath.Join(parent, nameA))
+				mustNotExist(t, holder.Path(parent, nameA))
+				// The Warn names the epoch of the holder file, not the
+				// annotation's text.
+				if want := fmt.Sprintf("node=node-a epoch=%d", h.Epoch()); !strings.Contains(e.logs.String(), want) {
+					t.Errorf("no warning with %q in the log:\n%s", want, e.logs.String())
+				}
+				return
+			}
+			if strings.Contains(e.logs.String(), "abandon") {
+				t.Errorf("a refused delete logged an abandonment:\n%s", e.logs.String())
+			}
+			if codeOf(err) != codes.Unavailable || !strings.Contains(err.Error(), "did not match") {
+				t.Fatalf("err = %v, want Unavailable saying the annotation did not match", err)
+			}
+			mustExist(t, filepath.Join(parent, nameA))
+		})
+	}
+}
+
+// The abandonment is on record before anything is removed, so it is there even
+// if the removal fails half way: the warning is in the log by the time the
+// removal first reads the mount table.
+func TestDeleteVolumeForceDetachLogsBeforeRemoving(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	id, parent := createdVolume(t, e)
+	resp, err := e.ctrl.CreateVolume(context.Background(), e.volumeReq(nameA, 1<<30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := e.mountDir()
 	h, err := holder.Acquire(context.Background(), parent, nameA, "node-a", holder.Judgement{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	pv := pvFor(resp)
+	pv.Annotations = map[string]string{kube.AnnotationForceDetach: fmt.Sprintf("node-a@%d", h.Epoch())}
+	e.pvs.Add(pv)
 
-	_, err = e.ctrl.DeleteVolume(context.Background(), deleteReq(id))
-	if codeOf(err) != codes.Unavailable {
-		t.Fatalf("code = %v (%v), want Unavailable while a holder is live", codeOf(err), err)
-	}
-	mustExist(t, filepath.Join(parent, nameA))
-
-	// A holder that has not renewed for longer than the takeover timeout is a
-	// dead node's: the delete goes on and takes the holder files with it.
-	old := time.Now().Add(-2 * volume.DefaultTakeoverTimeout)
-	if err := os.Chtimes(holder.Path(parent, nameA), old, old); err != nil {
+	var atLastRead string
+	e.mounter.onMounts = func() { atLastRead = e.logs.String() }
+	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(resp.GetVolume().GetVolumeId())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(id)); err != nil {
-		t.Fatalf("delete past the takeover timeout: %v", err)
+	if !strings.Contains(atLastRead, "abandon") {
+		t.Errorf("the removal began before the abandonment was logged:\n%s", atLastRead)
 	}
-	mustNotExist(t, filepath.Join(parent, nameA))
+	// And the holder files were still there when it was logged: they go last.
 	mustNotExist(t, holder.Path(parent, nameA))
-	_ = h
-}
-
-// A takeoverTimeout set on the class decides what "live" means: a holder aged
-// past the default but inside the configured value still blocks the delete.
-func TestDeleteVolumeHonoursTheClassTakeoverTimeout(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	resp, err := e.ctrl.CreateVolume(context.Background(), e.volumeReq(nameA, 1<<30, "takeoverTimeout", "30m"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.pvs.Add(pvFor(resp))
-	id, parent := resp.GetVolume().GetVolumeId(), e.mountDir()
-	if _, err := holder.Acquire(context.Background(), parent, nameA, "node-a", holder.Judgement{}); err != nil {
-		t.Fatal(err)
-	}
-	age := func(d time.Duration) {
-		old := time.Now().Add(-d)
-		if err := os.Chtimes(holder.Path(parent, nameA), old, old); err != nil {
-			t.Fatal(err)
-		}
-	}
-	age(10 * time.Minute) // past the 5m default, inside 30m
-	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(id)); codeOf(err) != codes.Unavailable {
-		t.Fatalf("code = %v, want Unavailable: the class says 30m", codeOf(err))
-	}
-	age(40 * time.Minute)
-	if _, err := e.ctrl.DeleteVolume(context.Background(), deleteReq(id)); err != nil {
-		t.Fatalf("delete past the configured timeout: %v", err)
-	}
 }
 
 func TestDeleteVolumeWithoutHolder(t *testing.T) {
