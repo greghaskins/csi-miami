@@ -22,7 +22,7 @@ const (
 	ParamTakeoverTimeout    = "takeoverTimeout"
 	cipherAdiantum          = "xchacha12,aes-adiantum-plain64"
 	cipherXTS               = "aes-xts-plain64"
-	minGenerationInterval   = time.Minute
+	MinGenerationInterval   = time.Minute
 	maxKeySizeBits          = 512
 	defaultEncryption       = true
 	DefaultCipher           = cipherAdiantum
@@ -96,7 +96,7 @@ func (v VolumeParams) check() error {
 	switch {
 	case g.Keep < 1:
 		return invalid("generations.keep must be at least 1")
-	case g.Interval < minGenerationInterval:
+	case g.Interval < MinGenerationInterval:
 		return invalid("generations.interval must be at least 1m")
 	case g.MaxAge < g.Interval:
 		return invalid("generations.maxAge must be at least generations.interval")

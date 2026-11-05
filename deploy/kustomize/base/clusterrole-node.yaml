@@ -1,6 +1,9 @@
 # What the node binary's event recorder (internal/kube/events.go) does: it
-# reads the PersistentVolume an event is about. A PersistentVolume is
-# cluster-scoped, so this is the one cluster-wide grant the node holds. The
+# reads the PersistentVolume an event is about, and the generation timers
+# (internal/reconcile/generation.go) read its miami.csi.greghaskins.com/publish
+# annotation, one `get` per staged volume per pass. A PersistentVolume is
+# cluster-scoped, so this is the one cluster-wide grant the node holds. It is
+# read-only: the node never writes an annotation. The
 # events it writes are namespaced (the `default` namespace) and have their own
 # Role, role-node.yaml. The registrar and the liveness probe call no API.
 apiVersion: rbac.authorization.k8s.io/v1

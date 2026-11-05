@@ -119,6 +119,7 @@ func (r *Reconciler) runPass(ctx context.Context, batch []*request) {
 	p.keys = batchKeys(batch)
 	p.teardown(batch)
 	p.convergeAll()
+	p.generationTick()
 	p.reportIntents()
 	p.reportConditions()
 	p.collectGarbage(batch, len(loaded.Failures) == 0)

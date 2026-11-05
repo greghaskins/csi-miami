@@ -149,6 +149,11 @@ var (
 	// of Converge.
 	ErrGenerationOverdue = errors.New("the volume's newest generation is overdue")
 
+	// ErrGenerationSkipped is returned by a volume item's Generation when a
+	// publish was already in flight, so that no file system was frozen and
+	// nothing was done. It is not a failure: the next trigger tries again.
+	ErrGenerationSkipped = errors.New("a publish is in flight; the generation is skipped")
+
 	// ErrPublishRefused is the condition of a volume whose generations the
 	// store refuses because the volume is no longer ours.
 	ErrPublishRefused = errors.New("the store refuses the volume's generations: it is no longer ours")
