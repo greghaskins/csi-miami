@@ -1043,6 +1043,25 @@ func (e *env) manifests(ctx context.Context, vol volumeInfo) ([]manifestID, erro
 	return ms, nil
 }
 
+// newestOfEpoch is the newest manifest in the volume's directory made under a
+// holder epoch, zero if there is none.
+func (e *env) newestOfEpoch(t *testing.T, vol volumeInfo, epoch uint64) manifestID {
+	t.Helper()
+	ctx, cancel := e.withDeadline()
+	defer cancel()
+	ms, err := e.manifests(ctx, vol)
+	if err != nil {
+		t.Fatalf("listing the manifests: %v", err)
+	}
+	var newest manifestID
+	for _, m := range ms {
+		if m.Epoch == epoch && m.after(newest) {
+			newest = m
+		}
+	}
+	return newest
+}
+
 // currentID is the manifest `current` names, zero while there is none.
 func (e *env) currentID(ctx context.Context, vol volumeInfo) (manifestID, error) {
 	name, ok, err := e.storeCurrent(ctx, vol)

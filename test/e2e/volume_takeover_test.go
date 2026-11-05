@@ -63,7 +63,6 @@ func takeover(t *testing.T, e *env, mode string) {
 
 	// A generation, so that there is something to mount from on the other node.
 	cur0 := e.waitStoreCurrent(t, vol, "", "the first generation (current)")
-	cur0ID, _ := parseManifest(cur0)
 	ctx, cancel := e.withDeadline()
 	held, err := e.holder(ctx, vol)
 	cancel()
@@ -80,6 +79,9 @@ func takeover(t *testing.T, e *env, mode string) {
 	// the other worker reaches the driver and cannot have the volume.
 	// (downTheNode also deletes the VolumeAttachment: that stands in for the attach-detach controller's six-minute forced detach, or the out-of-service taint's immediate one. It is cluster behaviour, not something the driver does.)
 	n.downTheNode(t, a, "a", vol)
+	// The old holder's last generation, now that it is down: a routine one
+	// from before the crash is not the fenced node publishing.
+	lastOfA := e.newestOfEpoch(t, vol, held.Epoch)
 	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
 	n.waitHolderContended(t, "b", vol)
 	deadline := time.Now().Add(holdWait)
@@ -181,9 +183,9 @@ func takeover(t *testing.T, e *env, mode string) {
 		// The fenced node publishes nothing: no manifest of its epoch appears
 		// beyond the last one it published before the crash.
 		for _, m := range ms {
-			if m.Epoch == held.Epoch && m.after(cur0ID) {
+			if m.Epoch == held.Epoch && m.after(lastOfA) {
 				cancel()
-				t.Fatalf("manifest %d.%d, of the old holder's epoch, appeared after its last generation %d.%d: the fenced node published", m.Epoch, m.Seq, cur0ID.Epoch, cur0ID.Seq)
+				t.Fatalf("manifest %d.%d, of the old holder's epoch, appeared after its last generation %d.%d, made before its node went down: the fenced node published", m.Epoch, m.Seq, lastOfA.Epoch, lastOfA.Seq)
 			}
 		}
 		h, herr := e.holder(ctx, vol)
@@ -245,7 +247,6 @@ func TestVolumeOrphanDrain(t *testing.T) {
 	// A generation, then synced writes that only the cache holds: five more
 	// than the generation had.
 	cur0 := e.waitStoreCurrent(t, vol, "", "the first generation (current)")
-	cur0ID, _ := parseManifest(cur0)
 	ctx, cancel := e.withDeadline()
 	log0, err := e.logs(ctx, n.Name, "a")
 	cancel()
@@ -270,6 +271,10 @@ func TestVolumeOrphanDrain(t *testing.T) {
 	// record of the volume kept.
 	// (downTheNode also deletes the VolumeAttachment: that stands in for the attach-detach controller's six-minute forced detach, or the out-of-service taint's immediate one. It is cluster behaviour, not something the driver does.)
 	n.downTheNode(t, a, "a", vol)
+	// The old holder's last generation, now that it is down: the drain must
+	// publish one newer, not be credited with a routine one from before the
+	// crash.
+	lastOfA := e.newestOfEpoch(t, vol, held.Epoch)
 	ctx, cancel = e.withDeadline()
 	hasCache, cacheErr := nodeDirExists(ctx, a, cachePath(vol.PV))
 	hasIntent, intentErr := existsOn(ctx, func(argv ...string) (string, error) { return nodeExec(ctx, a, argv...) }, "-f", intentPath(vol.ID))
@@ -318,12 +323,12 @@ func TestVolumeOrphanDrain(t *testing.T) {
 	// before it let go; nothing was discarded; and nothing was taken over.
 	published := false
 	for _, m := range ms {
-		if m.Epoch == held.Epoch && m.after(cur0ID) {
+		if m.Epoch == held.Epoch && m.after(lastOfA) {
 			published = true
 		}
 	}
 	if !published {
-		t.Errorf("no manifest of the old holder's epoch %d newer than its first generation %d.%d: it released without publishing the dirty chunks (manifests %v)", held.Epoch, cur0ID.Epoch, cur0ID.Seq, ms)
+		t.Errorf("no manifest of the old holder's epoch %d newer than its last generation before the crash, %d.%d: it released without publishing the dirty chunks (manifests %v)", held.Epoch, lastOfA.Epoch, lastOfA.Seq, ms)
 	}
 	if len(lost) != 0 {
 		t.Errorf("%d GenerationLost events on %s: the old holder discarded unpublished writes: %s", len(lost), vol.PV, lost[0].Message)
