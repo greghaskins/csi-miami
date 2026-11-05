@@ -48,17 +48,15 @@ os.close(fd)
 mode = stat.S_IMODE(os.stat("blob.sh").st_mode)
 if mode != 0o755:
     fail("exec bit", "mode is %o, want 755" % mode)
-try:
-    r = subprocess.run(["./blob.sh"], capture_output=True, text=True)
-except OSError as e:
-    mi = [l.strip() for l in open("/proc/self/mountinfo") if " /data " in l]
-    fail("exec bit", "running ./blob.sh: %s; mode %o; mountinfo %s; uid %d" % (e, stat.S_IMODE(os.stat("blob.sh").st_mode), mi, os.getuid()))
+r = subprocess.run(["./blob.sh"], capture_output=True, text=True)
 if r.returncode != 0 or r.stdout.strip() != "blob-ran":
     fail("exec bit", "running it gave %r %r" % (r.returncode, r.stdout + r.stderr))
 os.chmod("blob.sh", 0o644)
-r = subprocess.run(["./blob.sh"], capture_output=True, text=True)
-if r.returncode == 0:
+try:
+    subprocess.run(["./blob.sh"], capture_output=True, text=True)
     fail("exec bit", "a file with mode 644 ran")
+except PermissionError:
+    pass
 os.chmod("blob.sh", 0o755)
 print("ok exec bit (100755)", flush=True)
 
