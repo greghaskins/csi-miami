@@ -131,6 +131,7 @@ type Reconciler struct {
 	lastErr     map[string]string     // volume → text of its last error, for dedup
 	marked      map[string]*markState // volume → retry state of an unstage that has not finished
 	gens        *generations          // the generation timers (generation.go)
+	stopMargin  time.Duration         // added to the items' freeze bound when Run waits for generations
 	reported    map[string]string     // transport dir → kind, for the metrics seam
 	up          map[string]bool       // transport dir → whether it answered its last probe, to log changes
 	kinds       map[string]struct{}   // intent kinds reported, so a kind that empties reads 0
@@ -227,6 +228,7 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		lastErr:     map[string]string{},
 		marked:      map[string]*markState{},
 		gens:        newGenerations(),
+		stopMargin:  defaultStopMargin,
 		reported:    map[string]string{},
 		up:          map[string]bool{},
 		kinds:       map[string]struct{}{},
@@ -746,6 +748,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	r.started = true
 	r.mu.Unlock()
 	defer r.stop()
+	defer r.waitForGenerations()
 
 	ticks, stopTicks := r.newTicker(r.opts.Interval)
 	defer stopTicks()

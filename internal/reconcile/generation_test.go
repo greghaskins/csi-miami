@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,8 +30,15 @@ type genItem struct {
 	block    chan struct{} // when set, GenerationFor waits for it to close
 	triggers []string
 	running  int
-	maxRun   int
-	clock    *fakeClock
+	// freezeBound is what FreezeBound reports. A generation that is cancelled
+	// while blocked takes thawDelay to "thaw" (and waits for stuck, when set,
+	// ignoring its context) and records it in thawed.
+	freezeBound time.Duration
+	thawDelay   time.Duration
+	stuck       chan struct{}
+	thawed      atomic.Bool
+	maxRun      int
+	clock       *fakeClock
 }
 
 func (g *genItem) Kind() volume.Kind                              { return volume.KindVolume }
@@ -39,6 +47,8 @@ func (g *genItem) Converge(context.Context, intent.Intent, item.Observed) error 
 	return nil
 }
 func (g *genItem) Teardown(context.Context, intent.Intent, item.Observed) error { return nil }
+
+func (g *genItem) FreezeBound() time.Duration { return g.freezeBound }
 
 func (g *genItem) Status(context.Context, intent.Intent) (blockd.Status, error) {
 	g.mu.Lock()
@@ -62,6 +72,11 @@ func (g *genItem) GenerationFor(ctx context.Context, _ intent.Intent, trigger st
 		select {
 		case <-block:
 		case <-ctx.Done():
+			if g.stuck != nil {
+				<-g.stuck
+			}
+			time.Sleep(g.thawDelay)
+			g.thawed.Store(true)
 			return ctx.Err()
 		}
 	}
@@ -217,18 +232,24 @@ func TestAnnotationTriggersOnce(t *testing.T) {
 	if got := e.g.calls(); len(got) != 0 {
 		t.Fatalf("calls = %v with no annotation", got)
 	}
+	e.clock.Advance(time.Minute)
 	setValue("a")
 	e.tick()
+	e.clock.Advance(time.Minute)
 	e.tick()
+	e.clock.Advance(time.Minute)
 	e.tick()
 	if got := e.g.calls(); !slices.Equal(got, []string{"request"}) {
 		t.Fatalf("calls = %v, want one request", got)
 	}
 	setValue("")
+	e.clock.Advance(time.Minute)
 	e.tick()
 	setValue("a") // the same value coming back is a new request: it differs from the last seen
+	e.clock.Advance(time.Minute)
 	e.tick()
 	setValue("b")
+	e.clock.Advance(time.Minute)
 	e.tick()
 	if got := e.g.calls(); !slices.Equal(got, []string{"request", "request", "request"}) {
 		t.Fatalf("calls = %v, want three requests", got)
@@ -269,6 +290,7 @@ func TestAnnotationRequestSurvivesAFailedGeneration(t *testing.T) {
 	e.g.set(func(g *genItem) { g.err = errors.New("transport down") })
 	e.tick()
 	e.g.set(func(g *genItem) { g.err = nil })
+	e.tick()
 	e.tick()
 	e.tick()
 	if got := e.g.calls(); !slices.Equal(got, []string{"request", "request"}) {
@@ -518,5 +540,113 @@ func TestOptionsGenerationsAreDefaults(t *testing.T) {
 	e.tick()
 	if got := e.g.calls(); !slices.Equal(got, []string{"interval"}) {
 		t.Fatalf("calls = %v", got)
+	}
+}
+
+// The annotation is a call to the API server: once a minute per volume, not on
+// every pass, and a new value is still honoured within the minute.
+func TestAnnotationIsReadAtMostOncePerMinute(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	reads, value := 0, ""
+	e := newGenEnv(t, func(o *Options) {
+		o.PVAnnotation = func(context.Context, string, string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			reads++
+			return value, nil
+		}
+	})
+	count := func() int { mu.Lock(); defer mu.Unlock(); return reads }
+	for range 5 {
+		e.tick()
+		e.clock.Advance(10 * time.Second)
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("reads = %d in 50 s of passes, want 1", n)
+	}
+	mu.Lock()
+	value = "go"
+	mu.Unlock()
+	e.clock.Advance(10 * time.Second) // a minute since the first read
+	e.tick()
+	if n := count(); n != 2 {
+		t.Fatalf("reads = %d after a minute, want 2", n)
+	}
+	if got := e.g.calls(); !slices.Equal(got, []string{"request"}) {
+		t.Fatalf("calls = %v, want the new value honoured on that read", got)
+	}
+}
+
+// A record that cannot be read for a pass is not a volume that left: its
+// interval and its overdue clock go on.
+func TestTimersSurviveATransientLoadFailure(t *testing.T) {
+	t.Parallel()
+	e := newGenEnv(t)
+	e.g.set(func(g *genItem) { g.status.Dirty = 4096 })
+	e.tick() // first seen: due in 5 minutes
+	e.clock.Advance(4 * time.Minute)
+	good := e.breakRecord(e.in.VolumeID)
+	e.tick() // unreadable for a pass
+	e.restoreRecord(e.in.VolumeID, good)
+	e.clock.Advance(time.Minute)
+	e.tick()
+	if got := e.g.calls(); !slices.Equal(got, []string{"interval"}) {
+		t.Fatalf("calls = %v: the interval was restarted by the unreadable record", got)
+	}
+	// An unstage really ends the state.
+	if err := e.r.runUnstageForTest(e.in.VolumeID); err != nil {
+		t.Logf("unstage: %v", err)
+	}
+	e.r.gens.wait()
+	e.r.gens.mu.Lock()
+	defer e.r.gens.mu.Unlock()
+	if _, ok := e.r.gens.vols[e.in.VolumeID]; ok {
+		t.Error("state kept for a volume that was unstaged")
+	}
+}
+
+// Run does not return while a generation may hold a file system frozen: it
+// cancels them and waits for their thaw.
+func TestShutdownWaitsForTheThaw(t *testing.T) {
+	t.Parallel()
+	e := newGenEnv(t)
+	e.g.set(func(g *genItem) {
+		g.status.Dirty = genCache
+		g.block = make(chan struct{}) // never released: only the cancellation ends it
+		g.freezeBound = 5 * time.Second
+		g.thawDelay = 100 * time.Millisecond
+	})
+	e.start()
+	waitUntil(t, "the generation to start", func() bool { return len(e.g.calls()) == 1 })
+	e.stop() // cancels Run and waits for it to return
+	if !e.g.thawed.Load() {
+		t.Fatal("Run returned before the generation had thawed")
+	}
+}
+
+// The wait is the item's own freeze bound plus a margin, not a constant of the
+// reconciler's, and a generation that outlasts it does not hold Run forever.
+func TestShutdownWaitUsesTheItemsFreezeBound(t *testing.T) {
+	t.Parallel()
+	e := newGenEnv(t)
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	e.g.set(func(g *genItem) {
+		g.status.Dirty = genCache
+		g.block = make(chan struct{})
+		g.freezeBound = 300 * time.Millisecond
+		g.stuck = stuck
+	})
+	e.r.stopMargin = 200 * time.Millisecond
+	e.start()
+	waitUntil(t, "the generation to start", func() bool { return len(e.g.calls()) == 1 })
+	began := time.Now()
+	e.stop()
+	if d := time.Since(began); d < 450*time.Millisecond || d > 5*time.Second {
+		t.Errorf("Run took %s to return, want about the item's bound plus the margin (500ms)", d)
+	}
+	if e.g.thawed.Load() {
+		t.Error("the stuck generation finished; the test did not exercise the bound")
 	}
 }

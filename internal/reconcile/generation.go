@@ -19,9 +19,18 @@ type Generator interface {
 	// GenerationFor makes one generation for the trigger (interval, watermark
 	// or request). item.ErrGenerationSkipped is not a failure.
 	GenerationFor(ctx context.Context, in intent.Intent, trigger string) error
+	// FreezeBound is the longest the item leaves a file system frozen. Run
+	// waits this long (plus a margin) for the generations to finish at exit.
+	FreezeBound() time.Duration
 	// Status reads the block server's status without changing anything.
 	Status(ctx context.Context, in intent.Intent) (blockd.Status, error)
 }
+
+// annotationEvery is how often a volume's PV annotation is read.
+const annotationEvery = time.Minute
+
+// defaultStopMargin is added to the items' freeze bound when Run waits.
+const defaultStopMargin = 2 * time.Second
 
 // Generation triggers, as blockd.PublishArgs names them.
 const (
@@ -56,6 +65,9 @@ type genState struct {
 	// requested holds a new value until a generation has carried it out.
 	seen      string
 	requested bool
+	// annAt is when the annotation was last read; it is read at most once an
+	// annotationEvery, so a request is honoured within about a minute.
+	annAt time.Time
 	// overdue is the verdict of the latest status read; reported is what the
 	// loop last told the world.
 	overdue, reported bool
@@ -113,7 +125,10 @@ func (p *pass) generationTick() {
 	defer g.mu.Unlock()
 	for id := range g.vols {
 		in, recorded := p.intents[id]
-		if _, leaving := p.unstaging[id]; !recorded || in.Unstaging || leaving {
+		_, leaving := p.unstaging[id]
+		// A record that failed to load in this pass may be this volume's: its
+		// clocks go on. The state ends when the volume is unstaged or gone.
+		if (!recorded && !p.unreadable(id)) || in.Unstaging || leaving {
 			delete(g.vols, id) // a restage starts its timers afresh
 		}
 	}
@@ -187,11 +202,22 @@ func (r *Reconciler) runGeneration(parent context.Context, gen Generator, in int
 	set := r.genSettingsOf(in)
 	now := r.opts.Now()
 
-	// The annotation is read before the lock: it is a call to the API server.
-	annotation, annErr := r.readAnnotation(ctx, in)
+	// The annotation is a call to the API server, made outside the lock and
+	// at most once an annotationEvery.
+	g.mu.Lock()
+	readAnn := r.opts.PVAnnotation != nil && now.Sub(st.annAt) >= annotationEvery
+	if readAnn {
+		st.annAt = now
+	}
+	g.mu.Unlock()
+	var annotation string
+	var annErr error
+	if readAnn {
+		annotation, annErr = r.readAnnotation(ctx, in)
+	}
 
 	g.mu.Lock()
-	trigger := r.decide(st, set, status, now, annotation, annErr)
+	trigger := r.decide(st, set, status, now, readAnn, annotation, annErr)
 	st.overdue = r.isOverdue(st, set, status, now)
 	g.mu.Unlock()
 	if trigger == "" {
@@ -252,10 +278,12 @@ func (r *Reconciler) readAnnotation(ctx context.Context, in intent.Intent) (stri
 // watermark and the interval need dirty bytes: a clean volume has nothing to
 // publish, and the count leaves out trimmed chunks, which is fine for a
 // trigger (the final generation at unstage still takes them).
-func (r *Reconciler) decide(st *genState, set genSettings, status blockd.Status, now time.Time, annotation string, annErr error) string {
-	if annErr != nil {
+func (r *Reconciler) decide(st *genState, set genSettings, status blockd.Status, now time.Time, read bool, annotation string, annErr error) string {
+	switch {
+	case !read:
+	case annErr != nil:
 		r.log.Debug("could not read the publish annotation", "error", annErr)
-	} else if annotation != st.seen {
+	case annotation != st.seen:
 		st.seen = annotation
 		if annotation != "" {
 			st.requested = true
@@ -279,7 +307,9 @@ func (r *Reconciler) decide(st *genState, set genSettings, status blockd.Status,
 // maximum age while there are writes it does not hold. A clean volume is never
 // overdue, however long it has been idle. A server that has not published
 // since it began (blockd keeps the time in memory) is measured from when the
-// timers first saw the volume.
+// timers first saw the volume. On a cache resumed after a takeover LastPublish
+// is the base manifest's time, written by whichever node published it, so a
+// skewed clock there shifts the verdict by the skew.
 func (r *Reconciler) isOverdue(st *genState, set genSettings, status blockd.Status, now time.Time) bool {
 	if status.Dirty <= 0 {
 		return false
@@ -314,4 +344,27 @@ func (o *GenerationOptions) validate() error {
 		o.Timeout = DefaultGenerationTimeout
 	}
 	return nil
+}
+
+// waitForGenerations is Run's last step: the generations' contexts are already
+// cancelled, and each goroutine thaws its file system as it returns, so the
+// process must not exit before they have. It waits for the items' longest
+// freeze bound plus a margin, and says so if that passes: a file system left
+// frozen stays so until the next start thaws it.
+func (r *Reconciler) waitForGenerations() {
+	var bound time.Duration
+	for _, it := range r.items {
+		if g, ok := it.(Generator); ok {
+			bound = max(bound, g.FreezeBound())
+		}
+	}
+	done := make(chan struct{})
+	go func() { r.gens.wait(); close(done) }()
+	t := time.NewTimer(bound + r.stopMargin)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+		r.log.Error("a generation was still running when the reconciler stopped; its file system may stay frozen until the next start", "waited", bound+r.stopMargin)
+	}
 }

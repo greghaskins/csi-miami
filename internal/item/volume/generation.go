@@ -42,6 +42,10 @@ func (it *Item) GenerationFor(ctx context.Context, in intent.Intent, trigger str
 	return it.generate(ctx, v, it.state(in.VolumeID), trigger)
 }
 
+// FreezeBound is how long a file system may stay frozen by a generation; the
+// reconciler waits that long for generations to thaw at exit.
+func (it *Item) FreezeBound() time.Duration { return it.cfg.FreezeBound }
+
 // Status is the block server's status for a staged volume, read without
 // freezing or changing anything. The reconciler's generation timers decide
 // from it (dirty bytes, the last successful publish); a server that does not
