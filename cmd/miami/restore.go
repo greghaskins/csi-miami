@@ -108,8 +108,9 @@ func within(dir, root string) (bool, error) {
 // restoreHooks let a test observe the steps of restoreVolume; every field may
 // be nil.
 type restoreHooks struct {
-	beforeCreate  func()           // called just before the temporary file is created
-	afterAssemble func(tmp string) // called once the temporary file is complete and synced
+	beforeCreate  func()                 // called just before the temporary file is created
+	afterAssemble func(tmp string)       // called once the temporary file is complete and synced
+	syncDir       func(dir string) error // replaces the output directory's fsync
 }
 
 // restoreVolume writes the named manifest of the store (the one current names
@@ -172,7 +173,28 @@ func restoreVolume(ctx context.Context, store, dest, name string, h restoreHooks
 	if err := os.Link(tmp, dest); err != nil {
 		return chunk.Manifest{}, err
 	}
+	// Make the name durable, so a host crash cannot lose a completed image.
+	sync := h.syncDir
+	if sync == nil {
+		sync = fsyncDir
+	}
+	if err := sync(filepath.Dir(dest)); err != nil {
+		return chunk.Manifest{}, fmt.Errorf("sync %s: %w", filepath.Dir(dest), err)
+	}
 	return m, nil
+}
+
+// fsyncDir fsyncs a directory so a link into it survives a crash.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir) //nolint:gosec // dir is the parent of a validated absolute path
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func randHex() string {

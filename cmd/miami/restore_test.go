@@ -476,3 +476,27 @@ func TestRestoreStreamsLargeChunks(t *testing.T) {
 		t.Fatalf("output: %v, %v", fi, err)
 	}
 }
+
+func TestRestoreSyncsTheOutputDirectoryAfterTheLink(t *testing.T) {
+	t.Parallel()
+	ts, _ := twoChunkStore(t)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "v.img")
+	var synced string
+	h := restoreHooks{syncDir: func(d string) error {
+		if _, err := os.Lstat(dest); err != nil {
+			t.Errorf("the directory was synced before the image was linked: %v", err)
+		}
+		synced = d
+		return nil
+	}}
+	if _, err := restoreVolume(t.Context(), ts.dir, dest, "", h); err != nil {
+		t.Fatal(err)
+	}
+	if synced != dir {
+		t.Fatalf("synced %q, want %q", synced, dir)
+	}
+	if err := fsyncDir(dir); err != nil {
+		t.Fatalf("the real directory sync fails: %v", err)
+	}
+}

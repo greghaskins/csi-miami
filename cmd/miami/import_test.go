@@ -317,3 +317,54 @@ func TestImportCapacityDerivesTheChunkSizeAndSizesTheDevice(t *testing.T) {
 		t.Error("a capacity below the image size was accepted")
 	}
 }
+
+// A racing "holder" makes the volume live (current = 1.1, created exclusively)
+// as soon as the import's manifest appears, which is after the import's last
+// check and before its publish. Whoever creates current first wins: the
+// import must either win outright or fail, and must never replace 1.1.
+func TestImportRaceWithALiveHolderNeverRollsBack(t *testing.T) {
+	t.Parallel()
+	img := writeImage(t, ext4Image(int(8*testMiB)))
+	var raced int
+	for range 60 {
+		vol := volumeDir(t)
+		done := make(chan bool)
+		go func() {
+			for {
+				ents, _ := os.ReadDir(filepath.Join(vol, "manifests"))
+				for _, e := range ents {
+					if e.Name() == "0.1" {
+						f, err := os.OpenFile(filepath.Join(vol, "current"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // test fixture
+						if err != nil {
+							done <- false
+							return
+						}
+						_, _ = f.WriteString("1.1\n")
+						_ = f.Close()
+						done <- true
+						return
+					}
+				}
+				if _, err := os.Stat(filepath.Join(vol, "current")); err == nil {
+					done <- false
+					return
+				}
+			}
+		}()
+		code, _, stderr := runMiami("import", "-image", img, "-store", vol, "-chunk-size", "1048576")
+		holderWon := <-done
+		b, _ := os.ReadFile(filepath.Join(vol, "current")) //nolint:gosec // test fixture
+		if holderWon {
+			raced++
+			if string(b) != "1.1\n" {
+				t.Fatalf("import rolled a live current back to %q", b)
+			}
+			if code == 0 {
+				t.Fatalf("import reported success but the holder's current stands: %s", stderr)
+			}
+		} else if code != 0 || string(b) != "0.1\n" {
+			t.Fatalf("import won but exit %d, current %q: %s", code, b, stderr)
+		}
+	}
+	t.Logf("holder won %d of 60", raced)
+}

@@ -33,7 +33,10 @@ What each step does:
 `miami restore` does the same for a volume larger than the restoring
 machine's disk: it verifies every chunk before it writes a byte, then
 assembles the image into a new file (never overwriting one), leaving holes
-for zero chunks, with memory bounded by one read buffer.
+for zero chunks, with memory bounded by one read buffer. The image is assembled into a hidden
+file `.<name>.tmp-<random>` beside the output and linked to its name only when
+complete, so the output either does not exist or is whole. A restore that was
+killed leaves that hidden file, full size, behind: delete it.
 
 ```sh
 miami restore --store /path/to/pvc-<uuid> --out /path/to/volume.img [--manifest 3.17]
