@@ -25,10 +25,20 @@ func Mkfs(ctx context.Context, r tool.Runner, dev string) error {
 
 // HasFilesystem reports whether dev carries a file system signature, by
 // blkid's low-level probe (exit 2 is "nothing found"). A blank device is the
-// one case where Mkfs is right; a device with any signature is Fsck's. Any
-// other failure is an error, never "no file system", so a probe that cannot
-// run does not lead to a mkfs over data.
+// one case where Mkfs is right; a device with any signature is Fsck's.
+//
+// blkid exits 2 for a device that is not there or cannot be read as it does
+// for a blank one, so the device is looked at first: it must exist, be a block
+// device and read, or the answer is an error. "Nothing found" counts as no
+// file system only if the start of the device also reads as zeros; a device
+// with data and no signature is an error, left for a person. Any other failure
+// is an error too, so a probe that cannot run does not lead to a mkfs over
+// data.
 func HasFilesystem(ctx context.Context, r tool.Runner, dev string) (bool, error) {
+	d, err := tool.ProbeDevice(r, dev)
+	if err != nil {
+		return false, fmt.Errorf("ext4: %w", err)
+	}
 	stdout, stderr, code, err := r.Run(ctx, []string{"blkid", "-p", "-o", "value", "-s", "TYPE", dev}, nil)
 	if err != nil {
 		return false, fmt.Errorf("ext4: blkid: %w", err)
@@ -37,6 +47,9 @@ func HasFilesystem(ctx context.Context, r tool.Runner, dev string) (bool, error)
 	case code == 0 && strings.TrimSpace(string(stdout)) != "":
 		return true, nil
 	case code == 2 || code == 0:
+		if !d.Blank {
+			return false, fmt.Errorf("ext4: %s holds data but no file system signature; not treating it as blank", dev)
+		}
 		return false, nil
 	}
 	return false, fmt.Errorf("ext4: blkid: exit %d: %s", code, strings.TrimSpace(string(stderr)))

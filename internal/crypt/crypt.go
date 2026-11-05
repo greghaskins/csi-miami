@@ -105,8 +105,17 @@ func Rotate(ctx context.Context, r tool.Runner, dev string, oldKey, newKey []byt
 	return run(ctx, r, "luksChangeKey", argv, oldKey, newKey)
 }
 
-// IsLUKS reports whether dev carries a LUKS header. Exit code 1 is "no".
+// IsLUKS reports whether dev carries a LUKS header. Exit code 1 is "no", but
+// cryptsetup exits 1 for a header it could not read as well (an I/O error on
+// the device), and the answer "no" is what leads to a luksFormat. So the device
+// is looked at first (it must exist, be a block device and read), and "no"
+// stands only if the start of the device also reads as zeros: a device with
+// data and no header is an error, left for a person.
 func IsLUKS(ctx context.Context, r tool.Runner, dev string) (bool, error) {
+	d, err := tool.ProbeDevice(r, dev)
+	if err != nil {
+		return false, fmt.Errorf("crypt: isLuks: %w", err)
+	}
 	stdout, stderr, code, err := r.Run(ctx, []string{"cryptsetup", "isLuks", dev}, nil)
 	if err != nil {
 		return false, fmt.Errorf("crypt: isLuks: %w", err)
@@ -115,6 +124,9 @@ func IsLUKS(ctx context.Context, r tool.Runner, dev string) (bool, error) {
 	case 0:
 		return true, nil
 	case 1:
+		if !d.Blank {
+			return false, fmt.Errorf("crypt: isLuks: %s holds data but no LUKS header; not treating it as blank", dev)
+		}
 		return false, nil
 	}
 	return false, fmt.Errorf("crypt: isLuks: exit %d: %s", code, output(stdout, stderr))

@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"syscall"
@@ -75,4 +76,62 @@ func (host) Run(ctx context.Context, argv []string, extra []*os.File) ([]byte, [
 	default:
 		return stdout.Bytes(), stderr.Bytes(), -1, fmt.Errorf("tool: %s: %w", argv[0], err)
 	}
+}
+
+// Device is what a read-only look at a block device finds.
+type Device struct {
+	// Blank is true when the first sector block (4 KiB) reads as all zeros.
+	Blank bool
+}
+
+// Prober is a Runner that can also look at a block device itself, without a
+// program: whether it exists, is a block device and can be read. A tool's
+// exit status cannot tell a device that is blank from one that is not there
+// or cannot be read (blkid exits 2 for both, and cryptsetup isLuks exits 1 for
+// a header it could not read), so a caller that is about to format on "nothing
+// found" first establishes that the device is there with ProbeDevice.
+type Prober interface {
+	ProbeDevice(dev string) (Device, error)
+}
+
+// ProbeDevice looks at dev through r. A Runner that cannot is an error, never
+// a blank device.
+func ProbeDevice(r Runner, dev string) (Device, error) {
+	p, ok := r.(Prober)
+	if !ok {
+		return Device{}, fmt.Errorf("tool: this runner cannot look at %s", dev)
+	}
+	return p.ProbeDevice(dev)
+}
+
+// probeSize is how much of the start of the device is read: the sector block
+// where a boot sector, a LUKS header and the first ext4 structures start.
+const probeSize = 4096
+
+// ProbeDevice stats dev, requires a block device, opens it read-only and reads
+// its first 4 KiB. A missing device node, anything that is not a block device
+// and a device that cannot be opened or read is an error.
+func (host) ProbeDevice(dev string) (Device, error) {
+	fi, err := os.Stat(dev)
+	if err != nil {
+		return Device{}, fmt.Errorf("tool: device %s: %w", dev, err)
+	}
+	if fi.Mode()&os.ModeDevice == 0 || fi.Mode()&os.ModeCharDevice != 0 {
+		return Device{}, fmt.Errorf("tool: %s is not a block device (mode %s)", dev, fi.Mode())
+	}
+	f, err := os.Open(dev) //nolint:gosec // the driver's own device path, opened read-only
+	if err != nil {
+		return Device{}, fmt.Errorf("tool: device %s: %w", dev, err)
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, probeSize)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return Device{}, fmt.Errorf("tool: reading the start of %s: %w", dev, err)
+	}
+	for _, b := range buf {
+		if b != 0 {
+			return Device{}, nil
+		}
+	}
+	return Device{Blank: true}, nil
 }

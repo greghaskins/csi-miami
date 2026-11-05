@@ -29,6 +29,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/systemd"
 	sdfake "github.com/greghaskins/csi-miami/internal/systemd/fake"
+	"github.com/greghaskins/csi-miami/internal/tool"
 	"github.com/greghaskins/csi-miami/internal/transport"
 	kinds "github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -394,11 +395,26 @@ func (e *env) attach() {
 // ---- fakes ----
 
 type fakeTools struct {
-	e       *env
-	luks    bool
-	hasFS   bool
-	luksKey []byte
-	calls   [][]string
+	e     *env
+	luks  bool
+	hasFS bool
+	// probeErr, when set, is what looking at any device finds: it is not there.
+	probeErr error
+	luksKey  []byte
+	calls    [][]string
+}
+
+// ProbeDevice finds the device there. The raw device is blank until a LUKS
+// header or a file system has been made on it; the mapping above a LUKS header
+// is blank until a file system has.
+func (f *fakeTools) ProbeDevice(dev string) (tool.Device, error) {
+	if f.probeErr != nil {
+		return tool.Device{}, f.probeErr
+	}
+	if strings.HasPrefix(dev, "/dev/mapper/") {
+		return tool.Device{Blank: !f.hasFS}, nil
+	}
+	return tool.Device{Blank: !f.luks && !f.hasFS}, nil
 }
 
 func (f *fakeTools) Run(_ context.Context, argv []string, extra []*os.File) ([]byte, []byte, int, error) {

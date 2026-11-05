@@ -3,10 +3,13 @@ package ext4_test
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
 	"slices"
 	"testing"
 
 	"github.com/greghaskins/csi-miami/internal/ext4"
+	"github.com/greghaskins/csi-miami/internal/tool"
 	"github.com/greghaskins/csi-miami/internal/tool/fake"
 )
 
@@ -91,5 +94,62 @@ func TestHasFilesystem(t *testing.T) {
 		if want := []string{"blkid", "-p", "-o", "value", "-s", "TYPE", "/dev/x"}; !slices.Equal(f.Calls()[0].Argv, want) {
 			t.Errorf("%s: argv = %v", name, f.Calls()[0].Argv)
 		}
+	}
+}
+
+// blkid exits 2 for a device that is not there as for a blank one, so the
+// device is looked at first and a device that cannot be looked at is an error,
+// with blkid never run.
+func TestHasFilesystemNeedsTheDevice(t *testing.T) {
+	t.Parallel()
+	for name, probeErr := range map[string]error{
+		"missing":    fs.ErrNotExist,
+		"unreadable": fs.ErrPermission,
+		"io error":   errors.New("input/output error"),
+	} {
+		f := &fake.Runner{
+			Replies: []fake.Reply{{Code: 2}},
+			Device:  func(string) (tool.Device, error) { return tool.Device{}, probeErr },
+		}
+		got, err := ext4.HasFilesystem(ctx, f, "/dev/x")
+		if err == nil || got || !errors.Is(err, probeErr) {
+			t.Errorf("%s: got %v, %v, want an error naming the device's problem", name, got, err)
+		}
+		if n := len(f.Calls()); n != 0 {
+			t.Errorf("%s: %d tools ran, want none: %v", name, n, f.Calls())
+		}
+	}
+}
+
+// The real probe: a path with no node, and things that are not block devices,
+// are errors and blkid does not run.
+func TestHasFilesystemRealProbeRefusesWhatIsNotABlockDevice(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	regular := dir + "/file"
+	if err := os.WriteFile(regular, make([]byte, 8192), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, dev := range map[string]string{"missing": dir + "/nonesuch", "a file": regular, "a directory": dir, "a character device": "/dev/zero"} {
+		got, err := ext4.HasFilesystem(ctx, tool.Real(), dev)
+		if err == nil || got {
+			t.Errorf("%s: got %v, %v, want an error", name, got, err)
+		}
+	}
+}
+
+func TestHasFilesystemBlankNeedsZeros(t *testing.T) {
+	t.Parallel()
+	blank := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(string) (tool.Device, error) { return tool.Device{Blank: true}, nil }}
+	if got, err := ext4.HasFilesystem(ctx, blank, "/dev/x"); err != nil || got {
+		t.Errorf("a blank device: got %v, %v, want no file system", got, err)
+	}
+	data := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(string) (tool.Device, error) { return tool.Device{}, nil }}
+	if got, err := ext4.HasFilesystem(ctx, data, "/dev/x"); err == nil || got {
+		t.Errorf("a device with data and no signature: got %v, %v, want an error", got, err)
+	}
+	ext := &fake.Runner{Replies: []fake.Reply{{Stdout: "ext4\n"}}, Device: func(string) (tool.Device, error) { return tool.Device{}, nil }}
+	if got, err := ext4.HasFilesystem(ctx, ext, "/dev/x"); err != nil || !got {
+		t.Errorf("an ext4: got %v, %v, want a file system", got, err)
 	}
 }
