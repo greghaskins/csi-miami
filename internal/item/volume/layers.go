@@ -3,6 +3,7 @@ package volume
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -351,6 +352,8 @@ func (it *Item) ensureBinary() error {
 			return fmt.Errorf("hashing the running binary: %w", err)
 		}
 		m.srcKey, m.haveSrc, m.dstOK = keyOf(si), true, false
+		hexSum := hex.EncodeToString(m.srcSum[:])
+		it.srcHex.Store(&hexSum)
 		if _, err := src.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("the running binary: %w", err)
 		}

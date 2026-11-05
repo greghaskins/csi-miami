@@ -3,6 +3,8 @@ package volume
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -1031,5 +1033,31 @@ func TestAbandonmentAfterTheRestartUsesTheAdoptedEpoch(t *testing.T) {
 		if !errors.Is(err, item.ErrUnstageIncomplete) || !e.cacheExists() || len(e.events) != 0 {
 			t.Fatalf("attempt %d: err=%v cache=%v events=%v", i, err, e.cacheExists(), e.events)
 		}
+	}
+}
+
+// A block server whose binary hash is not the running binary's is outdated;
+// before the item has hashed the running binary it cannot say.
+func TestServerOutdatedComparesTheBinaryHash(t *testing.T) {
+	e := newEnv(t)
+	if e.it.ServerOutdated(blockd.Status{BinaryHash: "anything"}) {
+		t.Error("outdated before the running binary was hashed")
+	}
+	if err := e.it.ensureBinary(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(e.exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	if e.it.ServerOutdated(blockd.Status{BinaryHash: hex.EncodeToString(sum[:])}) {
+		t.Error("a server running the current binary is outdated")
+	}
+	if !e.it.ServerOutdated(blockd.Status{BinaryHash: strings.Repeat("0", 64)}) {
+		t.Error("a server running another binary is current")
+	}
+	if e.it.ServerOutdated(blockd.Status{}) {
+		t.Error("a status with no hash (an older server) counts as outdated; it says nothing")
 	}
 }

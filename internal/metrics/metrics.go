@@ -29,6 +29,10 @@ const shutdownTimeout = 5 * time.Second
 // from a metadata call to a stage that waits for a slow transport.
 var requestBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
 
+// publishBuckets are the bounds, in seconds, of the generation histogram: a
+// freeze, a boundary and an upload, from a quiet volume to a slow transport.
+var publishBuckets = []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
+
 // reconcileBuckets are the bounds, in seconds, of the converge-pass histogram.
 var reconcileBuckets = []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60}
 
@@ -48,6 +52,15 @@ const (
 	NameNodeCapability      = "miami_node_capability"
 	NameCSIRequests         = "miami_csi_requests_total"
 	NameCSIRequestDuration  = "miami_csi_request_duration_seconds"
+
+	NameVolumesServed             = "miami_volumes_served"
+	NameGenerationAge             = "miami_generation_age_seconds"
+	NameGenerationDirty           = "miami_generation_dirty_bytes"
+	NameGenerationPublishDuration = "miami_generation_publish_duration_seconds"
+	NameGenerationPublishes       = "miami_generation_publishes_total"
+	NameCacheBytes                = "miami_cache_bytes"
+	NameChunkFetchDuration        = "miami_chunk_fetch_duration_seconds"
+	NameChunkFetchErrors          = "miami_chunk_fetch_errors_total"
 )
 
 // NodeFamilies are the families a node plugin serves: its reconciler's and the
@@ -56,6 +69,17 @@ var NodeFamilies = []string{
 	NameIntents, NameTransports, NameTransportUp, NameVolumeCondition, NameReconcileDuration, NameReconcileErrors,
 	NameObservationTimeouts, NameGarbageUnmounts, NameIntentLoadFailures, NameNodeCapability,
 	NameCSIRequests, NameCSIRequestDuration,
+	NameVolumesServed, NameGenerationPublishDuration, NameGenerationPublishes,
+}
+
+// VolumeFamilies are the families with one series per staged volume of kind
+// volume, labelled volume=<PV name>. They are served by the node plugin like
+// NodeFamilies, but a node with no such volume has no series and so no family
+// in its scrape: a test that expects them checks them only where it has staged
+// a volume of that kind.
+var VolumeFamilies = []string{
+	NameVolumeProbeOK, NameGenerationAge, NameGenerationDirty, NameCacheBytes,
+	NameChunkFetchDuration, NameChunkFetchErrors,
 }
 
 // ControllerFamilies are the families the controller serves: the CSI request
@@ -85,11 +109,20 @@ type Registry struct {
 	capability      *prometheus.GaugeVec
 	requests        *prometheus.CounterVec
 	requestDuration *prometheus.HistogramVec
+
+	volumesServed *prometheus.GaugeVec
+	genAge        *prometheus.GaugeVec
+	genDirty      *prometheus.GaugeVec
+	publishDur    prometheus.Histogram
+	publishes     *prometheus.CounterVec
+	cacheBytes    *prometheus.GaugeVec
+	fetches       *fetchCollector
 }
 
 var (
-	_ reconcile.Metrics      = (*Registry)(nil)
-	_ reconcile.ProbeMetrics = (*Registry)(nil)
+	_ reconcile.Metrics           = (*Registry)(nil)
+	_ reconcile.ProbeMetrics      = (*Registry)(nil)
+	_ reconcile.GenerationMetrics = (*Registry)(nil)
 )
 
 // Option configures New.
@@ -155,12 +188,38 @@ func New(opts ...Option) *Registry {
 		Name: NameCSIRequestDuration, Help: "Duration of CSI calls, by method.", Buckets: requestBuckets,
 	}, []string{"method"})
 
+	r.volumesServed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameVolumesServed, Help: "Staged volumes of kind volume by the state of their block server: serving, outdated-binary (answering, on an older binary) or down.",
+	}, []string{"state"})
+	r.genAge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameGenerationAge, Help: "Seconds since the volume's newest published generation (since the node first saw the volume, if its server has not published yet).",
+	}, []string{"volume"})
+	r.genDirty = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameGenerationDirty, Help: "Bytes the volume has written that no published generation holds.",
+	}, []string{"volume"})
+	r.publishDur = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: NameGenerationPublishDuration, Help: "Duration of a successful generation, freeze to upload.", Buckets: publishBuckets,
+	})
+	r.publishes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: NameGenerationPublishes, Help: "Finished generations by result: ok, refused (the fencing check said another node owns the volume) or failed. A generation skipped because another is running is not counted.",
+	}, []string{"result"})
+	r.cacheBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameCacheBytes, Help: "Bytes in the volume's node-local cache: clean (copies of chunks the store holds) or dirty (unpublished writes).",
+	}, []string{"volume", "state"})
+	r.fetches = newFetchCollector()
+
 	// The steps the reconciler reports are a fixed list (reconcile.Metrics), so
 	// their counters exist at zero from the start: a series that appears only
 	// at the first failure cannot be rated or alerted on before it.
 	// The same goes for every condition a volume can be in.
 	for _, c := range reconcile.Conditions {
 		r.volumeCondition.WithLabelValues(c)
+	}
+	for _, state := range reconcile.ServedStates {
+		r.volumesServed.WithLabelValues(state)
+	}
+	for _, res := range reconcile.PublishResults {
+		r.publishes.WithLabelValues(res)
 	}
 	for _, step := range ReconcileSteps {
 		r.reconcileErrs.WithLabelValues(step)
@@ -176,6 +235,7 @@ func New(opts ...Option) *Registry {
 		r.reg.MustRegister(
 			r.intents, r.transports, r.transportUp, r.volumeCondition, r.volumeProbeOK, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
 			r.garbage, r.loadFailures, r.capability,
+			r.volumesServed, r.genAge, r.genDirty, r.publishDur, r.publishes, r.cacheBytes, r.fetches,
 		)
 	}
 	return r
@@ -234,6 +294,64 @@ func (r *Registry) SetVolumeProbe(volumeID string, ok bool) {
 func (r *Registry) DeleteVolumeProbe(volumeID string) {
 	if id, err := volume.ParseID(volumeID); err == nil {
 		r.volumeProbeOK.DeleteLabelValues(id.Name)
+	}
+}
+
+// volumeName returns the PV name of a volume ID, or false when the ID names
+// no volume: the {volume} label is a PV name and nothing else, never a path.
+func volumeName(volumeID string) (string, bool) {
+	id, err := volume.ParseID(volumeID)
+	if err != nil {
+		return "", false
+	}
+	return id.Name, true
+}
+
+// SetVolumeGeneration implements reconcile.GenerationMetrics.
+func (r *Registry) SetVolumeGeneration(volumeID string, g reconcile.VolumeGeneration) {
+	name, ok := volumeName(volumeID)
+	if !ok {
+		return
+	}
+	r.genAge.WithLabelValues(name).Set(g.Age.Seconds())
+	r.genDirty.WithLabelValues(name).Set(float64(g.DirtyBytes))
+	r.cacheBytes.WithLabelValues(name, "dirty").Set(float64(g.DirtyBytes))
+	r.cacheBytes.WithLabelValues(name, "clean").Set(float64(g.CleanBytes))
+	r.fetches.set(name, g.Fetch)
+}
+
+// DeleteVolumeGeneration implements reconcile.GenerationMetrics.
+func (r *Registry) DeleteVolumeGeneration(volumeID string) {
+	name, ok := volumeName(volumeID)
+	if !ok {
+		return
+	}
+	r.genAge.DeleteLabelValues(name)
+	r.genDirty.DeleteLabelValues(name)
+	r.cacheBytes.DeleteLabelValues(name, "dirty")
+	r.cacheBytes.DeleteLabelValues(name, "clean")
+	r.fetches.delete(name)
+}
+
+// ObservePublish implements reconcile.GenerationMetrics. A result that is not
+// one of reconcile.PublishResults is dropped. Only a successful generation's
+// duration is observed: a refusal or a failure ends early or at a deadline
+// and would blur what a publish costs.
+func (r *Registry) ObservePublish(result string, d time.Duration) {
+	if !slices.Contains(reconcile.PublishResults, result) {
+		return
+	}
+	r.publishes.WithLabelValues(result).Inc()
+	if result == reconcile.PublishOK {
+		r.publishDur.Observe(d.Seconds())
+	}
+}
+
+// SetVolumesServed implements reconcile.GenerationMetrics. Only the states the
+// reconciler names are set, so the label values are a fixed list.
+func (r *Registry) SetVolumesServed(counts map[string]int) {
+	for _, s := range reconcile.ServedStates {
+		r.volumesServed.WithLabelValues(s).Set(float64(counts[s]))
 	}
 }
 

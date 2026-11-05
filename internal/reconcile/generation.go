@@ -26,6 +26,13 @@ type Generator interface {
 	Status(ctx context.Context, in intent.Intent) (blockd.Status, error)
 }
 
+// BinaryChecker is implemented by an item that can say whether a block server
+// runs an older binary than the one the node would start now. It is optional:
+// without it no server counts as outdated.
+type BinaryChecker interface {
+	ServerOutdated(st blockd.Status) bool
+}
+
 // annotationEvery is how often a volume's PV annotation is read.
 const annotationEvery = time.Minute
 
@@ -71,6 +78,9 @@ type genState struct {
 	// overdue is the verdict of the latest status read; reported is what the
 	// loop last told the world.
 	overdue, reported bool
+	// served is the state of the volume's block server at the latest status
+	// read ("" before the first); it is what the volumes-served metric counts.
+	served string
 	// lastErr is the text of the last failure, so a repeat is not logged
 	// again at warn level.
 	lastErr string
@@ -121,6 +131,7 @@ func (r *Reconciler) genSettingsOf(in intent.Intent) genSettings {
 func (p *pass) generationTick() {
 	r := p.r
 	g := r.gens
+	gm, _ := r.metrics.(GenerationMetrics)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for id := range g.vols {
@@ -130,7 +141,22 @@ func (p *pass) generationTick() {
 		// clocks go on. The state ends when the volume is unstaged or gone.
 		if (!recorded && !p.unreadable(id)) || in.Unstaging || leaving {
 			delete(g.vols, id) // a restage starts its timers afresh
+			if gm != nil {
+				gm.DeleteVolumeGeneration(id)
+			}
 		}
+	}
+	if gm != nil {
+		counts := map[string]int{}
+		for _, state := range ServedStates {
+			counts[state] = 0
+		}
+		for _, st := range g.vols {
+			if st.served != "" {
+				counts[st.served]++
+			}
+		}
+		gm.SetVolumesServed(counts)
 	}
 	if p.ctx.Err() != nil {
 		return
@@ -193,8 +219,15 @@ func (r *Reconciler) runGeneration(parent context.Context, gen Generator, in int
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
+	gm, _ := r.metrics.(GenerationMetrics)
 	status, err := gen.Status(ctx, in)
 	if err != nil {
+		g.mu.Lock()
+		st.served = ServedDown
+		if gm != nil && g.vols[in.VolumeID] == st {
+			gm.DeleteVolumeGeneration(in.VolumeID)
+		}
+		g.mu.Unlock()
 		// The server's being down is the item's condition, reported by Converge.
 		r.log.Debug("could not read the block server's status for the generation timers", "volume", in.VolumeID, "error", err)
 		return
@@ -219,14 +252,42 @@ func (r *Reconciler) runGeneration(parent context.Context, gen Generator, in int
 	g.mu.Lock()
 	trigger := r.decide(st, set, status, now, readAnn, annotation, annErr)
 	st.overdue = r.isOverdue(st, set, status, now)
+	st.served = ServedServing
+	if bc, ok := gen.(BinaryChecker); ok && bc.ServerOutdated(status) {
+		st.served = ServedOutdatedBinary
+	}
+	// The series belong to a staged volume: a volume that left while the
+	// status was being read must not get them back.
+	if gm != nil && g.vols[in.VolumeID] == st {
+		last := status.LastPublish
+		if last.IsZero() {
+			last = st.since
+		}
+		gm.SetVolumeGeneration(in.VolumeID, VolumeGeneration{
+			Age: max(now.Sub(last), 0), DirtyBytes: status.Dirty, CleanBytes: max(status.Cached-status.Dirty, 0), Fetch: status.Fetch,
+		})
+	}
 	g.mu.Unlock()
 	if trigger == "" {
 		return
 	}
 
+	began := time.Now()
 	err = gen.GenerationFor(ctx, in, trigger)
+	took := time.Since(began)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if gm != nil && (err == nil || parent.Err() == nil) { // a generation cut short by the stop is no outcome
+		switch {
+		case err == nil:
+			gm.ObservePublish(PublishOK, took)
+		case errors.Is(err, item.ErrGenerationSkipped):
+		case errors.Is(err, item.ErrPublishRefused):
+			gm.ObservePublish(PublishRefused, took)
+		default:
+			gm.ObservePublish(PublishFailed, took)
+		}
+	}
 	switch {
 	case err == nil:
 		st.due = r.opts.Now().Add(set.interval)
