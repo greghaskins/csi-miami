@@ -72,6 +72,7 @@ func takeover(t *testing.T, e *env, mode string) {
 	// The holder's node goes down under the volume, its plugin with it (its pod
 	// is gone from the API, so the volume's attachment can move); the pod on
 	// the other worker reaches the driver and cannot have the volume.
+	// (downTheNode also deletes the VolumeAttachment: that stands in for the attach-detach controller's six-minute forced detach, or the out-of-service taint's immediate one. It is cluster behaviour, not something the driver does.)
 	n.downTheNode(t, a, "a", vol)
 	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
 	e.waitFor(t, fmt.Sprintf("the node plugin on %s to report holder-contended for the waiting pod", b), func(ctx context.Context) (string, bool, error) {
@@ -230,6 +231,7 @@ func TestVolumeOrphanDrain(t *testing.T) {
 
 	// The holder node goes down and forgets the volume: its record of it is
 	// gone, its cache is not.
+	// (downTheNode also deletes the VolumeAttachment: that stands in for the attach-detach controller's six-minute forced detach, or the out-of-service taint's immediate one. It is cluster behaviour, not something the driver does.)
 	n.downTheNode(t, a, "a", vol)
 	ctx, cancel = e.withDeadline()
 	_, err = nodeExec(ctx, a, "rm", "-f", intentPath(vol.ID))

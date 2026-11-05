@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -444,15 +445,50 @@ func TestVolumeNodeRebootReusesCache(t *testing.T) {
 
 	ctx, cancel = e.withDeadline()
 	out, err := nodeExec(ctx, node, "cat", probe)
+	starts, startsErr := blockdStarts(ctx, node, vol.PV)
+	indexJSON, indexErr := nodeExec(ctx, node, "cat", cachePath(vol.PV)+"/index.json")
 	cancel()
 	if err != nil || strings.TrimSpace(out) != "reused" {
 		t.Errorf("the file placed in the cache directory before the restart is %q (error %v) after it: the cache was discarded, not reused", out, err)
+	}
+	// A cold start: the reboot left no device in the kernel, so the new stage
+	// connected a fresh one. A re-point of a device left in place would be a
+	// block server restart, which is criterion 4.
+	if startsErr != nil || len(starts) == 0 {
+		t.Errorf("the block server's journal after the restart: %d starts, error %v", len(starts), startsErr)
+	} else if last := starts[len(starts)-1]; !strings.Contains(last, "path=connect") {
+		t.Errorf("the block server after the node restart is %q, want path=connect (a fresh device)", last)
+	}
+	// The cache descends from the manifest current names, which is why it was
+	// reused (the store's current is not newer than the cache's base).
+	var idx struct {
+		Base  string
+		Dirty []uint32
+	}
+	if indexErr != nil {
+		t.Errorf("reading the cache index: %v", indexErr)
+	} else if err := json.Unmarshal([]byte(indexJSON), &idx); err != nil {
+		t.Errorf("decoding the cache index: %v (%q)", err, indexJSON)
+	} else if idx.Base != cur0 {
+		t.Errorf("the cache descends from manifest %q, but current names %q", idx.Base, cur0)
 	}
 	got := n.runOnce(t, "data", node, "cat /data/loop.log")
 	if err := checkSequence(got, wrote); err != nil {
 		t.Errorf("after the node restart: %v", err)
 	}
 	cur1 := e.waitStoreCurrent(t, vol, cur0, "a generation of the reused cache to move current")
+	// The dirty chunks were published: the generation restored from the store
+	// alone holds the lines synced before the restart.
+	img := e.restoreImage(t, vol)
+	fs := openImage(t, img, true)
+	mnt := fs.mountRO(t)
+	published, err := readFile(mnt + "/loop.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkSequence(published, wrote); err != nil {
+		t.Errorf("the generation published after the restart: %v", err)
+	}
 	t.Logf("the cache was reused and published: current %q -> %q; the file has %d lines (%d synced before the restart)", cur0, cur1, len(strings.Fields(got)), wrote)
 }
 

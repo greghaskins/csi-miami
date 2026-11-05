@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
+	"github.com/greghaskins/csi-miami/internal/nbd"
 	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/systemd"
 	"github.com/greghaskins/csi-miami/internal/volume"
@@ -512,15 +513,17 @@ func (n *testNS) downTheNode(t *testing.T, node, pod string, vol volumeInfo) {
 }
 
 // rebootNode restarts a node as a machine's reboot would, in the ways the
-// kind node can: systemd in the node is given 90 seconds to stop its units in
-// order (a kill after 5 seconds left docker unable to reap the container),
-// and the mappings of the named volumes are removed from the kernel while the
-// node is stopped. The nodes share the runner's kernel, which a real reboot
-// resets: a dm-crypt mapping made by the node survives its container, without
-// the device node in the restarted /dev, and the volume then reads as blank.
-// The nbd devices cannot be removed from outside; the block server's
-// re-point (decision 51) takes the stale device over, as it does for a block
-// server killed under a served volume.
+// kind node can. A shared kernel is not a reboot: the kind nodes run on the
+// runner's kernel, which a real reboot resets, so a plain `docker restart`
+// leaves behind what the node had made in it, and the restarted node would be
+// testing something else (a block server restarted under a served volume,
+// decision 51, instead of a cold start that reuses the cache). So systemd in
+// the node is given 90 seconds to stop its units in order (a kill after 5
+// seconds left docker unable to reap the container), and while the node is
+// stopped the runner removes from the kernel what the volumes left in it: the
+// dm-crypt mapping (which survives its container without the device node in
+// the restarted /dev, and the volume then reads as blank) and the nbd device
+// (disconnected through netlink, as the block server does at an unstage).
 func (e *env) rebootNode(t *testing.T, node string, pvs ...string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -528,9 +531,34 @@ func (e *env) rebootNode(t *testing.T, node string, pvs ...string) {
 	if _, err := docker(ctx, "stop", "--time", "90", node); err != nil {
 		t.Fatal(err)
 	}
+	k := nbd.Real("/sys")
 	for _, pv := range pvs {
 		if out, err := run(ctx, "cryptsetup", "close", "miami-"+pv); err != nil {
 			t.Logf("removing the mapping of %s from the kernel (it may be gone already): %v: %s", pv, err, out)
+		}
+		devs, err := k.Devices()
+		if err != nil {
+			t.Fatalf("listing the nbd devices: %v", err)
+		}
+		for _, d := range devs {
+			if d.Backend != pv {
+				continue
+			}
+			if err := k.Disconnect(ctx, d.Index); err != nil {
+				t.Fatalf("disconnecting nbd%d of %s: %v", d.Index, pv, err)
+			}
+			e.waitFor(t, fmt.Sprintf("nbd%d of %s to be unconfigured in the kernel", d.Index, pv), func(context.Context) (string, bool, error) {
+				devs, err := k.Devices()
+				if err != nil {
+					return "", false, err
+				}
+				for _, x := range devs {
+					if x.Index == d.Index {
+						return fmt.Sprintf("nbd%d pid %d backend %q", x.Index, x.Pid, x.Backend), x.Pid == 0 && x.Backend == "", nil
+					}
+				}
+				return "gone", true, nil
+			})
 		}
 	}
 	if _, err := docker(ctx, "start", node); err != nil {
@@ -538,11 +566,30 @@ func (e *env) rebootNode(t *testing.T, node string, pvs ...string) {
 	}
 }
 
+// blockdStarts are the "blockd serving" lines of a volume's block server in
+// the node's journal, in order; path= says how the device was got: connect for
+// a new device, reconfigure for one left in place (decision 51).
+func blockdStarts(ctx context.Context, node, pv string) ([]string, error) {
+	out, err := nodeExec(ctx, node, "journalctl", "-u", systemd.UnitName(pv), "--no-pager", "-o", "cat")
+	if err != nil {
+		return nil, err
+	}
+	var starts []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "blockd serving") {
+			starts = append(starts, l)
+		}
+	}
+	return starts, nil
+}
+
 // releaseAttachment deletes the VolumeAttachment of a volume to a node. The
 // attach-detach controller does it by itself, six minutes after the pod is
 // gone, for a kubelet that has not unmounted (a plugin that is down cannot);
 // and at once for a node marked out of service. Without it the next pod waits
-// at the attach and never reaches the driver.
+// at the attach and never reaches the driver. This stands in for that forced
+// detach, or the taint's immediate one: it is cluster behaviour, not something
+// the driver does.
 func (e *env) releaseAttachment(t *testing.T, pv, node string) {
 	t.Helper()
 	ctx, cancel := e.withDeadline()
