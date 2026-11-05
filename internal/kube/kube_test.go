@@ -36,7 +36,7 @@ func TestGetPV(t *testing.T) {
 	t.Parallel()
 	pv := map[string]any{
 		"apiVersion": "v1", "kind": "PersistentVolume",
-		"metadata": map[string]any{"name": "pvc-1"},
+		"metadata": map[string]any{"name": "pvc-1", "annotations": map[string]any{"a": "b"}},
 		"spec": map[string]any{
 			"persistentVolumeReclaimPolicy": "Delete",
 			"capacity":                      map[string]any{"storage": "1Gi"},
@@ -131,6 +131,7 @@ func TestGetPV(t *testing.T) {
 	want := &PV{
 		Name: "pvc-1", Driver: "d.example.com", VolumeHandle: "directory:pvc-1", ReclaimPolicy: "Delete",
 		VolumeAttributes: map[string]string{"miami/kind": "directory", "x": "y"},
+		Annotations:      map[string]string{"a": "b"},
 	}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Errorf("GetPV(pvc-1) = %+v, %v; want %+v", got, err, want)

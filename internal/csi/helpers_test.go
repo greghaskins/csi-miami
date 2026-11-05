@@ -286,6 +286,16 @@ func wantOf(t *testing.T, dir string) transportMount {
 // controller's own checks will find them.
 type simMounter struct {
 	*fake.Mounter
+	// onMounts, when set, is called at each read of the mount table, before
+	// it is answered; tests use it to look at what happened by then.
+	onMounts func()
+}
+
+func (m *simMounter) Mounts(ctx context.Context) (observe.Table, error) {
+	if m.onMounts != nil {
+		m.onMounts()
+	}
+	return m.Mounter.Mounts(ctx)
 }
 
 func (m *simMounter) Mount(ctx context.Context, source, target, fstype string, flags uintptr, data string) error {

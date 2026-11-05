@@ -828,8 +828,9 @@ its own self-fenced rule); consumes `holder.Judgement`.
       no base) before it serves the cache; otherwise it discards and
       releases nothing. A drained generation is a crash image (flushed writes,
       no freeze): restore replays the journal.
-- [ ] `DeleteVolume` refuses while any holder file exists (the timed
+- [x] `DeleteVolume` refuses while any holder file exists (the timed
       `refuseLiveHolder` rule goes); the emergency detach is the way through.
+      Landed in branch `m2/delete-refuses-any-holder`.
 - [ ] The `takeoverTimeout` StorageClass parameter and the node's
       `-takeover-timeout` flag no longer mean anything: reject the parameter
       for new classes with a message naming decision 52 and remove the flag
