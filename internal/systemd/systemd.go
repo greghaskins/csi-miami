@@ -61,10 +61,17 @@ const (
 // Unit is a transient service to start. ExecStart is the argv, first element
 // the absolute path of the binary. Environment is KEY=value entries; it must
 // never carry a key, which would be visible to every process on the host.
+//
+// Restart, when set, is systemd's Restart= policy ("on-failure", "always"),
+// and RestartDelay the delay before a restart; zero leaves systemd's default.
+// A unit with a restart policy that exits is not collected while it waits to
+// restart: State reports it as "activating", sub-state "auto-restart".
 type Unit struct {
 	Name, Description string
 	ExecStart         []string
 	Environment       []string
+	Restart           string
+	RestartDelay      time.Duration
 }
 
 // State is what systemd reports about a unit. Present is false for a unit
@@ -91,9 +98,17 @@ type Manager interface {
 	// units are created with CollectMode=inactive-or-failed, systemd forgets
 	// a crashed unit at once: it reports Present=false, never "failed". A
 	// caller must treat a unit that is absent while its volume is staged as
-	// a crash.
+	// a crash. A unit started with a restart policy is the exception: while it
+	// waits to restart it is Present with Active "activating" and Sub
+	// "auto-restart", and only a unit that gave up (the start limit) is
+	// collected.
 	State(ctx context.Context, name string) (State, error)
 }
+
+// ErrExecStartDiffers is wrapped by the error Start returns when a unit of
+// that name is active with a different ExecStart: the binary changed under a
+// running unit. The unit is left as it is.
+var ErrExecStartDiffers = errors.New("systemd: the unit is running a different ExecStart")
 
 // UnitName is the unit that runs the block server of a volume,
 // miami-blockd-<volume>.service. It returns "" for anything but a pvc-<uuid>
@@ -328,7 +343,7 @@ func dial(socket string) (*godbus.Conn, error) {
 // is systemd's ignore-failure flag: false means a non-zero exit counts as a
 // failure.
 func properties(u Unit) []sdbus.Property {
-	return []sdbus.Property{
+	props := []sdbus.Property{
 		sdbus.PropType("simple"),
 		sdbus.PropExecStart(u.ExecStart, false),
 		{Name: "Environment", Value: godbus.MakeVariant(append([]string(nil), u.Environment...))},
@@ -338,6 +353,13 @@ func properties(u Unit) []sdbus.Property {
 		{Name: "StandardOutput", Value: godbus.MakeVariant("journal")},
 		{Name: "StandardError", Value: godbus.MakeVariant("journal")},
 	}
+	if u.Restart != "" {
+		props = append(props, sdbus.Property{Name: "Restart", Value: godbus.MakeVariant(u.Restart)})
+	}
+	if u.RestartDelay > 0 {
+		props = append(props, sdbus.Property{Name: "RestartUSec", Value: godbus.MakeVariant(uint64(u.RestartDelay / time.Microsecond))})
+	}
+	return props
 }
 
 func checkName(name string) error {
@@ -407,7 +429,7 @@ func (m *manager) adopt(ctx context.Context, u Unit) error {
 		return fmt.Errorf("systemd: unit %s already exists: %w", u.Name, err)
 	}
 	if len(argvs) != 1 || !reflect.DeepEqual(argvs[0], u.ExecStart) {
-		return fmt.Errorf("systemd: unit %s already exists with a different ExecStart", u.Name)
+		return fmt.Errorf("systemd: unit %s already exists with a different ExecStart: %w", u.Name, ErrExecStartDiffers)
 	}
 	return nil
 }

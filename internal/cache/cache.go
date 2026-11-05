@@ -801,6 +801,13 @@ func (c *Cache) Close() error {
 	return err
 }
 
+// ReadIndex returns the index of the cache in dir without opening the cache:
+// no chunk files are scanned and nothing is created or changed. It returns
+// ErrNoIndex when there is none and an error wrapping ErrCorrupt when the index
+// is unreadable. A node plugin uses it to decide whether a cache that survived
+// a reboot may be reused.
+func ReadIndex(dir string) (Index, error) { return readIndex(dir) }
+
 // Remove deletes a cache directory whole. It refuses a directory that lacks
 // an index.json or a c/ directory, so a wrong --cache-dir cannot cost the
 // operator anything else.

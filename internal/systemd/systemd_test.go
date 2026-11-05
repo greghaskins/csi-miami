@@ -327,3 +327,29 @@ func TestDialGivesUpOnAWedgedPeer(t *testing.T) {
 		t.Fatalf("New took %v", d)
 	}
 }
+
+func TestRestartPropertiesAreSetOnlyWhenAsked(t *testing.T) {
+	u := Unit{Name: UnitName(vol), ExecStart: []string{"/bin/true"}, Restart: "on-failure", RestartDelay: time.Second}
+	got := map[string]any{}
+	for _, p := range properties(u) {
+		got[p.Name] = p.Value.Value()
+	}
+	if got["Restart"] != "on-failure" {
+		t.Errorf("Restart = %v", got["Restart"])
+	}
+	if got["RestartUSec"] != uint64(1_000_000) {
+		t.Errorf("RestartUSec = %v", got["RestartUSec"])
+	}
+}
+
+func TestStartWithADifferentExecStartIsErrExecStartDiffers(t *testing.T) {
+	active := map[string]any{"ActiveState": "active", "SubState": "running", "MainPID": uint32(7)}
+	b := &stubBus{startErr: dbusErr(errUnitExists), props: active, exec: [][]string{{"/bin/sleep", "31"}}}
+	if err := (&manager{b}).Start(context.Background(), testUnit); !errors.Is(err, ErrExecStartDiffers) {
+		t.Fatalf("err = %v", err)
+	}
+	b = &stubBus{startErr: dbusErr(errUnitExists), props: map[string]any{"ActiveState": "activating", "SubState": "auto-restart"}}
+	if err := (&manager{b}).Start(context.Background(), testUnit); err == nil || errors.Is(err, ErrExecStartDiffers) {
+		t.Fatalf("a unit waiting to restart is not a different ExecStart: %v", err)
+	}
+}

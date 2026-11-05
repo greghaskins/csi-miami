@@ -23,6 +23,25 @@ func Mkfs(ctx context.Context, r tool.Runner, dev string) error {
 	return run(ctx, r, "mkfs", []string{"mkfs.ext4", "-q", "-F", "-E", "lazy_itable_init=0,lazy_journal_init=0", dev})
 }
 
+// HasFilesystem reports whether dev carries a file system signature, by
+// blkid's low-level probe (exit 2 is "nothing found"). A blank device is the
+// one case where Mkfs is right; a device with any signature is Fsck's. Any
+// other failure is an error, never "no file system", so a probe that cannot
+// run does not lead to a mkfs over data.
+func HasFilesystem(ctx context.Context, r tool.Runner, dev string) (bool, error) {
+	stdout, stderr, code, err := r.Run(ctx, []string{"blkid", "-p", "-o", "value", "-s", "TYPE", dev}, nil)
+	if err != nil {
+		return false, fmt.Errorf("ext4: blkid: %w", err)
+	}
+	switch {
+	case code == 0 && strings.TrimSpace(string(stdout)) != "":
+		return true, nil
+	case code == 2 || code == 0:
+		return false, nil
+	}
+	return false, fmt.Errorf("ext4: blkid: exit %d: %s", code, strings.TrimSpace(string(stderr)))
+}
+
 // Fsck runs e2fsck -p. Exit 0 (clean), 1 (corrected) and 2 (corrected, reboot
 // advised, which a mapping does not need) are success; 4 and above are ErrFsck.
 func Fsck(ctx context.Context, r tool.Runner, dev string) error {
