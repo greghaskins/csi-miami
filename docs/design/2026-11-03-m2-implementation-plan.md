@@ -783,8 +783,8 @@ Options{Sysfs, SystemdSocket, CacheDir}) Report` with `Report.Missing()
 one kubelet hostPath covers it), `--bin-dir` (default
 `<kubelet>/plugins/<driver>/bin`), `--systemd-socket` (default
 `/run/systemd/private`), `--shared-dir` (repeatable; a directory other than
-the kubelet's that the container and host see at one path), `--remediate`
-(false until T15). A cache or bin dir outside those, or a cache dir whose
+the kubelet's that the container and host see at one path); there is no
+`--remediate` flag (decision 53). A cache or bin dir outside those, or a cache dir whose
 control socket path exceeds the 107-byte unix limit, makes the `cache-dir`
 prerequisite missing.
 
