@@ -594,14 +594,23 @@ func (it *Item) decideCache(v vol, cur current) error {
 // discardCache removes the volume's node-local cache directory. It is the
 // item's own directory, so a half-made one with no index goes with it.
 func (it *Item) discardCache(v vol, why string) error {
-	if _, err := os.Stat(v.cacheDir); errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	it.log.Info("removing the node-local cache", "volume", v.in.VolumeID, "reason", why)
-	if err := cache.Remove(v.cacheDir); err != nil {
-		if rerr := os.RemoveAll(v.cacheDir); rerr != nil {
-			return fmt.Errorf("volume item %s: removing the cache: %w", v.in.VolumeID, rerr)
+	if _, err := os.Stat(v.cacheDir); err == nil {
+		it.log.Info("removing the node-local cache", "volume", v.in.VolumeID, "reason", why)
+		if err := cache.Remove(v.cacheDir); err != nil {
+			if rerr := os.RemoveAll(v.cacheDir); rerr != nil {
+				return fmt.Errorf("volume item %s: removing the cache: %w", v.in.VolumeID, rerr)
+			}
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("volume item %s: the cache: %w", v.in.VolumeID, err)
+	}
+	// The block server's lock lives beside the directory, not in it, so that it
+	// survives the directory's removal and the next server cannot lock a
+	// directory it does not yet see. Nothing holds it now: every caller got
+	// here after the unit was stopped (and the orphan device disconnected), or
+	// before one was started. The next server makes its own.
+	if err := os.Remove(v.cacheDir + ".lock"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("volume item %s: removing the cache lock: %w", v.in.VolumeID, err)
 	}
 	return nil
 }

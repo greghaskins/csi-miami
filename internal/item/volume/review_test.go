@@ -809,3 +809,92 @@ func TestNoDisconnectWhileTheMappingOrMountIsUp(t *testing.T) {
 	}
 	e.rec.none(t, "nbd.Disconnect")
 }
+
+// ---- the block server's lock file, beside the cache directory ----
+
+func (e *env) lockFile() string { return e.v.cacheDir + ".lock" }
+
+func (e *env) makeLock() {
+	e.t.Helper()
+	if err := os.WriteFile(e.lockFile(), nil, 0o600); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func (e *env) lockExists() bool {
+	_, err := os.Stat(e.lockFile())
+	return err == nil
+}
+
+func TestCleanTeardownRemovesTheCacheLockAfterTheOrphanDisconnect(t *testing.T) {
+	e := dirtyEnv(t)
+	e.makeLock()
+	e.ctl.stopErr = errors.New("lost") // the disconnect step runs too
+	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
+		t.Fatal(err)
+	}
+	if e.lockExists() {
+		t.Error("the cache lock file survived a clean unstage")
+	}
+	// A teardown with nothing left (no cache directory) still removes it.
+	f := newEnv(t)
+	f.seedRunning()
+	_ = os.RemoveAll(f.v.cacheDir)
+	f.makeLock()
+	if err := f.it.Teardown(bg, f.in, item.Observed{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.lockExists() {
+		t.Error("an orphaned lock file survived")
+	}
+}
+
+func TestCacheLockIsKeptOnEveryIncompleteUnstage(t *testing.T) {
+	for name, setup := range map[string]func(*env){
+		"publish in flight":   func(e *env) { e.ctl.inFlight = true },
+		"publish error":       func(e *env) { e.ctl.publishErr = syscall.ESTALE },
+		"verification":        func(e *env) { e.ctl.wrongName = true },
+		"refusal, no proof":   func(e *env) { e.ctl.publishRefused = true },
+		"corrupt cache index": func(e *env) { e.sd.SetState(e.v.unit, systemd.State{}); e.corruptIndex() },
+		"absent holder file": func(e *env) {
+			e.newItem()
+			e.sd.SetState(e.v.unit, systemd.State{})
+			e.ctl.down = true
+			_ = os.RemoveAll(e.v.holdDir)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := dirtyEnv(t)
+			e.makeLock()
+			setup(e)
+			if err := e.it.Teardown(bg, e.in, item.Observed{}); !errors.Is(err, item.ErrUnstageIncomplete) {
+				t.Fatalf("err = %v, want ErrUnstageIncomplete", err)
+			}
+			if !e.lockExists() || !e.cacheExists() {
+				t.Errorf("lock=%v cache=%v: nothing may be removed on an incomplete unstage", e.lockExists(), e.cacheExists())
+			}
+		})
+	}
+}
+
+func (e *env) corruptIndex() {
+	e.t.Helper()
+	e.newItem()
+	e.ctl.down = true
+	if err := os.WriteFile(filepath.Join(e.v.cacheDir, "index.json"), []byte("not json"), 0o600); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// A discard at a stage (a lineage that is not current's) removes the lock too:
+// nothing runs, so nothing holds it.
+func TestDiscardAtStageRemovesTheLockFile(t *testing.T) {
+	e := newEnv(t)
+	e.holderAt(testNode, 2)
+	e.makeCache(2, "2.1")
+	e.makeLock()
+	e.mustConverge()
+	if e.cacheExists() || e.lockExists() {
+		t.Errorf("cache=%v lock=%v", e.cacheExists(), e.lockExists())
+	}
+}
