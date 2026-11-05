@@ -183,8 +183,10 @@ func TestCacheLayoutErr(t *testing.T) {
 		{name: "a declared shared dir covers it", args: []string{"-cache-dir=/var/lib/miami/cache", "-shared-dir=/var/lib/miami"}, kube: "/var/lib/kubelet"},
 		{name: "a sibling prefix is not under the dir", args: []string{"-cache-dir=/var/lib/kubelet2/c"}, kube: "/var/lib/kubelet", want: "/var/lib/kubelet2/c"},
 		{name: "a bin dir elsewhere is not shared", args: []string{"-bin-dir=/opt/bin"}, kube: "/var/lib/kubelet", want: "/opt/bin"},
-		{name: "a long kubelet dir crosses the socket limit", kube: long, want: "107"},
-		{name: "a short cache dir on a long kubelet dir fits", args: []string{"-cache-dir=/var/lib/rancher/k3s/agent/kubelet/c"}, kube: long},
+		{name: "k0s fits with the defaults", kube: "/var/lib/k0s/kubelet"},
+		{name: "k3s fits with the defaults", kube: long},
+		{name: "microk8s fits with the defaults", kube: "/var/snap/microk8s/common/var/lib/kubelet"},
+		{name: "a too-long custom cache dir is refused", args: []string{"-cache-dir=/var/lib/rancher/k3s/agent/kubelet/a-very-long-cache-directory-name-that-goes-on-and-on-and-on-past-the-limit"}, kube: long, want: "107"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

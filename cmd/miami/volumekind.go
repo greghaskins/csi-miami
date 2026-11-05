@@ -163,11 +163,6 @@ func (l *lazySystemd) Close() error {
 // bytes, one of them the terminating NUL.
 const maxSocketPath = 107
 
-// socketName is the control socket of a volume in the cache dir, at its
-// longest (see internal/item/volume); the lock file and the drain record sit
-// beside the cache the same way and are shorter.
-const socketName = "pvc-00000000-0000-0000-0000-000000000000.sock"
-
 // stringList is a repeatable string flag.
 type stringList []string
 
@@ -189,8 +184,8 @@ func cacheLayoutErr(cfg nodeConfig) error {
 			return fmt.Errorf("%s %s is under neither -kubelet-dir nor a -shared-dir, so the host and the container may see different directories", d.flag, d.path)
 		}
 	}
-	if sock := filepath.Join(cfg.cacheDir, socketName); len(sock) > maxSocketPath {
-		return fmt.Errorf("-cache-dir %s makes a control socket path of %d bytes, over the %d-byte limit; use a shorter -cache-dir", cfg.cacheDir, len(sock), maxSocketPath)
+	if n := volitem.SocketPathLen(cfg.cacheDir); n > maxSocketPath {
+		return fmt.Errorf("-cache-dir %s makes a control socket path of %d bytes, over the %d-byte limit; use a shorter -cache-dir", cfg.cacheDir, n, maxSocketPath)
 	}
 	return nil
 }
