@@ -437,7 +437,7 @@ func TestDrainKeepsTheRecordUntilTheReleaseSucceeds(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(e.v.holdDir, 0o750) }) //nolint:gosec // a directory in the test's temporary tree
 	err := e.it.Drain(bg, in)
 	_ = os.Chmod(e.v.holdDir, 0o750) //nolint:gosec // a directory in the test's temporary tree
-	if !errors.Is(err, item.ErrUnstageIncomplete) {
+	if !errors.Is(err, item.ErrReleasePending) || errors.Is(err, item.ErrUnstageIncomplete) {
 		t.Fatalf("Drain = %v, want a retryable release failure", err)
 	}
 	if !e.holderInfo().Present || !e.drainRecordExists() {
@@ -602,7 +602,7 @@ func TestTeardownReleaseFailureIsRetryableAndKeepsTheRecord(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(e.v.holdDir, 0o750) }) //nolint:gosec // a directory in the test's temporary tree
 	err := e.it.Teardown(bg, e.in, item.Observed{})
 	_ = os.Chmod(e.v.holdDir, 0o750) //nolint:gosec // a directory in the test's temporary tree
-	if !errors.Is(err, item.ErrUnstageIncomplete) {
+	if !errors.Is(err, item.ErrReleasePending) {
 		t.Fatalf("Teardown = %v, want a retryable release failure", err)
 	}
 	if !e.holderInfo().Present || !e.drainRecordExists() {
@@ -635,16 +635,48 @@ func TestReleaseFailureMessageSaysTheDataIsInTheStore(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(e.v.holdDir, 0o750) }) //nolint:gosec // a directory in the test's temporary tree
 	err := e.it.Drain(bg, in)
 	_ = os.Chmod(e.v.holdDir, 0o750) //nolint:gosec // a directory in the test's temporary tree
-	if !errors.Is(err, item.ErrUnstageIncomplete) {
+	if !errors.Is(err, item.ErrReleasePending) || errors.Is(err, item.ErrUnstageIncomplete) {
 		t.Fatalf("Drain = %v", err)
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "the data is in the store") || !strings.Contains(msg, "will be retried") {
-		t.Errorf("message = %q", msg)
+	// The whole text: no claim that anything is unproven, nothing about a way out.
+	prefix := "volume item " + e.in.VolumeID + ": the holder file could not be released yet: the data is in the store; it will be retried: "
+	if !strings.HasPrefix(msg, prefix) {
+		t.Errorf("message = %q, want prefix %q", msg, prefix)
 	}
-	for _, bad := range []string{"cannot prove", "force-detach", "annotation"} {
+	for _, bad := range []string{"cannot yet prove", "cannot prove", "force-detach", "annotation", "unstage"} {
 		if strings.Contains(msg, bad) {
 			t.Errorf("message %q contains %q", msg, bad)
+		}
+	}
+}
+
+// F2: the holder file is there and the store directory is not. With the PV
+// present nothing is proven and the volume waits; with the PV NotFound the
+// volume was deleted and the cache is discarded.
+func TestDrainWithAHolderAndNoStoreDirectoryNeedsTheAPIsWord(t *testing.T) {
+	for _, exists := range []bool{true, false} {
+		e := orphanEnv(t)
+		in := e.drainIntent(t)
+		if err := os.RemoveAll(e.v.storeDir); err != nil {
+			t.Fatal(err)
+		}
+		e.it.cfg.Current = storeCurrent
+		e.it.cfg.VolumeExists = func(context.Context, string) (bool, error) { return exists, nil }
+		mp, err := e.in.Transport.MountPoint(e.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.mnt.add(mp, "nfs", "nas.example.com:/export")
+		err = e.it.Drain(bg, in)
+		if exists {
+			if !errors.Is(err, item.ErrUnstageIncomplete) || !e.cacheExists() || len(e.events) != 0 {
+				t.Errorf("PV present: err %v, cache %t, events %v", err, e.cacheExists(), e.events)
+			}
+			continue
+		}
+		if err != nil || e.cacheExists() || !slices.Equal(e.events, []string{ReasonGenerationLost}) {
+			t.Errorf("PV NotFound: err %v, cache %t, events %v", err, e.cacheExists(), e.events)
 		}
 	}
 }

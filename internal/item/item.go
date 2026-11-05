@@ -144,6 +144,12 @@ var (
 	// as they were so the unstage can be retried (decision 52). Retryable.
 	ErrUnstageIncomplete = errors.New("the unstage cannot yet prove the volume's last writes are in the store")
 
+	// ErrReleasePending is returned when the volume's data is settled (in the
+	// store, or given up) and its cache is gone, and only the removal of the
+	// holder file failed. It is retried by itself and nothing is unproven: it
+	// is Unavailable, like ErrUnstageIncomplete, but says nothing about writes.
+	ErrReleasePending = errors.New("the holder file could not be released yet")
+
 	// ErrGenerationOverdue is the condition of a volume whose newest published
 	// generation is older than generations.maxAge. It is reported, not an error
 	// of Converge.

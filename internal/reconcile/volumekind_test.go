@@ -162,6 +162,9 @@ func TestIncompleteUnstageIsNotUndoneByLaterPasses(t *testing.T) {
 	if err := e.r.Unstage(bg, in.VolumeID); !errors.Is(err, item.ErrUnstageIncomplete) {
 		t.Fatalf("Unstage = %v, want ErrUnstageIncomplete", err)
 	}
+	if got := Classify(fmt.Errorf("x: %w", ErrReleasePending)); got != ClassUnavailable {
+		t.Errorf("Classify(ErrReleasePending) = %v, want Unavailable", got)
+	}
 	if got := Classify(fmt.Errorf("x: %w", ErrUnstageIncomplete)); got != ClassUnavailable {
 		t.Errorf("class = %v", got)
 	}

@@ -360,13 +360,13 @@ func (it *Item) finishDrain(ctx context.Context, v vol, st *vstate, served bool)
 // releaseFailed is the error for a holder file that could not be released
 // after the cache is gone. It says what is true: nothing is unproven and there
 // is no way out to take (the force-detach annotation would abandon nothing);
-// the release is retried by itself. It is an ErrUnstageIncomplete.
+// the release is retried by itself. It is an ErrReleasePending, which is retryable but claims nothing about the writes.
 func (it *Item) releaseFailed(v vol, inStore bool, err error) error {
 	what := "the cache was discarded"
 	if inStore {
 		what = "the data is in the store"
 	}
-	e := fmt.Errorf("volume item %s: %w: %s; releasing the holder file failed and will be retried: %v", v.in.VolumeID, item.ErrUnstageIncomplete, what, err)
+	e := fmt.Errorf("volume item %s: %w: %s; it will be retried: %v", v.in.VolumeID, item.ErrReleasePending, what, err)
 	it.log.Warn("the holder file could not be released; it is retried", "volume", v.in.VolumeID, "error", e)
 	return e
 }
