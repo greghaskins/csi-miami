@@ -47,8 +47,10 @@ carries them too, but its entrypoint is the driver, not a shell).
     docker rm miami-bench
     ./miami version
 
-Use the tag of the commit under test (the publish job tags images by commit
-sha). Load the kernel modules once: `modprobe nbd loop dm_crypt adiantum`.
+Use the tag of the commit under test. Every CI run builds and pushes a
+multi-arch image tagged `x-<content hash>` for the commit, on any branch (only
+the release tags wait for `main`); the run's build job logs it as
+`reports version x-<hash>`, and `./miami version` prints the same string. Load the kernel modules once: `modprobe nbd loop dm_crypt adiantum`.
 
 The bench must run as root, and it refuses to start otherwise. It also refuses
 any `--dir` or `--store` that holds something it did not create, and it only
