@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -292,11 +293,26 @@ func (b *built) nbd(ctx context.Context, o Options, work string, unmounted *bool
 		"-cache-bound", strconv.FormatInt(size, 10), "-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", node)
 	var logs lockedBuf
 	cmd.Stderr, cmd.Stdout = &logs, &logs
-	if err := cmd.Start(); err != nil {
+	// Pdeathsig fires when the thread that started the child exits, not the
+	// process, so the child is started and waited for on one locked thread
+	// that lives as long as the child does. A SIGKILLed bench then takes
+	// blockd down with a SIGTERM, which disconnects the device.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
+	exited := make(chan struct{})
+	started := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer close(exited)
+		if err := cmd.Start(); err != nil {
+			started <- err
+			return
+		}
+		started <- nil
+		_ = cmd.Wait()
+	}()
+	if err := <-started; err != nil {
 		return fmt.Errorf("starting blockd: %w", err)
 	}
-	exited := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(exited) }()
 	var cli *blockd.Client
 	b.u.add(func() error {
 		// Stop RPC so the server disconnects the device; kill only if it does

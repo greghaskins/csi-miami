@@ -79,3 +79,18 @@ func TestBenchCompareExit(t *testing.T) {
 		t.Errorf("bad: exit %d\n%s%s", code, o.String(), e.String())
 	}
 }
+
+func TestBenchOutRefusesExistingFile(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "r.json")
+	if err := os.WriteFile(out, []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var o, e bytes.Buffer
+	args := []string{"bench", "--stack", "none", "--dir", t.TempDir(), "--scale", "small", "--rounds", "1", "--out", out}
+	if code := run(args, &o, &e); code != 1 || !strings.Contains(e.String(), "refusing to overwrite") {
+		t.Errorf("exit %d, stderr %q", code, e.String())
+	}
+	if b, _ := os.ReadFile(out); string(b) != "mine" {
+		t.Error("the existing file was changed")
+	}
+}

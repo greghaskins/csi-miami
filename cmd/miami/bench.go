@@ -92,6 +92,12 @@ func runBench(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "miami bench: --rounds must be at least 1")
 		return 2
 	}
+	if outFile != "" {
+		if _, err := os.Lstat(outFile); err == nil {
+			_, _ = fmt.Fprintf(stderr, "miami bench: refusing to overwrite %s\n", outFile)
+			return 1
+		}
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "miami bench: %v\n", err)
@@ -153,7 +159,7 @@ func benchCompare(a, b string, asJSON bool, stdout, stderr io.Writer) int {
 }
 
 func writeReportFile(path string, rep bench.Report) error {
-	f, err := os.Create(path) //nolint:gosec // operator-supplied output path
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // operator-supplied output path; O_EXCL refuses an existing file
 	if err != nil {
 		return err
 	}

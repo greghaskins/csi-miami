@@ -55,6 +55,14 @@ any `--dir` or `--store` that holds something it did not create, and it only
 ever writes inside a `miami-bench-*` directory it makes there. Use empty
 directories.
 
+`--out` refuses a file that already exists. No generation runs during the
+phases (by G1's definition the gate measures the data path only); the one
+publish happens after the rounds and is not gated.
+
+The loop image is a sparse file of `--size` under `--dir`, so `--dir` needs
+that much free space (8 GiB for the runs below) while the loop run is in
+progress. It is removed at the end.
+
 ## Run 1: store on a local directory
 
     sudo mkdir -p /var/tmp/g1/dir /var/tmp/g1/store
@@ -84,6 +92,25 @@ an empty directory on it:
 
 The loop baseline is the same as in run 1 (local disk); only the nbd stack's
 store moves. Unmount the export and remove `g1` afterwards.
+
+The nbd run leaves its chunks under the store directory on the export, in a
+`miami-bench-*` directory, until you remove them. After the run, with the
+export still mounted: `sudo rm -rf /mnt/g1-transport/g1/miami-bench-*`, then
+unmount.
+
+## After a crash
+
+A bench that is interrupted cleans up after itself. If it was killed with
+SIGKILL or the machine lost power, its block server is sent SIGTERM and exits
+by itself, but check for leftovers as root:
+
+    sudo pkill -f 'miami blockd'            # only if one is still running
+    sudo cryptsetup close miami-benchvol*   # the nbd run's mapping, if present
+    sudo cryptsetup close miami-bench-*     # the loop run's mapping, if present
+
+The loop device clears itself once nothing holds it. Run these inside the same
+`unshare` shell if it is still open; otherwise the mounts went with it. Then
+remove the `miami-bench-*` directories under `--dir` and `--store`.
 
 ## Reading the result
 
