@@ -22,6 +22,7 @@ commands:
   controller  run the controller plugin
   blockd      run the per-volume block server
   lock        run the lock helper
+  bench       measure a device stack (gate G1)
   version     print the build version
 `
 
@@ -52,6 +53,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runBlockd(args[1:], stdout, stderr)
 	case "lock":
 		return runLock(args[1:], stdout, stderr)
+	case "bench":
+		return runBench(args[1:], stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "miami: unknown command %q\n\n%s", args[0], usage)
 		return 2
