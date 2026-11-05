@@ -180,3 +180,11 @@ func TestStatusReportsTheEpochItPublishesUnder(t *testing.T) {
 		t.Fatalf("status epoch = %d, want %d", got, cfg.Epoch)
 	}
 }
+
+func TestStatusCarriesTheVolume(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	if got := s.status().Volume; got != cfg.Volume || got == "" {
+		t.Fatalf("status volume = %q, want %q", got, cfg.Volume)
+	}
+}

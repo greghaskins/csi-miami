@@ -16,6 +16,7 @@ const controlServiceName = "Control"
 // Status is what the control service reports about the running server. It never
 // carries a key or any chunk content.
 type Status struct {
+	Volume           string    // the volume this server serves, so a client can tell it from another's
 	Index            int       // the nbd device index, -1 before the device connects
 	Size             int64     // the device size in bytes
 	Dirty            int64     // unpublished dirty bytes (trimmed chunks hold none)

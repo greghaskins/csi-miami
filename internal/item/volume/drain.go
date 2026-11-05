@@ -279,6 +279,9 @@ func (it *Item) Drain(ctx context.Context, in intent.Intent) error {
 
 	it.log.Info("draining a volume this node holds and no longer stages; the generation published is a crash image (the writes that reached the cache, not a frozen file system) and ext4 replays its journal at the next mount", "volume", v.in.VolumeID, "dirtyBytes", dirty)
 	if _, err := it.ensureServer(ctx, v, st, h, cur); err != nil {
+		if errors.Is(err, errWrongServer) {
+			return err
+		}
 		return it.incomplete(ctx, v, st, "the block server cannot be started to drain: %v", err)
 	}
 	if err := it.syncOut(ctx, v, st); err != nil {
