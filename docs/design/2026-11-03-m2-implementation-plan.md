@@ -839,6 +839,29 @@ its own self-fenced rule); consumes `holder.Judgement`.
       `get` (annotation read).
 - [ ] Commit.
 
+### Task T13w: Node wiring of the volume kind
+
+No earlier task constructs the `volume` item in the node binary: T11 built
+and registered the kind in the reconciler, T12 and T13 produce the
+generation timers, the judge and the orphan drain, all behind seams.
+
+**Files:** modify `cmd/miami/node.go` (and its flags/tests),
+`internal/reconcile` options as needed.
+
+- [ ] Construct `volume.New(Config)` with the real clients: the tool runner,
+      the systemd private-socket manager, nbd, `blockd.Dial`, the holder,
+      the mounter, `BinDir`, `CacheDir`, `Root`, `Sysfs`, the node name,
+      the timeouts; register it for the `volume` kind.
+- [ ] `Config.Judge` = T13's judge (node + PV reads); `Config.Event` = the
+      reconciler's event recorder; T12's PV annotation reader; T13's orphan
+      drain enabled.
+- [ ] Refuse to start the `volume` kind (not the whole node) when the
+      prerequisite probe (T10) fails, reporting `prerequisite-missing`.
+- [ ] Tests: flag parsing; a fake-backed construction test asserting every
+      Config field is set (no nil seam reaches production); smoke covers the
+      real stack via T11's `TestSmokeVolumeStack` and the e2e (T21).
+- [ ] Commit.
+
 ### Task T14: Probe and conditions for volumes
 
 **Files:** create `internal/probe/probe.go`, tests; modify
