@@ -813,6 +813,27 @@ its own self-fenced rule); consumes `holder.Judgement`.
       decision 52, stop, delete the cache, release. Failure retries next
       pass. Tests with the item fakes, including a drain refused by the
       fence (abandoned by the operator: discard and release nothing).
+- [ ] Holder renewal by touching, not rename-over: `Renew` keeps its
+      read-and-check, then `futimens` (`UTIME_NOW`, so the NFS server sets
+      the time) on the descriptor opened when the holder was loaded; ESTALE
+      or a changed inode is `ErrLost`. A takeover renames a new inode in, so
+      a stale node's late renewal can no longer regress the file to its own
+      `<node>@<epoch>`. A forced detach aims at a live, renewing node, which
+      made that race routine. Test: a renewal racing a takeover leaves the
+      taker's file intact.
+- [ ] The force-detach annotation is never removed by the driver; the judge
+      re-applies it idempotently while it matches the holder file.
+- [ ] The drain takes the stage's cache-reuse decision (`current`'s epoch ==
+      the index epoch, or `current` names the index base, or no `current` and
+      no base) before it serves the cache; otherwise it discards and
+      releases nothing. A drained generation is a crash image (flushed writes,
+      no freeze): restore replays the journal.
+- [ ] `DeleteVolume` refuses while any holder file exists (the timed
+      `refuseLiveHolder` rule goes); the emergency detach is the way through.
+- [ ] The `takeoverTimeout` StorageClass parameter and the node's
+      `-takeover-timeout` flag no longer mean anything: reject the parameter
+      for new classes with a message naming decision 52 and remove the flag
+      (T22 documents that a NotReady node is never taken over).
 - [ ] RBAC: node ClusterRole gains `nodes` `get` and `persistentvolumes`
       `get` (annotation read).
 - [ ] Commit.
