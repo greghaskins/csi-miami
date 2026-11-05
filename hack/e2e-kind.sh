@@ -143,6 +143,7 @@ go test -c -tags e2e -o "$kind_work/e2e.test" ./test/e2e
 # The tests every transport runs a variant of, and the ones only nfs3 runs.
 # A listing that lacks one means a rename or a build tag would pass by running
 # nothing.
+volume_tests=()
 if [ "$transport" = nfs3 ]; then
   expected=(
     TestTwoPodsOnTwoNodesSeeEachOthersWrites
@@ -152,6 +153,10 @@ if [ "$transport" = nfs3 ]; then
     TestMetrics
     TestNFSServerRestart
     TestLockSerializesPodsAndBreaksAStaleLock
+  )
+  # The volume kind's tests have no variant subtests: they run for nfs3 only
+  # and skip for local, so a pass of the test itself is the check.
+  volume_tests=(
     TestVolumeExt4Semantics
     TestVolumeSurvivesReschedule
     TestVolumePluginRestart
@@ -174,7 +179,7 @@ else
   )
 fi
 listed="$("$kind_work/e2e.test" -test.list '^Test')"
-for name in "${expected[@]}"; do
+for name in "${expected[@]}" "${volume_tests[@]}"; do
   if ! grep -qx "$name" <<<"$listed"; then
     echo "e2e: the e2e build of test/e2e does not list $name" >&2
     exit 1
@@ -219,4 +224,10 @@ for name in "${expected[@]}"; do
     exit 1
   fi
 done
-echo "e2e: all ${#expected[@]} criteria passed for ${transport}"
+for name in "${volume_tests[@]}"; do
+  if ! grep -Eq "^--- PASS: ${name} " "$log"; then
+    echo "e2e: ${name} did not pass" >&2
+    exit 1
+  fi
+done
+echo "e2e: all $((${#expected[@]} + ${#volume_tests[@]})) criteria passed for ${transport}"
