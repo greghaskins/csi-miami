@@ -245,6 +245,7 @@ func (s *server) device() device {
 func (s *server) status() Status {
 	s.mu.Lock()
 	st := Status{
+		Volume:           s.cfg.Volume,
 		Index:            s.device().index(),
 		Size:             s.back.Size(),
 		Dirty:            s.back.cache.DirtyBytes(),

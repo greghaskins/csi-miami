@@ -355,7 +355,7 @@ func (it *Item) volOf(in intent.Intent) (vol, error) {
 	return vol{
 		in: in, name: id.Name, params: p, storeDir: storeDir, holdDir: filepath.Dir(storeDir),
 		cacheDir: filepath.Join(it.cfg.CacheDir, id.Name),
-		socket:   filepath.Join(it.cfg.CacheDir, id.Name+".sock"),
+		socket:   SocketPath(it.cfg.CacheDir, id.Name),
 		unit:     unit, stage: in.StagePath, size: size, chunk: p.ChunkSize, bound: bound,
 	}, nil
 }

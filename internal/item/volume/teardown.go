@@ -141,7 +141,9 @@ func (it *Item) unmountAndClose(ctx context.Context, v vol, st *vstate) error {
 // and the mapping down first, which is checked again before disconnecting. An
 // orphan device would otherwise strand the volume on this node.
 func (it *Item) stopServerAndUnit(ctx context.Context, v vol) error {
-	it.stopServer(ctx, v)
+	if err := it.stopServer(ctx, v); err != nil {
+		return err
+	}
 	if err := it.cfg.Systemd.Stop(ctx, v.unit); err != nil {
 		return fmt.Errorf("volume item %s: %w: stopping the unit: %w", v.in.VolumeID, item.ErrServerDown, err)
 	}
@@ -217,8 +219,10 @@ func deviceNumbers(path string) (major, minor int, ok bool) {
 
 // stopServer sends the server its Stop request. A dial or a request that
 // fails is a Warn naming the device, because the device is what stays behind
-// if the unit stop does not take it down.
-func (it *Item) stopServer(ctx context.Context, v vol) {
+// if the unit stop does not take it down. It reads the server's status first
+// and sends nothing to a server that serves another volume, which is the
+// error returned.
+func (it *Item) stopServer(ctx context.Context, v vol) error {
 	device := -1
 	if dev, ok, err := it.findDevice(v); err == nil && ok {
 		device = dev.Index
@@ -228,12 +232,18 @@ func (it *Item) stopServer(ctx context.Context, v vol) {
 	c, err := it.cfg.Dial(cctx, v.socket)
 	if err != nil {
 		it.log.Warn("could not reach the block server to stop it", "volume", v.in.VolumeID, "device", device, "error", err)
-		return
+		return nil
 	}
 	defer func() { _ = c.Close() }()
+	if st, err := c.Status(cctx); err == nil {
+		if err := it.identity(v, st); err != nil {
+			return err
+		}
+	}
 	if err := c.Stop(cctx); err != nil {
 		it.log.Warn("the block server did not take the stop request", "volume", v.in.VolumeID, "device", device, "error", err)
 	}
+	return nil
 }
 
 // incomplete is the retryable unstage error. Its text, and a Warn with the
@@ -365,6 +375,9 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 	if err != nil {
 		return it.incomplete(ctx, v, st, "the block server does not answer after the final generation: %v", err)
 	}
+	if err := it.identity(v, ss); err != nil {
+		return err
+	}
 	want := reply.Name
 	if want == "" {
 		want = ss.Base // nothing to add: the store must already name what the cache descends from
@@ -423,6 +436,9 @@ func (it *Item) waitNoPublish(ctx context.Context, v vol, st *vstate, c Control)
 		if err != nil {
 			return it.incomplete(ctx, v, st, "the block server does not answer: %v", err)
 		}
+		if err := it.identity(v, ss); err != nil {
+			return err
+		}
 		if !ss.PublishInFlight {
 			return nil
 		}
@@ -476,6 +492,9 @@ func (it *Item) serverUp(ctx context.Context, v vol, st *vstate) (bool, error) {
 		return false, nil
 	}
 	if _, serr := it.ensureServer(ctx, v, st, h, cur); serr != nil {
+		if errors.Is(serr, errWrongServer) {
+			return false, serr
+		}
 		return false, it.incomplete(ctx, v, st, "the block server is not running and cannot be started to sync: %v", serr)
 	}
 	return true, nil

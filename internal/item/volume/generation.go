@@ -125,6 +125,10 @@ func (it *Item) markBoundary(ctx context.Context, v vol) (Control, error) {
 		_ = c.Close()
 		return nil, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
 	}
+	if err := it.identity(v, status); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 	if status.PublishInFlight {
 		_ = c.Close()
 		return nil, fmt.Errorf("volume item %s: %w", v.in.VolumeID, ErrGenerationSkipped)

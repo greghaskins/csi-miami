@@ -548,6 +548,7 @@ type fakeCtl struct {
 	stickyDirty    bool   // a publish leaves the dirty count as it was
 	wrongName      bool   // a publish succeeds but current does not move
 	onPublish      func() // runs as a publish begins, before it answers
+	volume         string // the volume Status names; empty means the env's own
 }
 
 func (c *fakeCtl) up() {
@@ -563,7 +564,11 @@ func (c *fakeCtl) Status(context.Context) (blockd.Status, error) {
 		c.inFlightPolls--
 		fl = true
 	}
-	return blockd.Status{Index: c.index, Size: c.size, Dirty: c.dirty, Base: c.base, Epoch: c.epoch, PublishInFlight: fl}, nil
+	vol := c.volume
+	if vol == "" {
+		vol = c.e.v.name
+	}
+	return blockd.Status{Volume: vol, Index: c.index, Size: c.size, Dirty: c.dirty, Base: c.base, Epoch: c.epoch, PublishInFlight: fl}, nil
 }
 
 func (c *fakeCtl) Boundary(ctx context.Context) error {

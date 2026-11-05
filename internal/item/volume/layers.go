@@ -515,7 +515,30 @@ func (it *Item) status(ctx context.Context, v vol) (statusT, error) {
 		return statusT{}, err
 	}
 	defer func() { _ = c.Close() }()
-	return c.Status(cctx)
+	st, err := c.Status(cctx)
+	if err != nil {
+		return statusT{}, err
+	}
+	if err := it.identity(v, st); err != nil {
+		return statusT{}, err
+	}
+	return st, nil
+}
+
+// errWrongServer marks the ErrServerDown of a server that answers for another
+// volume. The unstage and the drain return it as it is, not as a retryable
+// incomplete unstage: waiting does not change whose server it is.
+var errWrongServer = errors.New("the server on the control socket is not this volume's")
+
+// identity refuses a status that names another volume: the socket is this
+// volume's, so the server behind it is not the one to act on. Every path that
+// acts on a server (converge, generation, final sync, stop, drain) reads a
+// status first and passes it through here, directly or through status.
+func (it *Item) identity(v vol, st statusT) error {
+	if st.Volume != v.name {
+		return fmt.Errorf("volume item %s: %w: %w: it serves %q", v.in.VolumeID, item.ErrServerDown, errWrongServer, st.Volume)
+	}
+	return nil
 }
 
 // waitServing waits until the block server answers on its control socket

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
+	volkinds "github.com/greghaskins/csi-miami/internal/volume"
 )
 
 // nodeConfig is what the node's flags set.
@@ -46,8 +48,11 @@ type nodeConfig struct {
 	cacheDir      string
 	binDir        string
 	systemdSocket string
-	holderRenew   time.Duration
+	sharedDirs    stringList
 	remediate     bool
+
+	// The defaults of the generation timers, for a volume whose class sets none.
+	genInterval, genMaxAge, genTimeout time.Duration
 }
 
 // withDefaults fills the paths that default to places under the kubelet
@@ -62,6 +67,9 @@ func (c nodeConfig) withDefaults() nodeConfig {
 	if c.stageRoot == "" {
 		c.stageRoot = filepath.Join(c.kubeletDir, "plugins", "kubernetes.io", "csi", csi.DriverName)
 	}
+	if c.cacheDir == "" {
+		c.cacheDir = filepath.Join(c.kubeletDir, "plugins", csi.DriverName, "cache")
+	}
 	if c.binDir == "" {
 		c.binDir = filepath.Join(c.kubeletDir, "plugins", csi.DriverName, "bin")
 	}
@@ -75,14 +83,8 @@ type eventRunner interface {
 	Run(ctx context.Context)
 }
 
-// runNode parses the flags of `miami node` and serves CSI until SIGTERM or
-// SIGINT, then stops gracefully. Help goes to stdout and exits 0; a flag error
-// goes to stderr and exits 2; a failure to serve exits 1.
-func runNode(args []string, stdout, stderr io.Writer) int {
-	var out bytes.Buffer
-	var cfg nodeConfig
-	fs := flag.NewFlagSet("miami node", flag.ContinueOnError)
-	fs.SetOutput(&out)
+// nodeFlags defines the flags of `miami node` on fs, writing into cfg.
+func nodeFlags(fs *flag.FlagSet, cfg *nodeConfig) {
 	fs.StringVar(&cfg.endpoint, "endpoint", "unix:///csi/csi.sock", "CSI endpoint to listen on, unix:///<absolute path>")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "this node's name, as Kubernetes knows it (required)")
 	fs.StringVar(&cfg.kubeletDir, "kubelet-dir", "/var/lib/kubelet", "the kubelet's root directory on the host")
@@ -95,11 +97,25 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&cfg.transportIdle, "transport-idle", 0, "unmount a transport that no volume uses after this long; 0 means never")
 	fs.StringVar(&cfg.kubeconfig, "kubeconfig", "", "kubeconfig file, for development outside a cluster; in a cluster the service account is used")
 	fs.BoolVar(&cfg.noEvents, "no-events", false, "do not record Kubernetes events (for tests, where there is no API server)")
-	fs.StringVar(&cfg.cacheDir, "cache-dir", "/var/lib/miami/cache", "directory the volume caches live under on the host; must be writable")
+	fs.StringVar(&cfg.cacheDir, "cache-dir", "", "directory the volume caches live under on the host, writable and seen at the same path by the container and the host (default <kubelet-dir>/plugins/"+csi.DriverName+"/cache)")
 	fs.StringVar(&cfg.binDir, "bin-dir", "", "directory the per-hash copies of the miami binary are kept in (default <kubelet-dir>/plugins/"+csi.DriverName+"/bin)")
 	fs.StringVar(&cfg.systemdSocket, "systemd-socket", "/run/systemd/private", "systemd's private socket, used to run each volume's block server as a unit")
-	fs.DurationVar(&cfg.holderRenew, "holder-renew", 15*time.Second, "how often the node renews the holder file of each volume it serves")
+	fs.Var(&cfg.sharedDirs, "shared-dir", "a directory the node container sees at the same absolute path as the host, besides -kubelet-dir; -cache-dir and -bin-dir must lie under one (repeatable)")
+	fs.DurationVar(&cfg.genInterval, "generation-interval", volkinds.DefaultGenerationEvery, "how often a volume with unpublished writes publishes a generation, unless its class sets generations.interval")
+	fs.DurationVar(&cfg.genMaxAge, "generation-max-age", volkinds.DefaultGenerationMaxAge, "how old the newest generation of a volume with unpublished writes may get before the volume is reported overdue, unless its class sets generations.maxAge")
+	fs.DurationVar(&cfg.genTimeout, "generation-timeout", reconcile.DefaultGenerationTimeout, "deadline of one generation, freeze to upload")
 	fs.BoolVar(&cfg.remediate, "remediate", false, "let the reconciler repair what it finds wrong beyond converging intent (off until remediation ships)")
+}
+
+// runNode parses the flags of `miami node` and serves CSI until SIGTERM or
+// SIGINT, then stops gracefully. Help goes to stdout and exits 0; a flag error
+// goes to stderr and exits 2; a failure to serve exits 1.
+func runNode(args []string, stdout, stderr io.Writer) int {
+	var out bytes.Buffer
+	var cfg nodeConfig
+	fs := flag.NewFlagSet("miami node", flag.ContinueOnError)
+	fs.SetOutput(&out)
+	nodeFlags(fs, &cfg)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -122,10 +138,13 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		{"-reconcile-interval must be positive", cfg.interval <= 0},
 		{"-transport-idle must not be negative", cfg.transportIdle < 0},
 		{"-kubelet-dir must be an absolute path", !filepath.IsAbs(cfg.kubeletDir)},
-		{"-cache-dir must be an absolute path", !filepath.IsAbs(cfg.cacheDir)},
+		{"-cache-dir must be an absolute path", cfg.cacheDir != "" && !filepath.IsAbs(cfg.cacheDir)},
 		{"-bin-dir must be an absolute path", cfg.binDir != "" && !filepath.IsAbs(cfg.binDir)},
 		{"-systemd-socket must be an absolute path", !filepath.IsAbs(cfg.systemdSocket)},
-		{"-holder-renew must be positive", cfg.holderRenew <= 0},
+		{"-shared-dir must be an absolute path", slices.ContainsFunc(cfg.sharedDirs, func(d string) bool { return !filepath.IsAbs(d) })},
+		{"-generation-interval must be at least " + volkinds.MinGenerationInterval.String(), cfg.genInterval < volkinds.MinGenerationInterval},
+		{"-generation-max-age must not be under -generation-interval", cfg.genMaxAge < cfg.genInterval},
+		{"-generation-timeout must be positive", cfg.genTimeout <= 0},
 	} {
 		if p.bad {
 			_, _ = fmt.Fprintf(stderr, "miami node: %s\n", p.name)
@@ -148,6 +167,7 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 // ctx ends.
 func serveNode(ctx context.Context, cfg nodeConfig, log *slog.Logger) error {
 	var events eventRunner
+	var cluster clusterAPI
 	if !cfg.noEvents {
 		restCfg, err := kube.RestConfig(cfg.kubeconfig)
 		if err != nil {
@@ -160,19 +180,24 @@ func serveNode(ctx context.Context, cfg nodeConfig, log *slog.Logger) error {
 			return err
 		}
 		events = rec
+		kc, err := kube.NewClient(restCfg, cfg.deadline)
+		if err != nil {
+			return err
+		}
+		cluster = kc
 	}
-	return serveNodeWith(ctx, cfg, mount.New(cfg.deadline), events, log, nil)
+	return serveNodeWith(ctx, cfg, mount.New(cfg.deadline), events, cluster, log, nil)
 }
 
-// serveNodeWith serves with the given mounter and event recorder (nil for
-// none); tests replace them. ready, if not nil, is called with the address the
+// serveNodeWith serves with the given mounter, event recorder and cluster
+// reads (nil for none); tests replace them. ready, if not nil, is called with the address the
 // metrics server listens on once everything is listening.
 //
 // On ctx ending it stops in the order that loses nothing: the CSI server stops
 // accepting and finishes the calls in flight, which are waiting on the
 // reconciler; then the reconciler is cancelled; then the event recorder and
 // the metrics server, which the last calls were still reporting to.
-func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events eventRunner, log *slog.Logger, ready func(metricsAddr string)) error {
+func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events eventRunner, cluster clusterAPI, log *slog.Logger, ready func(metricsAddr string)) error {
 	tRoot, err := resolveRoot(cfg.transportsRoot)
 	if err != nil {
 		return err
@@ -201,12 +226,17 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		opts.Events = events
 	}
 	opts.CacheDir, opts.BinDir, opts.SystemdSocket = cfg.cacheDir, cfg.binDir, cfg.systemdSocket
-	opts.HolderRenew, opts.Remediate = cfg.holderRenew, cfg.remediate
+	opts.Remediate = cfg.remediate
 	// The prerequisites of the volume kind are probed now and on every pass;
 	// a node without them still serves directory volumes.
-	probe := newProber(prereq.Options{SystemdSocket: cfg.systemdSocket, CacheDir: cfg.cacheDir}, reg, log)
+	probe := newProber(prereq.Options{SystemdSocket: cfg.systemdSocket, CacheDir: cfg.cacheDir}, cacheLayoutErr(cfg), reg, log)
 	opts.Prereq = probe
 	probe(ctx)
+	deps := realDeps(cfg)
+	defer func() { _ = deps.Systemd.(io.Closer).Close() }()
+	if err := wireItems(&opts, cfg, tRoot, deps, m, events, cluster, log); err != nil {
+		return err
+	}
 	rec, err := reconcile.New(store, m, opts)
 	if err != nil {
 		return err
@@ -295,14 +325,22 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 }
 
 // newProber returns the probe of the node's prerequisites: it runs
-// prereq.Probe, sets the capability gauges and logs when the set of missing
+// prereq.Probe, counts a layout the host cannot share (layout, see
+// cacheLayoutErr) as a missing cache dir, sets the capability gauges and logs when the set of missing
 // features changes (not on every pass). It is safe for concurrent use.
-func newProber(o prereq.Options, reg *metrics.Registry, log *slog.Logger) func(context.Context) prereq.Report {
+func newProber(o prereq.Options, layout error, reg *metrics.Registry, log *slog.Logger) func(context.Context) prereq.Report {
 	var mu sync.Mutex
 	var last string
 	first := true
 	return func(ctx context.Context) prereq.Report {
 		rep := prereq.Probe(ctx, o)
+		if layout != nil {
+			for i := range rep.Features {
+				if rep.Features[i].Name == prereq.FeatureCacheDir {
+					rep.Features[i].Err = errors.Join(layout, rep.Features[i].Err)
+				}
+			}
+		}
 		for _, f := range rep.Features {
 			reg.SetCapability(f.Name, f.Err == nil)
 		}
