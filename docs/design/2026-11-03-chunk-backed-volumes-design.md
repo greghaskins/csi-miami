@@ -670,6 +670,29 @@ Appended to the brief's log as 36 to 50; the brief's numbering continues.
     signal: liveness is the unit's main process answering on the volume's
     control socket. A server stopping on request (unstage) still disconnects
     the device; a live binary upgrade is possible on this path and not built.
+52. **A volume moves only after a verified final sync** (supersedes the
+    timed takeover of 4.6 and brief 4.5, and narrows decision 43). The holder
+    is released only by a clean unstage: unmount, close the mapping, the
+    final generation published, `current` re-read from the store and found to
+    name it, and the server reporting nothing dirty and no publish in flight;
+    only then are the server stopped, the cache deleted and the holder file
+    removed. Anything short of that fails `NodeUnstageVolume` as retryable
+    and leaves the server and cache in place, retrying, so the volume stays
+    with the node that holds the unsynced data; a pod scheduled elsewhere
+    waits as `holder-contended`, naming the holder. No node takes over a
+    holder because it is old or its node is NotReady. A node that comes back
+    with a held volume it no longer stages (a crash, then the pod moved)
+    drains it on its own: it serves the cache without a key or a mount,
+    publishes, verifies as above and releases. The emergency detach, which
+    abandons whatever the holder had not published, is an operator act: a PV
+    annotation naming the exact holder (`<node>@<epoch>`, ignored when it
+    does not match the holder file), or the standard
+    `node.kubernetes.io/out-of-service` taint on the holder's node, which
+    abandons every volume that node holds. Both raise an event naming the
+    abandoned epoch. The epoch fence (45) is unchanged and is what keeps an
+    abandoned node's late publishes out after it returns; a fenced node's
+    unstage still discards and succeeds, since its data was given up by the
+    operator.
 
 ## 7. Milestones
 
