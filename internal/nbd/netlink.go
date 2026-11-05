@@ -135,6 +135,73 @@ func reconfigureAttrs(index int, size int64, backend string) ([]byte, error) {
 	return ae.Encode()
 }
 
+// Handshake runs the client half of the handshake on sock (NBD_OPT_GO for the
+// default export) and checks that the export is at least size bytes. The
+// kernel speaks only the transmission phase, so a socket must go through this
+// once, before it is handed over with ReconnectSocket (Connect does the same
+// for itself). It is bounded by ctx.
+func Handshake(ctx context.Context, sock *os.File, size int64) error {
+	e, err := handshakeFile(ctx, sock)
+	if err != nil {
+		return fmt.Errorf("nbd: handshake: %w", err)
+	}
+	if e.size < uint64(max(size, 0)) { //nolint:gosec // clamped non-negative
+		return fmt.Errorf("nbd: handshake: export is %d bytes, smaller than the device's %d", e.size, size)
+	}
+	return nil
+}
+
+// ReconnectSocket hands sock, already through Handshake, to a connected device
+// whose server is gone (NBD_CMD_RECONFIGURE with NBD_ATTR_SOCKETS). The device,
+// and whatever is stacked on it, stays; requests held while the connection was
+// dead are resent on sock. No size is sent: a size that differed from the
+// device's would notify a uevent.
+//
+// The kernel puts a socket only into a connection slot already marked dead.
+// With none it reports success and drops the socket, so a nil return does not
+// mean the device is served by sock: the caller confirms that by seeing a
+// request arrive on it, and may call again. The backend identifier is read
+// back from /sys/block/nbdN/backend and sent along, as Reconfigure does.
+func ReconnectSocket(ctx context.Context, index int, sock *os.File) error {
+	return reconnectSocket(ctx, "/sys", index, sock)
+}
+
+func reconnectSocket(ctx context.Context, sysfs string, index int, sock *os.File) error {
+	if index < 0 || sock == nil {
+		return fmt.Errorf("nbd: reconnect: index %d, socket %v", index, sock)
+	}
+	backend, _, err := readAttr(filepath.Join(sysfs, "block", "nbd"+strconv.Itoa(index)), "backend")
+	if err != nil {
+		return fmt.Errorf("nbd: reconnect nbd%d: %w", index, err)
+	}
+	_, err = bounded(ctx, func(ctx context.Context) (struct{}, error) {
+		fd := sock.Fd()
+		attrs, err := reconnectAttrs(index, backend, fd)
+		if err != nil {
+			return struct{}{}, err
+		}
+		_, err = execute(ctx, nlCmdReconfigure, attrs)
+		runtime.KeepAlive(sock)
+		return struct{}{}, err
+	})
+	if err != nil {
+		return fmt.Errorf("nbd: reconnect nbd%d: %w", index, err)
+	}
+	return nil
+}
+
+// reconnectAttrs encodes NBD_CMD_RECONFIGURE's attributes for a new socket:
+// the index, the backend identifier when there is one, and the socket.
+func reconnectAttrs(index int, backend string, fd uintptr) ([]byte, error) {
+	ae := netlink.NewAttributeEncoder()
+	ae.Uint32(attrIndex, uint32(index)) //nolint:gosec // checked non-negative
+	if backend != "" {
+		ae.String(attrBackendIdentifier, backend)
+	}
+	encodeSocket(ae, fd)
+	return ae.Encode()
+}
+
 // Disconnect asks the kernel to disconnect a device (NBD_CMD_DISCONNECT): it
 // sends NBD_CMD_DISC to the server and shuts the connection down.
 func Disconnect(ctx context.Context, index int) error {
@@ -191,6 +258,12 @@ func connectAttrs(o ConnectOptions, fd uintptr) ([]byte, error) {
 	if o.Backend != "" {
 		ae.String(attrBackendIdentifier, o.Backend)
 	}
+	encodeSocket(ae, fd)
+	return ae.Encode()
+}
+
+// encodeSocket adds the nested NBD_ATTR_SOCKETS list naming one descriptor.
+func encodeSocket(ae *netlink.AttributeEncoder, fd uintptr) {
 	ae.Nested(attrSockets, func(nae *netlink.AttributeEncoder) error {
 		nae.Nested(sockItem, func(sae *netlink.AttributeEncoder) error {
 			sae.Uint32(sockFD, uint32(fd)) //nolint:gosec // a file descriptor fits
@@ -198,7 +271,6 @@ func connectAttrs(o ConnectOptions, fd uintptr) ([]byte, error) {
 		})
 		return nil
 	})
-	return ae.Encode()
 }
 
 // seconds rounds d up to whole seconds; 0 for none.
