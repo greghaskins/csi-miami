@@ -157,6 +157,13 @@ type Config struct {
 	Judge    func(ctx context.Context, volumeID string, info holder.Info) holder.Judgement
 	Takeover func(volumeID string, j holder.Judgement)
 
+	// VolumeExists says whether the volume's PV exists: (false, nil) only when
+	// the API server answered that it does not (NotFound). It is the one proof
+	// of a deleted volume the drain accepts, because a store directory that is
+	// missing proves nothing (a mounted but empty export looks the same). Nil,
+	// an error and "exists" all keep a surviving cache.
+	VolumeExists func(ctx context.Context, name string) (bool, error)
+
 	// BinaryHash names the host copy of the binary, <BinDir>/miami-<hash>: the
 	// build's version string. Exe is the file copied, /proc/self/exe by
 	// default.

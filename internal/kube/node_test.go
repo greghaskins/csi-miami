@@ -96,3 +96,51 @@ func TestNodeStatus(t *testing.T) {
 }
 
 var _ reconcile.Cluster = (*Client)(nil)
+
+// VolumeExists backs the volume item's proof of deletion: false only on an
+// explicit NotFound. A PV of another driver, with another handle, is a PV
+// under that name: present.
+func TestPVExistsIsFalseOnlyOnNotFound(t *testing.T) {
+	t.Parallel()
+	pv := func(name, driver, handle string) map[string]any {
+		return map[string]any{
+			"apiVersion": "v1", "kind": "PersistentVolume",
+			"metadata": map[string]any{"name": name},
+			"spec":     map[string]any{"csi": map[string]any{"driver": driver, "volumeHandle": handle}},
+		}
+	}
+	cfg := apiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/persistentvolumes/ours":
+			writeJSON(w, 200, pv("ours", "d.example.com", "volume:ours"))
+		case "/api/v1/persistentvolumes/foreign":
+			writeJSON(w, 200, pv("foreign", "other.example.com", "something-else"))
+		case "/api/v1/persistentvolumes/gone":
+			writeJSON(w, 404, map[string]any{
+				"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 404, "reason": "NotFound",
+				"details": map[string]any{"name": "gone", "kind": "persistentvolumes"},
+			})
+		case "/api/v1/persistentvolumes/odd404":
+			http.NotFound(w, r) // not the API server's own answer
+		default:
+			writeJSON(w, 503, map[string]any{"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 503})
+		}
+	})
+	c, err := NewClient(cfg, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		exists  bool
+		wantErr bool
+	}{
+		{"ours", true, false}, {"foreign", true, false}, {"gone", false, false},
+		{"odd404", false, true}, {"broken", false, true},
+	} {
+		got, err := c.PVExists(context.Background(), tc.name)
+		if got != tc.exists || (err != nil) != tc.wantErr {
+			t.Errorf("%s: %t, %v; want %t, error %t", tc.name, got, err, tc.exists, tc.wantErr)
+		}
+	}
+}

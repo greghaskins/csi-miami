@@ -850,7 +850,7 @@ pass and on timer passes. `holder.Judge` (the timed rules) is removed. A cache
 left by a build from before this change has no drain record and is not drained
 until it is restaged (nothing is deployed yet). The drain applies decision 52's
 proof rule: a holder file naming another node, a store that moved past the
-cache, or a deleted volume discards with `GenerationLost`; an absent holder
+cache, or a deleted volume (the PV is NotFound; a missing store directory alone is not proof) discards with `GenerationLost`; an absent holder
 without proof keeps the cache and warns once.
 
 ### Task T13w: Node wiring of the volume kind
@@ -866,6 +866,7 @@ generation timers, the judge and the orphan drain, all behind seams.
       the systemd private-socket manager, nbd, `blockd.Dial`, the holder,
       the mounter, `BinDir`, `CacheDir`, `Root`, `Sysfs`, the node name,
       the timeouts; register it for the `volume` kind.
+- [ ] `Config.VolumeExists` = `kube.Client.PVExists` (T13; the drain's only proof of a deleted volume).
 - [ ] `Config.Judge` = T13's judge (node + PV reads); `Config.Event` = the
       reconciler's event recorder; T12's PV annotation reader; T13's orphan
       drain enabled.

@@ -99,3 +99,19 @@ func (c *Client) NodeOutOfService(ctx context.Context, name string) (bool, error
 	info, err := c.NodeStatus(ctx, name)
 	return info.OutOfService, err
 }
+
+// PVExists is volume.Config.VolumeExists: whether a PV of that name exists.
+// It is false only when the API server answered NotFound for it. Any object
+// under the name counts, whatever its driver or volume handle; an unreachable
+// server or an answer that is not the API server's own is an error, never
+// "does not exist".
+func (c *Client) PVExists(ctx context.Context, name string) (bool, error) {
+	_, err := c.GetPV(ctx, name)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrNotFound):
+		return false, nil
+	}
+	return false, err
+}

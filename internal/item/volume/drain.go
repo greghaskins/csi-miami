@@ -235,11 +235,12 @@ func (it *Item) Drain(ctx context.Context, in intent.Intent) error {
 		cur, cerr := it.readCurrent(ctx, v)
 		switch {
 		case errors.Is(cerr, item.ErrItemMissing):
-			if !it.transportMounted(ctx, v) {
-				return it.incomplete(ctx, v, st, "the volume's directory is missing and its transport does not look mounted")
+			if it.deleted(ctx, v) {
+				it.lost(v, dirty, "the volume's PV is gone; it was deleted")
+				return it.finishDrain(ctx, v, st, false)
 			}
-			it.lost(v, dirty, "the volume's directory is gone; it was deleted")
-			return it.finishDrain(ctx, v, st, false)
+			it.warnOnce(v, "a surviving cache has no holder file and its store directory is missing, which a mounted but empty export looks like too; it is left alone unless the volume's PV is gone. Remove the cache directory by hand to give it up")
+			return nil
 		case cerr != nil:
 			return fmt.Errorf("volume item %s: draining: %w: %w", v.in.VolumeID, item.ErrUnstageIncomplete, cerr)
 		case cur.ok && cur.epoch > idx.Epoch:
@@ -260,8 +261,8 @@ func (it *Item) Drain(ctx context.Context, in intent.Intent) error {
 	st.fz.Unlock()
 
 	cur, err := it.readCurrent(ctx, v)
-	if errors.Is(err, item.ErrItemMissing) && it.transportMounted(ctx, v) {
-		it.lost(v, dirty, "the volume's directory is gone; it was deleted")
+	if errors.Is(err, item.ErrItemMissing) && it.deleted(ctx, v) {
+		it.lost(v, dirty, "the volume's PV is gone; it was deleted")
 		return it.finishDrain(ctx, v, st, false)
 	}
 	if err != nil {
@@ -299,9 +300,24 @@ func (it *Item) warnOnce(v vol, msg string) {
 	it.log.Warn(msg, "volume", v.in.VolumeID, "cache", v.cacheDir)
 }
 
+// deleted reports whether the volume is known to have been deleted: the
+// transport is mounted (so the missing directory is not an unmounted mount
+// point) and the API server says the PV does not exist. Every other outcome,
+// including no way to ask, is "not known".
+func (it *Item) deleted(ctx context.Context, v vol) bool {
+	if it.cfg.VolumeExists == nil || !it.transportMounted(ctx, v) {
+		return false
+	}
+	exists, err := it.cfg.VolumeExists(ctx, v.name)
+	if err != nil {
+		it.log.Debug("could not ask whether the volume's PV exists", "volume", v.in.VolumeID, "error", err)
+		return false
+	}
+	return !exists
+}
+
 // transportMounted reports whether the volume's transport is in the mount
-// table: a store directory that is "gone" under a transport that is not
-// mounted is an empty mount point, not a deleted volume.
+// table.
 func (it *Item) transportMounted(ctx context.Context, v vol) bool {
 	mp, err := v.in.Transport.MountPoint(it.cfg.Root)
 	if err != nil {
@@ -330,7 +346,7 @@ func (it *Item) finishDrain(ctx context.Context, v vol, st *vstate, served bool)
 		return err
 	}
 	if err := it.release(ctx, v, st); err != nil {
-		return it.incomplete(ctx, v, st, "releasing the holder file: %v", err)
+		return it.releaseFailed(v, served, err)
 	}
 	if err := it.removeDrainRecord(v); err != nil {
 		return err
@@ -339,6 +355,20 @@ func (it *Item) finishDrain(ctx context.Context, v vol, st *vstate, served bool)
 	st.gone = true
 	st.fz.Unlock()
 	return nil
+}
+
+// releaseFailed is the error for a holder file that could not be released
+// after the cache is gone. It says what is true: nothing is unproven and there
+// is no way out to take (the force-detach annotation would abandon nothing);
+// the release is retried by itself. It is an ErrUnstageIncomplete.
+func (it *Item) releaseFailed(v vol, inStore bool, err error) error {
+	what := "the cache was discarded"
+	if inStore {
+		what = "the data is in the store"
+	}
+	e := fmt.Errorf("volume item %s: %w: %s; releasing the holder file failed and will be retried: %v", v.in.VolumeID, item.ErrUnstageIncomplete, what, err)
+	it.log.Warn("the holder file could not be released; it is retried", "volume", v.in.VolumeID, "error", e)
+	return e
 }
 
 // serverPresent reports whether a unit or a device of the volume exists.

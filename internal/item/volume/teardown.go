@@ -86,7 +86,7 @@ func (it *Item) Teardown(ctx context.Context, in intent.Intent, _ item.Observed)
 		return err
 	}
 	if err := it.release(ctx, v, st); err != nil {
-		return it.incomplete(ctx, v, st, "releasing the holder file: %v", err)
+		return it.releaseFailed(v, true, err)
 	}
 	if err := it.removeDrainRecord(v); err != nil {
 		return err

@@ -313,35 +313,69 @@ func TestDrainWithNoHolderNeedsProof(t *testing.T) {
 	})
 }
 
-// The volume's store directory is gone: it was deleted, and nothing is left to
-// drain into.
-func TestDrainDiscardsWhenTheVolumeWasDeleted(t *testing.T) {
-	e := orphanEnv(t)
-	in := e.drainIntent(t)
-	if err := os.RemoveAll(e.v.storeDir); err != nil {
-		t.Fatal(err)
+// A store directory that is missing proves nothing: a mounted but empty export
+// (a dataset not yet mounted on the NAS, a recreated share, a rollback) looks
+// the same as a deletion. Only the API's NotFound for the PV is proof.
+func TestDrainDiscardsOnlyWithTheAPIsWordThatTheVolumeIsDeleted(t *testing.T) {
+	setup := func(t *testing.T, exists func(context.Context, string) (bool, error)) (*env, intent.Intent) {
+		e := orphanEnv(t)
+		in := e.drainIntent(t)
+		_ = os.Remove(holder.Path(e.v.holdDir, e.v.name))
+		if err := os.RemoveAll(e.v.storeDir); err != nil {
+			t.Fatal(err)
+		}
+		e.it.cfg.Current = storeCurrent // the real reader, which reports a missing store directory
+		e.it.cfg.VolumeExists = exists
+		mp, err := e.in.Transport.MountPoint(e.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.mnt.add(mp, "nfs", "nas.example.com:/export")
+		return e, in
 	}
-	e.it.cfg.Current = storeCurrent // the real reader, which reports a missing store directory
-	mp, err := e.in.Transport.MountPoint(e.root)
-	if err != nil {
-		t.Fatal(err)
+	kept := func(t *testing.T, name string, exists func(context.Context, string) (bool, error)) {
+		t.Run(name, func(t *testing.T) {
+			e, in := setup(t, exists)
+			for range 2 {
+				if err := e.it.Drain(bg, in); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !e.cacheExists() || !e.drainRecordExists() || len(e.events) != 0 {
+				t.Errorf("cache %t, record %t, events %v: dirty data discarded without proof", e.cacheExists(), e.drainRecordExists(), e.events)
+			}
+			if n := strings.Count(e.logs.String(), "level=WARN"); n != 1 {
+				t.Errorf("%d warnings, want 1:\n%s", n, e.logs.String())
+			}
+		})
 	}
-	// With the transport not mounted, a missing directory is an empty mount
-	// point and says nothing.
-	if err := e.it.Drain(bg, in); err == nil || !e.cacheExists() {
-		t.Fatalf("discarded under an unmounted transport: %v", err)
-	}
-	e.events = nil
-	e.mnt.add(mp, "nfs", "nas.example.com:/export")
-	if err := e.it.Drain(bg, in); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(e.events, []string{ReasonGenerationLost}) {
-		t.Errorf("events = %v", e.events)
-	}
-	if e.cacheExists() || e.drainRecordExists() {
-		t.Error("the cache or its record is left")
-	}
+	kept(t, "no seam", nil)
+	kept(t, "the PV exists", func(context.Context, string) (bool, error) { return true, nil })
+	// Whatever the PV is (another driver's, another handle), the seam says it
+	// exists: only an explicit NotFound is proof; production's PVExists does
+	// not look inside the object.
+	kept(t, "the API cannot be asked", func(context.Context, string) (bool, error) { return false, errors.New("503") })
+
+	t.Run("the PV is NotFound", func(t *testing.T) {
+		e, in := setup(t, func(context.Context, string) (bool, error) { return false, nil })
+		if err := e.it.Drain(bg, in); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(e.events, []string{ReasonGenerationLost}) {
+			t.Errorf("events = %v", e.events)
+		}
+		if e.cacheExists() || e.drainRecordExists() {
+			t.Error("the cache or its record is left")
+		}
+	})
+	t.Run("the PV is NotFound but the transport is not mounted", func(t *testing.T) {
+		e, in := setup(t, func(context.Context, string) (bool, error) { return false, nil })
+		e.mnt.entries = nil
+		e.mnt.SetTable(nil)
+		if err := e.it.Drain(bg, in); err != nil || !e.cacheExists() {
+			t.Fatalf("Drain = %v, cache %t", err, e.cacheExists())
+		}
+	})
 }
 
 // B-M2: the fence is `current` above the larger of the cache's epoch and the
@@ -362,10 +396,12 @@ func TestDrainFenceUsesTheLargerOfTheIndexAndHeldEpoch(t *testing.T) {
 	}
 }
 
-// And a current above both is a fence even when the cache descends from it.
+// And a current above both is a fence even when the cache descends from it:
+// this node built the cache on a generation another acquisition published
+// (epoch 5), under an epoch-3 ownership that was then fenced.
 func TestDrainFencedByAGenerationAboveBothEpochsDiscards(t *testing.T) {
 	e := orphanEnv(t)
-	e.makeCache(3, "5.1", 3) // built on a manifest of epoch 5, under epoch 3
+	e.makeCache(3, "5.1", 3) // the cache's base is the epoch-5 manifest it was restaged from
 	e.curName = "5.1"
 	if err := e.it.Drain(bg, e.drainIntent(t)); err != nil {
 		t.Fatal(err)
@@ -586,5 +622,29 @@ func skipIfRoot(t *testing.T) {
 	t.Helper()
 	if os.Geteuid() == 0 {
 		t.Skip("a read-only directory does not stop root")
+	}
+}
+
+// R2: a failed release after a verified publish says so, and does not suggest
+// that anything is unproven or that the force-detach is the way out.
+func TestReleaseFailureMessageSaysTheDataIsInTheStore(t *testing.T) {
+	skipIfRoot(t)
+	e := orphanEnv(t)
+	in := e.drainIntent(t)
+	e.it.cfg.Systemd = chmodAfterStop{e.sd, e.v.holdDir}
+	t.Cleanup(func() { _ = os.Chmod(e.v.holdDir, 0o750) }) //nolint:gosec // a directory in the test's temporary tree
+	err := e.it.Drain(bg, in)
+	_ = os.Chmod(e.v.holdDir, 0o750) //nolint:gosec // a directory in the test's temporary tree
+	if !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("Drain = %v", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "the data is in the store") || !strings.Contains(msg, "will be retried") {
+		t.Errorf("message = %q", msg)
+	}
+	for _, bad := range []string{"cannot prove", "force-detach", "annotation"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("message %q contains %q", msg, bad)
+		}
 	}
 }
