@@ -77,6 +77,15 @@ type Item interface {
 	// nothing.
 	PublishSource(in intent.Intent) (string, error)
 
+	// PublishRoot is the directory PublishSource lies beneath, and the root
+	// the publish bind is resolved beneath (Mounter.Bind): the source is
+	// opened relative to it with no symlink, mount point or ".." able to lead
+	// out. For a directory item it is the transport's mount point; for a
+	// volume item it is the stage path, the mount that is the source itself. It
+	// is never empty: there is no host-wide resolution of a publish source. It
+	// decides from the intent alone and touches nothing.
+	PublishRoot(in intent.Intent) (string, error)
+
 	// Teardown undoes Converge: afterwards nothing the Item made is mounted at
 	// the stage path, and what the Item made below it is gone. It is a no-op
 	// when there is nothing to undo, and it never detaches lazily, so a busy

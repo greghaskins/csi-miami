@@ -1,0 +1,12 @@
+# The external programs the driver starts (internal/tool.Programs), one per
+# line: the path in the image, then the arguments the smoke test starts it with
+# to see that it runs (any exit status but "cannot execute" is fine; the output
+# must not be empty). The Dockerfile copies each program and its libraries from
+# this list (hack/image-closure.sh), hack/smoke.sh starts each one from the
+# built image, and a test in internal/tool compares the names with what the code
+# execs, so the three cannot drift apart.
+/sbin/cryptsetup --version
+/sbin/mkfs.ext4 -V
+/sbin/e2fsck -V
+/sbin/resize2fs
+/sbin/blkid --version

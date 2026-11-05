@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sync"
+
+	"github.com/greghaskins/csi-miami/internal/tool"
 )
 
 // Reply is one scripted answer.
@@ -32,6 +34,9 @@ type Runner struct {
 	Replies []Reply
 	// Func, when set, answers calls once Replies is exhausted.
 	Func func(argv []string) Reply
+	// Device, when set, answers ProbeDevice; by default every device exists, is
+	// 1 GiB and is blank. A probe is not a call: Calls does not list it.
+	Device func(dev string, offset int64) (tool.Device, error)
 
 	mu    sync.Mutex
 	next  int
@@ -79,4 +84,12 @@ func readAll(files []*os.File) [][]byte {
 		}
 	}
 	return out
+}
+
+// ProbeDevice answers from Device, or finds a blank device.
+func (r *Runner) ProbeDevice(dev string, offset int64) (tool.Device, error) {
+	if r.Device != nil {
+		return r.Device(dev, offset)
+	}
+	return tool.Device{Size: 1 << 30, Blank: true}, nil
 }

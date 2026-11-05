@@ -23,6 +23,7 @@ type sizeItem struct {
 
 func (s *sizeItem) Kind() volume.Kind                              { return volume.KindVolume }
 func (s *sizeItem) PublishSource(in intent.Intent) (string, error) { return in.StagePath, nil }
+func (s *sizeItem) PublishRoot(in intent.Intent) (string, error)   { return in.StagePath, nil }
 func (s *sizeItem) Converge(_ context.Context, in intent.Intent, _ item.Observed) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
