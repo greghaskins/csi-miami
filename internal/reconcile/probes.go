@@ -69,8 +69,14 @@ func (p *pass) probeTick() {
 		if st.Abnormal != r.probeBad[id] {
 			r.probeBad[id] = st.Abnormal
 			if st.Abnormal {
-				r.log.Warn("a volume's device failed its probe", "volume", id, "reason", st.Message)
-				r.events.Event(id, ReasonVolumeUnhealthy)
+				note := r.storeNote(in)
+				r.probeNote.Store(id, note)
+				r.log.Warn("a volume's device failed its probe; restart its pod once the store is reachable and the cache has drained", "volume", id, "reason", st.Message, "store", note)
+				if d, ok := r.events.(DetailEvents); ok && note != "" {
+					d.EventDetail(id, ReasonVolumeUnhealthy, note)
+				} else {
+					r.events.Event(id, ReasonVolumeUnhealthy)
+				}
 			} else {
 				r.log.Info("a volume's device answers its probe again", "volume", id)
 			}
@@ -83,6 +89,7 @@ func (p *pass) probeTick() {
 		}
 		r.probes.Forget(id)
 		delete(r.probeBad, id)
+		r.probeNote.Delete(id)
 		if pm != nil {
 			pm.DeleteVolumeProbe(id)
 		}
@@ -98,5 +105,27 @@ func (r *Reconciler) VolumeCondition(volumeID string) (abnormal bool, message st
 		return false, ""
 	}
 	st := r.probes.State(volumeID)
+	if st.Abnormal {
+		if n, ok := r.probeNote.Load(volumeID); ok && n.(string) != "" {
+			return true, st.Message + " (" + n.(string) + ")"
+		}
+	}
 	return st.Abnormal, st.Message
+}
+
+// StoreUnreachable is the note for a volume whose transport did not answer its
+// last probe.
+const StoreUnreachable = "the store is currently unreachable"
+
+// storeNote says what the reconciler knows about why: the volume's transport
+// not answering. (A cache full of dirty chunks is not known here.)
+func (r *Reconciler) storeNote(in intent.Intent) string {
+	dir, err := in.Transport.MountPoint(r.opts.TransportsRoot)
+	if err != nil {
+		return ""
+	}
+	if up, known := r.up[dir]; known && !up {
+		return StoreUnreachable
+	}
+	return ""
 }

@@ -38,9 +38,14 @@ const (
 // the kubelet and the pod's events, so it names no path and carries no error
 // text, which stays in the node's log.
 const (
-	MessageFailed  = "the volume's device did not answer a read of its first sector"
-	MessageTimeout = "the volume's device did not answer a read of its first sector in time"
+	MessageFailed  = "the volume's device did not answer a read of its first sector" + Guidance
+	MessageTimeout = "the volume's device did not answer a read of its first sector in time" + Guidance
 )
+
+// Guidance is what an operator does about an abnormal volume (decision 53:
+// M2 repairs nothing by itself). ext4 stays read-only after an I/O error until
+// it is mounted again, so waiting does not help: the pod has to restart.
+const Guidance = "; restart the volume's pod once the store is reachable and the cache has drained, because the file system stays read-only until it is remounted"
 
 // Options configure a Prober.
 type Options struct {

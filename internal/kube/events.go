@@ -300,7 +300,7 @@ func fixedMessage(reason, node string) string {
 	case reconcile.ReasonTransportUnavailable:
 		return "the volume's transport did not answer on node " + node + "; see the node plugin's log"
 	case reconcile.ReasonVolumeUnhealthy:
-		return "the volume's device on node " + node + " did not answer two reads of its first sector; the volume is reported abnormal"
+		return "the volume's device on node " + node + " did not answer two reads of its first sector; the volume is reported abnormal. Restart the volume's pod once the store is reachable and the cache has drained: the file system stays read-only until it is remounted"
 	case reconcile.ReasonKeyRequired:
 		return "the volume on node " + node + " needs an encryption key that the stage request did not carry"
 	case reconcile.ReasonGenerationOverdue:

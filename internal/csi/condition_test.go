@@ -2,11 +2,14 @@ package csi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/encoding/protowire"
+
+	"github.com/greghaskins/csi-miami/internal/probe"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -63,7 +66,7 @@ func TestNodeGetVolumeStatsReportsTheCondition(t *testing.T) {
 		abnormal bool
 		msg      string
 	}{
-		{"abnormal", true, "the volume's device did not answer a read of its first sector"},
+		{"abnormal", true, probe.MessageFailed},
 		{"normal", false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,5 +101,14 @@ func TestVolumeConditionCapabilityIsAdvertised(t *testing.T) {
 	t.Parallel()
 	if volumeConditionCapability != 4 {
 		t.Errorf("VOLUME_CONDITION is value 4 of the node capability enum, have %d", volumeConditionCapability)
+	}
+}
+
+func TestProbeMessagesCarryTheGuidance(t *testing.T) {
+	t.Parallel()
+	for _, m := range []string{probe.MessageFailed, probe.MessageTimeout} {
+		if !strings.Contains(m, "restart the volume's pod once the store is reachable and the cache has drained") {
+			t.Errorf("message %q lacks the guidance", m)
+		}
 	}
 }

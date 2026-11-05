@@ -361,7 +361,7 @@ func TestEventTextFixedPerReason(t *testing.T) {
 		typ     string
 		message string
 	}{
-		{reconcile.ReasonVolumeUnhealthy, "Warning", "the volume's device on node node-a did not answer two reads of its first sector; the volume is reported abnormal"},
+		{reconcile.ReasonVolumeUnhealthy, "Warning", "the volume's device on node node-a did not answer two reads of its first sector; the volume is reported abnormal. Restart the volume's pod once the store is reachable and the cache has drained: the file system stays read-only until it is remounted"},
 		{reconcile.ReasonKeyRequired, "Warning", "the volume on node node-a needs an encryption key that the stage request did not carry"},
 		{reconcile.ReasonGenerationOverdue, "Warning", "the volume's newest generation is older than its maximum age and node node-a holds unpublished writes"},
 		{ReasonPublishRefused, "Warning", "the store refused a generation of this volume from node node-a because the volume is no longer held by that node; see the node plugin's log"},

@@ -135,6 +135,7 @@ type Reconciler struct {
 	drainDue    bool                   // the next pass drains orphans: the start pass and the timer passes
 	gens        *generations           // the generation timers (generation.go)
 	probes      *probe.Prober          // the active probe (probes.go), nil when off
+	probeNote   sync.Map               // volume → note on why its probe failed, read by VolumeCondition
 	probeBad    map[string]bool        // volume → whether its probe state was last reported abnormal
 	stopMargin  time.Duration          // added to the items' freeze bound when Run waits for generations
 	reported    map[string]string      // transport dir → kind, for the metrics seam

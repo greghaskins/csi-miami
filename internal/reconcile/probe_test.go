@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -228,5 +229,36 @@ func TestNoProbeUnlessConfigured(t *testing.T) {
 	e.tick()
 	if abnormal, _ := e.r.VolumeCondition(e.in.VolumeID); abnormal {
 		t.Error("a condition without a probe")
+	}
+}
+
+// Decision 53: nothing is repaired automatically, so the abnormal condition
+// tells the operator what to do, and says when the store is the reason.
+func TestAbnormalConditionTellsTheOperatorToRestartThePod(t *testing.T) {
+	t.Parallel()
+	e := newProbeEnv(t)
+	e.rs.set(errors.New("input/output error"))
+	for range 3 {
+		e.tick()
+	}
+	_, msg := e.r.VolumeCondition(e.in.VolumeID)
+	for _, want := range []string{"restart the volume's pod", "store is reachable", "cache has drained", "read-only until it is remounted"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q lacks %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "unreachable") {
+		t.Errorf("message %q blames the store while it answers", msg)
+	}
+
+	dir, err := e.in.Transport.MountPoint(e.r.opts.TransportsRoot)
+	mustNil(t, "MountPoint", err)
+	e.r.up[dir] = false
+	if got := e.r.storeNote(e.in); got != StoreUnreachable {
+		t.Errorf("storeNote = %q with the transport down", got)
+	}
+	e.r.probeNote.Store(e.in.VolumeID, StoreUnreachable)
+	if _, msg := e.r.VolumeCondition(e.in.VolumeID); !strings.Contains(msg, StoreUnreachable) {
+		t.Errorf("message %q does not say the store is unreachable", msg)
 	}
 }
