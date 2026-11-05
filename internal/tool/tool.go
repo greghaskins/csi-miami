@@ -158,8 +158,8 @@ func (h host) readSector(dev string, offset int64) (Device, error) {
 	}
 	// O_DIRECT needs an aligned buffer.
 	raw := make([]byte, 2*ProbeSize)
-	pad := (ProbeSize - uintptr(unsafe.Pointer(&raw[0]))%ProbeSize) % ProbeSize
-	buf := raw[pad:][:ProbeSize] //nolint:gosec // pad is below ProbeSize, so the slice is in range
+	pad := (ProbeSize - uintptr(unsafe.Pointer(&raw[0]))%ProbeSize) % ProbeSize //nolint:gosec // only the address is read, to align the buffer
+	buf := raw[pad:][:ProbeSize]
 	if _, err := f.ReadAt(buf, offset); err != nil {
 		return Device{}, fmt.Errorf("tool: reading %s at offset %d: %w", dev, offset, err)
 	}
