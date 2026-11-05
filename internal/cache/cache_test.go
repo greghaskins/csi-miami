@@ -745,3 +745,24 @@ func TestCreateIgnoresLeftoverFiles(t *testing.T) {
 		t.Fatalf("Read = %v", err)
 	}
 }
+
+func TestReadIndexReadsWithoutOpening(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cache")
+	if _, err := ReadIndex(dir); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("missing dir: %v", err)
+	}
+	c, err := Create(dir, Index{Volume: "v", Base: "3.2", Epoch: 3, Size: 4 * testChunk, Chunk: testChunk}, 4*testChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Base != "3.2" || got.Epoch != 3 || got.Volume != "v" {
+		t.Fatalf("index %+v", got)
+	}
+}

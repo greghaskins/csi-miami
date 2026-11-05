@@ -88,6 +88,12 @@ type Intent struct {
 	// ignores it and so never creates: no Version bump.
 	EnsureItem bool
 
+	// Unstaging says an unstage of the volume has begun and not finished: the
+	// reconciler does not converge a volume with the mark (no remount, no
+	// fsck, no generation) until a Stage or a Publish for it clears it. The
+	// unstage itself retries under it. Informational for a version 1 reader.
+	Unstaging bool
+
 	// Generation counts the writes of the record: the store sets it to one
 	// more than the record it replaces (1 for a new record, whatever the
 	// caller put here), on every Save and Update. It tells a record that was

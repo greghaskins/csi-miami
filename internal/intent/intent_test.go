@@ -291,3 +291,26 @@ func TestEnsureItemRoundTrip(t *testing.T) {
 		t.Fatalf("round trip: %v, %v", back.EnsureItem, err)
 	}
 }
+
+// Unstaging is informational like EnsureItem: it round-trips, is absent when
+// false, and a record without it reads false.
+func TestUnstagingRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := sample("pvc-00000000-0000-4000-8000-000000000001")
+	raw, err := in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "unstaging") {
+		t.Errorf("a false mark is in the record: %s", raw)
+	}
+	in.Unstaging = true
+	raw, err = in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Intent
+	if err := back.UnmarshalJSON(raw); err != nil || !back.Unstaging {
+		t.Fatalf("round trip: %v, %v", back.Unstaging, err)
+	}
+}

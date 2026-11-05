@@ -27,6 +27,7 @@ type Status struct {
 	Refused          bool      // the last attempt was refused by the fencing check
 	PublishInFlight  bool      // a publish is running now
 	BinaryHash       string
+	Epoch            uint64 // the holder epoch this server publishes under
 }
 
 // PublishArgs is the argument of Publish; Trigger is interval|watermark|request|unstage.

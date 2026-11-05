@@ -7,6 +7,7 @@ package fake
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/systemd"
 )
@@ -86,7 +87,7 @@ func (m *Manager) State(_ context.Context, name string) (systemd.State, error) {
 
 // properties mirrors what the real Manager sets on a transient unit.
 func properties(u systemd.Unit) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"Type":           "simple",
 		"ExecStart":      append([]string(nil), u.ExecStart...),
 		"Environment":    append([]string(nil), u.Environment...),
@@ -96,4 +97,11 @@ func properties(u systemd.Unit) map[string]any {
 		"StandardOutput": "journal",
 		"StandardError":  "journal",
 	}
+	if u.Restart != "" {
+		m["Restart"] = u.Restart
+	}
+	if u.RestartDelay > 0 {
+		m["RestartUSec"] = uint64(u.RestartDelay / time.Microsecond)
+	}
+	return m
 }

@@ -18,6 +18,9 @@
 # devices, and in cmd/miami, which runs the node command and drives it over
 # its CSI socket.
 # internal/prereq binds Adiantum through AF_ALG on the real kernel.
+# internal/item/volume runs the volume item over all of it: the runner's systemd
+# executes a freshly built driver binary as the block server, and the item
+# stages, writes, publishes a generation, unstages and stages again.
 # Each package is built as its own test binary and run in its own namespace.
 #
 # A last step, `tools`, builds the image that would ship (hack/image-build.sh
@@ -69,7 +72,7 @@ fi
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-for path in internal/prereq internal/mount internal/transport internal/reconcile internal/nbd internal/blockd internal/systemd internal/crypt internal/ext4 cmd/miami; do
+for path in internal/item/volume internal/prereq internal/mount internal/transport internal/reconcile internal/nbd internal/blockd internal/systemd internal/crypt internal/ext4 cmd/miami; do
   pkg="$(basename "$path")"
   go test -c -tags smoke -o "$dir/$pkg.test" "./$path"
 

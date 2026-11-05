@@ -73,6 +73,7 @@ type Checker interface {
 type Acquirer interface {
 	Read(ctx context.Context, dir, name string) (Info, error)
 	Acquire(ctx context.Context, dir, name, node string, judge Judgement) (*Holder, error)
+	Adopt(ctx context.Context, dir, name, node string) (*Holder, error)
 }
 
 // Real is the Acquirer over the package functions.
@@ -84,6 +85,11 @@ func (Real) Read(ctx context.Context, dir, name string) (Info, error) { return R
 // Acquire implements Acquirer.
 func (Real) Acquire(ctx context.Context, dir, name, node string, judge Judgement) (*Holder, error) {
 	return Acquire(ctx, dir, name, node, judge)
+}
+
+// Adopt implements Acquirer.
+func (Real) Adopt(ctx context.Context, dir, name, node string) (*Holder, error) {
+	return Adopt(ctx, dir, name, node)
 }
 
 // file is the JSON content of the holder file.

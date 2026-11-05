@@ -69,3 +69,27 @@ func TestFreezeBadFd(t *testing.T) {
 		t.Fatal("Thaw(-1) must fail")
 	}
 }
+
+func TestHasFilesystem(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		reply   fake.Reply
+		want    bool
+		wantErr bool
+	}{
+		"ext4":      {reply: fake.Reply{Stdout: "ext4\n"}, want: true},
+		"blank":     {reply: fake.Reply{Code: 2}},
+		"no output": {reply: fake.Reply{}},
+		"failure":   {reply: fake.Reply{Code: 4, Stderr: "boom"}, wantErr: true},
+		"no start":  {reply: fake.Reply{Err: errors.New("start")}, wantErr: true},
+	} {
+		f := &fake.Runner{Replies: []fake.Reply{tc.reply}}
+		got, err := ext4.HasFilesystem(ctx, f, "/dev/x")
+		if got != tc.want || (err != nil) != tc.wantErr {
+			t.Errorf("%s: got %v, %v", name, got, err)
+		}
+		if want := []string{"blkid", "-p", "-o", "value", "-s", "TYPE", "/dev/x"}; !slices.Equal(f.Calls()[0].Argv, want) {
+			t.Errorf("%s: argv = %v", name, f.Calls()[0].Argv)
+		}
+	}
+}

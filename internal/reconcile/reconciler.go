@@ -129,6 +129,7 @@ type Reconciler struct {
 	drops       map[string]dropped    // targets to unmount once they are no longer claimed
 	idleSince   map[string]time.Time  // unreferenced transport dir → first pass that saw it
 	lastErr     map[string]string     // volume → text of its last error, for dedup
+	marked      map[string]*markState // volume → retry state of an unstage that has not finished
 	reported    map[string]string     // transport dir → kind, for the metrics seam
 	up          map[string]bool       // transport dir → whether it answered its last probe, to log changes
 	kinds       map[string]struct{}   // intent kinds reported, so a kind that empties reads 0
@@ -197,6 +198,15 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 	if opts.StatTimeout <= 0 {
 		opts.StatTimeout = DefaultStatTimeout
 	}
+	if opts.MarkRetry <= 0 {
+		opts.MarkRetry = time.Minute
+	}
+	if opts.MarkRetryMax <= 0 {
+		opts.MarkRetryMax = 10 * time.Minute
+	}
+	if opts.MarkWarnAfter <= 0 {
+		opts.MarkWarnAfter = 30 * time.Minute
+	}
 	r := &Reconciler{
 		store:       store,
 		m:           m,
@@ -211,6 +221,7 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		drops:       map[string]dropped{},
 		idleSince:   map[string]time.Time{},
 		lastErr:     map[string]string{},
+		marked:      map[string]*markState{},
 		reported:    map[string]string{},
 		up:          map[string]bool{},
 		kinds:       map[string]struct{}{},
@@ -424,6 +435,18 @@ func (r *Reconciler) PublishWith(ctx context.Context, volumeID string, p intent.
 		in.Publishes = append(in.Publishes, p)
 		return nil
 	})
+	if err == nil {
+		err = r.store.Update(volumeID, func(in *intent.Intent) error {
+			if !in.Unstaging {
+				return errNoChange
+			}
+			in.Unstaging = false // a publish means kubelet wants the volume again
+			return nil
+		})
+		if errors.Is(err, errNoChange) {
+			err = nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("recording the publish of %s: %w", volumeID, err)
 	}
@@ -646,6 +669,18 @@ func (r *Reconciler) Unstage(ctx context.Context, volumeID string) error {
 	if !ok {
 		r.nudge()
 		return nil
+	}
+	// Mark the record before the pass: an unstage that cannot finish (decision
+	// 52 retries it) must not be undone by the passes in between, which would
+	// fsck, remount and publish a volume kubelet is taking away.
+	if err := r.store.Update(volumeID, func(in *intent.Intent) error {
+		if in.VolumeID == "" || in.Unstaging {
+			return errNoChange
+		}
+		in.Unstaging = true
+		return nil
+	}); err != nil && !errors.Is(err, errNoChange) {
+		return fmt.Errorf("recording the unstage of %s: %w", volumeID, err)
 	}
 	return r.await(ctx, &request{kind: reqUnstage, volume: volumeID})
 }
