@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/greghaskins/csi-miami/internal/transport"
@@ -93,6 +94,13 @@ type Intent struct {
 	// fsck, no generation) until a Stage or a Publish for it clears it. The
 	// unstage itself retries under it. Informational for a version 1 reader.
 	Unstaging bool
+
+	// UnstagingSince is when the mark was first set, on the node's wall clock
+	// (zero when unset). It lets the warning for an unstage that does not
+	// finish count across restarts of the plugin. Cleared with the mark.
+	// Informational for a version 1 reader, which ignores it; a record without
+	// it reads as zero, which counts from the first time it is seen.
+	UnstagingSince time.Time
 
 	// Generation counts the writes of the record: the store sets it to one
 	// more than the record it replaces (1 for a new record, whatever the

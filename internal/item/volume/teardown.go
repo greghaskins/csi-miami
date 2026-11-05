@@ -261,7 +261,8 @@ func (it *Item) wayOut(ctx context.Context, v vol, st *vstate) string {
 
 // abandoned reports whether the store proves that the holder was given up:
 // the holder file names another node, or the store's current is at an epoch
-// above ours. Our own newer epoch on the file is not proof. Absence, an unreadable file or a store
+// above ours, the larger of the server's and the one this node holds. Our own
+// newer epoch on the file is not proof. Absence, an unreadable file or a store
 // that cannot be read prove nothing and are the retryable error: a transport
 // that is not mounted looks exactly like a volume with no holder. ours is the
 // epoch this node publishes under, 0 when not known from the server.
@@ -276,14 +277,14 @@ func (it *Item) abandoned(ctx context.Context, v vol, st *vstate, ours uint64) (
 	if info.Node != it.cfg.Node {
 		return true, nil
 	}
-	if ours == 0 {
-		ours = info.Epoch
-		if st.h != nil {
-			ours = st.h.Epoch()
-		}
+	// A current above the server's epoch but not above the one this node holds
+	// is our own earlier publish. The held epoch is read here: the file's, and
+	// st.h's as it is now (after restartAtHeldEpoch adopted again), never a
+	// copy taken before.
+	ours = max(ours, info.Epoch)
+	if st.h != nil {
+		ours = max(ours, st.h.Epoch())
 	}
-	// The holder file naming this node at a newer epoch is our own
-	// re-acquisition, not an operator's act: it is no proof (see syncOut).
 	cur, err := it.readCurrent(ctx, v)
 	if err != nil {
 		return false, it.incomplete(ctx, v, st, "reading the store: %v", err)

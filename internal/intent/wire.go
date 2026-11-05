@@ -29,6 +29,9 @@ type wireIntent struct {
 	// Unstaging is informational for a version 1 reader, which ignores it; a
 	// record without it reads false.
 	Unstaging bool `json:"unstaging,omitempty"`
+	// UnstagingSince is Unix nanoseconds, informational for a version 1
+	// reader, which ignores it; a record without it reads as zero.
+	UnstagingSince int64 `json:"unstagingSince,omitempty"`
 	// Generation is informational for a version 1 reader, which ignores it;
 	// a record without it reads as 0.
 	Generation uint64 `json:"generation"`
@@ -75,6 +78,10 @@ func toWire(in Intent) wireIntent {
 			TakeoverTimeout: int64(v.TakeoverTimeout),
 		}
 	}
+	var since int64
+	if !in.UnstagingSince.IsZero() {
+		since = in.UnstagingSince.UnixNano()
+	}
 	return wireIntent{
 		Volume:   vr,
 		Epoch:    in.Epoch,
@@ -87,15 +94,16 @@ func toWire(in Intent) wireIntent {
 			Export: in.Transport.Export,
 			Path:   in.Transport.Path,
 		},
-		Subdir:     in.Subdir,
-		Mode:       in.Mode,
-		StagePath:  in.StagePath,
-		Publishes:  in.Publishes,
-		MountFlags: in.MountFlags,
-		AccessMode: in.AccessMode,
-		EnsureItem: in.EnsureItem,
-		Unstaging:  in.Unstaging,
-		Generation: in.Generation,
+		Subdir:         in.Subdir,
+		Mode:           in.Mode,
+		StagePath:      in.StagePath,
+		Publishes:      in.Publishes,
+		MountFlags:     in.MountFlags,
+		AccessMode:     in.AccessMode,
+		EnsureItem:     in.EnsureItem,
+		Unstaging:      in.Unstaging,
+		UnstagingSince: since,
+		Generation:     in.Generation,
 	}
 }
 
@@ -123,14 +131,22 @@ func fromWire(w wireIntent) Intent {
 			Export: w.Transport.Export,
 			Path:   w.Transport.Path,
 		},
-		Subdir:     w.Subdir,
-		Mode:       w.Mode,
-		StagePath:  w.StagePath,
-		Publishes:  w.Publishes,
-		MountFlags: w.MountFlags,
-		AccessMode: w.AccessMode,
-		EnsureItem: w.EnsureItem,
-		Unstaging:  w.Unstaging,
-		Generation: w.Generation,
+		Subdir:         w.Subdir,
+		Mode:           w.Mode,
+		StagePath:      w.StagePath,
+		Publishes:      w.Publishes,
+		MountFlags:     w.MountFlags,
+		AccessMode:     w.AccessMode,
+		EnsureItem:     w.EnsureItem,
+		Unstaging:      w.Unstaging,
+		UnstagingSince: unixNano(w.UnstagingSince),
+		Generation:     w.Generation,
 	}
+}
+
+func unixNano(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n).UTC()
 }

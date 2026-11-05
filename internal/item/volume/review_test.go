@@ -972,3 +972,64 @@ func TestOrphanDisconnectRechecksTheBackendJustBeforeDisconnecting(t *testing.T)
 	}
 	e.rec.none(t, "nbd.Disconnect")
 }
+
+// ---- round 4 ----
+
+// The epoch the store's current must beat to prove an abandonment is the
+// larger of the server's and the one this node holds: a current between them
+// is this node's own earlier publish, not an operator's act.
+func TestAbandonmentNeedsACurrentAboveTheHeldEpochToo(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cur       string
+		abandoned bool
+	}{
+		{"between the server's and the held epoch", "2.1", false},
+		{"at the held epoch", "3.1", false},
+		{"above the held epoch", "4.1", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.seedRunning() // us@1, server epoch 1
+			e.makeCache(1, tc.cur, 3, 4, 5)
+			e.ctl.dirty = 2 << 20
+			e.holderAt(testNode, 3)
+			e.ctl.publishRefused = true
+			e.curName = tc.cur
+
+			err := e.it.Teardown(bg, e.in, item.Observed{})
+			if tc.abandoned {
+				if err != nil || !slices.Equal(e.events, []string{ReasonGenerationLost}) || e.cacheExists() {
+					t.Fatalf("err=%v events=%v cache=%v: want the abandonment reported", err, e.events, e.cacheExists())
+				}
+				return
+			}
+			if !errors.Is(err, item.ErrUnstageIncomplete) {
+				t.Fatalf("err = %v, want ErrUnstageIncomplete", err)
+			}
+			if !e.cacheExists() || len(e.events) != 0 {
+				t.Fatalf("our own earlier publish counted as abandonment: cache=%v events=%v", e.cacheExists(), e.events)
+			}
+			if got := e.epochOfLastStart(); got != 3 {
+				t.Errorf("restarted at epoch %d, want 3", got)
+			}
+		})
+	}
+}
+
+// The retry after the restart judges against the epoch the restart adopted.
+func TestAbandonmentAfterTheRestartUsesTheAdoptedEpoch(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.makeCache(1, "2.1", 3, 4, 5)
+	e.ctl.dirty = 2 << 20
+	e.holderAt(testNode, 3)
+	e.ctl.publishRefused = true
+	e.curName = "2.1"
+	for i := range 2 {
+		err := e.it.Teardown(bg, e.in, item.Observed{})
+		if !errors.Is(err, item.ErrUnstageIncomplete) || !e.cacheExists() || len(e.events) != 0 {
+			t.Fatalf("attempt %d: err=%v cache=%v events=%v", i, err, e.cacheExists(), e.events)
+		}
+	}
+}
