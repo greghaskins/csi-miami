@@ -569,8 +569,7 @@ jobs:
           E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-kind
           TRANSPORT: ${{ matrix.transport }}
           E2E_IMAGE: ${{ steps.image.outputs.image }}
-          E2E_FAILFAST: "1"
-          E2E_RUN: ^TestVolumeExt4Semantics$
+          E2E_FAILFAST: "0"
         run: sudo -E env "PATH=$PATH" make e2e E2E_MODE=kind E2E_TRANSPORT="$TRANSPORT" E2E_IMAGE="$E2E_IMAGE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
