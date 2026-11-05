@@ -893,20 +893,13 @@ generation timers, the judge and the orphan drain, all behind seams.
       `TestEventTextFixedPerReason`.
 - [ ] Commit.
 
-### Task T15: Remediation
+### Task T15: Remediation — dropped from M2 (decision 53)
 
-**Files:** create `internal/remediate/remediate.go`, tests;
-`internal/kube` pod list (own node, field selector) and delete with UID
-precondition; `deploy/kustomize/base/policy-remediate.yaml`
-(ValidatingAdmissionPolicy + binding: delete allowed only by the node SA,
-for pods on `spec.nodeName == request's node`, controller-owned, mounting a
-PVC whose PV is ours); RBAC `pods` `list`, `delete`; node flag `--remediate`.
-
-- [ ] Tests: `TestDeletesOnlyOwnNodePods`, `TestUIDPrecondition`,
-      `TestRateLimitPerVolume` (one delete per volume per 10 m),
-      `TestOptOutFlag`; envtest `TestRemediationPolicyAdmitsExactlyTheAllowedDelete`
-      (and denies a pod on another node, an unowned pod, a non-miami volume).
-- [ ] Commit.
+Failures are reported, not remediated: T14's condition, event and probe
+metric carry it, with a message saying to restart the pod once the store is
+back. No `internal/remediate`, no pod `list`/`delete` RBAC, no
+`ValidatingAdmissionPolicy`, no `--remediate` flag. T17 ships no
+`policy-remediate.yaml`.
 
 ### Task T16: Expansion
 
@@ -923,7 +916,7 @@ pinned, own commit), tests.
 
 **Files:** modify `deploy/kustomize/base/daemonset-node.yaml` (hostPaths:
 `/dev` HostToContainer, `/run/systemd`, the cache dir `DirectoryOrCreate`,
-`/sys` read-only), RBAC from T13 and T15, `policy-remediate.yaml`,
+`/sys` read-only), RBAC from T13 (T15 dropped, decision 53),
 examples `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rwo-plain.yaml`
 (node-stage and node-publish secret templates on `${pvc.namespace}`,
 `allowVolumeExpansion: true`), `deploy/policy_test.go`, `deploy/testdata/base.golden.yaml`,
@@ -935,7 +928,7 @@ examples `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rwo-plain.yaml`
       it only from that parameter (I4 makes the driver accept it). The
       `directory` classes must not set it. Test it, and have the e2e assert a
       pod's `fsGroup` owns the mounted root of a `volume`.
-- [ ] Tests: `TestNodeHostPaths`, `TestNodeRBACExact`, `TestRemediationPolicyPresent`,
+- [ ] Tests: `TestNodeHostPaths`, `TestNodeRBACExact` (no pod list/delete, decision 53),
       `TestExampleVolClassesSetBothSecretRefs`, `TestExampleVolClassesSetExt4FsType`,
       golden regenerated.
 - [ ] `make deploy-check` on kind: both pods Ready; `hack/kind.sh` asserts

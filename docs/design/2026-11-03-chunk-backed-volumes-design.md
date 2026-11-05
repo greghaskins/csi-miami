@@ -693,6 +693,15 @@ Appended to the brief's log as 36 to 50; the brief's numbering continues.
     abandoned node's late publishes out after it returns; a fenced node's
     unstage still discards and succeeds, since its data was given up by the
     operator.
+53. **No automatic remediation in M2; failures are reported** (narrows 4.9
+    and the brief's 4.6 remediation package). After 51 and 52 the only case
+    left for a pod deletion is ext4 gone read-only after the cache filled
+    while the store was unreachable, and that pod can only be restaged once
+    the store answers again (its unstage must verify a final generation).
+    The driver reports it (the `VolumeCondition`, an event, the probe
+    metric) with a message saying to restart the pod once the store is back;
+    it holds no pod-delete permission and ships no admission policy. A later
+    milestone can add the remediation if the case proves to matter.
 
 ## 7. Milestones
 
