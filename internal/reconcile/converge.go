@@ -245,10 +245,24 @@ func (p *pass) retryMarked(in intent.Intent) {
 	now := r.opts.Now()
 	ms := r.marked[in.VolumeID]
 	if ms == nil {
-		ms = &markState{since: now, next: now.Add(r.opts.MarkRetry), delay: r.opts.MarkRetry}
+		// The record says when the unstage began, so a plugin that restarts
+		// often still counts its age. It is the node's wall clock: one in the
+		// future, or none (a record from before the field), counts as now.
+		since := in.UnstagingSince
+		if since.IsZero() || since.After(now) {
+			since = now
+		}
+		ms = &markState{since: since, next: since.Add(r.opts.MarkRetry), delay: r.opts.MarkRetry}
 		r.marked[in.VolumeID] = ms
 	}
 	if now.Before(ms.next) {
+		return
+	}
+	// A Stage or a Publish may have cleared the mark after this pass loaded
+	// the record; tearing down then would undo what kubelet just asked for.
+	// DeleteIf stays as the backstop for a change after this read.
+	if cur, ok, gerr := r.store.Get(in.VolumeID); gerr == nil && (!ok || !cur.Unstaging) {
+		delete(r.marked, in.VolumeID)
 		return
 	}
 	err := p.teardownVolume(in)
@@ -262,9 +276,13 @@ func (p *pass) retryMarked(in intent.Intent) {
 	}
 	r.metrics.IncReconcileError("teardown")
 	r.log.Warn("unstage retry did not complete", "volume", in.VolumeID, "error", err)
+	// The cause is the volume's condition, not only a log line.
+	res := &volumeResult{stage: err, publish: map[string]error{}}
+	p.results[in.VolumeID] = res
+	p.noteVolume(in.VolumeID, res)
 	ms.delay = min(ms.delay*2, r.opts.MarkRetryMax)
 	ms.next = now.Add(ms.delay)
-	if !ms.warned && now.Sub(ms.since) >= r.opts.MarkWarnAfter {
+	if !ms.warned && max(0, now.Sub(ms.since)) >= r.opts.MarkWarnAfter {
 		ms.warned = true
 		r.log.Warn("an unstage has not finished; the volume stays with this node until its last writes are in the store", "volume", in.VolumeID, "since", ms.since, "lastError", err)
 		r.events.Event(in.VolumeID, ReasonUnstageStuck)

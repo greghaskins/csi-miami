@@ -446,6 +446,7 @@ func (r *Reconciler) PublishWith(ctx context.Context, volumeID string, p intent.
 				return errNoChange
 			}
 			in.Unstaging = false // a publish means kubelet wants the volume again
+			in.UnstagingSince = time.Time{}
 			return nil
 		})
 		if errors.Is(err, errNoChange) {
@@ -683,6 +684,7 @@ func (r *Reconciler) Unstage(ctx context.Context, volumeID string) error {
 			return errNoChange
 		}
 		in.Unstaging = true
+		in.UnstagingSince = r.opts.Now() // kept across retries; the stuck warning counts from it
 		return nil
 	}); err != nil && !errors.Is(err, errNoChange) {
 		return fmt.Errorf("recording the unstage of %s: %w", volumeID, err)
