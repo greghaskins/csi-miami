@@ -107,7 +107,7 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 		return err
 	}
 	st.blk = blk
-	if err := it.ensureMounted(ctx, v, st, blk, cur, obs.Mounts); err != nil {
+	if err := it.ensureMounted(ctx, v, st, blk, it.devPath(dev.Index), cur, obs.Mounts); err != nil {
 		return err
 	}
 	return it.ensureSize(ctx, v, st, blk)
@@ -794,20 +794,33 @@ func sameDevice(source, blk string) bool {
 }
 
 // ensureMounted adopts the ext4 mount at the stage path when it is this
-// volume's, else makes it: a blank device gets a file system (only when the
+// volume's, else makes it: a blank device (see below) gets a file system (only when the
 // volume has no published generation, so a lost mapping can never be formatted
 // over data), an existing one is checked, then mounted. A mount that is there
 // is never checked, stacked over or removed. The first time this process sees
 // a mount it did not make it thaws it: a plugin that crashed in the middle of
 // a generation must not leave the file system frozen.
-func (it *Item) ensureMounted(ctx context.Context, v vol, st *vstate, blk string, cur current, mounts observe.Table) error {
+func (it *Item) ensureMounted(ctx context.Context, v vol, st *vstate, blk, nbdPath string, cur current, mounts observe.Table) error {
 	if top, ok := mounts.At(v.stage); ok {
 		if top.FSType != "ext4" || !sameDevice(top.Source, blk) {
 			return fmt.Errorf("volume item %s: %w: %s is mounted as %s from %q", v.in.VolumeID, item.ErrStageConflict, v.stage, top.FSType, top.Source)
 		}
 		return it.thawOnce(v, st)
 	}
-	has, err := ext4.HasFilesystem(ctx, it.cfg.Tools, blk)
+	// Whether the device is blank is judged on the raw nbd device, never on the
+	// mapping: a fresh LUKS format writes only its header, so the start of the
+	// payload is zero until a file system is made through the mapping, and then
+	// it is ciphertext, which is never zero. That one witness also covers a crash
+	// between the format and the mkfs.
+	area := ext4.Area{Dev: nbdPath}
+	if v.params.Encryption {
+		off, err := crypt.PayloadOffset(ctx, it.cfg.Tools, nbdPath)
+		if err != nil {
+			return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+		}
+		area.Offset = off
+	}
+	has, err := ext4.HasFilesystem(ctx, it.cfg.Tools, blk, area)
 	if err != nil {
 		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
 	}

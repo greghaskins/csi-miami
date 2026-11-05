@@ -34,9 +34,9 @@ type Runner struct {
 	Replies []Reply
 	// Func, when set, answers calls once Replies is exhausted.
 	Func func(argv []string) Reply
-	// Device, when set, answers ProbeDevice; by default every device exists and
-	// is blank. A probe is not a call: Calls does not list it.
-	Device func(dev string) (tool.Device, error)
+	// Device, when set, answers ProbeDevice; by default every device exists, is
+	// 1 GiB and is blank. A probe is not a call: Calls does not list it.
+	Device func(dev string, offset int64) (tool.Device, error)
 
 	mu    sync.Mutex
 	next  int
@@ -87,9 +87,9 @@ func readAll(files []*os.File) [][]byte {
 }
 
 // ProbeDevice answers from Device, or finds a blank device.
-func (r *Runner) ProbeDevice(dev string) (tool.Device, error) {
+func (r *Runner) ProbeDevice(dev string, offset int64) (tool.Device, error) {
 	if r.Device != nil {
-		return r.Device(dev)
+		return r.Device(dev, offset)
 	}
-	return tool.Device{Blank: true}, nil
+	return tool.Device{Size: 1 << 30, Blank: true}, nil
 }

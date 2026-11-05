@@ -400,21 +400,35 @@ type fakeTools struct {
 	hasFS bool
 	// probeErr, when set, is what looking at any device finds: it is not there.
 	probeErr error
-	luksKey  []byte
-	calls    [][]string
+	// payloadDirty: something not zero is on the device though neither a LUKS
+	// header nor a file system signature is.
+	payloadDirty bool
+	luksKey      []byte
+	calls        [][]string
 }
 
-// ProbeDevice finds the device there. The raw device is blank until a LUKS
-// header or a file system has been made on it; the mapping above a LUKS header
-// is blank until a file system has.
-func (f *fakeTools) ProbeDevice(dev string) (tool.Device, error) {
+// payloadOffset is where the fake LUKS header says the data starts.
+const payloadOffset = 16 << 20
+
+// ProbeDevice finds the device there, 1 GiB, and says what its start reads as.
+// The raw device holds the LUKS header at offset 0 once one is made, and a
+// file system from the start (or from the payload, under LUKS) once mkfs has
+// run; the payload of a fresh format is zero. A mapping reads as ciphertext
+// over a zero payload, which is never zeros, so it is never blank.
+func (f *fakeTools) ProbeDevice(dev string, offset int64) (tool.Device, error) {
 	if f.probeErr != nil {
 		return tool.Device{}, f.probeErr
 	}
-	if strings.HasPrefix(dev, "/dev/mapper/") {
-		return tool.Device{Blank: !f.hasFS}, nil
+	d := tool.Device{Size: 1 << 30}
+	switch {
+	case strings.HasPrefix(dev, "/dev/mapper/"):
+		d.Blank = false
+	case offset == payloadOffset:
+		d.Blank = !f.hasFS && !f.payloadDirty
+	default:
+		d.Blank = !f.luks && !f.hasFS && !f.payloadDirty
 	}
-	return tool.Device{Blank: !f.luks && !f.hasFS}, nil
+	return d, nil
 }
 
 func (f *fakeTools) Run(_ context.Context, argv []string, extra []*os.File) ([]byte, []byte, int, error) {
@@ -446,6 +460,8 @@ func (f *fakeTools) Run(_ context.Context, argv []string, extra []*os.File) ([]b
 			return nil, nil, 2, nil
 		}
 		f.luksKey = read(1)
+	case "cryptsetup luksDump":
+		return []byte(fmt.Sprintf(`{"segments":{"0":{"type":"crypt","offset":"%d","size":"dynamic"}}}`, payloadOffset)), nil, 0, nil
 	case "cryptsetup close":
 		f.e.setDM(false)
 	case "blkid":

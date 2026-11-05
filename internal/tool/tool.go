@@ -80,38 +80,41 @@ func (host) Run(ctx context.Context, argv []string, extra []*os.File) ([]byte, [
 
 // Device is what a read-only look at a block device finds.
 type Device struct {
-	// Blank is true when the first sector block (4 KiB) reads as all zeros.
+	// Size is the device's size in bytes.
+	Size int64
+	// Blank is true when the 4 KiB read at the offset asked for is all zeros.
 	Blank bool
 }
 
 // Prober is a Runner that can also look at a block device itself, without a
-// program: whether it exists, is a block device and can be read. A tool's
-// exit status cannot tell a device that is blank from one that is not there
-// or cannot be read (blkid exits 2 for both, and cryptsetup isLuks exits 1 for
-// a header it could not read), so a caller that is about to format on "nothing
-// found" first establishes that the device is there with ProbeDevice.
+// program: whether it exists, is a block device and can be read, and whether a
+// part of it reads as zeros. A tool's exit status cannot tell a device that is
+// blank from one that is not there or cannot be read (blkid exits 2 for both,
+// and cryptsetup isLuks exits 1 for a header it could not read), so a caller
+// that is about to format on "nothing found" first establishes with ProbeDevice
+// that the device is there, and that the area that must be zero is.
 type Prober interface {
-	ProbeDevice(dev string) (Device, error)
+	ProbeDevice(dev string, offset int64) (Device, error)
 }
 
-// ProbeDevice looks at dev through r. A Runner that cannot is an error, never
-// a blank device.
-func ProbeDevice(r Runner, dev string) (Device, error) {
+// ProbeDevice looks at dev through r, reading 4 KiB at offset. A Runner that
+// cannot is an error, never a blank device.
+func ProbeDevice(r Runner, dev string, offset int64) (Device, error) {
 	p, ok := r.(Prober)
 	if !ok {
 		return Device{}, fmt.Errorf("tool: this runner cannot look at %s", dev)
 	}
-	return p.ProbeDevice(dev)
+	return p.ProbeDevice(dev, offset)
 }
 
-// probeSize is how much of the start of the device is read: the sector block
-// where a boot sector, a LUKS header and the first ext4 structures start.
-const probeSize = 4096
+// ProbeSize is how much of the device is read at the offset.
+const ProbeSize = 4096
 
-// ProbeDevice stats dev, requires a block device, opens it read-only and reads
-// its first 4 KiB. A missing device node, anything that is not a block device
-// and a device that cannot be opened or read is an error.
-func (host) ProbeDevice(dev string) (Device, error) {
+// ProbeDevice stats dev, requires a block device, opens it read-only, finds
+// its size and reads ProbeSize bytes at offset. A missing device node,
+// anything that is not a block device, a device that cannot be opened or read,
+// and an offset that leaves no room for the read are errors.
+func (host) ProbeDevice(dev string, offset int64) (Device, error) {
 	fi, err := os.Stat(dev)
 	if err != nil {
 		return Device{}, fmt.Errorf("tool: device %s: %w", dev, err)
@@ -124,14 +127,23 @@ func (host) ProbeDevice(dev string) (Device, error) {
 		return Device{}, fmt.Errorf("tool: device %s: %w", dev, err)
 	}
 	defer func() { _ = f.Close() }()
-	buf := make([]byte, probeSize)
-	if _, err := io.ReadFull(f, buf); err != nil {
-		return Device{}, fmt.Errorf("tool: reading the start of %s: %w", dev, err)
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return Device{}, fmt.Errorf("tool: size of %s: %w", dev, err)
 	}
+	if offset < 0 || offset+ProbeSize > size {
+		return Device{}, fmt.Errorf("tool: %s is %d bytes, which has no room for a read at offset %d", dev, size, offset)
+	}
+	buf := make([]byte, ProbeSize)
+	if _, err := f.ReadAt(buf, offset); err != nil {
+		return Device{}, fmt.Errorf("tool: reading %s at offset %d: %w", dev, offset, err)
+	}
+	d := Device{Size: size, Blank: true}
 	for _, b := range buf {
 		if b != 0 {
-			return Device{}, nil
+			d.Blank = false
+			break
 		}
 	}
-	return Device{Blank: true}, nil
+	return d, nil
 }

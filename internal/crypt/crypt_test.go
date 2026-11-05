@@ -179,23 +179,52 @@ func TestErrorCarriesStdoutWhenStderrIsEmpty(t *testing.T) {
 // an error too.
 func TestIsLUKSNeedsTheDeviceAndZeros(t *testing.T) {
 	t.Parallel()
-	missing := &fake.Runner{Replies: []fake.Reply{{Code: 1}}, Device: func(string) (tool.Device, error) { return tool.Device{}, fs.ErrNotExist }}
+	missing := &fake.Runner{Replies: []fake.Reply{{Code: 1}}, Device: func(string, int64) (tool.Device, error) { return tool.Device{}, fs.ErrNotExist }}
 	if got, err := crypt.IsLUKS(ctx, missing, "/dev/x"); err == nil || got || !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("a missing device: got %v, %v", got, err)
 	}
 	if n := len(missing.Calls()); n != 0 {
 		t.Errorf("a missing device: %d tools ran", n)
 	}
-	data := &fake.Runner{Replies: []fake.Reply{{Code: 1}}, Device: func(string) (tool.Device, error) { return tool.Device{}, nil }}
+	data := &fake.Runner{Replies: []fake.Reply{{Code: 1}}, Device: func(string, int64) (tool.Device, error) { return tool.Device{}, nil }}
 	if got, err := crypt.IsLUKS(ctx, data, "/dev/x"); err == nil || got {
 		t.Errorf("data and no header: got %v, %v", got, err)
 	}
-	blank := &fake.Runner{Replies: []fake.Reply{{Code: 1}}, Device: func(string) (tool.Device, error) { return tool.Device{Blank: true}, nil }}
+	blank := &fake.Runner{Replies: []fake.Reply{{Code: 1}}, Device: func(string, int64) (tool.Device, error) { return tool.Device{Blank: true}, nil }}
 	if got, err := crypt.IsLUKS(ctx, blank, "/dev/x"); err != nil || got {
 		t.Errorf("a blank device: got %v, %v, want not LUKS", got, err)
 	}
-	luks := &fake.Runner{Replies: []fake.Reply{{Code: 0}}, Device: func(string) (tool.Device, error) { return tool.Device{}, nil }}
+	luks := &fake.Runner{Replies: []fake.Reply{{Code: 0}}, Device: func(string, int64) (tool.Device, error) { return tool.Device{}, nil }}
 	if got, err := crypt.IsLUKS(ctx, luks, "/dev/x"); err != nil || !got {
 		t.Errorf("a LUKS device: got %v, %v", got, err)
+	}
+}
+
+func TestPayloadOffset(t *testing.T) {
+	t.Parallel()
+	dump := func(off string) fake.Reply {
+		return fake.Reply{Stdout: `{"keyslots":{},"segments":{"0":{"type":"crypt","offset":"` + off + `","size":"dynamic"}}}`}
+	}
+	f := &fake.Runner{Replies: []fake.Reply{dump("16777216")}}
+	got, err := crypt.PayloadOffset(ctx, f, "/dev/nbd0")
+	if err != nil || got != 16<<20 {
+		t.Fatalf("got %d, %v, want 16 MiB", got, err)
+	}
+	if want := []string{"cryptsetup", "luksDump", "--dump-json-metadata", "/dev/nbd0"}; !slices.Equal(f.Calls()[0].Argv, want) {
+		t.Errorf("argv = %v", f.Calls()[0].Argv)
+	}
+	for name, rep := range map[string]fake.Reply{
+		"not a number":     dump("x"),
+		"zero":             dump("0"),
+		"not whole sector": dump("1000"),
+		"beyond device":    dump("2147483648"),
+		"not json":         {Stdout: "LUKS header"},
+		"no segment":       {Stdout: `{"segments":{}}`},
+		"failure":          {Code: 4, Stderr: "no device"},
+	} {
+		f := &fake.Runner{Replies: []fake.Reply{rep}}
+		if got, err := crypt.PayloadOffset(ctx, f, "/dev/nbd0"); err == nil {
+			t.Errorf("%s: accepted, offset %d", name, got)
+		}
 	}
 }

@@ -10,6 +10,7 @@ package crypt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -112,7 +113,7 @@ func Rotate(ctx context.Context, r tool.Runner, dev string, oldKey, newKey []byt
 // stands only if the start of the device also reads as zeros: a device with
 // data and no header is an error, left for a person.
 func IsLUKS(ctx context.Context, r tool.Runner, dev string) (bool, error) {
-	d, err := tool.ProbeDevice(r, dev)
+	d, err := tool.ProbeDevice(r, dev, 0)
 	if err != nil {
 		return false, fmt.Errorf("crypt: isLuks: %w", err)
 	}
@@ -140,6 +141,46 @@ func output(stdout, stderr []byte) string {
 		return s
 	}
 	return strings.TrimSpace(string(stdout))
+}
+
+// PayloadOffset is where the data of the LUKS2 volume on dev starts, in bytes:
+// the offset of its segment in the header's JSON metadata. A format writes the
+// header and the key slots below it and nothing above, so the first bytes of
+// the payload are zero until something is written through the mapping, and then
+// they are ciphertext, never zeros. The offset is checked: positive, a whole
+// number of sectors, and leaving room on the device to read from.
+func PayloadOffset(ctx context.Context, r tool.Runner, dev string) (int64, error) {
+	stdout, stderr, code, err := r.Run(ctx, []string{"cryptsetup", "luksDump", "--dump-json-metadata", dev}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("crypt: luksDump: %w", err)
+	}
+	if code != 0 {
+		return 0, fmt.Errorf("crypt: luksDump: exit %d: %s", code, output(stdout, stderr))
+	}
+	var meta struct {
+		Segments map[string]struct {
+			Offset string `json:"offset"`
+		} `json:"segments"`
+	}
+	if err := json.Unmarshal(stdout, &meta); err != nil {
+		return 0, fmt.Errorf("crypt: luksDump: the metadata does not decode: %w", err)
+	}
+	seg, ok := meta.Segments["0"]
+	if !ok {
+		return 0, errors.New("crypt: luksDump: the metadata has no data segment")
+	}
+	off, err := strconv.ParseInt(seg.Offset, 10, 64)
+	if err != nil || off <= 0 || off%512 != 0 {
+		return 0, fmt.Errorf("crypt: luksDump: the data segment's offset %q is not a positive whole number of sectors", seg.Offset)
+	}
+	d, err := tool.ProbeDevice(r, dev, 0)
+	if err != nil {
+		return 0, fmt.Errorf("crypt: %w", err)
+	}
+	if off+tool.ProbeSize > d.Size {
+		return 0, fmt.Errorf("crypt: the data segment's offset %d leaves no room on %s, which is %d bytes", off, dev, d.Size)
+	}
+	return off, nil
 }
 
 func run(ctx context.Context, r tool.Runner, op string, argv []string, keys ...[]byte) error {

@@ -87,6 +87,33 @@ func TestFirstStageFormatsAndMounts(t *testing.T) {
 	}
 }
 
+// A format that died before the mkfs (the plugin crashed, or the pass was
+// abandoned) leaves a LUKS header and a zero payload: the mapping reads as
+// ciphertext, which is not zeros, but the raw payload is, and the next pass
+// makes the file system.
+func TestCrashBetweenFormatAndMkfsIsFinishedByTheNextPass(t *testing.T) {
+	e := newEnv(t)
+	e.tools.luks = true
+	e.tools.luksKey = e.keys.Key
+	e.mustConverge()
+	e.rec.inOrder(t, "tool cryptsetup open", "tool cryptsetup luksDump", "tool blkid", "tool mkfs.ext4", "mount ext4 /dev/mapper/miami-"+e.v.name)
+	e.rec.none(t, "tool cryptsetup luksFormat")
+}
+
+// Data on the payload with no file system signature is not blank, whatever the
+// volume's history: nothing is formatted, and a person is left the error.
+func TestNonZeroPayloadWithoutASignatureIsNeverFormatted(t *testing.T) {
+	e := newEnv(t)
+	e.tools.luks = true
+	e.tools.luksKey = e.keys.Key
+	e.tools.payloadDirty = true
+	err := e.converge()
+	if err == nil || !strings.Contains(err.Error(), "no file system signature") {
+		t.Fatalf("Converge = %v, want the refusal", err)
+	}
+	e.rec.none(t, "tool mkfs.ext4", "mount ext4")
+}
+
 func TestPlainVolumeHasNoMapping(t *testing.T) {
 	e := newEnv(t)
 	e.in.Volume.Encryption = false

@@ -87,7 +87,7 @@ func TestHasFilesystem(t *testing.T) {
 		"no start":  {reply: fake.Reply{Err: errors.New("start")}, wantErr: true},
 	} {
 		f := &fake.Runner{Replies: []fake.Reply{tc.reply}}
-		got, err := ext4.HasFilesystem(ctx, f, "/dev/x")
+		got, err := ext4.HasFilesystem(ctx, f, "/dev/x", ext4.Area{Dev: "/dev/x"})
 		if got != tc.want || (err != nil) != tc.wantErr {
 			t.Errorf("%s: got %v, %v", name, got, err)
 		}
@@ -109,9 +109,9 @@ func TestHasFilesystemNeedsTheDevice(t *testing.T) {
 	} {
 		f := &fake.Runner{
 			Replies: []fake.Reply{{Code: 2}},
-			Device:  func(string) (tool.Device, error) { return tool.Device{}, probeErr },
+			Device:  func(string, int64) (tool.Device, error) { return tool.Device{}, probeErr },
 		}
-		got, err := ext4.HasFilesystem(ctx, f, "/dev/x")
+		got, err := ext4.HasFilesystem(ctx, f, "/dev/x", ext4.Area{Dev: "/dev/x"})
 		if err == nil || got || !errors.Is(err, probeErr) {
 			t.Errorf("%s: got %v, %v, want an error naming the device's problem", name, got, err)
 		}
@@ -131,7 +131,7 @@ func TestHasFilesystemRealProbeRefusesWhatIsNotABlockDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, dev := range map[string]string{"missing": dir + "/nonesuch", "a file": regular, "a directory": dir, "a character device": "/dev/zero"} {
-		got, err := ext4.HasFilesystem(ctx, tool.Real(), dev)
+		got, err := ext4.HasFilesystem(ctx, tool.Real(), dev, ext4.Area{Dev: dev})
 		if err == nil || got {
 			t.Errorf("%s: got %v, %v, want an error", name, got, err)
 		}
@@ -140,16 +140,57 @@ func TestHasFilesystemRealProbeRefusesWhatIsNotABlockDevice(t *testing.T) {
 
 func TestHasFilesystemBlankNeedsZeros(t *testing.T) {
 	t.Parallel()
-	blank := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(string) (tool.Device, error) { return tool.Device{Blank: true}, nil }}
-	if got, err := ext4.HasFilesystem(ctx, blank, "/dev/x"); err != nil || got {
+	blank := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(string, int64) (tool.Device, error) { return tool.Device{Blank: true}, nil }}
+	if got, err := ext4.HasFilesystem(ctx, blank, "/dev/x", ext4.Area{Dev: "/dev/x"}); err != nil || got {
 		t.Errorf("a blank device: got %v, %v, want no file system", got, err)
 	}
-	data := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(string) (tool.Device, error) { return tool.Device{}, nil }}
-	if got, err := ext4.HasFilesystem(ctx, data, "/dev/x"); err == nil || got {
+	data := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(string, int64) (tool.Device, error) { return tool.Device{}, nil }}
+	if got, err := ext4.HasFilesystem(ctx, data, "/dev/x", ext4.Area{Dev: "/dev/x"}); err == nil || got {
 		t.Errorf("a device with data and no signature: got %v, %v, want an error", got, err)
 	}
-	ext := &fake.Runner{Replies: []fake.Reply{{Stdout: "ext4\n"}}, Device: func(string) (tool.Device, error) { return tool.Device{}, nil }}
-	if got, err := ext4.HasFilesystem(ctx, ext, "/dev/x"); err != nil || !got {
+	ext := &fake.Runner{Replies: []fake.Reply{{Stdout: "ext4\n"}}, Device: func(string, int64) (tool.Device, error) { return tool.Device{}, nil }}
+	if got, err := ext4.HasFilesystem(ctx, ext, "/dev/x", ext4.Area{Dev: "/dev/x"}); err != nil || !got {
 		t.Errorf("an ext4: got %v, %v, want a file system", got, err)
+	}
+}
+
+// An encrypted volume's file system is on the mapping, which reads as
+// ciphertext over a zero payload: the blank test is on the raw device at the
+// payload's offset, not on the mapping.
+func TestHasFilesystemJudgesBlankOnTheRawPayload(t *testing.T) {
+	t.Parallel()
+	const mapper, raw, off = "/dev/mapper/m", "/dev/nbd0", int64(16 << 20)
+	area := ext4.Area{Dev: raw, Offset: off}
+	device := func(payloadBlank bool) func(string, int64) (tool.Device, error) {
+		return func(dev string, offset int64) (tool.Device, error) {
+			switch {
+			case dev == mapper:
+				return tool.Device{Size: 1 << 30}, nil // ciphertext: never blank
+			case dev == raw && offset == off:
+				return tool.Device{Size: 1 << 30, Blank: payloadBlank}, nil
+			}
+			return tool.Device{}, errors.New("unexpected probe")
+		}
+	}
+	fresh := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: device(true)}
+	if got, err := ext4.HasFilesystem(ctx, fresh, mapper, area); err != nil || got {
+		t.Errorf("a fresh format (zero payload, ciphertext mapping): got %v, %v, want no file system", got, err)
+	}
+	dirty := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: device(false)}
+	if got, err := ext4.HasFilesystem(ctx, dirty, mapper, area); err == nil || got {
+		t.Errorf("a payload with data and no signature: got %v, %v, want an error", got, err)
+	}
+	made := &fake.Runner{Replies: []fake.Reply{{Stdout: "ext4\n"}}, Device: device(false)}
+	if got, err := ext4.HasFilesystem(ctx, made, mapper, area); err != nil || !got {
+		t.Errorf("a made file system: got %v, %v, want one", got, err)
+	}
+	gone := &fake.Runner{Replies: []fake.Reply{{Code: 2}}, Device: func(dev string, off int64) (tool.Device, error) {
+		if dev == mapper {
+			return tool.Device{}, fs.ErrNotExist
+		}
+		return tool.Device{Size: 1 << 30, Blank: true}, nil
+	}}
+	if got, err := ext4.HasFilesystem(ctx, gone, mapper, area); err == nil || got || len(gone.Calls()) != 0 {
+		t.Errorf("a missing mapping: got %v, %v with %d tools run, want an error and none", got, err, len(gone.Calls()))
 	}
 }
