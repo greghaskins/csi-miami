@@ -13,6 +13,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
+	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
 
@@ -122,15 +123,35 @@ func (it *Item) unmountAndClose(ctx context.Context, v vol, st *vstate) error {
 }
 
 // stopServerAndUnit stops the block server, by its Stop request first so that
-// it syncs its cache and disconnects its device, and then its unit, which also
-// stops a server that was restarting. The request is best effort and its
-// failure is logged with the device; the unit's stop is not.
+// it syncs its cache and disconnects its device (the only thing that does: a
+// stopped unit leaves the device configured), and then its unit, which also
+// stops a server that was restarting. The request is best effort. If the device
+// is still there afterwards, the request was lost, and the device is
+// disconnected here, since nothing holds it any more: the caller took the mount
+// and the mapping down first, which is checked again before disconnecting. An
+// orphan device would otherwise strand the volume on this node.
 func (it *Item) stopServerAndUnit(ctx context.Context, v vol) error {
 	it.stopServer(ctx, v)
 	if err := it.cfg.Systemd.Stop(ctx, v.unit); err != nil {
 		return fmt.Errorf("volume item %s: %w: stopping the unit: %w", v.in.VolumeID, item.ErrServerDown, err)
 	}
 	_ = os.Remove(v.socket)
+	dev, ok, err := it.findDevice(v)
+	if err != nil || !ok {
+		return err
+	}
+	if mounted, merr := it.mounted(ctx, v); merr != nil || mounted {
+		return fmt.Errorf("volume item %s: %w: refusing to disconnect device %d while the stage is mounted", v.in.VolumeID, item.ErrServerDown, dev.Index)
+	}
+	if v.params.Encryption {
+		if present, derr := it.dmPresent(crypt.Name(v.name)); derr != nil || present {
+			return fmt.Errorf("volume item %s: %w: refusing to disconnect device %d while its mapping is open", v.in.VolumeID, item.ErrServerDown, dev.Index)
+		}
+	}
+	it.log.Warn("the block server left its device behind; disconnecting it", "volume", v.in.VolumeID, "device", dev.Index)
+	if err := it.cfg.NBD.Disconnect(ctx, dev.Index); err != nil {
+		return fmt.Errorf("volume item %s: %w: disconnecting device %d: %w", v.in.VolumeID, item.ErrServerDown, dev.Index, err)
+	}
 	return nil
 }
 
@@ -155,9 +176,65 @@ func (it *Item) stopServer(ctx context.Context, v vol) {
 	}
 }
 
-// incomplete wraps a cause as the retryable unstage error.
-func (it *Item) incomplete(v vol, format string, args ...any) error {
-	return fmt.Errorf("volume item %s: %w: %s", v.in.VolumeID, item.ErrUnstageIncomplete, fmt.Sprintf(format, args...))
+// incomplete is the retryable unstage error. Its text, and a Warn with the
+// same text, name the operator's way through for a cause that does not clear
+// by itself: the PV annotation that abandons the holder's unpublished data,
+// and the exact value that names this holder. The value is read from the holder
+// file (best effort, bounded); when it cannot be, the form is shown.
+func (it *Item) incomplete(ctx context.Context, v vol, st *vstate, format string, args ...any) error {
+	cause := fmt.Sprintf(format, args...)
+	err := fmt.Errorf("volume item %s: %w: %s; %s", v.in.VolumeID, item.ErrUnstageIncomplete, cause, it.wayOut(ctx, v, st))
+	it.log.Warn("the unstage cannot finish", "volume", v.in.VolumeID, "error", err)
+	return err
+}
+
+// wayOut says how an operator abandons the volume's unpublished data.
+func (it *Item) wayOut(ctx context.Context, v vol, st *vstate) string {
+	value := "<node>@<epoch>"
+	if st != nil && st.h != nil {
+		value = fmt.Sprintf("%s@%d", it.cfg.Node, st.h.Epoch())
+	} else {
+		// A fresh deadline: the one that just ran out is often why we are here.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), it.cfg.Timeout)
+		defer cancel()
+		if info, err := it.cfg.Holder.Read(rctx, v.holdDir, v.name); err == nil && info.Present {
+			value = fmt.Sprintf("%s@%d", info.Node, info.Epoch)
+		}
+	}
+	return fmt.Sprintf("to give up the unpublished data an operator sets the PV annotation %s to %q (the holder's node@epoch)", kube.AnnotationForceDetach, value)
+}
+
+// abandoned reports whether the store proves that the holder was given up:
+// the holder file names another node, or an epoch above ours, or the store's
+// current is at an epoch above ours. Absence, an unreadable file or a store
+// that cannot be read prove nothing and are the retryable error: a transport
+// that is not mounted looks exactly like a volume with no holder. ours is the
+// epoch this node publishes under, 0 when not known from the server.
+func (it *Item) abandoned(ctx context.Context, v vol, st *vstate, ours uint64) (bool, error) {
+	info, err := it.cfg.Holder.Read(ctx, v.holdDir, v.name)
+	if err != nil {
+		return false, it.incomplete(ctx, v, st, "reading the holder file: %v", err)
+	}
+	if !info.Present {
+		return false, it.incomplete(ctx, v, st, "the holder file is absent, which is not proof that the volume was given up (is the transport mounted?)")
+	}
+	if info.Node != it.cfg.Node {
+		return true, nil
+	}
+	if ours == 0 {
+		ours = info.Epoch
+		if st.h != nil {
+			ours = st.h.Epoch()
+		}
+	}
+	if info.Epoch > ours {
+		return true, nil
+	}
+	cur, err := it.readCurrent(ctx, v)
+	if err != nil {
+		return false, it.incomplete(ctx, v, st, "reading the store: %v", err)
+	}
+	return cur.ok && cur.epoch > ours, nil
 }
 
 // syncOut gets the volume's last writes into the store and proves it, or
@@ -178,7 +255,7 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 	c, err := it.cfg.Dial(cctx, v.socket)
 	ccancel()
 	if err != nil {
-		return it.incomplete(v, "the block server does not answer: %v", err)
+		return it.incomplete(ctx, v, st, "the block server does not answer: %v", err)
 	}
 	defer func() { _ = c.Close() }()
 
@@ -186,7 +263,7 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 	// even with nothing dirty, since the dirty byte count leaves out trimmed
 	// chunks. The file system is unmounted, so there is nothing to freeze.
 	for {
-		if err := it.waitNoPublish(pctx, v, c); err != nil {
+		if err := it.waitNoPublish(pctx, v, st, c); err != nil {
 			return err
 		}
 		st.fz.Lock()
@@ -196,7 +273,7 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 			continue // a publish began between the status and the boundary
 		}
 		if err != nil {
-			return it.incomplete(v, "marking the final boundary: %v", err)
+			return it.incomplete(ctx, v, st, "marking the final boundary: %v", err)
 		}
 		break
 	}
@@ -204,18 +281,26 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 	reply, err := c.Publish(pctx, "unstage")
 	switch {
 	case errors.Is(err, blockd.ErrRefused) || (err == nil && reply.Refused):
-		// Fenced: an operator gave this holder's data up.
+		// Refused: only the store can say whether that is because an operator
+		// gave this holder's data up.
 		ss, _ := c.Status(pctx)
+		gone, aerr := it.abandoned(pctx, v, st, ss.Epoch)
+		if aerr != nil {
+			return aerr
+		}
+		if !gone {
+			return it.incomplete(ctx, v, st, "the final generation was refused but the store does not show the holder was abandoned")
+		}
 		it.lost(v, ss.Dirty, "the final generation was refused; the holder was abandoned")
 		return nil
 	case err != nil:
-		return it.incomplete(v, "the final generation failed: %v", err)
+		return it.incomplete(ctx, v, st, "the final generation failed: %v", err)
 	}
 
 	// Verify against the store itself, fresh, and then against the server.
 	ss, err := c.Status(pctx)
 	if err != nil {
-		return it.incomplete(v, "the block server does not answer after the final generation: %v", err)
+		return it.incomplete(ctx, v, st, "the block server does not answer after the final generation: %v", err)
 	}
 	want := reply.Name
 	if want == "" {
@@ -223,13 +308,13 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 	}
 	cur, err := it.readCurrent(pctx, v)
 	if err != nil {
-		return it.incomplete(v, "reading the store after the final generation: %v", err)
+		return it.incomplete(ctx, v, st, "reading the store after the final generation: %v", err)
 	}
 	if got := cur.name; got != want {
-		return it.incomplete(v, "the store names %q, the final generation is %q", got, want)
+		return it.incomplete(ctx, v, st, "the store names %q, the final generation is %q", got, want)
 	}
 	if ss.PublishInFlight {
-		return it.incomplete(v, "a publish is still running")
+		return it.incomplete(ctx, v, st, "a publish is still running")
 	}
 	it.log.Info("the final generation is in the store", "volume", v.in.VolumeID, "manifest", want, "dirtyBytes", ss.Dirty)
 	return nil
@@ -237,18 +322,18 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 
 // waitNoPublish polls the server until no publish is running, within the
 // context's deadline.
-func (it *Item) waitNoPublish(ctx context.Context, v vol, c Control) error {
+func (it *Item) waitNoPublish(ctx context.Context, v vol, st *vstate, c Control) error {
 	for {
 		ss, err := c.Status(ctx)
 		if err != nil {
-			return it.incomplete(v, "the block server does not answer: %v", err)
+			return it.incomplete(ctx, v, st, "the block server does not answer: %v", err)
 		}
 		if !ss.PublishInFlight {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return it.incomplete(v, "a publish is still in flight after %s", it.cfg.PublishTimeout)
+			return it.incomplete(ctx, v, st, "a publish is still in flight after %s", it.cfg.PublishTimeout)
 		case <-time.After(it.cfg.PollEvery):
 		}
 	}
@@ -256,42 +341,47 @@ func (it *Item) waitNoPublish(ctx context.Context, v vol, c Control) error {
 
 // serverUp makes sure a server is running to publish from, when the cache
 // holds anything to publish. It returns false, nil when there is nothing to
-// sync: no cache, or the holder is no longer ours (abandoned, or fenced), in
-// which case the loss is reported. A server that is gone while the holder is
-// still ours is started again, as a drain, and a failure to start it is
-// retryable.
+// sync: no cache, or the store proves the holder was given up (which is
+// reported). A server that is gone while the holder is still ours is started
+// again, as a drain, and a failure to start it is retryable. A cache index that
+// cannot be read is retryable too, and no server is started over it: it may
+// hold writes only an operator can judge.
 func (it *Item) serverUp(ctx context.Context, v vol, st *vstate) (bool, error) {
 	us, err := it.cfg.Systemd.State(ctx, v.unit)
 	if err == nil && us.Present && us.Active == "active" {
 		return true, nil
 	}
 	idx, ierr := cache.ReadIndex(v.cacheDir)
-	if errors.Is(ierr, cache.ErrNoIndex) {
+	switch {
+	case errors.Is(ierr, cache.ErrNoIndex):
 		return false, nil
+	case ierr != nil:
+		return false, it.incomplete(ctx, v, st, "the cache index is unreadable (%v); the cache is left alone", ierr)
 	}
 	dirty := int64(len(idx.Dirty)) * v.chunk
 	h := st.h
 	if h == nil {
 		var aerr error
 		if h, aerr = it.cfg.Holder.Adopt(ctx, v.holdDir, v.name, it.cfg.Node); aerr != nil {
-			if errors.Is(aerr, holder.ErrHeld) || errors.Is(aerr, holder.ErrLost) {
-				it.lost(v, dirty, "the holder is no longer ours; its data was given up")
+			if errors.Is(aerr, holder.ErrHeld) {
+				it.lost(v, dirty, "the holder file names another node; its data was given up")
 				return false, nil
 			}
-			return false, it.incomplete(v, "reading the holder file: %v", aerr)
+			// Absent (the transport may not be mounted) or unreadable: no proof.
+			return false, it.incomplete(ctx, v, st, "reading the holder file: %v", aerr)
 		}
 		st.h = h
 	}
 	cur, cerr := it.readCurrent(ctx, v)
 	if cerr != nil {
-		return false, it.incomplete(v, "reading the store: %v", cerr)
+		return false, it.incomplete(ctx, v, st, "reading the store: %v", cerr)
 	}
 	if cur.ok && cur.epoch > h.Epoch() {
 		it.lost(v, dirty, "our ownership was fenced by a newer generation; its data was given up")
 		return false, nil
 	}
 	if _, serr := it.ensureServer(ctx, v, st, h, cur); serr != nil {
-		return false, it.incomplete(v, "the block server is not running and cannot be started to sync: %v", serr)
+		return false, it.incomplete(ctx, v, st, "the block server is not running and cannot be started to sync: %v", serr)
 	}
 	return true, nil
 }

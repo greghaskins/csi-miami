@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/greghaskins/csi-miami/internal/transport"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
@@ -107,4 +109,114 @@ func TestVolumeConditionsAreRegisteredAndClassified(t *testing.T) {
 			t.Errorf("%q is not in Conditions", tc.condition)
 		}
 	}
+}
+
+// countItem counts Converge calls and fails Teardown on request.
+type countItem struct {
+	mu       sync.Mutex
+	converge int
+	teardown int
+	failTear error
+}
+
+func (c *countItem) Kind() volume.Kind                              { return volume.KindDirectory }
+func (c *countItem) PublishSource(in intent.Intent) (string, error) { return in.StagePath, nil }
+func (c *countItem) Converge(context.Context, intent.Intent, item.Observed) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.converge++
+	return nil
+}
+func (c *countItem) Teardown(context.Context, intent.Intent, item.Observed) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.teardown++
+	return c.failTear
+}
+func (c *countItem) counts() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.converge, c.teardown
+}
+
+// An unstage that cannot finish is retried; the passes between the retries
+// must not converge the volume (no fsck, no remount, no generations) until a
+// Stage or a Publish for it says kubelet wants it back.
+func TestIncompleteUnstageIsNotUndoneByLaterPasses(t *testing.T) {
+	t.Parallel()
+	ci := &countItem{failTear: item.ErrUnstageIncomplete}
+	e := newEnv(t, func(o *Options) { o.Items = []item.Item{ci} })
+	e.start()
+	in := e.vol("a", pvc1)
+	mustNil(t, "Stage", e.r.Stage(bg, in))
+	staged, _ := ci.counts()
+
+	if err := e.r.Unstage(bg, in.VolumeID); !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("Unstage = %v, want ErrUnstageIncomplete", err)
+	}
+	if got := Classify(fmt.Errorf("x: %w", ErrUnstageIncomplete)); got != ClassUnavailable {
+		t.Errorf("class = %v", got)
+	}
+	e.pass()
+	e.pass()
+	if c, _ := ci.counts(); c != staged {
+		t.Errorf("Converge ran %d more times for a volume being unstaged", c-staged)
+	}
+	rec, ok := e.intentOf(in.VolumeID)
+	if !ok || !rec.Unstaging {
+		t.Fatalf("the record does not carry the mark: %+v", rec)
+	}
+
+	// kubelet wants it back: a Stage clears the mark and converges again.
+	mustNil(t, "Stage", e.r.Stage(bg, in))
+	if c, _ := ci.counts(); c <= staged {
+		t.Error("a Stage did not converge the volume")
+	}
+	if rec, _ := e.intentOf(in.VolumeID); rec.Unstaging {
+		t.Error("a Stage left the mark")
+	}
+}
+
+// The final generation and the holder file live on the transport: an unstage
+// of a volume of the volume kind needs it mounted whether or not a stage is.
+func TestVolumeKindUnstageNeedsItsTransportMounted(t *testing.T) {
+	t.Parallel()
+	vi := &volumeKindItem{}
+	e := newEnv(t, func(o *Options) { o.Items = []item.Item{vi} })
+	in := intent.Intent{
+		Version:   intent.Version,
+		VolumeID:  "volume:" + pvc1,
+		Kind:      volume.KindVolume,
+		Transport: transport.Spec{Kind: transport.KindNFS3, Server: "nas.example.com", Export: "/export"},
+		StagePath: e.stage(pvc1), AccessMode: "SINGLE_NODE_WRITER",
+	}
+	in.Volume = &volume.VolumeParams{ChunkSize: 1 << 20, CacheSize: 8 << 20, Size: 8 << 20, Encryption: true, Cipher: "xchacha12,aes-adiantum-plain64", KeySize: 256,
+		Generations: volume.GenerationParams{Interval: 5 * time.Minute, MaxAge: time.Hour, Keep: 3}}
+	mustNil(t, "save", e.store.Save(in))
+	err := e.r.runUnstageForTest(in.VolumeID)
+	if !errors.Is(err, ErrTransportUnavailable) && !errors.Is(err, ErrTransportConflict) {
+		t.Fatalf("err = %v, want the transport's error", err)
+	}
+	if vi.teardowns != 0 {
+		t.Error("the item was torn down with its transport absent")
+	}
+}
+
+type volumeKindItem struct{ teardowns int }
+
+func (v *volumeKindItem) Kind() volume.Kind                              { return volume.KindVolume }
+func (v *volumeKindItem) PublishSource(in intent.Intent) (string, error) { return in.StagePath, nil }
+func (v *volumeKindItem) Converge(context.Context, intent.Intent, item.Observed) error {
+	return nil
+}
+func (v *volumeKindItem) Teardown(context.Context, intent.Intent, item.Observed) error {
+	v.teardowns++
+	return nil
+}
+
+// runUnstageForTest runs one pass carrying an Unstage for the volume.
+func (r *Reconciler) runUnstageForTest(volumeID string) error {
+	req := &request{kind: reqUnstage, volume: volumeID, done: make(chan error, 1)}
+	r.runPass(context.Background(), []*request{req})
+	return <-req.done
 }

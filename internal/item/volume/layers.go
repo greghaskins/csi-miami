@@ -79,7 +79,9 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 		if err := it.refuseIfBound(v, obs.Mounts); err != nil {
 			return err
 		}
-		if err := it.stopAndDiscard(ctx, v, st, "the running server publishes under another epoch"); err != nil {
+		// Stop it; whether its cache is kept is decideCache's call when the
+		// server is started again, the same rule as at any other start.
+		if err := it.stopStack(ctx, v, st); err != nil {
 			return err
 		}
 		if obs.Mounts, err = it.cfg.Mounter.Mounts(ctx); err != nil {
@@ -209,7 +211,10 @@ func (it *Item) judge(v vol, info holder.Info, cur current) holder.Judgement {
 // volume is acquired afresh at an epoch above `current`'s, to be started at.
 func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*holder.Holder, error) {
 	it.log.Warn("our ownership is fenced by a newer generation; starting over at a new epoch", "volume", v.in.VolumeID, "currentEpoch", cur.epoch)
-	if err := it.stopAndDiscard(ctx, v, st, "the ownership was fenced"); err != nil {
+	// The cache is not discarded here: when the server is started again at
+	// the new epoch, decideCache keeps it if current proves it is the newest
+	// data and removes it, reporting any unpublished chunks, if not.
+	if err := it.stopStack(ctx, v, st); err != nil {
 		return nil, err
 	}
 	st.h = nil
@@ -224,16 +229,13 @@ func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*h
 	return h, nil
 }
 
-// stopAndDiscard stops everything raised above the store and removes the
-// cache, for an ownership that is over: the next start is a fresh one.
-func (it *Item) stopAndDiscard(ctx context.Context, v vol, st *vstate, why string) error {
+// stopStack stops everything raised above the store: the mount, the mapping,
+// the server and its device. The cache stays.
+func (it *Item) stopStack(ctx context.Context, v vol, st *vstate) error {
 	if err := it.unmountAndClose(ctx, v, st); err != nil {
 		return err
 	}
-	if err := it.stopServerAndUnit(ctx, v); err != nil {
-		return err
-	}
-	return it.discardCache(v, why)
+	return it.stopServerAndUnit(ctx, v)
 }
 
 // refuseIfBound refuses to tear the stage down while it is still bound into
@@ -242,12 +244,17 @@ func (it *Item) stopAndDiscard(ctx context.Context, v vol, st *vstate, why strin
 // reconcile pass. The condition is publish-refused; the next pass looks again,
 // and the teardown happens once the binds are gone.
 func (it *Item) refuseIfBound(v vol, mounts observe.Table) error {
-	top, ok := mounts.At(v.stage)
-	if !ok {
-		return nil
-	}
+	own := it.ownsStage(v)
+	top, mounted := mounts.At(v.stage)
 	for _, m := range mounts {
-		if m.ID != top.ID && m.FSType == top.FSType && m.Major == top.Major && m.Minor == top.Minor && m.MountPoint != v.stage {
+		if m.MountPoint == v.stage {
+			continue
+		}
+		// A bind of the stage is the same device again: by device numbers
+		// when the stage is mounted, and by the device it is made from either
+		// way, so a stage already unmounted does not hide a pod's bind.
+		sameNumbers := mounted && m.ID != top.ID && m.FSType == top.FSType && m.Major == top.Major && m.Minor == top.Minor
+		if ours, _ := own(mounts, m); sameNumbers || ours {
 			return fmt.Errorf("volume item %s: %w: the ownership is fenced but the stage is still bound into a pod; leaving it until the binds are gone", v.in.VolumeID, item.ErrPublishRefused)
 		}
 	}
@@ -452,7 +459,7 @@ func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.H
 			// Adopting is for a different binary; a different epoch is a
 			// fenced server. Stop it so that the next pass starts one at the
 			// held epoch.
-			if serr := it.stopAndDiscard(ctx, v, st, "the running server publishes under another epoch"); serr != nil {
+			if serr := it.stopStack(ctx, v, st); serr != nil {
 				return nbd.Device{}, serr
 			}
 			return nbd.Device{}, fmt.Errorf("volume item %s: %w: the running unit published under another epoch and was stopped", v.in.VolumeID, item.ErrServerDown)
@@ -568,15 +575,18 @@ func (it *Item) decideCache(v vol, cur current) error {
 		}
 		return nil
 	case err != nil:
-		return it.discardCache(v, "the index is unreadable")
+		// An index that cannot be read may be holding unpublished writes that
+		// only a person can judge. It is not removed and no server is started
+		// over it.
+		it.log.Warn("the node-local cache index is unreadable; leaving the cache alone", "volume", v.in.VolumeID, "error", err)
+		return fmt.Errorf("volume item %s: %w: the cache index is unreadable (%v); the cache is left for an operator", v.in.VolumeID, item.ErrServerDown, err)
 	case reuse(idx, cur):
 		return nil
 	}
 	if len(idx.Dirty) > 0 {
 		// Writes that were never published are discarded: the store has
-		// moved on without them. Say so; the loss is the event's to report.
-		it.log.Warn("discarding a node-local cache with unpublished chunks", "volume", v.in.VolumeID, "chunks", len(idx.Dirty))
-		it.event(v.in.VolumeID, ReasonGenerationLost)
+		// moved on without them.
+		it.lost(v, int64(len(idx.Dirty))*v.chunk, "the node-local cache is not descended from the store's current generation")
 	}
 	return it.discardCache(v, "the store's current generation is not this cache's")
 }

@@ -158,7 +158,7 @@ func newEnv(t *testing.T) *env {
 	}
 	e.tools = &fakeTools{e: e}
 	e.sd = &fakeSystemd{Manager: &sdfake.Manager{}, e: e}
-	e.nbd = &fakeNBD{}
+	e.nbd = &fakeNBD{e: e}
 	e.ctl = &fakeCtl{e: e}
 	e.mnt = &simMounter{Mounter: &mountfake.Mounter{}, e: e}
 	e.hold = &recHolder{e: e}
@@ -471,11 +471,13 @@ func (s *fakeSystemd) Start(_ context.Context, u systemd.Unit) error {
 func (s *fakeSystemd) Stop(ctx context.Context, name string) error {
 	s.e.rec.add("systemd.Stop")
 	s.e.atStop = [2]bool{s.e.cacheExists(), s.e.holderInfo().Present}
-	s.e.nbd.remove(s.e.v.name)
 	return s.Manager.Stop(ctx, name)
 }
 
-type fakeNBD struct{ devs []nbd.Device }
+type fakeNBD struct {
+	e    *env
+	devs []nbd.Device
+}
 
 func (f *fakeNBD) set(d nbd.Device) {
 	if d.Backend == "" {
@@ -500,7 +502,11 @@ func (f *fakeNBD) Connect(context.Context, *os.File, nbd.ConnectOptions) (int, e
 	return 0, errors.New("the item never connects a device")
 }
 func (f *fakeNBD) Reconfigure(context.Context, int, int64) error { return errors.New("not used") }
-func (f *fakeNBD) Disconnect(context.Context, int) error         { return errors.New("not used") }
+func (f *fakeNBD) Disconnect(_ context.Context, idx int) error {
+	f.e.rec.add("nbd.Disconnect")
+	f.devs = slices.DeleteFunc(f.devs, func(d nbd.Device) bool { return d.Index == idx })
+	return nil
+}
 
 type fakeCtl struct {
 	e              *env
@@ -595,6 +601,7 @@ func (c *fakeCtl) Stop(context.Context) error {
 		return c.stopErr
 	}
 	c.down = true
+	c.e.nbd.remove(c.e.v.name) // blockd disconnects its device on the Stop request, and only then
 	return nil
 }
 

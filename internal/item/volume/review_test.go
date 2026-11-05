@@ -17,6 +17,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/blockd"
 	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/item"
+	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/systemd"
 )
 
@@ -65,6 +66,9 @@ func TestTeardownWaitsOutAnInFlightPublishThenPublishes(t *testing.T) {
 	if e.cacheExists() {
 		t.Error("cache left")
 	}
+	if len(e.events) != 0 {
+		t.Errorf("events = %v: waiting out a publish loses nothing", e.events)
+	}
 }
 
 // Reviewers' probe: an unstage that finds a publish in flight used to discard
@@ -76,6 +80,7 @@ func TestTeardownDuringInFlightPublishDoesNotLoseWrites(t *testing.T) {
 	if !errors.Is(err, item.ErrUnstageIncomplete) {
 		t.Fatalf("err = %v, want ErrUnstageIncomplete", err)
 	}
+	wayOut(t, e, err)
 	e.rec.none(t, "ctl.Stop", "systemd.Stop")
 	if !e.cacheExists() || !e.holderInfo().Present {
 		t.Error("the cache or holder was removed while a publish was in flight")
@@ -166,6 +171,7 @@ func TestTeardownNothingDirtyVerifiesTheBase(t *testing.T) {
 func TestTeardownRefusedPublishDiscardsReportsAndSucceeds(t *testing.T) {
 	e := dirtyEnv(t)
 	e.ctl.publishRefused = true
+	e.holderAt(otherNode, 3) // the operator's force-detach: another node holds it now
 	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
 		t.Fatalf("a fenced unstage discards and succeeds: %v", err)
 	}
@@ -592,4 +598,214 @@ func TestKeysNeverReachLogsOrErrors(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ---- round 2: the rule is that dirty data goes only on proof ----
+
+// wayOut asserts that an error names the operator's way through: the
+// annotation and the exact value, the holder's node@epoch.
+func wayOut(t *testing.T, _ *env, err error) {
+	t.Helper()
+	want := kube.AnnotationForceDetach
+	if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), testNode+"@1") {
+		t.Errorf("error does not name %s and %s@1: %v", want, testNode, err)
+	}
+}
+
+// B-C1: a holder file that is absent (the transport is not mounted after a
+// reboot, an empty mountpoint) proves nothing; it is retryable, not a discard.
+func TestTeardownWithAnAbsentHolderFileIsIncompleteNotADiscard(t *testing.T) {
+	e := dirtyEnv(t)
+	e.newItem() // plugin restarted: no in-memory holder
+	e.sd.SetState(e.v.unit, systemd.State{})
+	e.ctl.down = true
+	if err := os.RemoveAll(e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	err := e.it.Teardown(bg, e.in, item.Observed{})
+	if !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("err = %v, want ErrUnstageIncomplete", err)
+	}
+	if !e.cacheExists() || len(e.events) != 0 {
+		t.Errorf("a dirty cache was removed on no proof: cache=%v events=%v", e.cacheExists(), e.events)
+	}
+}
+
+// A refusal is only proof when the store says the holder is not ours; a refusal
+// while the holder file is absent (or still ours) is not.
+func TestTeardownRefusalWithoutProofOfAbandonmentIsIncomplete(t *testing.T) {
+	e := dirtyEnv(t)
+	e.ctl.publishRefused = true
+	if err := os.Remove(holder.Path(e.v.holdDir, e.v.name)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.it.Teardown(bg, e.in, item.Observed{}); !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("absent file: err = %v", err)
+	}
+	if !e.cacheExists() {
+		t.Error("cache removed on an unproven refusal")
+	}
+	f := dirtyEnv(t)
+	f.ctl.publishRefused = true // the file still names us at our epoch: why was it refused?
+	if err := f.it.Teardown(bg, f.in, item.Observed{}); !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("file still ours: err = %v", err)
+	}
+	if !f.cacheExists() {
+		t.Error("cache removed on an unproven refusal")
+	}
+}
+
+// A refusal with the holder file naming another node, or current at a higher
+// epoch, is proof.
+func TestTeardownRefusalWithAHigherCurrentEpochIsProof(t *testing.T) {
+	e := dirtyEnv(t)
+	e.ctl.publishRefused = true
+	e.curName = "7.1"
+	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !slices.Equal(e.events, []string{ReasonGenerationLost}) || e.cacheExists() {
+		t.Errorf("events=%v cache=%v", e.events, e.cacheExists())
+	}
+}
+
+// B-C2 / reviewer B's P6: the server runs at an epoch other than the held one
+// and the cache is the newest data there is: it is kept and restarted under.
+func TestStaleEpochKeepsAReusableDirtyCache(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.makeCache(1, "", 3, 4, 5)
+	if err := os.Remove(holder.Path(e.v.holdDir, e.v.name)); err != nil {
+		t.Fatal(err)
+	}
+	e.newItem()
+	e.mustConverge()
+	if !e.cacheExists() {
+		t.Fatalf("a reusable dirty cache was discarded (events=%v): %v", e.events, e.rec.all())
+	}
+	if got := e.epochOfLastStart(); got != 2 {
+		t.Errorf("restarted at epoch %d, want 2", got)
+	}
+}
+
+// Every removal of a cache with dirty chunks is a GenerationLost.
+func TestStaleEpochDiscardOfADirtyCacheIsReported(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.makeCache(7, "1.9", 3) // a base current no longer names, and an epoch it is not at: not reusable
+	e.curName = "1.2"
+	if err := os.Remove(holder.Path(e.v.holdDir, e.v.name)); err != nil {
+		t.Fatal(err)
+	}
+	e.newItem()
+	e.mustConverge()
+	if e.cacheExists() {
+		t.Fatal("a stale lineage was kept")
+	}
+	if !slices.Contains(e.events, ReasonGenerationLost) {
+		t.Errorf("events = %v", e.events)
+	}
+}
+
+// B-I1 with the orchestrator's ruling: a corrupt index is never discarded and
+// never started over; the unstage is retryable and names the way out.
+func TestCorruptIndexAtTeardownIsIncompleteAndNamesTheWayOut(t *testing.T) {
+	e := dirtyEnv(t)
+	e.sd.SetState(e.v.unit, systemd.State{})
+	e.ctl.down = true
+	if err := os.WriteFile(filepath.Join(e.v.cacheDir, "index.json"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.newItem()
+	e.rec.reset()
+	err := e.it.Teardown(bg, e.in, item.Observed{})
+	if !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("err = %v, want ErrUnstageIncomplete", err)
+	}
+	wayOut(t, e, err)
+	if !e.cacheExists() {
+		t.Error("a corrupt cache was removed")
+	}
+	e.rec.none(t, "systemd.Start")
+	if out := e.logs.String(); !strings.Contains(out, kube.AnnotationForceDetach) || !strings.Contains(out, "level=WARN") {
+		t.Errorf("no Warn naming the way out:\n%s", out)
+	}
+	if len(e.events) != 0 {
+		t.Errorf("events = %v: a corrupt index is not a loss event", e.events)
+	}
+}
+
+func TestCorruptIndexInConvergeIsServerDownAndKept(t *testing.T) {
+	e := newEnv(t)
+	e.holderAt(testNode, 1)
+	e.makeCache(1, "", 3)
+	if err := os.WriteFile(filepath.Join(e.v.cacheDir, "index.json"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.converge(); !errors.Is(err, item.ErrServerDown) {
+		t.Fatalf("err = %v, want ErrServerDown", err)
+	}
+	if !e.cacheExists() {
+		t.Error("the corrupt cache was removed")
+	}
+	e.rec.none(t, "systemd.Start")
+}
+
+// B-M1: binds are found by device, also when the stage itself is unmounted.
+func TestFencedWithTheStageUnmountedButBoundIsLeftAlone(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.holderAt(otherNode, 3)
+	e.regressHolder(testNode, 1)
+	e.curName = "3.1"
+	e.mnt.entries = nil
+	e.mnt.add("/var/lib/kubelet/pods/p/volumes/mount", "ext4", "/dev/mapper/miami-"+e.v.name)
+	err := e.converge()
+	if !errors.Is(err, item.ErrPublishRefused) {
+		t.Fatalf("err = %v, want ErrPublishRefused", err)
+	}
+	e.rec.none(t, "ctl.Stop", "systemd.Stop", "holder.Acquire")
+}
+
+// A-I1: the Stop request is the only thing that disconnects the device. When
+// it is lost and the unit is stopped anyway, the device is disconnected here,
+// or the next stage finds an orphan and waits for a person for ever.
+func TestLostStopRequestDoesNotLeaveAnOrphanDevice(t *testing.T) {
+	e := dirtyEnv(t)
+	e.ctl.stopErr = errors.New("probe: stop request lost")
+	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range e.nbd.devs {
+		if d.Backend == e.v.name {
+			t.Fatalf("nbd%d still carries the volume after a successful unstage", d.Index)
+		}
+	}
+	e.rec.inOrder(t, "systemd.Stop", "nbd.Disconnect")
+}
+
+func TestStopAndDiscardDoesNotLeaveAnOrphanDeviceEither(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.ctl.stopErr = errors.New("probe: stop request lost")
+	if err := e.it.unmountAndClose(bg, e.v, e.it.state(e.in.VolumeID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.it.stopServerAndUnit(bg, e.v); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := e.it.findDevice(e.v); ok {
+		t.Error("the device is still there")
+	}
+}
+
+func TestNoDisconnectWhileTheMappingOrMountIsUp(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.ctl.stopErr = errors.New("lost")
+	err := e.it.stopServerAndUnit(bg, e.v) // the mapping is still open
+	if err == nil {
+		t.Fatal("disconnected a device that still carries a mapping")
+	}
+	e.rec.none(t, "nbd.Disconnect")
 }

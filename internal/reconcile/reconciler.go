@@ -424,6 +424,18 @@ func (r *Reconciler) PublishWith(ctx context.Context, volumeID string, p intent.
 		in.Publishes = append(in.Publishes, p)
 		return nil
 	})
+	if err == nil {
+		err = r.store.Update(volumeID, func(in *intent.Intent) error {
+			if !in.Unstaging {
+				return errNoChange
+			}
+			in.Unstaging = false // a publish means kubelet wants the volume again
+			return nil
+		})
+		if errors.Is(err, errNoChange) {
+			err = nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("recording the publish of %s: %w", volumeID, err)
 	}
@@ -646,6 +658,18 @@ func (r *Reconciler) Unstage(ctx context.Context, volumeID string) error {
 	if !ok {
 		r.nudge()
 		return nil
+	}
+	// Mark the record before the pass: an unstage that cannot finish (decision
+	// 52 retries it) must not be undone by the passes in between, which would
+	// fsck, remount and publish a volume kubelet is taking away.
+	if err := r.store.Update(volumeID, func(in *intent.Intent) error {
+		if in.VolumeID == "" || in.Unstaging {
+			return errNoChange
+		}
+		in.Unstaging = true
+		return nil
+	}); err != nil && !errors.Is(err, errNoChange) {
+		return fmt.Errorf("recording the unstage of %s: %w", volumeID, err)
 	}
 	return r.await(ctx, &request{kind: reqUnstage, volume: volumeID})
 }

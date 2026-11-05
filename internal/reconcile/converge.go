@@ -16,6 +16,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/transport"
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 // teardown is the unstage half of a pass: for each volume with an unstage
@@ -134,7 +135,10 @@ func (p *pass) teardownVolume(in intent.Intent) error {
 		if err != nil {
 			return err
 		}
-		if _, staged := t.At(in.StagePath); staged || len(in.Publishes) > 0 {
+		// A volume of the volume kind needs its transport for the final
+		// generation and the holder file whether or not a stage is mounted: a
+		// retry after a reboot must not look for them in an empty mountpoint.
+		if _, staged := t.At(in.StagePath); staged || len(in.Publishes) > 0 || in.Kind == volume.KindVolume {
 			if err := transportMounted(t, tdir); err != nil {
 				return err
 			}
@@ -185,6 +189,18 @@ var errTargetGone = errors.New("the publish target's parent directory does not e
 func (p *pass) convergeAll() {
 	for _, id := range sortedIDs(p.intents) {
 		if _, skip := p.unstaging[id]; skip {
+			continue
+		}
+		if p.intents[id].Unstaging {
+			// An unstage began and has not finished (it is retried): do not
+			// fsck, remount or publish a volume that is being taken away. A
+			// Stage or a Publish clears the mark. The transport is still kept
+			// mounted: the retry of the unstage, and the final generation it
+			// makes, need it.
+			in := p.intents[id]
+			if dir, err := in.Transport.MountPoint(p.r.opts.TransportsRoot); err == nil {
+				_ = p.ensureTransport(in, dir)
+			}
 			continue
 		}
 		res := p.convergeVolume(p.intents[id])

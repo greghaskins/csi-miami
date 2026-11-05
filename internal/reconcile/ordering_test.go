@@ -167,6 +167,7 @@ func TestUnstageDoesNotDeleteARecordChangedSinceItWasLoaded(t *testing.T) {
 		if c.Op == fake.OpUnmount && c.Target == first {
 			mustNil(t, "late publish", e.store.Update(in.VolumeID, func(r *intent.Intent) error {
 				r.Publishes = append(r.Publishes, intent.Publish{TargetPath: late})
+				r.Unstaging = false // what the Publish that wrote it does
 				return nil
 			}))
 		}
