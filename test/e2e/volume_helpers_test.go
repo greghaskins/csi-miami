@@ -393,6 +393,19 @@ func cachePath(pv string) string {
 // its intent, its block server unit, its nbd device and its cache.
 func (e *env) waitVolumeGone(t *testing.T, node string, vol volumeInfo) {
 	t.Helper()
+	e.waitVolumeGoneChecking(t, node, vol, true)
+}
+
+// waitVolumeGoneExceptDevice is waitVolumeGone without the nbd device: when
+// another node serves the volume, the device is its own, and shows in sysfs
+// of every node because they share the kernel.
+func (e *env) waitVolumeGoneExceptDevice(t *testing.T, node string, vol volumeInfo) {
+	t.Helper()
+	e.waitVolumeGoneChecking(t, node, vol, false)
+}
+
+func (e *env) waitVolumeGoneChecking(t *testing.T, node string, vol volumeInfo, device bool) {
+	t.Helper()
 	e.waitFor(t, fmt.Sprintf("%s to keep nothing of %s (no intent, no unit, no nbd device, no cache)", node, vol.PV), func(ctx context.Context) (string, bool, error) {
 		var left []string
 		if ok, err := existsOn(ctx, func(argv ...string) (string, error) { return nodeExec(ctx, node, argv...) }, "-e", intentPath(vol.ID)); err != nil {
@@ -407,7 +420,7 @@ func (e *env) waitVolumeGone(t *testing.T, node string, vol volumeInfo) {
 		if u.Active == "active" || u.Active == "activating" {
 			left = append(left, "unit "+u.Active)
 		}
-		if _, err := nbdIndex(ctx, node, vol.PV); err == nil {
+		if _, err := nbdIndex(ctx, node, vol.PV); err == nil && device {
 			left = append(left, "nbd device")
 		}
 		if ok, err := nodeDirExists(ctx, node, cachePath(vol.PV)); err != nil {

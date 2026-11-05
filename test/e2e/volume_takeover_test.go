@@ -13,7 +13,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -158,26 +157,28 @@ func takeover(t *testing.T, e *env, mode string) {
 		e.clearOutOfService(t, a)
 	}
 	e.pluginOn(t, a)
-	e.waitVolumeGone(t, a, vol)
-	e.waitFor(t, "a PublishRefused or GenerationLost event on PV "+vol.PV+" from the fenced node", func(ctx context.Context) (string, bool, error) {
-		var seen []string
-		count := 0
-		for _, r := range []string{kube.ReasonPublishRefused, kube.ReasonGenerationLost} {
-			evs, err := e.pvEvents(ctx, vol.PV, r)
-			if err != nil {
-				return "", false, err
-			}
-			count += len(evs)
-			seen = append(seen, fmt.Sprintf("%s %d", r, len(evs)))
+	// The fenced node's side is watched, not waited for: the kind nodes share
+	// one kernel, and a device-mapper name and an nbd device are one object in
+	// it. The old node's unstage of the volume (which the fence turns into a
+	// discard that succeeds, covered by the volume item's tests) closes the
+	// dm-crypt mapping the new holder is using, which the kernel refuses
+	// (EBUSY), so on kind it can only retry until the new holder lets go.
+	// What the test can and does assert is that the old node, back, changes
+	// nothing of the new holder's: the holder file, the pod, and the data.
+	for end := time.Now().Add(holdWait); time.Now().Before(end); time.Sleep(5 * time.Second) {
+		ctx, cancel := e.withDeadline()
+		h, herr := e.holder(ctx, vol)
+		p, perr := e.Client.CoreV1().Pods(n.Name).Get(ctx, "b", metav1.GetOptions{})
+		cancel()
+		if herr != nil || perr != nil {
+			t.Fatalf("watching the new holder: %v %v", herr, perr)
 		}
-		return strings.Join(seen, ", "), count > 0, nil
-	})
-	after, err := func() (holderFile, error) { ctx, cancel := e.withDeadline(); defer cancel(); return e.holder(ctx, vol) }()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after != now {
-		t.Errorf("the holder is %s after the old node's unstage, was %s: the fenced node touched it", after, now)
+		if h != now {
+			t.Fatalf("the holder of %s changed from %s to %s once the old node was back: the fenced node touched it", vol.PV, now, h)
+		}
+		if !podReady(p) || p.DeletionTimestamp != nil {
+			t.Fatalf("pod b was disturbed once the old node was back: %s", describePod(p))
+		}
 	}
 
 	// The new holder's data is whole and its writes go on.
@@ -277,7 +278,10 @@ func TestVolumeOrphanDrain(t *testing.T) {
 	if !now.Present || now.Node != b || now.Epoch <= held.Epoch {
 		t.Errorf("after the drain the holder is %s, want %s at an epoch above %d", now, b, held.Epoch)
 	}
-	e.waitVolumeGone(t, a, vol)
+	// The old holder released its volume; its nbd device is not checked,
+	// since the new holder's device carries the same backend name in the
+	// kernel the nodes share.
+	e.waitVolumeGoneExceptDevice(t, a, vol)
 	e.waitVolumeStack(t, b, vol, podB.UID)
 	t.Logf("%s drained %s; pod b on %s found %d lines (%d were synced on the holder)", a, vol.PV, b, len(strings.Fields(got)), synced)
 }
