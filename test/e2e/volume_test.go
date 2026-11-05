@@ -435,7 +435,7 @@ func TestVolumeNodeRebootReusesCache(t *testing.T) {
 	pluginContainer := containerStatusID(plugin, "miami")
 	appContainer := containerID(app)
 	t.Logf("rebooting %s (docker restart); current %q, the app has synced %d lines", node, cur0, wrote)
-	err = restartNode(ctx, node)
+	err = restartNodeGracefully(ctx, node)
 	cancel()
 	if err != nil {
 		t.Fatal(err)

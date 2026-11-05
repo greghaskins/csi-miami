@@ -69,9 +69,10 @@ func takeover(t *testing.T, e *env, mode string) {
 	}
 	t.Logf("%s is held by %s; current %q", vol.PV, held, cur0)
 
-	// The holder's plugin is stopped. Its pod still runs and writes; the other
-	// worker's pod cannot have the volume.
-	e.pluginOff(t, a)
+	// The holder's node goes down under the volume, its plugin with it (its pod
+	// is gone from the API, so the volume's attachment can move); the pod on
+	// the other worker reaches the driver and cannot have the volume.
+	n.downTheNode(t, a, "a")
 	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
 	e.waitFor(t, fmt.Sprintf("the node plugin on %s to report holder-contended for the waiting pod", b), func(ctx context.Context) (string, bool, error) {
 		v, err := e.volumeCondition(ctx, b, reconcile.ConditionHolderContended)
@@ -142,7 +143,6 @@ func takeover(t *testing.T, e *env, mode string) {
 		e.clearOutOfService(t, a)
 	}
 	e.pluginOn(t, a)
-	n.deletePod(t, "a")
 	e.waitVolumeGone(t, a, vol)
 	e.waitFor(t, "a PublishRefused or GenerationLost event on PV "+vol.PV+" from the fenced node", func(ctx context.Context) (string, bool, error) {
 		var seen []string
@@ -214,22 +214,9 @@ func TestVolumeOrphanDrain(t *testing.T) {
 	synced := lastWrote(log)
 	t.Logf("%s is held by %s; current %q; %d lines synced", vol.PV, held, cur0, synced)
 
-	e.pluginOff(t, a)
-	n.forceDeletePod(t, "a")
-	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
-	e.waitFor(t, fmt.Sprintf("the node plugin on %s to report holder-contended for the waiting pod", b), func(ctx context.Context) (string, bool, error) {
-		v, err := e.volumeCondition(ctx, b, reconcile.ConditionHolderContended)
-		return fmt.Sprintf("%s=%v", reconcile.ConditionHolderContended, v), v >= 1, err
-	})
-
-	// The holder node restarts and forgets the volume.
-	ctx, cancel = e.withDeadline()
-	err = restartNode(ctx, a)
-	cancel()
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.waitNodeReady(t, a)
+	// The holder node goes down and forgets the volume: its record of it is
+	// gone, its cache is not.
+	n.downTheNode(t, a, "a")
 	ctx, cancel = e.withDeadline()
 	_, err = nodeExec(ctx, a, "rm", "-f", intentPath(vol.ID))
 	hasCache, cacheErr := nodeDirExists(ctx, a, cachePath(vol.PV))
@@ -249,6 +236,13 @@ func TestVolumeOrphanDrain(t *testing.T) {
 	if pending != held {
 		t.Fatalf("the holder of %s is %s while its node restarted, want %s: no one may take it", vol.PV, pending, held)
 	}
+
+	// The pod on the other worker reaches the driver and waits.
+	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
+	e.waitFor(t, fmt.Sprintf("the node plugin on %s to report holder-contended for the waiting pod", b), func(ctx context.Context) (string, bool, error) {
+		v, err := e.volumeCondition(ctx, b, reconcile.ConditionHolderContended)
+		return fmt.Sprintf("%s=%v", reconcile.ConditionHolderContended, v), v >= 1, err
+	})
 
 	// Its plugin returns and drains.
 	e.pluginOn(t, a)

@@ -447,15 +447,21 @@ func (e *env) workersApart(t *testing.T) (a, b string) {
 	return a, b
 }
 
-// pluginOff stops the node plugin on a node (the e2e overlay keeps the
-// DaemonSet off a node with the label) and waits for its pod to be gone. The
-// cleanup puts it back, so a failed test does not leave the node without one.
+// pluginOff keeps the node plugin off a node (the e2e overlay keeps the
+// DaemonSet off a node with the label); the cleanup puts it back, so a failed
+// test does not leave the node without one. It does not wait: the pod goes when
+// the DaemonSet controller and the kubelet get to it (waitPluginGone).
 func (e *env) pluginOff(t *testing.T, node string) {
 	t.Helper()
 	e.labelNode(t, node, "true")
 	t.Cleanup(func() {
 		e.labelNode(t, node, "")
 	})
+}
+
+// waitPluginGone waits for the node plugin pod on a node to be gone.
+func (e *env) waitPluginGone(t *testing.T, node string) {
+	t.Helper()
 	e.waitFor(t, "the node plugin pod on "+node+" to be gone", func(ctx context.Context) (string, bool, error) {
 		pods, err := e.Client.CoreV1().Pods(e.DriverNS).List(ctx, metav1.ListOptions{
 			LabelSelector: componentLabel + "=" + roleNode, FieldSelector: "spec.nodeName=" + node,
@@ -465,6 +471,41 @@ func (e *env) pluginOff(t *testing.T, node string) {
 		}
 		return fmt.Sprintf("%d node plugin pods on %s", len(pods.Items), node), len(pods.Items) == 0, nil
 	})
+}
+
+// downTheNode takes a node out from under a volume it holds the way a crash
+// does: the node's plugin is kept off it, the pod using the volume is deleted
+// from the API (its kubelet cannot unmount through a plugin that is not
+// there), and the node is restarted, so its kubelet no longer reports the
+// volume in use and the attach-detach controller can move the volume's
+// attachment. The node's disk, and so its cache, survives. Without the restart
+// the attachment stays for as long as the controller waits for the kubelet to
+// unmount (six minutes), and the next pod waits at the attach, never reaching
+// the driver. It returns when the node is Ready again and the plugin pod is gone.
+func (n *testNS) downTheNode(t *testing.T, node, pod string) {
+	t.Helper()
+	e := n.e
+	e.pluginOff(t, node)
+	n.forceDeletePod(t, pod)
+	ctx, cancel := e.withDeadline()
+	err := restartNodeGracefully(ctx, node)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.waitNodeReady(t, node)
+	e.waitPluginGone(t, node)
+}
+
+// restartNodeGracefully is restartNode with the time systemd in the node needs
+// to stop its units in order (kind stops a node with the signal that starts the
+// shutdown): the block servers flush and the file systems unmount before the
+// container is killed, as they do when a machine is shut down. A kill after 5
+// seconds leaves processes stuck on devices whose server is gone, and docker
+// cannot reap the container.
+func restartNodeGracefully(ctx context.Context, node string) error {
+	_, err := docker(ctx, "restart", "--time", "90", node)
+	return err
 }
 
 // pluginOn lets the DaemonSet start the node plugin on the node again and
