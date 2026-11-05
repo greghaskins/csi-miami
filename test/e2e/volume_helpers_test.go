@@ -496,36 +496,80 @@ func (e *env) waitPluginGone(t *testing.T, node string) {
 // downTheNode takes a node out from under a volume it holds the way a crash
 // does: the node's plugin is kept off it, the pod using the volume is deleted
 // from the API (its kubelet cannot unmount through a plugin that is not
-// there), and the node is restarted, so its kubelet no longer reports the
-// volume in use and the attach-detach controller can move the volume's
-// attachment. The node's disk, and so its cache, survives. Without the restart
-// the attachment stays for as long as the controller waits for the kubelet to
-// unmount (six minutes), and the next pod waits at the attach, never reaching
-// the driver. It returns when the node is Ready again and the plugin pod is gone.
-func (n *testNS) downTheNode(t *testing.T, node, pod string) {
+// there), and the node is restarted, so nothing is mounted on it any more. Its
+// disk, and so its cache, survives. It returns when the node is Ready again,
+// the plugin pod is gone and the volume's attachment to the node has been
+// released (see releaseAttachment).
+func (n *testNS) downTheNode(t *testing.T, node, pod string, vol volumeInfo) {
 	t.Helper()
 	e := n.e
 	e.pluginOff(t, node)
 	n.forceDeletePod(t, pod)
+	e.rebootNode(t, node, vol.PV)
+	e.waitNodeReady(t, node)
+	e.waitPluginGone(t, node)
+	e.releaseAttachment(t, vol.PV, node)
+}
+
+// rebootNode restarts a node as a machine's reboot would, in the ways the
+// kind node can: systemd in the node is given 90 seconds to stop its units in
+// order (a kill after 5 seconds left docker unable to reap the container),
+// and the mappings of the named volumes are removed from the kernel while the
+// node is stopped. The nodes share the runner's kernel, which a real reboot
+// resets: a dm-crypt mapping made by the node survives its container, without
+// the device node in the restarted /dev, and the volume then reads as blank.
+// The nbd devices cannot be removed from outside; the block server's
+// re-point (decision 51) takes the stale device over, as it does for a block
+// server killed under a served volume.
+func (e *env) rebootNode(t *testing.T, node string, pvs ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := docker(ctx, "stop", "--time", "90", node); err != nil {
+		t.Fatal(err)
+	}
+	for _, pv := range pvs {
+		if out, err := run(ctx, "cryptsetup", "close", "miami-"+pv); err != nil {
+			t.Logf("removing the mapping of %s from the kernel (it may be gone already): %v: %s", pv, err, out)
+		}
+	}
+	if _, err := docker(ctx, "start", node); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// releaseAttachment deletes the VolumeAttachment of a volume to a node. The
+// attach-detach controller does it by itself, six minutes after the pod is
+// gone, for a kubelet that has not unmounted (a plugin that is down cannot);
+// and at once for a node marked out of service. Without it the next pod waits
+// at the attach and never reaches the driver.
+func (e *env) releaseAttachment(t *testing.T, pv, node string) {
+	t.Helper()
 	ctx, cancel := e.withDeadline()
-	err := restartNodeGracefully(ctx, node)
-	cancel()
+	defer cancel()
+	vas, err := e.Client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.waitNodeReady(t, node)
-	e.waitPluginGone(t, node)
-}
-
-// restartNodeGracefully is restartNode with the time systemd in the node needs
-// to stop its units in order (kind stops a node with the signal that starts the
-// shutdown): the block servers flush and the file systems unmount before the
-// container is killed, as they do when a machine is shut down. A kill after 5
-// seconds leaves processes stuck on devices whose server is gone, and docker
-// cannot reap the container.
-func restartNodeGracefully(ctx context.Context, node string) error {
-	_, err := docker(ctx, "restart", "--time", "90", node)
-	return err
+	for _, va := range vas.Items {
+		if va.Spec.NodeName == node && va.Spec.Source.PersistentVolumeName != nil && *va.Spec.Source.PersistentVolumeName == pv {
+			if err := e.Client.StorageV1().VolumeAttachments().Delete(ctx, va.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				t.Fatalf("deleting VolumeAttachment %s: %v", va.Name, err)
+			}
+		}
+	}
+	e.waitFor(t, fmt.Sprintf("the VolumeAttachment of %s to %s to be gone", pv, node), func(ctx context.Context) (string, bool, error) {
+		vas, err := e.Client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return "", false, err
+		}
+		for _, va := range vas.Items {
+			if va.Spec.NodeName == node && va.Spec.Source.PersistentVolumeName != nil && *va.Spec.Source.PersistentVolumeName == pv {
+				return "VolumeAttachment " + va.Name + " is still there", false, nil
+			}
+		}
+		return "gone", true, nil
+	})
 }
 
 // pluginOn lets the DaemonSet start the node plugin on the node again and

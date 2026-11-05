@@ -72,7 +72,7 @@ func takeover(t *testing.T, e *env, mode string) {
 	// The holder's node goes down under the volume, its plugin with it (its pod
 	// is gone from the API, so the volume's attachment can move); the pod on
 	// the other worker reaches the driver and cannot have the volume.
-	n.downTheNode(t, a, "a")
+	n.downTheNode(t, a, "a", vol)
 	n.createPod(t, podSpec{Name: "b", Claim: "data", Node: b, Run: loop})
 	e.waitFor(t, fmt.Sprintf("the node plugin on %s to report holder-contended for the waiting pod", b), func(ctx context.Context) (string, bool, error) {
 		v, err := e.volumeCondition(ctx, b, reconcile.ConditionHolderContended)
@@ -230,7 +230,7 @@ func TestVolumeOrphanDrain(t *testing.T) {
 
 	// The holder node goes down and forgets the volume: its record of it is
 	// gone, its cache is not.
-	n.downTheNode(t, a, "a")
+	n.downTheNode(t, a, "a", vol)
 	ctx, cancel = e.withDeadline()
 	_, err = nodeExec(ctx, a, "rm", "-f", intentPath(vol.ID))
 	hasCache, cacheErr := nodeDirExists(ctx, a, cachePath(vol.PV))
