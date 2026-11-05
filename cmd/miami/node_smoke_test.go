@@ -100,7 +100,8 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 	cfg := nodeConfig{
 		endpoint: "unix://" + sock, nodeID: "smoke-node", kubeletDir: filepath.Join(base, "kubelet"),
 		transportsRoot: filepath.Join(base, "miami"), metricsAddr: "127.0.0.1:0",
-		interval: time.Hour, deadline: 10 * time.Second,
+		interval: time.Hour, deadline: 10 * time.Second, cacheDir: filepath.Join(base, "cache"),
+		genInterval: time.Minute, genMaxAge: time.Hour, genTimeout: time.Minute,
 	}.withDefaults()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,7 +109,7 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 	done := make(chan error, 1)
 	ready := make(chan string, 1)
 	go func() {
-		done <- serveNodeWith(ctx, cfg, mount.New(cfg.deadline), nil, slog.New(slog.NewTextHandler(&logs, nil)), func(a string) { ready <- a })
+		done <- serveNodeWith(ctx, cfg, mount.New(cfg.deadline), nil, nil, slog.New(slog.NewTextHandler(&logs, nil)), func(a string) { ready <- a })
 	}()
 	var addr string
 	select {
