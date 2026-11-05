@@ -39,7 +39,14 @@ type PV struct {
 	VolumeHandle     string            // spec.csi.volumeHandle
 	VolumeAttributes map[string]string // spec.csi.volumeAttributes
 	ReclaimPolicy    string            // spec.persistentVolumeReclaimPolicy: Delete, Retain or Recycle
+	Annotations      map[string]string // metadata.annotations
 }
+
+// AnnotationForceDetach is the PV annotation of the emergency detach
+// (decision 52). Its value is "<node>@<epoch>", naming the holder whose
+// unsynced data the operator gives up; it takes effect only when it equals the
+// holder file's node and epoch exactly, and is ignored otherwise.
+const AnnotationForceDetach = "miami.csi.greghaskins.com/force-detach"
 
 // PVReader reads PersistentVolumes by name.
 type PVReader interface {
@@ -211,7 +218,7 @@ func isPVNotFound(err error, name string) bool {
 // decodePV reads the fields of PV out of the object. A field of the wrong
 // type is an error, never a zero value.
 func decodePV(obj *unstructured.Unstructured) (*PV, error) {
-	pv := &PV{Name: obj.GetName()}
+	pv := &PV{Name: obj.GetName(), Annotations: obj.GetAnnotations()}
 	var err error
 	if pv.ReclaimPolicy, _, err = unstructured.NestedString(obj.Object, "spec", "persistentVolumeReclaimPolicy"); err != nil {
 		return nil, fmt.Errorf("kube: PV %q: %w", pv.Name, err)
