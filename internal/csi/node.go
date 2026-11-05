@@ -401,7 +401,7 @@ func (n *Node) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVo
 // (a statfs that fails or times out) fails the call with the code of its class
 // (DeadlineExceeded for a timeout, Unavailable for a busy path, Internal for
 // an unexpected errno), so that a wedged transport is counted as the failure it
-// is. The CSI specification this driver is built against (v1.13) has removed
+// is. The CSI specification this driver is built against (v1.12) has removed
 // the VolumeCondition field of this response, so there is nowhere to report an
 // abnormal condition alongside an answer.
 func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
@@ -512,6 +512,11 @@ func (n *Node) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRe
 	if limit := r.GetLimitBytes(); limit > 0 && want > limit {
 		return nil, status.Errorf(codes.OutOfRange, "the size rounded up to whole %d byte chunks (%d) exceeds the limit", in.Volume.ChunkSize, want)
 	}
+	// The intent is the floor this node can check without I/O: the size record
+	// and the manifest may hold more, but the item never lowers the size below
+	// any of them (raiseSize), so a request under those is a no-op and cannot
+	// shrink the volume. ControllerExpandVolume has already refused to shrink
+	// below the record, and kubelet calls it first.
 	if cur := max(in.Volume.Size, in.GrownSize); want < cur {
 		return nil, status.Errorf(codes.OutOfRange, "the volume is %d bytes and does not shrink to %d", cur, want)
 	}
