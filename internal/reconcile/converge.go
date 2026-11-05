@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/intent"
@@ -104,6 +105,7 @@ func (p *pass) deleteRecord(in intent.Intent) error {
 	if deleted {
 		delete(p.intents, in.VolumeID)
 		delete(r.lastErr, in.VolumeID)
+		delete(r.marked, in.VolumeID)
 		return nil
 	}
 	if _, ok, gerr := r.store.Get(in.VolumeID); gerr == nil && !ok {
@@ -197,15 +199,71 @@ func (p *pass) convergeAll() {
 			// Stage or a Publish clears the mark. The transport is still kept
 			// mounted: the retry of the unstage, and the final generation it
 			// makes, need it.
+			//
+			// Nothing here renews the volume's holder, and a marked volume's
+			// holder file ages between retries. Under decision 52 nothing
+			// judges a holder by its age, so that is harmless; logic that
+			// ever does must not read a stale renewal on a marked volume as a
+			// dead holder. (The item's Teardown, retried below, does not renew
+			// either: it publishes and releases.)
 			in := p.intents[id]
 			if dir, err := in.Transport.MountPoint(p.r.opts.TransportsRoot); err == nil {
 				_ = p.ensureTransport(in, dir)
 			}
+			p.retryMarked(in)
 			continue
 		}
+		delete(p.r.marked, id)
 		res := p.convergeVolume(p.intents[id])
 		p.results[id] = res
 		p.noteVolume(id, res)
+	}
+}
+
+// markState is the retry state of one unstage that has begun and not finished.
+type markState struct {
+	since, next time.Time
+	delay       time.Duration
+	warned      bool
+}
+
+// retryMarked retries the teardown of a volume whose unstage began and has not
+// finished, with no request to answer: kubelet can stop retrying (it restarts
+// with the pod directories gone, the node re-registers), and decision 52 has
+// the node drain what it holds on its own. The first retry comes MarkRetry
+// after the mark was first seen, and the gap doubles up to MarkRetryMax. A
+// success deletes the record as a kubelet-driven unstage does, so a late
+// NodeUnstage finds no record and answers OK. An unstage still unfinished
+// after MarkWarnAfter raises ReasonUnstageStuck once; the log line beside it
+// carries the error, which names the holder and the way out.
+func (p *pass) retryMarked(in intent.Intent) {
+	r := p.r
+	now := r.opts.Now()
+	ms := r.marked[in.VolumeID]
+	if ms == nil {
+		ms = &markState{since: now, next: now.Add(r.opts.MarkRetry), delay: r.opts.MarkRetry}
+		r.marked[in.VolumeID] = ms
+	}
+	if now.Before(ms.next) {
+		return
+	}
+	err := p.teardownVolume(in)
+	if err == nil {
+		err = p.deleteRecord(in)
+	}
+	if err == nil {
+		delete(r.marked, in.VolumeID)
+		r.log.Info("an unstage that kubelet did not retry has finished", "volume", in.VolumeID)
+		return
+	}
+	r.metrics.IncReconcileError("teardown")
+	r.log.Warn("unstage retry did not complete", "volume", in.VolumeID, "error", err)
+	ms.delay = min(ms.delay*2, r.opts.MarkRetryMax)
+	ms.next = now.Add(ms.delay)
+	if !ms.warned && now.Sub(ms.since) >= r.opts.MarkWarnAfter {
+		ms.warned = true
+		r.log.Warn("an unstage has not finished; the volume stays with this node until its last writes are in the store", "volume", in.VolumeID, "since", ms.since, "lastError", err)
+		r.events.Event(in.VolumeID, ReasonUnstageStuck)
 	}
 }
 

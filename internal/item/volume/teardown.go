@@ -5,7 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/blockd"
 	"github.com/greghaskins/csi-miami/internal/cache"
@@ -14,6 +18,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/kube"
+	"github.com/greghaskins/csi-miami/internal/nbd"
 	"github.com/greghaskins/csi-miami/internal/observe"
 )
 
@@ -140,19 +145,69 @@ func (it *Item) stopServerAndUnit(ctx context.Context, v vol) error {
 	if err != nil || !ok {
 		return err
 	}
-	if mounted, merr := it.mounted(ctx, v); merr != nil || mounted {
-		return fmt.Errorf("volume item %s: %w: refusing to disconnect device %d while the stage is mounted", v.in.VolumeID, item.ErrServerDown, dev.Index)
+	if err := it.deviceFree(ctx, v, dev); err != nil {
+		return err
 	}
-	if v.params.Encryption {
-		if present, derr := it.dmPresent(crypt.Name(v.name)); derr != nil || present {
-			return fmt.Errorf("volume item %s: %w: refusing to disconnect device %d while its mapping is open", v.in.VolumeID, item.ErrServerDown, dev.Index)
-		}
+	// The look and the disconnect are not atomic: the index may have been
+	// reused by another volume in between. Disconnect only what is still ours.
+	if again, ok, err := it.findDevice(v); err != nil {
+		return err
+	} else if !ok || again.Index != dev.Index {
+		it.log.Info("the device is no longer this volume's; not disconnecting it", "volume", v.in.VolumeID, "device", dev.Index)
+		return nil
 	}
 	it.log.Warn("the block server left its device behind; disconnecting it", "volume", v.in.VolumeID, "device", dev.Index)
 	if err := it.cfg.NBD.Disconnect(ctx, dev.Index); err != nil {
 		return fmt.Errorf("volume item %s: %w: disconnecting device %d: %w", v.in.VolumeID, item.ErrServerDown, dev.Index, err)
 	}
 	return nil
+}
+
+// deviceFree checks that nothing uses the device before it is disconnected:
+// the stage is not mounted, no mapping is open, nothing is stacked on it in
+// sysfs (holders), and no mount anywhere is made from it, by path or by device
+// numbers.
+func (it *Item) deviceFree(ctx context.Context, v vol, dev nbd.Device) error {
+	busy := func(format string, args ...any) error {
+		return fmt.Errorf("volume item %s: %w: refusing to disconnect device %d: %s", v.in.VolumeID, item.ErrServerDown, dev.Index, fmt.Sprintf(format, args...))
+	}
+	tbl, err := it.cfg.Mounter.Mounts(ctx)
+	if err != nil {
+		return fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrObserve, err)
+	}
+	if _, mounted := tbl.At(v.stage); mounted {
+		return busy("the stage is mounted")
+	}
+	path := it.devPath(dev.Index)
+	major, minor, haveNumbers := deviceNumbers(path)
+	for _, m := range tbl {
+		if sameDevice(m.Source, path) || (haveNumbers && m.Major == major && m.Minor == minor) {
+			return busy("%s is mounted from it", m.MountPoint)
+		}
+	}
+	if v.params.Encryption {
+		if present, derr := it.dmPresent(crypt.Name(v.name)); derr != nil || present {
+			return busy("its mapping is open")
+		}
+	}
+	holders, herr := os.ReadDir(filepath.Join(it.cfg.Sysfs, "block", "nbd"+strconv.Itoa(dev.Index), "holders"))
+	if herr != nil && !errors.Is(herr, os.ErrNotExist) {
+		return busy("its holders cannot be read: %v", herr)
+	}
+	if len(holders) > 0 {
+		return busy("%d device(s) are stacked on it", len(holders))
+	}
+	return nil
+}
+
+// deviceNumbers is the major and minor of a block device node, when path is
+// one.
+func deviceNumbers(path string) (major, minor int, ok bool) {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return 0, 0, false
+	}
+	return int(unix.Major(uint64(st.Rdev))), int(unix.Minor(uint64(st.Rdev))), true //nolint:gosec // device numbers
 }
 
 // stopServer sends the server its Stop request. A dial or a request that
@@ -205,8 +260,8 @@ func (it *Item) wayOut(ctx context.Context, v vol, st *vstate) string {
 }
 
 // abandoned reports whether the store proves that the holder was given up:
-// the holder file names another node, or an epoch above ours, or the store's
-// current is at an epoch above ours. Absence, an unreadable file or a store
+// the holder file names another node, or the store's current is at an epoch
+// above ours. Our own newer epoch on the file is not proof. Absence, an unreadable file or a store
 // that cannot be read prove nothing and are the retryable error: a transport
 // that is not mounted looks exactly like a volume with no holder. ours is the
 // epoch this node publishes under, 0 when not known from the server.
@@ -227,9 +282,8 @@ func (it *Item) abandoned(ctx context.Context, v vol, st *vstate, ours uint64) (
 			ours = st.h.Epoch()
 		}
 	}
-	if info.Epoch > ours {
-		return true, nil
-	}
+	// The holder file naming this node at a newer epoch is our own
+	// re-acquisition, not an operator's act: it is no proof (see syncOut).
 	cur, err := it.readCurrent(ctx, v)
 	if err != nil {
 		return false, it.incomplete(ctx, v, st, "reading the store: %v", err)
@@ -289,6 +343,9 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 			return aerr
 		}
 		if !gone {
+			if it.ownsNewerEpoch(pctx, v, ss.Epoch) {
+				return it.restartAtHeldEpoch(ctx, v, st)
+			}
 			return it.incomplete(ctx, v, st, "the final generation was refused but the store does not show the holder was abandoned")
 		}
 		it.lost(v, ss.Dirty, "the final generation was refused; the holder was abandoned")
@@ -318,6 +375,38 @@ func (it *Item) syncOut(ctx context.Context, v vol, st *vstate) error {
 	}
 	it.log.Info("the final generation is in the store", "volume", v.in.VolumeID, "manifest", want, "dirtyBytes", ss.Dirty)
 	return nil
+}
+
+// ownsNewerEpoch reports whether the holder file names this node at an epoch
+// above the one the running server publishes under: this node took the volume
+// again (the file vanished, a late renewal landed) and the server was never
+// restarted at the new epoch.
+func (it *Item) ownsNewerEpoch(ctx context.Context, v vol, serverEpoch uint64) bool {
+	info, err := it.cfg.Holder.Read(ctx, v.holdDir, v.name)
+	return err == nil && info.Present && info.Node == it.cfg.Node && serverEpoch != 0 && info.Epoch > serverEpoch
+}
+
+// restartAtHeldEpoch stops the server that publishes under an old epoch and
+// starts it again at the held one, over the same cache (the start decides
+// whether the cache is the newest data, as at any start); the retry publishes
+// there. The mount and mapping are already down.
+func (it *Item) restartAtHeldEpoch(ctx context.Context, v vol, st *vstate) error {
+	if err := it.stopServerAndUnit(ctx, v); err != nil {
+		return it.incomplete(ctx, v, st, "stopping the server that publishes under an old epoch: %v", err)
+	}
+	h, err := it.cfg.Holder.Adopt(ctx, v.holdDir, v.name, it.cfg.Node)
+	if err != nil {
+		return it.incomplete(ctx, v, st, "adopting the holder file: %v", err)
+	}
+	st.h = h
+	cur, err := it.readCurrent(ctx, v)
+	if err != nil {
+		return it.incomplete(ctx, v, st, "reading the store: %v", err)
+	}
+	if _, err := it.ensureServer(ctx, v, st, h, cur); err != nil {
+		return it.incomplete(ctx, v, st, "restarting the server at the held epoch: %v", err)
+	}
+	return it.incomplete(ctx, v, st, "the server published under an older epoch than the held one; it was restarted at the held epoch and the next retry publishes there")
 }
 
 // waitNoPublish polls the server until no publish is running, within the

@@ -117,10 +117,18 @@ type countItem struct {
 	converge int
 	teardown int
 	failTear error
+	src      string // the publish source, when a test publishes
 }
 
-func (c *countItem) Kind() volume.Kind                              { return volume.KindDirectory }
-func (c *countItem) PublishSource(in intent.Intent) (string, error) { return in.StagePath, nil }
+func (c *countItem) Kind() volume.Kind { return volume.KindDirectory }
+func (c *countItem) PublishSource(in intent.Intent) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.src != "" {
+		return c.src, nil
+	}
+	return in.StagePath, nil
+}
 func (c *countItem) Converge(context.Context, intent.Intent, item.Observed) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -219,4 +227,113 @@ func (r *Reconciler) runUnstageForTest(volumeID string) error {
 	req := &request{kind: reqUnstage, volume: volumeID, done: make(chan error, 1)}
 	r.runPass(context.Background(), []*request{req})
 	return <-req.done
+}
+
+// ---- a marked record is retried by the reconciler itself ----
+
+func newMarked(t *testing.T) (*env, *countItem, intent.Intent) {
+	t.Helper()
+	ci := &countItem{failTear: item.ErrUnstageIncomplete}
+	e := newEnv(t, func(o *Options) { o.Items = []item.Item{ci} })
+	e.start()
+	in := e.vol("a", pvc1)
+	mustNil(t, "Stage", e.r.Stage(bg, in))
+	if err := e.r.Unstage(bg, in.VolumeID); !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("Unstage = %v", err)
+	}
+	return e, ci, in
+}
+
+// Only a kubelet retry used to re-run Teardown for a marked record, and
+// kubelet can stop retrying. The reconciler retries it on timer passes, with a
+// backoff, and a success removes the record as an unstage would.
+func TestMarkedRecordIsRetriedOnTimerPassesWithBackoff(t *testing.T) {
+	t.Parallel()
+	e, ci, in := newMarked(t)
+	_, base := ci.counts()
+
+	e.pass() // no time has passed: the request's own attempt was just made
+	if _, n := ci.counts(); n != base {
+		t.Fatalf("retried at once: %d teardowns after %d", n, base)
+	}
+	var seen []int
+	last := base
+	for i := 0; i < 6; i++ {
+		e.clock.Advance(time.Minute)
+		e.pass()
+		_, n := ci.counts()
+		seen = append(seen, n-last)
+		last = n
+	}
+	// The first minute retries (the initial delay); the delay then doubles, so
+	// six minutes hold only a few attempts, not six.
+	total := 0
+	for _, d := range seen {
+		total += d
+	}
+	if total < 2 || total > 4 {
+		t.Errorf("attempts per minute = %v: want a few with a growing gap", seen)
+	}
+
+	// Success deletes the record exactly as a kubelet-driven unstage does.
+	ci.mu.Lock()
+	ci.failTear = nil
+	ci.mu.Unlock()
+	for range 30 {
+		e.clock.Advance(time.Minute)
+		e.pass()
+		if _, ok := e.intentOf(in.VolumeID); !ok {
+			break
+		}
+	}
+	if _, ok := e.intentOf(in.VolumeID); ok {
+		t.Fatal("a successful timer retry did not remove the record")
+	}
+	// A late NodeUnstage from kubelet answers OK and does nothing.
+	_, before := ci.counts()
+	mustNil(t, "late Unstage", e.r.Unstage(bg, in.VolumeID))
+	if _, after := ci.counts(); after != before {
+		t.Error("a late Unstage tore the item down again")
+	}
+	e.noStageMount(in)
+}
+
+func TestOldMarkRaisesAWarningEventNamingTheWayOut(t *testing.T) {
+	t.Parallel()
+	e, _, in := newMarked(t)
+	count := func() int {
+		n := 0
+		for _, ev := range e.events.all() {
+			if ev.Reason == ReasonUnstageStuck && ev.Volume == in.VolumeID {
+				n++
+			}
+		}
+		return n
+	}
+	e.clock.Advance(10 * time.Minute)
+	e.pass()
+	if count() != 0 {
+		t.Fatal("warned too early")
+	}
+	e.clock.Advance(40 * time.Minute)
+	e.pass()
+	e.clock.Advance(40 * time.Minute)
+	e.pass()
+	if got := count(); got != 1 {
+		t.Errorf("stuck events = %d, want exactly 1", got)
+	}
+}
+
+// B-M2: a Publish means kubelet wants the volume again, and clears the mark.
+func TestPublishClearsTheUnstagingMark(t *testing.T) {
+	t.Parallel()
+	e, ci, in := newMarked(t)
+	ci.mu.Lock()
+	ci.src = e.itemDir("a", pvc1)
+	ci.mu.Unlock()
+	e.mkTargetParent("pod1")
+	mustNil(t, "Publish", e.r.Publish(bg, in.VolumeID, intent.Publish{TargetPath: e.target("pod1")}))
+	if rec, ok := e.intentOf(in.VolumeID); !ok || rec.Unstaging {
+		t.Fatalf("the mark survived a Publish: %+v %v", rec, ok)
+	}
 }

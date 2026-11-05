@@ -898,3 +898,77 @@ func TestDiscardAtStageRemovesTheLockFile(t *testing.T) {
 		t.Errorf("cache=%v lock=%v", e.cacheExists(), e.lockExists())
 	}
 }
+
+// ---- round 3 ----
+
+// B-N1: our own newer claim on the holder file is a re-acquisition, not an
+// operator's abandonment. blockd refuses the old-epoch server's publish; the
+// right answer is to restart the server at the held epoch and retry.
+func TestOwnNewerEpochIsNotAbandonment(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning() // us@1, server epoch 1
+	e.makeCache(1, "", 3, 4, 5)
+	e.ctl.dirty = 2 << 20
+	e.holderAt(testNode, 2)
+	e.ctl.publishRefused = true // the server's Mine() is false: the file says epoch 2
+
+	err := e.it.Teardown(bg, e.in, item.Observed{})
+	if !errors.Is(err, item.ErrUnstageIncomplete) {
+		t.Fatalf("err = %v, want ErrUnstageIncomplete", err)
+	}
+	if !e.cacheExists() || len(e.events) != 0 {
+		t.Fatalf("our own newer claim counted as abandonment: cache=%v events=%v", e.cacheExists(), e.events)
+	}
+	// The server was restarted at the held epoch, over the same cache.
+	if got := e.epochOfLastStart(); got != 2 {
+		t.Errorf("restarted at epoch %d, want 2", got)
+	}
+	// The retry publishes there and finishes.
+	e.ctl.publishRefused = false
+	e.rec.reset()
+	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	e.rec.inOrder(t, "ctl.Publish unstage", "ctl.Stop", "systemd.Stop")
+	if e.cacheExists() || len(e.events) != 0 {
+		t.Errorf("cache=%v events=%v", e.cacheExists(), e.events)
+	}
+}
+
+// B-M1: before the orphan device is disconnected, nothing may be holding it,
+// and it must still be this volume's.
+func TestOrphanDisconnectRefusesWhileTheDeviceHasHolders(t *testing.T) {
+	e := dirtyEnv(t)
+	e.ctl.stopErr = errors.New("lost")
+	if err := os.MkdirAll(filepath.Join(e.sysfs, "block", "nbd0", "holders", "dm-3"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	err := e.it.Teardown(bg, e.in, item.Observed{})
+	if err == nil {
+		t.Fatal("disconnected a device something still holds")
+	}
+	e.rec.none(t, "nbd.Disconnect")
+}
+
+func TestOrphanDisconnectRefusesWhileAnyMountUsesTheDevice(t *testing.T) {
+	e := dirtyEnv(t)
+	e.ctl.stopErr = errors.New("lost")
+	// Not at the stage path: a bind elsewhere of the device's file system.
+	e.mnt.add("/var/lib/kubelet/pods/p/volumes/mount", "ext4", filepath.Join(e.devDir, "nbd0"))
+	// (the stage itself is unmounted by the teardown; this one is not ours to unmount)
+	err := e.it.Teardown(bg, e.in, item.Observed{})
+	if err == nil {
+		t.Fatal("disconnected a device a mount still uses")
+	}
+	e.rec.none(t, "nbd.Disconnect")
+}
+
+func TestOrphanDisconnectRechecksTheBackendJustBeforeDisconnecting(t *testing.T) {
+	e := dirtyEnv(t)
+	e.ctl.stopErr = errors.New("lost")
+	e.nbd.renameOn = 2 // the look after the unit stop is the first; the re-check is the second
+	if err := e.it.Teardown(bg, e.in, item.Observed{}); err != nil {
+		t.Fatalf("a device that is no longer ours is simply not disconnected: %v", err)
+	}
+	e.rec.none(t, "nbd.Disconnect")
+}

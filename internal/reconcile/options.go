@@ -27,6 +27,10 @@ const (
 	// ReasonTransportUnavailable is a volume whose transport could not be
 	// observed or mounted.
 	ReasonTransportUnavailable = "TransportUnavailable"
+	// ReasonUnstageStuck is an unstage that has been retrying for a long time
+	// without finishing (an item's retryable teardown error); the log line
+	// beside it carries the cause and the way out.
+	ReasonUnstageStuck = "UnstageStuck"
 	// ReasonGarbageUnmounted is a mount the reconciler removed because no
 	// intent claims it.
 	ReasonGarbageUnmounted = "GarbageUnmounted"
@@ -158,6 +162,13 @@ type Options struct {
 	// means the volume item's defaults (5m and 15s).
 	TakeoverTimeout time.Duration
 	HolderRenew     time.Duration
+
+	// MarkRetry is the delay before the reconciler first retries the teardown
+	// of a volume whose unstage began and has not finished, MarkRetryMax the
+	// longest the delay grows to (it doubles), and MarkWarnAfter how long such
+	// an unstage may go on before ReasonUnstageStuck is raised. Zero means
+	// 1 minute, 10 minutes and 30 minutes.
+	MarkRetry, MarkRetryMax, MarkWarnAfter time.Duration
 
 	// Remediate permits the reconciler to repair what it finds wrong beyond
 	// converging intent (see the remediation task); false observes and reports

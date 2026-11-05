@@ -470,6 +470,7 @@ func (s *fakeSystemd) Start(_ context.Context, u systemd.Unit) error {
 
 func (s *fakeSystemd) Stop(ctx context.Context, name string) error {
 	s.e.rec.add("systemd.Stop")
+	s.e.nbd.sinceStop = 0
 	s.e.atStop = [2]bool{s.e.cacheExists(), s.e.holderInfo().Present}
 	return s.Manager.Stop(ctx, name)
 }
@@ -477,6 +478,11 @@ func (s *fakeSystemd) Stop(ctx context.Context, name string) error {
 type fakeNBD struct {
 	e    *env
 	devs []nbd.Device
+
+	// renameOn, when positive, makes the Nth Devices call after the unit's
+	// stop report the volume's device under another backend, as when the
+	// index was reused by another volume between the look and the disconnect.
+	renameOn, sinceStop int
 }
 
 func (f *fakeNBD) set(d nbd.Device) {
@@ -496,8 +502,19 @@ func (f *fakeNBD) remove(backend string) {
 	f.devs = slices.DeleteFunc(f.devs, func(d nbd.Device) bool { return d.Backend == backend })
 }
 
-func (f *fakeNBD) Devices() ([]nbd.Device, error) { return slices.Clone(f.devs), nil }
-func (f *fakeNBD) Available() error               { return nil }
+func (f *fakeNBD) Devices() ([]nbd.Device, error) {
+	out := slices.Clone(f.devs)
+	if f.renameOn > 0 {
+		f.sinceStop++
+		if f.sinceStop >= f.renameOn {
+			for i := range out {
+				out[i].Backend = "pvc-someone-else"
+			}
+		}
+	}
+	return out, nil
+}
+func (f *fakeNBD) Available() error { return nil }
 func (f *fakeNBD) Connect(context.Context, *os.File, nbd.ConnectOptions) (int, error) {
 	return 0, errors.New("the item never connects a device")
 }
