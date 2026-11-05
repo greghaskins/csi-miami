@@ -1,0 +1,688 @@
+package volume
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/greghaskins/csi-miami/internal/cache"
+	"github.com/greghaskins/csi-miami/internal/crypt"
+	"github.com/greghaskins/csi-miami/internal/ext4"
+	"github.com/greghaskins/csi-miami/internal/holder"
+	"github.com/greghaskins/csi-miami/internal/intent"
+	"github.com/greghaskins/csi-miami/internal/item"
+	"github.com/greghaskins/csi-miami/internal/nbd"
+	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/prereq"
+	"github.com/greghaskins/csi-miami/internal/systemd"
+)
+
+// luksSlack is how far a LUKS mapping may be smaller than the device under it
+// (the header) before the mapping counts as not yet resized.
+const luksSlack = 64 << 20
+
+// fencedReason is the judgement's reason for a holder file that names this
+// node while the store has moved on to a newer epoch.
+const fencedReason = "own ownership fenced by a newer generation"
+
+// Converge runs the seven layers; see the package comment.
+func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observed) error {
+	v, err := it.volOf(in)
+	if err != nil {
+		return err
+	}
+	if err := it.checkPrereq(v, obs.Prereq); err != nil {
+		return err
+	}
+	st := it.state(in.VolumeID)
+
+	// Layer 2, first half: the holder. It comes before anything is read from
+	// the store that decides what to mount and at which epoch.
+	h, err := it.ensureHolder(ctx, v, st)
+	if err != nil {
+		return err
+	}
+
+	// Then `current`, fresh, and the stage-time fence: if the store has moved
+	// to a newer epoch than the one we hold, our ownership is already fenced,
+	// whatever the holder file says, and no server may be started at it.
+	cur, err := it.readCurrent(ctx, v)
+	if err != nil {
+		return err
+	}
+	if cur.ok && cur.epoch > h.Epoch() {
+		if h, err = it.refence(ctx, v, st, cur); err != nil {
+			return err
+		}
+		if obs.Mounts, err = it.cfg.Mounter.Mounts(ctx); err != nil {
+			return fmt.Errorf("volume item %s: %w: %w", in.VolumeID, item.ErrObserve, err)
+		}
+	}
+
+	if err := it.ensureBinary(); err != nil {
+		return fmt.Errorf("volume item %s: %w", in.VolumeID, err)
+	}
+	dev, err := it.ensureServer(ctx, v, h, cur)
+	if err != nil {
+		return err
+	}
+	blk, err := it.ensureMapping(ctx, v, dev, cur, obs.Keys)
+	if err != nil {
+		return err
+	}
+	if err := it.ensureMounted(ctx, v, st, blk, cur, obs.Mounts); err != nil {
+		return err
+	}
+	return it.ensureSize(ctx, v, st, blk)
+}
+
+// ---- layer 1: prerequisites ----
+
+// checkPrereq refuses a volume on a node whose probe found a feature missing
+// that this volume needs, before anything is started or created. The cipher
+// and the mapper matter only to an encrypted volume.
+func (it *Item) checkPrereq(v vol, rep prereq.Report) error {
+	need := map[string]bool{prereq.FeatureNBD: true, prereq.FeatureSystemdSocket: true, prereq.FeatureCacheDir: true}
+	if v.params.Encryption {
+		need[prereq.FeatureDeviceMapper] = true
+		need[prereq.FeatureAdiantum] = strings.Contains(v.params.Cipher, "adiantum")
+	}
+	var missing []string
+	for _, f := range rep.Features {
+		if f.Err != nil && need[f.Name] {
+			missing = append(missing, f.Name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("volume item %s: %w: %s", v.in.VolumeID, item.ErrPrerequisiteMissing, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// ---- layer 2: holder ----
+
+// ensureHolder returns the volume's holder: renewed when this process already
+// holds it, otherwise adopted when the holder file names this node (a plugin
+// restart continues the ownership at its epoch) or acquired.
+func (it *Item) ensureHolder(ctx context.Context, v vol, st *vstate) (*holder.Holder, error) {
+	if st.h != nil {
+		err := st.h.Renew(ctx)
+		switch {
+		case err == nil:
+			return st.h, nil
+		case !errors.Is(err, holder.ErrLost):
+			// The transport did not answer; the ownership is as it was.
+			return nil, fmt.Errorf("volume item %s: renewing the holder file: %w", v.in.VolumeID, err)
+		}
+		it.log.Warn("the holder file is no longer ours", "volume", v.in.VolumeID)
+		st.h = nil
+	}
+	h, err := it.acquire(ctx, v, current{})
+	if err != nil {
+		return nil, err
+	}
+	st.h = h
+	return h, nil
+}
+
+// acquire adopts or acquires the holder file. cur is what the store's `current`
+// says when the caller has read it, and is only used for the fence rule.
+func (it *Item) acquire(ctx context.Context, v vol, cur current) (*holder.Holder, error) {
+	info, err := it.cfg.Holder.Read(ctx, v.holdDir, v.name)
+	if err != nil {
+		return nil, fmt.Errorf("volume item %s: reading the holder file: %w", v.in.VolumeID, err)
+	}
+	if info.Present && info.Node == it.cfg.Node && (!cur.ok || cur.epoch <= info.Epoch) {
+		h, err := it.cfg.Holder.Adopt(ctx, v.holdDir, v.name, it.cfg.Node)
+		switch {
+		case err == nil:
+			return h, nil
+		case errors.Is(err, holder.ErrHeld):
+			return nil, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrHolderContended, err)
+		case !errors.Is(err, holder.ErrLost):
+			return nil, fmt.Errorf("volume item %s: adopting the holder file: %w", v.in.VolumeID, err)
+		}
+		// The file vanished between the read and the adoption: acquire it.
+	}
+	j := it.judge(v, info, cur)
+	h, err := it.cfg.Holder.Acquire(ctx, v.holdDir, v.name, it.cfg.Node, j)
+	switch {
+	case err == nil:
+		return h, nil
+	case errors.Is(err, holder.ErrHeld):
+		return nil, fmt.Errorf("volume item %s: %w: %w (%s)", v.in.VolumeID, item.ErrHolderContended, err, j.Reason)
+	}
+	return nil, fmt.Errorf("volume item %s: acquiring the holder file: %w", v.in.VolumeID, err)
+}
+
+// judge is Config.Judge with this item's one rule on top: a holder file that
+// names this node at an epoch older than the store's `current` is a fenced
+// ownership of our own (another node took the volume over, published, and our
+// late renewal put our older claim back), and the only way out is to take our
+// own file over, at an epoch above everything claimed. The reconciler's judge
+// says no to a node's own Ready, in-use holder, so the rule lives here.
+func (it *Item) judge(v vol, info holder.Info, cur current) holder.Judgement {
+	if info.Present && info.Node == it.cfg.Node && cur.ok && cur.epoch > info.Epoch {
+		return holder.Judgement{Takeover: true, Reason: fencedReason, Info: info}
+	}
+	var j holder.Judgement
+	if it.cfg.Judge != nil {
+		j = it.cfg.Judge(v.in.VolumeID)
+	}
+	if j.Takeover && !j.Info.Present {
+		j.Info = info
+	}
+	return j
+}
+
+// refence handles the stage-time fence: the epoch we hold is below `current`'s.
+// Whatever serves at the fenced epoch is stopped (it refuses every publish
+// anyway), the cache is discarded (its lineage is not the newest), and the
+// volume is acquired afresh at an epoch above `current`'s, to be started at.
+func (it *Item) refence(ctx context.Context, v vol, st *vstate, cur current) (*holder.Holder, error) {
+	it.log.Warn("our ownership is fenced by a newer generation; starting over at a new epoch", "volume", v.in.VolumeID, "currentEpoch", cur.epoch)
+	if err := it.stopStack(ctx, v); err != nil {
+		return nil, err
+	}
+	if err := it.discardCache(v, "the ownership was fenced"); err != nil {
+		return nil, err
+	}
+	st.h = nil
+	h, err := it.acquire(ctx, v, cur)
+	if err != nil {
+		return nil, err
+	}
+	if h.Epoch() <= cur.epoch {
+		return nil, fmt.Errorf("volume item %s: %w: epoch %d is not above the current generation's %d", v.in.VolumeID, item.ErrHolderContended, h.Epoch(), cur.epoch)
+	}
+	st.h = h
+	return h, nil
+}
+
+// ---- layer 3: binary ----
+
+// binPath is the host copy of the binary the units execute.
+func (it *Item) binPath() string {
+	return filepath.Join(it.cfg.BinDir, "miami-"+it.cfg.BinaryHash)
+}
+
+// ensureBinary makes the host copy: present with the size of the running
+// binary, else copied to a temporary name and renamed into place with mode
+// 0755. A copy that exists is never rewritten, so a running unit's binary is
+// never changed under it.
+func (it *Item) ensureBinary() error {
+	dst := it.binPath()
+	src, err := os.Open(it.cfg.Exe)
+	if err != nil {
+		return fmt.Errorf("opening the running binary: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+	si, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("the running binary: %w", err)
+	}
+	if di, err := os.Stat(dst); err == nil && di.Mode().IsRegular() && di.Size() == si.Size() && di.Mode().Perm()&0o111 != 0 {
+		return nil
+	}
+	if err := os.MkdirAll(it.cfg.BinDir, 0o755); err != nil { //nolint:gosec // the host directory the units execute from
+		return fmt.Errorf("making the binary directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(it.cfg.BinDir, ".miami-copy-*")
+	if err != nil {
+		return fmt.Errorf("copying the binary: %w", err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("copying the binary: %w", err)
+	}
+	if err := tmp.Chmod(0o755); err != nil { //nolint:gosec // an executable the unit runs
+		_ = tmp.Close()
+		return fmt.Errorf("copying the binary: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("copying the binary: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("copying the binary: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), dst); err != nil {
+		return fmt.Errorf("installing the binary: %w", err)
+	}
+	return nil
+}
+
+// ---- layer 4: unit and device ----
+
+// unitFor is the block server's unit: the host binary's blockd subcommand with
+// the volume's geometry and the epoch it publishes under, restarted by systemd
+// a second after it fails. No key is anywhere in it.
+func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
+	itoa := func(n int64) string { return strconv.FormatInt(n, 10) }
+	return systemd.Unit{
+		Name:        v.unit,
+		Description: "csi-miami block server for " + v.name,
+		ExecStart: []string{
+			it.binPath(), "blockd",
+			"-volume", v.name, "-store", v.storeDir, "-cache-dir", v.cacheDir, "-control", v.socket,
+			"-size", itoa(v.size), "-chunk-size", itoa(v.chunk), "-cache-bound", itoa(v.bound),
+			"-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", it.cfg.Node,
+		},
+		Restart:      "on-failure",
+		RestartDelay: RestartDelay,
+	}
+}
+
+// ensureServer makes the volume's nbd device served by a running block server
+// and returns the device. It observes before it acts (I8): a unit that is
+// active whose control socket names the volume's device is adopted without a
+// call. A unit that is not running is started, and when the device is still
+// there the new server re-points it (decision 51), so the mapping and the
+// mount above are never touched. Only a start with no device in the kernel
+// decides what to do with a node-local cache.
+func (it *Item) ensureServer(ctx context.Context, v vol, h *holder.Holder, cur current) (nbd.Device, error) {
+	us, err := it.cfg.Systemd.State(ctx, v.unit)
+	if err != nil {
+		return nbd.Device{}, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
+	dev, haveDev, err := it.findDevice(v)
+	if err != nil {
+		return nbd.Device{}, err
+	}
+	if us.Present {
+		switch us.Active {
+		case "active":
+			if haveDev {
+				st, serr := it.status(ctx, v)
+				switch {
+				case serr != nil:
+					return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit is active and its control socket does not answer: %w", v.in.VolumeID, item.ErrServerDown, serr)
+				case st.Index != dev.Index:
+					return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit serves device %d, the volume's device is %d", v.in.VolumeID, item.ErrServerDown, st.Index, dev.Index)
+				}
+				return dev, nil
+			}
+			return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit is active and the volume has no device", v.in.VolumeID, item.ErrServerDown)
+		case "activating", "deactivating", "reloading":
+			// Systemd is restarting (or stopping) it: wait for the next pass.
+			return nbd.Device{}, fmt.Errorf("volume item %s: %w: the unit is %s (%s)", v.in.VolumeID, item.ErrServerDown, us.Active, us.Sub)
+		}
+	}
+
+	if !haveDev {
+		if err := it.decideCache(v, cur); err != nil {
+			return nbd.Device{}, err
+		}
+	}
+	err = it.cfg.Systemd.Start(ctx, it.unitFor(v, h))
+	switch {
+	case errors.Is(err, systemd.ErrExecStartDiffers):
+		// The binary changed under a unit that is running (a plugin upgrade
+		// raced this start). The running unit is the volume's server; the new
+		// binary is used at the next stage.
+		it.log.Info("the unit runs a different binary; adopting it", "volume", v.in.VolumeID)
+	case err != nil:
+		return nbd.Device{}, fmt.Errorf("volume item %s: %w: starting the unit: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
+	want := -1
+	if haveDev {
+		want = dev.Index
+	}
+	return it.waitServing(ctx, v, want)
+}
+
+// findDevice looks for the nbd device whose backend is the volume.
+func (it *Item) findDevice(v vol) (nbd.Device, bool, error) {
+	devs, err := it.cfg.NBD.Devices()
+	if err != nil {
+		return nbd.Device{}, false, fmt.Errorf("volume item %s: listing the nbd devices: %w", v.in.VolumeID, err)
+	}
+	for _, d := range devs {
+		if d.Backend == v.name {
+			return d, true, nil
+		}
+	}
+	return nbd.Device{}, false, nil
+}
+
+// status asks the volume's block server for its status.
+func (it *Item) status(ctx context.Context, v vol) (statusT, error) {
+	cctx, cancel := context.WithTimeout(ctx, it.cfg.Timeout)
+	defer cancel()
+	c, err := it.cfg.Dial(cctx, v.socket)
+	if err != nil {
+		return statusT{}, err
+	}
+	defer func() { _ = c.Close() }()
+	return c.Status(cctx)
+}
+
+// waitServing waits until the block server answers on its control socket
+// naming a device that exists in the kernel with the volume as its backend,
+// and, when the device already existed (want >= 0), naming that same device.
+func (it *Item) waitServing(ctx context.Context, v vol, want int) (nbd.Device, error) {
+	end := time.Now().Add(it.cfg.StartTimeout)
+	var last error
+	for {
+		st, err := it.status(ctx, v)
+		if err == nil {
+			dev, ok, derr := it.findDevice(v)
+			switch {
+			case derr != nil:
+				err = derr
+			case ok && st.Index == dev.Index && (want < 0 || want == dev.Index):
+				return dev, nil
+			default:
+				err = fmt.Errorf("the server names device %d, the volume's device is %d (found: %t, wanted: %d)", st.Index, dev.Index, ok, want)
+			}
+		}
+		last = err
+		if time.Now().After(end) {
+			return nbd.Device{}, fmt.Errorf("volume item %s: %w: not serving %s after starting: %w", v.in.VolumeID, item.ErrServerDown, it.cfg.StartTimeout, last)
+		}
+		select {
+		case <-ctx.Done():
+			return nbd.Device{}, fmt.Errorf("volume item %s: waiting for the block server: %w", v.in.VolumeID, ctx.Err())
+		case <-time.After(it.cfg.PollEvery):
+		}
+	}
+}
+
+// ---- the node-local cache ----
+
+// reuse says whether a cache that survived (a reboot, a crashed server) may be
+// served again, with the store's `current` as the witness:
+//
+//   - `current` exists and its epoch is the cache's: an epoch is issued to one
+//     node only, so a generation at that epoch was published from this very
+//     cache directory (the directory is per volume and per node, and removed at
+//     unstage), and the directory is at least as new as `current`. Anyone
+//     else's publish carries another epoch and moves `current` off this one.
+//   - `current` is absent and the cache descends from nothing: nobody ever
+//     published, so nothing in the store is newer.
+//
+// The epoch held now is deliberately not the test. The holder file can be put
+// back to an older claim of ours by a late renewal that raced a takeover, which
+// would make a stale cache look current; and it is too strict when another
+// node took over and never published, leaving our cache the newest data there
+// is. A cache reused under a newer held epoch just publishes at that epoch on
+// the base it descends from.
+func reuse(idx cache.Index, cur current) bool {
+	if cur.ok {
+		return cur.epoch == idx.Epoch
+	}
+	return idx.Base == ""
+}
+
+// decideCache runs before a server is started with no device in the kernel:
+// it keeps a reusable cache and removes any other, so that the server builds a
+// fresh one from `current`.
+func (it *Item) decideCache(v vol, cur current) error {
+	idx, err := cache.ReadIndex(v.cacheDir)
+	switch {
+	case errors.Is(err, cache.ErrNoIndex):
+		// Nothing to reuse; a directory left half made is cleared.
+		if _, serr := os.Stat(v.cacheDir); serr == nil {
+			return it.discardCache(v, "the directory has no index")
+		}
+		return nil
+	case err != nil:
+		return it.discardCache(v, "the index is unreadable")
+	case reuse(idx, cur):
+		return nil
+	}
+	if len(idx.Dirty) > 0 {
+		// Writes that were never published are discarded: the store has
+		// moved on without them. Say so; the loss is the event's to report.
+		it.log.Warn("discarding a node-local cache with unpublished chunks", "volume", v.in.VolumeID, "chunks", len(idx.Dirty))
+		it.event(v.in.VolumeID, ReasonGenerationLost)
+	}
+	return it.discardCache(v, "the store's current generation is not this cache's")
+}
+
+// discardCache removes the volume's node-local cache directory. It is the
+// item's own directory, so a half-made one with no index goes with it.
+func (it *Item) discardCache(v vol, why string) error {
+	if _, err := os.Stat(v.cacheDir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	it.log.Info("removing the node-local cache", "volume", v.in.VolumeID, "reason", why)
+	if err := cache.Remove(v.cacheDir); err != nil {
+		if rerr := os.RemoveAll(v.cacheDir); rerr != nil {
+			return fmt.Errorf("volume item %s: removing the cache: %w", v.in.VolumeID, rerr)
+		}
+	}
+	return nil
+}
+
+// ---- layer 5: LUKS mapping ----
+
+// dmPresent reports whether a device-mapper device called name exists, from
+// the names sysfs shows.
+func (it *Item) dmPresent(name string) (bool, error) {
+	names, err := filepath.Glob(filepath.Join(it.cfg.Sysfs, "block", "dm-*", "dm", "name"))
+	if err != nil {
+		return false, err
+	}
+	for _, n := range names {
+		b, err := os.ReadFile(n) //nolint:gosec // sysfs
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		if strings.TrimSpace(string(b)) == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ensureMapping returns the block device the file system lives on: the nbd
+// device of an unencrypted volume, else the LUKS mapping, which is adopted
+// when it exists and otherwise formatted (the volume's first stage, when there
+// is no generation anywhere) and opened with the request's key. A wrong key
+// that a previous key repairs is rotated to the new one first.
+func (it *Item) ensureMapping(ctx context.Context, v vol, dev nbd.Device, cur current, keys item.Keys) (string, error) {
+	nbdPath := it.devPath(dev.Index)
+	if !v.params.Encryption {
+		return nbdPath, nil
+	}
+	name := crypt.Name(v.name)
+	present, err := it.dmPresent(name)
+	if err != nil {
+		return "", fmt.Errorf("volume item %s: looking for the mapping: %w", v.in.VolumeID, err)
+	}
+	if present {
+		return crypt.MapperPath(name), nil
+	}
+	if len(keys.Key) == 0 {
+		return "", fmt.Errorf("volume item %s: %w", v.in.VolumeID, item.ErrKeyRequired)
+	}
+	isLUKS, err := crypt.IsLUKS(ctx, it.cfg.Tools, nbdPath)
+	if err != nil {
+		return "", fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+	}
+	if !isLUKS {
+		if cur.ok {
+			return "", fmt.Errorf("volume item %s: the device holds no LUKS header but the volume has published generations; not formatting it", v.in.VolumeID)
+		}
+		if err := crypt.Format(ctx, it.cfg.Tools, nbdPath, keys.Key, crypt.Params{Cipher: v.params.Cipher, KeySize: v.params.KeySize}); err != nil {
+			return "", fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+		}
+	}
+	err = crypt.Open(ctx, it.cfg.Tools, nbdPath, name, keys.Key)
+	if errors.Is(err, crypt.ErrBadKey) {
+		if len(keys.PreviousKey) == 0 {
+			return "", fmt.Errorf("volume item %s: %w", v.in.VolumeID, item.ErrBadKey)
+		}
+		if rerr := crypt.Rotate(ctx, it.cfg.Tools, nbdPath, keys.PreviousKey, keys.Key); rerr != nil {
+			if errors.Is(rerr, crypt.ErrBadKey) {
+				return "", fmt.Errorf("volume item %s: %w", v.in.VolumeID, item.ErrBadKey)
+			}
+			return "", fmt.Errorf("volume item %s: rotating the key: %w", v.in.VolumeID, rerr)
+		}
+		err = crypt.Open(ctx, it.cfg.Tools, nbdPath, name, keys.Key)
+		if errors.Is(err, crypt.ErrBadKey) {
+			return "", fmt.Errorf("volume item %s: %w", v.in.VolumeID, item.ErrBadKey)
+		}
+	}
+	if err != nil {
+		return "", fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+	}
+	return crypt.MapperPath(name), nil
+}
+
+// ---- layer 6: file system and mount ----
+
+// sameDevice reports whether a mount source names the block device blk,
+// directly or through a symlink (a mapper path and its /dev/dm-N).
+func sameDevice(source, blk string) bool {
+	if source == blk {
+		return true
+	}
+	a, aerr := filepath.EvalSymlinks(source)
+	b, berr := filepath.EvalSymlinks(blk)
+	return aerr == nil && berr == nil && a == b
+}
+
+// ensureMounted adopts the ext4 mount at the stage path when it is this
+// volume's, else makes it: a blank device gets a file system (only when the
+// volume has no published generation, so a lost mapping can never be formatted
+// over data), an existing one is checked, then mounted. A mount that is there
+// is never checked, stacked over or removed. The first time this process sees
+// a mount it did not make it thaws it: a plugin that crashed in the middle of
+// a generation must not leave the file system frozen.
+func (it *Item) ensureMounted(ctx context.Context, v vol, st *vstate, blk string, cur current, mounts observe.Table) error {
+	if top, ok := mounts.At(v.stage); ok {
+		if top.FSType != "ext4" || !sameDevice(top.Source, blk) {
+			return fmt.Errorf("volume item %s: %w: %s is mounted as %s from %q", v.in.VolumeID, item.ErrStageConflict, v.stage, top.FSType, top.Source)
+		}
+		return it.thawOnce(v, st)
+	}
+	has, err := ext4.HasFilesystem(ctx, it.cfg.Tools, blk)
+	if err != nil {
+		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+	}
+	if !has {
+		if cur.ok {
+			return fmt.Errorf("volume item %s: the device holds no file system but the volume has published generations; not formatting it", v.in.VolumeID)
+		}
+		if err := ext4.Mkfs(ctx, it.cfg.Tools, blk); err != nil {
+			return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+		}
+	} else if err := ext4.Fsck(ctx, it.cfg.Tools, blk); err != nil {
+		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+	}
+	if err := it.cfg.Mounter.Mount(ctx, blk, v.stage, "ext4", unix.MS_NOSUID|unix.MS_NODEV, ext4.MountOptions); err != nil {
+		return fmt.Errorf("volume item %s: mounting the file system: %w", v.in.VolumeID, err)
+	}
+	st.fz.Lock()
+	st.thawed = true
+	st.fz.Unlock()
+	return nil
+}
+
+// thawOnce issues FITHAW on a mount this process found already there, once.
+// EINVAL, "not frozen", is the normal answer and is the reason the call is
+// harmless; it is made once so that it can never end a generation's freeze.
+func (it *Item) thawOnce(v vol, st *vstate) error {
+	st.fz.Lock()
+	defer st.fz.Unlock()
+	if st.thawed {
+		return nil
+	}
+	if err := it.cfg.Thaw(v.stage); err != nil {
+		return fmt.Errorf("volume item %s: thawing the adopted mount: %w", v.in.VolumeID, err)
+	}
+	st.thawed = true
+	return nil
+}
+
+// ---- layer 7: size ----
+
+// ensureSize grows what is smaller than the record says, in order: the block
+// server's device, the LUKS mapping, the file system. Each step is taken when
+// its own layer is short, so a pass that finds a half-done grow finishes it.
+// (A grown device and mapping with a file system not yet grown is told by the
+// file system being well under its device; see below.)
+func (it *Item) ensureSize(ctx context.Context, v vol, vs *vstate, blk string) error {
+	st, err := it.status(ctx, v)
+	if err != nil {
+		return fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
+	grew := false
+	if st.Size < v.size {
+		if err := it.grow(ctx, v); err != nil {
+			return err
+		}
+		grew = true
+	}
+	size, err := it.cfg.DeviceSize(blk)
+	if err != nil {
+		return fmt.Errorf("volume item %s: the size of %s: %w", v.in.VolumeID, blk, err)
+	}
+	if v.params.Encryption && (grew || size+luksSlack < v.size) {
+		if err := crypt.Resize(ctx, it.cfg.Tools, crypt.Name(v.name)); err != nil {
+			return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+		}
+		if size, err = it.cfg.DeviceSize(blk); err != nil {
+			return fmt.Errorf("volume item %s: the size of %s: %w", v.in.VolumeID, blk, err)
+		}
+	}
+	fsBytes, known, err := it.fsSize(ctx, v.stage)
+	if err != nil {
+		return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+	}
+	// statfs counts a file system's blocks net of its own overhead (journal,
+	// inode tables), so "smaller than the device" is only a safe test when the
+	// shortfall is large: a file system under four fifths of its device is a
+	// grow that was not finished. resize2fs on a file system that fills its
+	// device does nothing, so a false alarm costs one call, made once per size.
+	short := known && fsBytes*100 < size*80
+	if grew || (short && vs.resizedTo != size) {
+		if err := ext4.Resize(ctx, it.cfg.Tools, blk); err != nil {
+			return fmt.Errorf("volume item %s: %w", v.in.VolumeID, err)
+		}
+		vs.resizedTo = size
+	}
+	return nil
+}
+
+// grow raises the block server's device to the volume's size.
+func (it *Item) grow(ctx context.Context, v vol) error {
+	cctx, cancel := context.WithTimeout(ctx, it.cfg.Timeout)
+	defer cancel()
+	c, err := it.cfg.Dial(cctx, v.socket)
+	if err != nil {
+		return fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+	}
+	defer func() { _ = c.Close() }()
+	if err := c.Grow(cctx, v.size); err != nil {
+		return fmt.Errorf("volume item %s: growing the device: %w", v.in.VolumeID, err)
+	}
+	return nil
+}
+
+// fsSize is the mounted file system's size in bytes; known is false when the
+// kernel reports none.
+func (it *Item) fsSize(ctx context.Context, stage string) (int64, bool, error) {
+	sf, err := it.cfg.Mounter.Statfs(ctx, stage)
+	if err != nil {
+		return 0, false, err
+	}
+	if sf.Blocks == 0 || sf.Bsize <= 0 {
+		return 0, false, nil
+	}
+	return int64(sf.Blocks) * int64(sf.Bsize), true, nil //nolint:gosec // block counts fit int64
+}
