@@ -78,7 +78,7 @@ Each StorageClass picks one option per dimension, in any combination the item ty
 | **Directories** | **local disk:** in progress<br>**NAS:** in progress | **single node:** in progress<br>**shared:** in progress | **off:** in progress<br>**on:** not supported |
 | **Volumes** | **local disk:** not supported<br>**NAS:** in progress | **single node:** in progress<br>**shared:** not yet (M3, re-export) | **off:** in progress (`-plain` classes)<br>**on:** in progress (the default) |
 
-"In progress" means merged on the M2 branch and covered by tests; the end-to-end suite for volumes and the throughput gate on a Raspberry Pi 4 are not yet green (see the [plan](docs/design/2026-11-03-m2-implementation-plan.md), section 1). Blobs are not a kind: a content-addressed store is a layout an application keeps on a volume.
+"In progress" means merged on the M2 branch and covered by tests. The end-to-end suite for volumes passes on kind (both architectures, the nfs3 variant); only the throughput gate (G1, `miami bench` on a Raspberry Pi 4) is pending. Blobs are not a kind: a content-addressed store is a layout an application keeps on a volume.
 
 ## Installation
 

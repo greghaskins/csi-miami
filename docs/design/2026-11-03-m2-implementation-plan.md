@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Status:** Active. T1 to T20 are merged into `m2/design` (T15 was dropped, decision 53);
-T21 (e2e) is PR #71 and T22 (docs) is the PR that carries this edit. Gate G1
+T21 (e2e, PR #71) is merged and T22 (docs) is the PR that carries this edit. Gate G1
 (criterion 10) waits for the owner's Raspberry Pi run. The tables in sections 1
 and 5 say where each criterion and task stands.
 **Created:** 2026-11-03
@@ -139,24 +139,24 @@ M2 is done when, on the kind e2e cluster over the nfs3 transport:
 11. The M1 e2e suite, sanity, smoke, envtest and the deploy check still pass;
     directory items are unchanged.
 
-**Where the criteria stand.** The e2e tests are T21's (`test/e2e/volume_*_test.go`),
+**Where the criteria stand.** Green means `ci-ok` passed with the nfs3 e2e legs on both architectures. The e2e tests are T21's (`test/e2e/volume_*_test.go`),
 run in the nfs3 variant on both architectures; the local variant skips them
 with a reason.
 
 | # | Status | Test |
 |---|---|---|
-| 1 | covered by T21, PR #71 | `TestVolumeExt4Semantics` |
-| 2 | covered by T21 | `TestVolumeSurvivesReschedule` |
-| 3 | covered by T21 | `TestVolumePluginRestart` |
-| 4 | covered by T21 | `TestVolumeServerKill` |
-| 5 (G2) | covered by T21 | `TestVolumeNASOutageNoHungTask` |
-| 6 | covered by T21, with a gap in kind (below) | `TestVolumeTakeover`, both modes |
-| 6a | covered by T21 | `TestVolumeOrphanDrain` |
-| 7 | covered by T21 | `TestVolumeNodeRebootReusesCache` |
-| 8 | covered by T21 | `TestVolumeRestoreDrill` |
-| 9 | covered by T21 | `TestVolumeExpandOnline` |
+| 1 | green | `TestVolumeExt4Semantics` |
+| 2 | green | `TestVolumeSurvivesReschedule` |
+| 3 | green | `TestVolumePluginRestart` |
+| 4 | green | `TestVolumeServerKill` |
+| 5 (G2) | green | `TestVolumeNASOutageNoHungTask` |
+| 6 | green, with a gap in kind (below) | `TestVolumeTakeover`, both modes |
+| 6a | green | `TestVolumeOrphanDrain` |
+| 7 | green | `TestVolumeNodeRebootReusesCache` |
+| 8 | green | `TestVolumeRestoreDrill` |
+| 9 | green | `TestVolumeExpandOnline` |
 | 10 | **pending** the owner's Pi run (gate G1); `miami bench` and `docs/bench.md` are merged (T20) and CI runs the harness as a smoke on amd64 | `miami bench` |
-| 11 | covered by CI on every PR: `static`, `unit`, `envtest`, `sanity` and `smoke` on both architectures, `deploy`, and the M1 e2e suite | `ci-ok` |
+| 11 | green; covered by CI on every PR: `static`, `unit`, `envtest`, `sanity` and `smoke` on both architectures, `deploy`, and the M1 e2e suite | `ci-ok` |
 
 **The kind gap in criterion 6.** Kind nodes share the runner's kernel, where a
 device-mapper name and an nbd device are single objects, so the old node's
@@ -493,7 +493,7 @@ with their task):
 | T18 | merged | #66 |
 | T19 | merged | #69 |
 | T20 | merged; gate G1 run pending | #70 |
-| T21 | in review | #71 |
+| T21 | merged | #71 |
 | T22 | in review | the PR carrying this table |
 
 Waves (at most three subagents at a time):

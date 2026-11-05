@@ -5,7 +5,7 @@
 **Created:** 2026-11-03
 **Reads with:** `README.md`, `docs/operating-volumes.md`,
 `2026-10-30-architecture-brief.md` (decisions 1 to 35 and, after this
-document, 36 to 58), `2026-11-01-goals-ahead-of-the-design.md`
+document, 36 to 59), `2026-11-01-goals-ahead-of-the-design.md`
 **Supersedes:** the brief's section 1 (purpose), 4.7 (encryption), 4.8's
 single-node limits, 5.2 (node-local persistent), 5.3 (S3 service), lesson 8
 (FUSE) and section 10 (milestones). The brief's text is kept; the decision log
@@ -744,9 +744,9 @@ amplification on cold blobs.
 
 ## 6. Decisions
 
-Appended to the brief's log as 36 to 58; the brief's numbering continues. 36 to
+Appended to the brief's log as 36 to 59; the brief's numbering continues. 36 to
 50 are the design pass; 51 to 53 were recorded while the plan ran and are folded
-into section 4; 54 to 58 record where the merged code settled a point the design
+into section 4; 54 to 59 record where the merged code settled a point the design
 left open or put differently.
 
 36. **The `volume` kind replaces the image item.** Ext4 over dm-crypt over a
@@ -840,6 +840,12 @@ left open or put differently.
     metric) with a message saying to restart the pod once the store is back;
     it holds no pod-delete permission and ships no admission policy. A later
     milestone can add the remediation if the case proves to matter.
+59. **The cache-full case is signalled by dirty bytes and the overdue condition,
+    not reliably by `VolumeCondition`** (clarifies 53, which is kept). The probe
+    reads one sector, which a full cache that still holds that chunk serves.
+    `miami_generation_dirty_bytes` near the cache bound, the `GenerationOverdue`
+    event and the `generation-overdue` condition are the signals; the probe's
+    report is a bonus when reads fail.
 54. **The cache and the binary copies live under the kubelet directory** (amends
     4.3, which had a hostPath the overlay chooses). The container and the host
     must see them at the same absolute path, and the kubelet directory is the
@@ -955,7 +961,7 @@ left open or put differently.
 
 A new session continues from here with no other context:
 
-1. Read `README.md`, the brief (its sections stand; decisions 36 to 58 win
+1. Read `README.md`, the brief (its sections stand; decisions 36 to 59 win
    where they differ), `2026-10-31-working-mode.md`, then this document.
 2. Confirm the secret-scan config (`hack/secret-scan/require-config.sh`).
 3. The spec is approved. The plan is `2026-11-03-m2-implementation-plan.md`

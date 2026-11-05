@@ -1316,7 +1316,7 @@ text is kept and the decision wins.
 
 Pending: none that block M2.
 
-Decisions 51 to 58 were recorded while the M2 plan ran, in full in
+Decisions 51 to 59 were recorded while the M2 plan ran, in full in
 `2026-11-03-chunk-backed-volumes-design.md` section 6 and folded into its
 section 4. Where they contradict a section above (4.5 takeover and its two
 clocks, 4.6 remediation, decision 8's fence timing), the section's text is kept
@@ -1360,6 +1360,9 @@ and the decision wins.
 58. **The mapping is opened with `--disable-keyring`**, so `cryptsetup resize`
     needs no passphrase; the spec module is pinned at v1.12.0 to keep the alpha
     `VolumeCondition` field until the kubelet adopts the volume-health API.
+59. **The cache-full case is signalled by dirty bytes and the overdue
+    condition, not reliably by `VolumeCondition`** (clarifies 53): the probe
+    reads one sector, which a full cache that still holds it serves.
 
 ## 10. Milestones
 

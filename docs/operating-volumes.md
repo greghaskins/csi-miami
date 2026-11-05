@@ -128,10 +128,12 @@ remounted, and the unstage that remounting needs must publish a final
 generation, which needs the store. So: restore the store, wait for the cache
 to drain (watch `miami_generation_dirty_bytes` fall), then restart the pod.
 The driver reports it and does nothing else (decision 53; it has no pod-delete
-permission). What reports it is the probe, described under VolumeCondition
-below; a full cache whose first chunk is still cached can serve reads, so
-watch `miami_generation_dirty_bytes` approach the cache bound and the
-`GenerationOverdue` event too.
+permission). The signals are `miami_generation_dirty_bytes` approaching the
+cache bound and the `GenerationOverdue` event (and the `generation-overdue`
+condition). The probe may also report it (`VolumeUnhealthy`,
+`miami_volume_probe_ok`, the `VolumeCondition`, described below), but it reads
+one sector and a full cache that still holds that chunk serves the read, so do
+not rely on it.
 
 ## A stage that refuses
 
@@ -168,7 +170,7 @@ is well inside it. Unpublished writes are in the cache and are served again.
 The `ServerRestarted` event (Normal) means "the blockd unit restarted": the
 plugin saw a different main process under the volume's unit, or started the
 unit again onto a surviving device. It misses a restart that happened while
-the plugin was down and a re-point by the same process. A restart of the
+the plugin was down. A restart of the
 plugin pod changes nothing: it adopts the unit, the device, the mapping and the
 mount. The server's own output goes to the host journal
 (`journalctl -u miami-blockd-<pv>.service`).
@@ -217,8 +219,9 @@ node serves no volumes.
 The socket check is on the path `<cache-dir>/<16 hex>.s`, at most 107 bytes
 (`sun_path` is 108 with its NUL), so the cache directory itself may be at most
 88 bytes. The hashed names make the length the same for every volume. The
-default cache directory under the common layouts gives 75 bytes (stock
-kubelet), 79 (k0s), 93 (k3s) and 100 (microk8s), all with room.
+default cache directory under the common layouts is 56 bytes (stock kubelet),
+60 (k0s), 74 (k3s) and 81 (microk8s), all within the 88-byte limit (the socket
+paths are 75, 79, 93 and 100 bytes, within 107).
 
 ## Monitoring
 
