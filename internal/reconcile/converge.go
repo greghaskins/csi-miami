@@ -768,8 +768,9 @@ func (p *pass) publish(in intent.Intent, pub intent.Publish, obs observe.Table) 
 			return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 		}
 	}
-	// Bound beneath the transport's mount point, by descriptor: see Mounter.Bind.
-	root, err := in.Transport.MountPoint(r.opts.TransportsRoot)
+	// Bound beneath the item's root (the transport's mount point for a
+	// directory, the stage mount for a volume), by descriptor: see Mounter.Bind.
+	root, err := it.PublishRoot(in)
 	if err != nil {
 		return fmt.Errorf("volume %s, publish %q: %w", in.VolumeID, target, err)
 	}

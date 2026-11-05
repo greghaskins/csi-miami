@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"slices"
 	"sync"
 	"syscall"
@@ -238,6 +239,22 @@ func TestPublishSourceIsTheItemDirectory(t *testing.T) {
 		bad.VolumeID = id
 		if _, err := fx.item.PublishSource(bad); err == nil {
 			t.Errorf("volume ID %q accepted", id)
+		}
+	}
+}
+
+func TestPublishRootIsTheTransportMountPoint(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	for _, in := range []intent.Intent{theIntent(), func() intent.Intent { n := theIntent(); n.Transport = nfsSpec; return n }()} {
+		want, _ := in.Transport.MountPoint(root)
+		got, err := fx.item.PublishRoot(in)
+		if err != nil || got != want {
+			t.Errorf("%s: PublishRoot = %q, %v, want %q", in.Transport.Kind, got, err, want)
+		}
+		src, _ := fx.item.PublishSource(in)
+		if !strings.HasPrefix(src, got+"/") {
+			t.Errorf("the source %q is not beneath the root %q", src, got)
 		}
 	}
 }

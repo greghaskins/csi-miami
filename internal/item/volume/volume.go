@@ -338,6 +338,13 @@ func (it *Item) PublishSource(in intent.Intent) (string, error) {
 	return in.StagePath, nil
 }
 
+// PublishRoot is the stage path too: the source is the mount there, so it is
+// bound from beneath itself, which still resolves it without following a
+// symlink or crossing into another mount.
+func (it *Item) PublishRoot(in intent.Intent) (string, error) {
+	return it.PublishSource(in)
+}
+
 // vol is one volume's names and paths, computed from its intent.
 type vol struct {
 	in       intent.Intent

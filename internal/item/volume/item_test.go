@@ -432,6 +432,19 @@ func TestTeardownLeavesAForeignMountAlone(t *testing.T) {
 	e.rec.none(t, "unmount", "systemd.Stop")
 }
 
+func TestPublishRootIsStagePath(t *testing.T) {
+	e := newEnv(t)
+	got, err := e.it.PublishRoot(e.in)
+	if err != nil || got != e.in.StagePath || got == "" {
+		t.Fatalf("PublishRoot = %q, %v, want the stage path %q", got, err, e.in.StagePath)
+	}
+	none := e.in
+	none.StagePath = ""
+	if got, err := e.it.PublishRoot(none); err == nil {
+		t.Errorf("an intent with no stage path gave root %q", got)
+	}
+}
+
 func TestPublishSourceIsStagePath(t *testing.T) {
 	e := newEnv(t)
 	got, err := e.it.PublishSource(e.in)

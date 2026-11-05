@@ -45,6 +45,7 @@ type genItem struct {
 
 func (g *genItem) Kind() volume.Kind                              { return volume.KindVolume }
 func (g *genItem) PublishSource(in intent.Intent) (string, error) { return in.StagePath, nil }
+func (g *genItem) PublishRoot(in intent.Intent) (string, error)   { return in.StagePath, nil }
 func (g *genItem) Converge(context.Context, intent.Intent, item.Observed) error {
 	return nil
 }
