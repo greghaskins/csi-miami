@@ -3,8 +3,9 @@
 **Status:** Approved by the owner on 2026-11-03; the plan is
 `2026-11-03-m2-implementation-plan.md`
 **Created:** 2026-11-03
-**Reads with:** `README.md`, `2026-10-30-architecture-brief.md` (decisions 1 to
-35 and, after this document, 36 to 50), `2026-11-01-goals-ahead-of-the-design.md`
+**Reads with:** `README.md`, `docs/operating-volumes.md`,
+`2026-10-30-architecture-brief.md` (decisions 1 to 35 and, after this
+document, 36 to 59), `2026-11-01-goals-ahead-of-the-design.md`
 **Supersedes:** the brief's section 1 (purpose), 4.7 (encryption), 4.8's
 single-node limits, 5.2 (node-local persistent), 5.3 (S3 service), lesson 8
 (FUSE) and section 10 (milestones). The brief's text is kept; the decision log
@@ -260,6 +261,8 @@ A `volume` has one directory on its transport, at decision 20's path
   manifests/<epoch>.<n>    one generation: header lines, then one chunk hash per line in device order
   current                  the name of the latest complete manifest, replaced by rename
 <name>.holder              the holder file of brief 4.5, beside the directory
+<name>.holder.epoch-<N>    the durable claim of epoch N (the two newest are kept)
+<name>.size                the grown size in bytes, beside the directory; written only by expand
 ```
 
 - **Chunks** are fixed-size pieces of the block device as dm-crypt wrote
@@ -271,12 +274,20 @@ A `volume` has one directory on its transport, at decision 20's path
   manifest never exceeds about 4 MB and a generation's fixed cost stays
   bounded; a class value that would exceed the line cap is `InvalidArgument`.
   A requested size is rounded up to a whole number of chunks and the rounded
-  capacity is reported, on create and on expand. A chunk is written to a temporary
+  capacity is reported, on create and on expand. The size record (`<name>.size`,
+  decimal bytes and a newline) exists because a PV's attributes are immutable:
+  expand raises it before answering and it only grows, a stage takes the
+  largest of the context's size, the record and the size in the manifest
+  `current` names, and a record that cannot be parsed stops the stage rather
+  than be repaired (a smaller size must never come from a record that could
+  not be read). A chunk is written to a temporary
   name beside its final name and renamed into place; a chunk that already
   exists is never rewritten. The all-zero chunk has one well-known name and is
-  stored once per volume, so unwritten and discarded regions cost nothing; every
-  writer stores it (as a sparse file) before any manifest that names it, so the
-  restore drill of 5.1 finds it like any other chunk.
+  stored once per volume, so unwritten and discarded regions cost nothing. The
+  store guarantees it (`EnsureZero`): every writer (the block server before it
+  publishes a manifest that names it, `miami import`) stores it as a sparse file
+  of one chunk first, so the restore drill of 5.1 finds it like any other
+  chunk and a prune cannot leave a manifest naming a chunk that is missing.
   The two-character fan-out keeps directories small for a terabyte volume.
 - **A manifest** is plain text: `#`-prefixed header lines (`volume`, `generation`,
   `size` in bytes, `chunk` size, `holder` epoch, `time`, `format 1`), then
@@ -312,7 +323,11 @@ volume serves the volume as an nbd device backed by a local chunk cache:
   the driver's own binary that the node plugin places at
   `<kubelet-dir>/plugins/<driver>/bin/miami-<content-hash>` at startup. The
   service's lifetime is the volume's stage, not the plugin pod's. The plugin can
-  be upgraded, crash or be rescheduled without the device noticing. The
+  be upgraded, crash or be rescheduled without the device noticing. The unit is
+  started with `Restart=on-failure` and a one-second delay, its output goes to
+  the host journal, and its name is `miami-blockd-<volume>.service`. A server
+  that dies is restarted by systemd and re-points the same device (4.4, decision
+  51); a server that is stopped on request (unstage) disconnects it. The
   server's own binary is upgraded only when the volume is next staged; the
   reconciler reports volumes served by an older hash in a metric, and a
   rollout that must reach every server is a drain. A node without systemd
@@ -321,13 +336,18 @@ volume serves the volume as an nbd device backed by a local chunk cache:
   netlink interface so the count is not bounded by the module's static
   default; the connection carries a dead-connection timeout and a request
   timeout so a dead server gives I/O errors, never an unbounded wait. The
-  reconciler observes devices through sysfs (the serving pid and the backend
-  string, which names the volume) and the unit through systemd; the kernel
-  and systemd are the truth, as the brief's principle says.
-- **The cache.** A directory on a node-local path (`--cache-dir`, a hostPath
-  the overlay chooses; it must be on local disk, never on a transport), one
-  file per chunk, read and written with O_DIRECT so the chunk files are not
-  cached twice beneath ext4's own page cache. Reads of a chunk not in the
+  reconciler observes devices through sysfs (the backend string, which names
+  the volume) and the unit through systemd; the kernel and systemd are the
+  truth, as the brief's principle says. The sysfs pid is the connecting
+  process's and survives a re-point, so it is not a liveness signal: liveness
+  is the unit being active and its control socket naming the volume's device.
+- **The cache.** A directory on a node-local path (`-cache-dir` of `miami
+  node`, default `<kubelet-dir>/plugins/<driver>/cache`; it must be on local
+  disk, never on a transport, and the plugin's container and the host must see
+  it at the same absolute path, so it lies under the kubelet directory or a
+  `-shared-dir`, which is why it needs no hostPath of its own), one file per
+  chunk, read and written with O_DIRECT where the file system allows it (not on
+  tmpfs) so the chunk files are not cached twice beneath ext4's own page cache. Reads of a chunk not in the
   cache fetch it from the transport; a background prefetch walks the current
   manifest so a volume that fits fills its cache after stage. The cache bound
   is a class parameter (`cacheSize`, default the volume's size); clean chunks
@@ -337,19 +357,36 @@ volume serves the volume as an nbd device backed by a local chunk cache:
   filesystem goes read-only and the failure is visible (section 4.9), and no
   kernel thread waits uninterruptibly on the NAS.
 - **Dirty tracking.** The server is the write path, so it knows the dirty
-  set exactly: a small on-disk index in the cache directory recording the
+  set exactly: a small on-disk index (`index.json`) in the cache directory recording the
   base manifest the cache was built from and the dirty chunk list, so a server
   restarted on the same node after a crash resumes with its unpublished dirty
   chunks intact. This is why the brief's era target is not needed (decision
   44).
 - **A cache that survives a node reboot.** The unit and the stage are gone
-  but the directory remains. The next stage of that volume on that node may
-  reuse it only if `current` on the transport still names the index's base
-  manifest, which proves no other node published in between; the dirty
-  chunks are then recovered into the next generation. If `current` moved,
-  the cache is discarded whole, dirty chunks included, since a newer lineage
-  exists. A cache directory with no intent and no stage is garbage and is
-  removed by the reconciler's collection pass.
+  but the directory remains. The next stage of that volume on that node reuses
+  it when `current` on the transport proves nothing newer was published: it
+  still names the manifest the cache was built from (its base), or its epoch
+  is the cache's own (an epoch is issued to one node, so a generation at that
+  epoch was published from this very directory), or there is no `current` and
+  the cache descends from nothing. The epoch the node holds now is not the
+  test: a late holder renewal can put an older claim back. The dirty chunks are
+  then recovered into the next generation. If `current` moved on, the cache is
+  discarded whole, dirty chunks included, since a newer lineage exists, and a
+  `GenerationLost` event says so. A cache whose index cannot be read is not
+  touched and no server is started over it: it may hold writes only a person
+  can judge.
+- **A cache with no stage (decision 52).** A cache is not garbage. A node
+  keeps a small record beside each cache (`<name>.drain.json`, the volume's
+  intent, written before the server first starts) so that a node which lost
+  its intent records, or whose pod moved while it was down, finds the volume
+  again and **drains** it: serve the cache without a key or a mount, publish,
+  verify against the store as an unstage does, stop, delete the cache, release
+  the holder. It runs at plugin start and on timer passes, retries with a
+  growing delay, and raises `DrainStuck` after 30 minutes. A cache with no
+  holder file and no proof it was given up (the holder names another node,
+  `current` has moved past it, or the PV is gone) is kept and logged once; an
+  operator who removes it by hand gives it up. A cache from a build before the
+  record is not drained until restaged.
 - **The transport it reads and writes through** is the node plugin's own
   transport mount under the kubelet plugin directory, visible on the host by
   propagation. A served volume has an intent record until unstage, and
@@ -379,21 +416,43 @@ pod ──bind──▶ stage mount: ext4 (discard, errors=remount-ro)
 - **LUKS2** is formatted at the first stage on the raw nbd device, so the
   header lives in the first chunk; cipher and key size are class parameters
   with `xchacha12,aes-adiantum-plain64` as the default (brief 4.7's reasoning
-  for CPUs without AES instructions holds); the key arrives from the
-  StorageClass's node-stage Secret over `/dev/fd/N` and is never persisted;
-  `previousKey` rotates a keyslot and re-uploads one chunk. The key is held by
-  the kernel in the mapping, so `cryptsetup resize` needs no passphrase.
+  for CPUs without AES instructions holds) or `aes-xts-plain64`; the key
+  arrives from the StorageClass's node-stage Secret (the node-publish reference
+  names the same Secret, so a restage from a publish has it) over `/dev/fd/N`
+  and is never persisted or sent to the block server. When a stage finds that
+  `key` does not open the volume and the Secret carries `previousKey`, the
+  keyslot that opens with `previousKey` is changed to `key`
+  (`cryptsetup luksChangeKey`) and the volume opens; the header chunks it
+  touches go out with the next generation. The mapping is opened with
+  `--disable-keyring`: the key is held by the kernel in the dm-crypt table, not
+  in a keyring, because with a keyring key `cryptsetup resize` asks for a
+  passphrase to reload it and a node-side expand has none. With the key in the
+  table, resize needs no passphrase.
+- **Restart model (decision 51).** A killed block server is restarted by systemd
+  a second later and, finding its nbd device still present (matched by backend
+  identifier), re-points that device with `NBD_CMD_RECONFIGURE` instead of
+  connecting a new one. The device, the mapping and the ext4 mount survive: a
+  restart needs no pod deletion, no `e2fsck` and no key, and the cache index
+  resumes the unpublished writes. The kernel takes a socket only into a slot
+  already marked dead, which its receive thread does at once on EOF; a
+  reconfigure with no dead slot returns success and drops the socket, so the
+  server confirms the device is served by its own socket (a read through the
+  device reaching it) before it reports ready. Requests that arrive while the
+  connection is dead wait up to the dead-connection timeout (60 s) and then
+  fail with EIO. A device whose cache is gone is never re-pointed by building a
+  new one; the volume waits for a person.
 - **Plain variant** (`encryption: "off"`): ext4 directly on the nbd device.
   The chunk store then holds plaintext ext4 blocks; the class name says so.
 - **Formatting and checking** stay the real tools of decision 16: `mkfs.ext4`
   once, `e2fsck -p` on every stage, `resize2fs` online for growth.
-- **Growth** is online: `ControllerExpandVolume` records the new size in a
-  small record beside the volume's directory in the store (a PV's attributes
-  are immutable, so the volume context cannot carry it; the record only
-  grows), and a stage takes the largest of the context's size, that record and
-  the current manifest's, so no restage comes back smaller; the node grows the nbd device (the server extends its size,
-  new chunks are zero), `cryptsetup resize`, then `resize2fs` on the mounted
-  filesystem. Shrink is refused.
+- **Growth** is online: `ControllerExpandVolume` records the new size in the
+  size record beside the volume's directory in the store (4.2; a PV's
+  attributes are immutable, so the volume context cannot carry it; the record
+  only grows), and a stage takes the largest of the context's size, that record
+  and the current manifest's, so no restage comes back smaller; the node grows
+  the nbd device (the server extends its size, new chunks are zero),
+  `cryptsetup resize`, then `resize2fs` on the mounted filesystem. Shrink is
+  `OutOfRange`.
 - **fsGroup** applies: the volume has an fsType and is RWO, so decision 27's
   `ReadWriteOnceWithFSType` policy covers it; uid fidelity is full because the
   ext4 is the node's own.
@@ -403,11 +462,15 @@ pod ──bind──▶ stage mount: ext4 (discard, errors=remount-ro)
 A generation is a point-in-time copy of the ciphertext device published to
 the chunk store. It runs on the node that holds the volume:
 
-1. **Trigger.** Every `generations.interval` (class parameter, default 5 m);
-   when the dirty set passes `generations.dirtyWatermark` (default half the
-   cache bound); on a PVC annotation the controller relays as "publish now";
-   and always at unstage, before the device is closed. A generation with an
-   empty dirty set publishes nothing.
+1. **Trigger.** Every `generations.interval` (class parameter, default 5 m,
+   at least 1 m) while the dirty set is not empty; when the dirty set reaches
+   `generations.dirtyWatermark` (default half the cache bound); when the PV's
+   `miami.csi.greghaskins.com/publish` annotation changes value (the node reads
+   the PV directly, about once a minute; no controller relays it; a standing
+   value after a plugin restart asks once more, which costs a freeze and
+   publishes nothing on a clean volume); and always at unstage, after the file
+   system is unmounted and the mapping closed. A generation with an empty
+   dirty set publishes nothing.
 2. **Freeze.** `FIFREEZE` on the stage mount: ext4 commits its journal and
    flushes to the device, writers block in uninterruptible sleep for the
    duration, which is milliseconds. The server marks the boundary: it snapshots
@@ -422,60 +485,101 @@ the chunk store. It runs on the node that holds the volume:
 
 A generation that cannot complete (transport unavailable, publish refused)
 leaves everything as it was and is retried at the next trigger; the dirty set
-only grows. The age of the newest published generation is a metric and the
-basis of a `VolumeCondition`; a volume whose generation age passes
-`generations.maxAge` (default 1 h) is reported abnormal, not remediated.
+only grows. The age of the newest published generation is a metric. A volume
+that holds unpublished writes whose newest generation is older than
+`generations.maxAge` (default 1 h, at least the interval) is **overdue**: the
+`generation-overdue` condition, a `GenerationOverdue` event, and nothing else.
+A clean volume is never overdue however long it idles, and overdue is not part
+of the `VolumeCondition` (that is the active probe's, 4.9). It is reported, not
+remediated.
 
-**Loss window.** On an orderly unstage nothing is lost. On a node's death the
-volume restages elsewhere from `current`, and the writes since it are gone:
-at most one interval plus the publish time. The restaged filesystem is
+**Loss window.** On an orderly unstage nothing is lost. When a holder is
+abandoned by an operator (4.6) the volume restages elsewhere from `current`,
+and the writes since it are gone: at most one interval plus the publish time
+while the store was reachable, more if it was not. The restaged filesystem is
 crash-consistent, since every generation was taken under a freeze.
 
-### 4.6 Exclusivity, takeover and fencing
+### 4.6 Exclusivity, emergency detach and fencing
 
 - **Attach** serialises as in brief 4.5: `attachRequired`, one node at a time.
-- **The holder file** and its renewal, the transport-clock age and the two-
-  clock rule, and the three takeover conditions are brief 4.5 unchanged. Each
-  acquisition increments an epoch stored in the holder file.
+  On a real cluster a pod on another node does not reach the driver at all
+  until the attach-detach controller has moved the attachment.
+- **The holder file** `<name>.holder` beside the volume's directory, and the
+  transport-clock renewal, are brief 4.5 with one change: **no node takes a
+  holder over because it is old or its node is NotReady** (decision 52; the
+  brief's takeover conditions 3 and 4 and the timeout `T` are not built, and a
+  class that sets `takeoverTimeout` is refused). Each acquisition increments an
+  epoch stored in the holder file, claimed first by a durable per-epoch file
+  so two holders never share one. Renewal touches the file with `futimens`
+  (the server sets the time) after a read-and-check, rather than renaming over
+  it.
+- **A volume moves only after a verified final sync (decision 52).** The
+  holder is released only by a clean unstage (4.7): the final generation
+  published, `current` re-read from the store and found to name it, and the
+  server reporting nothing dirty and no publish in flight. Anything short of
+  that fails `NodeUnstageVolume` as retryable and leaves the server, the cache
+  and the holder file as they were, so the volume stays with the node that
+  holds the unsynced data. A pod scheduled elsewhere waits with the
+  `holder-contended` condition, and the error names the holder and the way out.
+- **Orphan drain.** A node that comes back with a held volume it no longer
+  stages (a crash, then the pod moved) drains it by itself (4.3).
+- **Emergency detach.** The only way a node's data is given up is an
+  operator's act, in one of two forms, each abandoning exactly what the holder
+  had not published: a PV annotation `miami.csi.greghaskins.com/force-detach`
+  whose value is the holder file's `<node>@<epoch>` as read at that moment
+  (ignored when it does not match, so a stale annotation can never take over
+  its successor), or the standard `node.kubernetes.io/out-of-service` taint on
+  the holder's node, which abandons every volume that node holds. The driver
+  only reads them (the node's role has `get` on PVs and nodes, nothing else). A
+  takeover raises an `EmergencyDetach` event naming the abandoned `<node>@<epoch>`
+  and the trigger. `DeleteVolume` is refused while any holder file exists
+  unless the same annotation names the holder. `docs/operating-volumes.md` has
+  the runbook.
 - **The fencing token.** Every manifest carries the publisher's holder epoch,
   and a publisher re-reads the holder file immediately before renaming
   `current`; if the holder is no longer its own, or `current` names a manifest
   with a higher epoch, it refuses, keeps its dirty data in the cache until
   unstage, and reports a `PublishRefused` event. So a node partitioned from
-  the NAS, or one that lost the holder while its pod kept writing, can never
+  the NAS, or one an operator detached while its pod kept writing, can never
   make its writes authoritative. Its pod continues on a volume that will be
-  discarded at unstage; that is a liveness matter for kubelet's own node-lost
-  handling, not a data-safety one. **When that node unstages**, the final
-  generation is refused by the same token, the cache is deleted with its dirty
-  chunks (decision 43; the event records the bytes discarded), the holder is
-  released only if it is still this node's, and the unstage succeeds: a
-  refused publish is never a reason to fail `NodeUnstageVolume`, which would
-  otherwise retry forever.
+  discarded at unstage; that is a liveness matter for the operator's detach,
+  not a data-safety one. **When that node unstages**, a refused final
+  generation is accepted as an abandonment only on proof from the store (the
+  holder file names another node, or `current` is at an epoch above ours):
+  then the cache is deleted with its dirty chunks (decision 43; a
+  `GenerationLost` event), the holder is released only if it is still this
+  node's, and the unstage succeeds. A refusal the store does not explain
+  (decision 52) is retryable, like any other failure to sync: the node's data
+  is not given up by guessing. A holder file that is absent proves nothing (the
+  transport may not be mounted).
 - **No self-fence of the pod is needed** for data safety. The brief's ext4
   shutdown ioctl and the TCP reset of the NFS socket (decision 8's
   `FenceAfter` and `ResetAfter`) exist to stop a stale holder's in-flight NFS
   writes from landing on the shared image; here nothing a stale holder writes
-  reaches the shared store except through a token-checked publish. The
-  takeover timeout `T` is therefore only "how long to wait for a dead node"
-  and no longer bound to the NFS major timeout; its default is 5 m.
-- **Takeover** restages from `current`. The window of decision 32's kind
-  remains: a publisher that passed its holder check and is about to rename
-  `current` while a taker that has just acquired the holder publishes its
-  first generation can, in one round trip of bad luck, leave `current` on the
-  older epoch until the taker's next generation; a third node restaging in
-  that instant would start from the stale holder's last generation. Not a
-  corruption, a fork of at most one interval, and documented.
+  reaches the shared store except through a token-checked publish. Nothing
+  waits a timeout for a dead node any more; the only bound is the operator.
+- **The remaining window.** A publisher that passed its holder check and is
+  about to rename `current` while a taker that has just acquired the holder
+  publishes its first generation can, in one round trip of bad luck, leave
+  `current` on the older epoch until the taker's next generation; a third node
+  restaging in that instant would start from the stale holder's last
+  generation. Not a corruption, a fork of at most one interval, and
+  documented.
 
 ### 4.7 Stage and publish
 
-`NodeStageVolume` for a `volume`: transport mounted → holder acquired → the
-binary copy present on the host → `current` read (or absent for a new volume)
-→ server started as a transient unit with the manifest → nbd device present →
-LUKS formatted (first stage) or opened → `e2fsck -p` → mounted at the stage
-path → resize if the recorded size grew. Each step is one `Observe`/`Converge`
-layer in the existing reconciler; the kernel, sysfs and systemd are observed,
-the intent record carries the desired state, and garbage collection is the
-same loop with no intent (a served device with no intent is torn down).
+`NodeStageVolume` for a `volume`: prerequisites probed → transport mounted →
+holder acquired → `current` read (or absent for a new volume) and the size
+raised to the largest any record holds → the binary copy present on the host →
+server started as a transient unit (or its running unit adopted) → nbd device
+present → LUKS formatted (first stage) or opened → `e2fsck -p` (or `mkfs.ext4`
+on a device that is blank and whose volume has never published) → mounted at
+the stage path → resize if the recorded size grew. A device that holds data but
+no LUKS header or file system signature is never formatted over. Each step is
+one `Observe`/`Converge` layer in the existing reconciler; the kernel, sysfs
+and systemd are observed, the intent record carries the desired state, and
+garbage collection is the same loop with no intent (a served device with no
+intent is torn down, and a cache with no intent is drained, 4.3).
 
 Unlike a directory item (decision 25), a `volume` *does* mount at the stage
 path: the ext4 mount is a real mount with its own device, so kubelet's
@@ -483,16 +587,24 @@ unstage reference check behaves as it does for every block-backed CSI driver.
 Publish is a bind of the stage mount, read-only when the request or the access
 mode says so.
 
-`NodeUnstageVolume`: final generation → unmount → LUKS closed → server stopped
-and the unit collected → cache directory deleted → holder released. The cache
-is deleted on every unstage by design (the owner's call: a node's disk must
-not fill with copies of volumes it no longer serves). Returning to the same
-node fetches the volume again.
+`NodeUnstageVolume` (decision 52): thaw → unmount → LUKS closed → any publish
+already in flight waited out → boundary and final generation → `current` read
+back from the store and required to name it, the server required to report
+nothing dirty and no publish running → server stopped (the one call that
+disconnects the device) and the unit stopped → cache directory deleted →
+holder released. Any step short of the verification fails the unstage as
+retryable and leaves the server, the cache and the holder alone; a busy mount
+is an error before anything past it is touched. The cache is deleted on every
+clean unstage by design (the owner's call: a node's disk must not fill with
+copies of volumes it no longer serves). Returning to the same node fetches the
+volume again.
 
 The controller for a `volume`: `CreateVolume` makes the directory and writes
 nothing else (the first stage formats and publishes generation 1);
-`DeleteVolume` removes the directory after confirming no holder is live;
-`ControllerExpandVolume` records the size.
+`DeleteVolume` is refused while any holder file exists beside the directory,
+however old, and removes the directory, the holder files and the size record
+once none does (or once the PV's force-detach annotation names the holder,
+4.6); `ControllerExpandVolume` records the size.
 
 ### 4.8 RWX: re-export from the holder node (M3)
 
@@ -509,13 +621,18 @@ the holder as the load-bearing node until takeover.
 | Failure | What happens | What the driver does |
 |---|---|---|
 | NAS unreachable | pods keep running on local data; generations wait | reports (transport gauge, generation age); nothing else |
-| NAS unreachable and the cache fills with dirty chunks | writes get I/O errors; ext4 goes read-only | `VolumeCondition` abnormal; the remediation package of brief 4.6 (pod deletion behind the admission policy) applies |
-| block server dies | the device returns errors after the dead-connection timeout; ext4 goes read-only | restart the server from the cache index (dirty data intact), then the pod is deleted so it remounts after `e2fsck` |
-| node dies | attach moves after takeover; restage elsewhere from `current` | as 4.6 |
+| NAS unreachable and the cache fills with dirty chunks | writes get I/O errors; ext4 goes read-only and stays so until remounted | reports (the probe's `VolumeCondition`, `VolumeUnhealthy`, `miami_volume_probe_ok`, `GenerationOverdue`, dirty bytes) with a message to restart the pod once the store is back and the cache has drained; nothing else (decision 53) |
+| block server dies | requests wait while the connection is dead, up to the dead-connection timeout (60 s); systemd restarts the server within a second | systemd restarts it; it re-points the same nbd device from the cache index (dirty data intact); no pod deletion, no `e2fsck`; a `ServerRestarted` event (decision 51) |
+| node dies | the pod and attachment stay with the dead node; the volume stays held | nothing by itself: a pod elsewhere waits as `holder-contended`. The operator's emergency detach (annotation or `out-of-service` taint, 4.6) abandons what the holder had not published and restages from `current`; the node, if it returns first, drains (4.3) |
 | plugin pod restarts or upgrades | nothing: the server, device and mounts are the kernel's and systemd's | reconciles from observation |
 
-Brief 4.6's active probe stays, reading the device's first sector through the
-nbd device and `statfs` on the stage mount; brief lesson 12's `ESTALE` on a
+Brief 4.6's active probe stays, reading the first sector of the device the file
+system sits on (the mapper, or the nbd device of a plain volume) directly, and
+failing a volume after two failures in a row. A full cache that still has the
+first chunk resident serves that read, so the probe alone does not see every
+full-cache case; the dirty-bytes metric and the overdue condition do. The
+brief's remediation package, its pod-deletion admission policy and the
+`--remediate` opt-in are not built (decision 53). Brief lesson 12's `ESTALE` on a
 file held open does not arise, since no pod holds a file open on the NAS.
 
 ### 4.10 The one non-transparent semantic
@@ -531,7 +648,11 @@ Nothing else in this design leaks into a pod manifest.
 Added to brief 4.12's set: served volumes by server binary hash; generation
 age, count and last publish duration; dirty bytes and cache fill per volume;
 chunk fetch latency and failures; publishes refused by the token; prunes.
-Events on the PV for publish refused, generation overdue, server restarted.
+Events on the PV for publish refused, generation lost, emergency detach,
+generation overdue, volume unhealthy, key required, server restarted, and a
+stuck unstage or drain. The names and what they mean are in
+`docs/operating-volumes.md`. While a block server is down, its per-volume
+series are absent; the alert is on the server's state (`miami_volumes_served`).
 
 ### 4.12 Security posture
 
@@ -545,10 +666,15 @@ Events on the PV for publish refused, generation overdue, server restarted.
   class's node-stage Secret template, plus the storage-isolation admission
   policy a cluster already applies to the transport subtree. Any pod can mount
   the export inline and read chunks; they are ciphertext.
-- **New privileges**, each mirrored by an admission policy: the host's
-  `/run/systemd/private` socket and `/run/systemd/system` directory
-  (hostPath, read-write for the socket); the nbd module; the cache directory
-  hostPath; the binary copy under the kubelet plugin directory. No `hostPID`.
+- **New privileges**: the host's `/dev` (hostPath, `HostToContainer`, so the nbd
+  and device-mapper nodes that appear after the container starts are seen),
+  `/run/systemd` (read-only: connecting to the private socket needs write
+  permission on the socket file, not a writable mount) and `/sys` (read-only,
+  for the nbd entries); the nbd module; the cache directory and the binary copy
+  under the kubelet plugin directory, which the container already shares with
+  the host, so they need no hostPath of their own. No `hostPID`. The driver
+  ships no admission policy for any of it (a cluster's own policies cover
+  hostPaths), and the node's API access is `get` on PVs and nodes plus events.
 - **The transient unit** runs the binary from the kubelet plugin directory,
   which only the node plugin writes; the unit's command line carries the
   volume name and paths, never the key, which the server never sees.
@@ -618,7 +744,10 @@ amplification on cold blobs.
 
 ## 6. Decisions
 
-Appended to the brief's log as 36 to 50; the brief's numbering continues.
+Appended to the brief's log as 36 to 59; the brief's numbering continues. 36 to
+50 are the design pass; 51 to 53 were recorded while the plan ran and are folded
+into section 4; 54 to 59 record where the merged code settled a point the design
+left open or put differently.
 
 36. **The `volume` kind replaces the image item.** Ext4 over dm-crypt over a
     chunk-backed nbd device whose live data is on the node and whose
@@ -711,6 +840,47 @@ Appended to the brief's log as 36 to 50; the brief's numbering continues.
     metric) with a message saying to restart the pod once the store is back;
     it holds no pod-delete permission and ships no admission policy. A later
     milestone can add the remediation if the case proves to matter.
+59. **The cache-full case is signalled by dirty bytes and the overdue condition,
+    not reliably by `VolumeCondition`** (clarifies 53, which is kept). The probe
+    reads one sector, which a full cache that still holds that chunk serves.
+    `miami_generation_dirty_bytes` near the cache bound, the `GenerationOverdue`
+    event and the `generation-overdue` condition are the signals; the probe's
+    report is a bonus when reads fail.
+54. **The cache and the binary copies live under the kubelet directory** (amends
+    4.3, which had a hostPath the overlay chooses). The container and the host
+    must see them at the same absolute path, and the kubelet directory is the
+    one mount the node pod already shares with the host, so
+    `<kubelet-dir>/plugins/<driver>/cache` and `.../bin` need no hostPath of
+    their own. `-cache-dir`, `-bin-dir` and the repeatable `-shared-dir` move
+    them; a layout outside the shared directories, or a cache directory over 88
+    bytes (the control socket `<cache-dir>/<16 hex>.s` must fit 107), is
+    reported as the `cache-dir` prerequisite missing. Socket names are a hash
+    of the volume name so the length does not vary.
+55. **"Publish now" is a PV annotation** (amends 4.5, which had the controller
+    relay a PVC annotation). The node reads `miami.csi.greghaskins.com/publish`
+    on the PV about once a minute; a changed value asks for one generation.
+56. **Overdue is reported, and is not a `VolumeCondition`** (amends 4.5). A
+    volume with unpublished writes whose newest generation is older than
+    `generations.maxAge` has the `generation-overdue` condition and a
+    `GenerationOverdue` event. The `VolumeCondition` is the active probe's
+    alone, because the probe is the only signal that the device itself is
+    failing. The probe reads the device's first sector, so a full cache that
+    still has that chunk resident serves it: decision 53's report of the
+    cache-full case then rests on the dirty-bytes metric and the overdue
+    condition, not on the probe.
+57. **A surviving cache is reused on `current`'s epoch or base** (amends 4.3).
+    The witness that nothing newer was published is that `current` still names
+    the cache's base manifest, or carries the cache's own epoch; never the
+    epoch the node holds now, which a late holder renewal can set back. A cache
+    that fails the test is discarded with its unpublished chunks reported.
+58. **The mapping is opened with `--disable-keyring`** (amends 4.4's "held by
+    the kernel in the mapping"). The key sits in the dm-crypt table, which is
+    what lets `cryptsetup resize` and an online expand run without a
+    passphrase. Related and also settled by the merged code: `DeleteVolume` is
+    refused while any holder file exists (4.7), the unit restarts on failure
+    after one second (4.3), and a CSI spec module pinned at v1.12.0 keeps the
+    alpha `VolumeCondition` field the node answers with, until the kubelet
+    adopts the volume-health API that replaced it in v1.13.0.
 
 ## 7. Milestones
 
@@ -724,25 +894,29 @@ Appended to the brief's log as 36 to 50; the brief's numbering continues.
    and import do not depend on the server's data path and may proceed
    meanwhile, the server's data path does not ship.
    M1 built none of the brief's M2 machinery, so M2 builds all of it that this
-   design still needs: the holder file and its renewal, the takeover
-   conditions and the two-clock rule (brief 4.5), the epoch and token check,
-   the active probe and `VolumeCondition` for volumes (brief 4.6), the
-   remediation package with its pod-deletion admission policy and opt-out
-   flag, and re-stage through the publish Secret after a server restart; not
+   design still needs: the holder file and its renewal, the epoch and token
+   check, the active probe and `VolumeCondition` for volumes (brief 4.6), the
+   emergency detach and the orphan drain of decision 52 (in place of the
+   brief's takeover conditions and two-clock rule, which are not built), and
+   the keys riding the publish Secret so that a restage after a plugin restart
+   has them (a block-server restart no longer restages, decision 51); not the
+   remediation package or its pod-deletion admission policy (decision 53), nor
    the ext4 shutdown, the TCP reset or the fence timing (decision 45).
    Then: `noacl`; the chunk store and manifests; `miami blockd`; the device
-   stack with LUKS2; stage, publish, unstage with cache deletion and the
-   reboot-survival rule; generations with all four triggers; online growth;
-   `miami restore` and `miami import`; metrics and events; the admission
-   policies for the new privileges; the e2e matrix extended with server kill,
-   plugin restart under a served volume, node reboot with a surviving cache,
-   takeover with a partitioned writer, and a restore drill run from the test;
-   the README matrix and class examples.
-   **Node prerequisites**, each probed at startup and reported as a named
-   error when missing, in the style of decision 27(h): the `nbd` and
-   `dm-crypt` modules with the Adiantum ciphers (standard in Ubuntu-class
-   kernels on both architectures), `FIFREEZE`, and systemd as the host's init
-   with its private socket mountable. A node missing one serves directory
+   stack with LUKS2; stage, publish, unstage with the verified final sync, cache
+   deletion and the reboot-survival rule; generations with all four triggers;
+   online growth; `miami restore` and `miami import`; metrics and events; the
+   e2e matrix extended with server kill, plugin restart under a served volume,
+   node reboot with a surviving cache, an emergency detach of a stopped holder
+   and an orphan drain, and a restore drill run from the test; the README
+   matrix and class examples.
+   **Node prerequisites**, each probed on every reconcile pass and reported as a
+   named error when missing, in the style of decision 27(h): the `nbd` netlink
+   family, the device-mapper control node and the Adiantum cipher (standard in
+   Ubuntu-class kernels on both architectures; the latter two only for an
+   encrypted volume), systemd as the host's init with its private socket
+   mountable, and a writable cache directory. `FIFREEZE` is not probed: a
+   freeze that fails fails that generation. A node missing one serves directory
    items only. The e2e harness runs on kind nodes, which run systemd and share
    the runner's kernel, so the runner must have the `nbd` module; verifying
    that on both runner architectures is the first task of the plan.
@@ -780,13 +954,14 @@ Appended to the brief's log as 36 to 50; the brief's numbering continues.
 - The e2e harness changes: nbd on kind nodes (kind nodes run systemd and share
   the host kernel, so the module is the runner's), the transient-unit path from
   inside the node pod, and the restore drill as a test.
-- The content of the admission policies for the new hostPaths.
+- The content of any admission policy for the new hostPaths (the base ships
+  none; it is a cluster's own).
 
 ## 9. Resuming from this document
 
 A new session continues from here with no other context:
 
-1. Read `README.md`, the brief (its sections stand; decisions 36 to 50 win
+1. Read `README.md`, the brief (its sections stand; decisions 36 to 59 win
    where they differ), `2026-10-31-working-mode.md`, then this document.
 2. Confirm the secret-scan config (`hack/secret-scan/require-config.sh`).
 3. The spec is approved. The plan is `2026-11-03-m2-implementation-plan.md`

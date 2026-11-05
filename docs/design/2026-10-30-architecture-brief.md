@@ -1316,6 +1316,54 @@ text is kept and the decision wins.
 
 Pending: none that block M2.
 
+Decisions 51 to 59 were recorded while the M2 plan ran, in full in
+`2026-11-03-chunk-backed-volumes-design.md` section 6 and folded into its
+section 4. Where they contradict a section above (4.5 takeover and its two
+clocks, 4.6 remediation, decision 8's fence timing), the section's text is kept
+and the decision wins.
+
+51. **A restarted block server re-points the same nbd device** (supersedes the
+    recovery shape of 41): a new `miami
+    blockd` for a volume whose device still exists sends `NBD_CMD_RECONFIGURE`
+    with the new socket and the same backend identifier, so the device, the
+    dm-crypt mapping and the ext4 mount survive; a restart needs no pod
+    deletion, no `e2fsck` and no key. Liveness is the unit's main process
+    answering on the volume's control socket, not the sysfs pid.
+52. **A volume moves only after a verified final sync** (supersedes the timed
+    takeover of 4.5 and its conditions 3 and 4, decision 8's takeover timeout
+    `T`, and narrows 43). The holder is released only by a clean unstage; a
+    pod elsewhere waits as `holder-contended`; no node takes a holder over
+    because it is old or its node is NotReady. A node that returns with a held
+    volume it no longer stages drains it itself. The emergency detach, which
+    abandons what the holder had not published, is an operator act: the PV
+    annotation `miami.csi.greghaskins.com/force-detach` naming the holder's
+    exact `<node>@<epoch>`, or the `node.kubernetes.io/out-of-service` taint
+    on its node. The epoch fence (45) is unchanged. `takeoverTimeout` is
+    refused as a class parameter, and `DeleteVolume` is refused while any
+    holder file exists.
+53. **No automatic remediation in M2; failures are reported** (narrows 4.6's
+    remediation package and drops its admission policy and opt-out flag). The
+    one case left for a pod deletion, ext4 read-only after the cache filled
+    while the store was unreachable, is reported through the probe, an event
+    and a metric with a message to restart the pod; the driver holds no
+    pod-delete permission.
+54. **The cache and binary copies live under the kubelet directory** (amends
+    the design's 4.3): no hostPath of their own; `-cache-dir`, `-bin-dir` and
+    `-shared-dir` move them within the directories the container and host both
+    see.
+55. **"Publish now" is a PV annotation** the node reads, not a PVC annotation a
+    controller relays.
+56. **Overdue is a condition and an event, and not a `VolumeCondition`**; the
+    `VolumeCondition` is the active probe's alone.
+57. **A surviving cache is reused on `current`'s epoch or base**, never on the
+    epoch the node holds now.
+58. **The mapping is opened with `--disable-keyring`**, so `cryptsetup resize`
+    needs no passphrase; the spec module is pinned at v1.12.0 to keep the alpha
+    `VolumeCondition` field until the kubelet adopts the volume-health API.
+59. **The cache-full case is signalled by dirty bytes and the overdue
+    condition, not reliably by `VolumeCondition`** (clarifies 53): the probe
+    reads one sector, which a full cache that still holds it serves.
+
 ## 10. Milestones
 
 1. **M1, directory items on NFSv3 and local**: the binary, controller and
