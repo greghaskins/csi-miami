@@ -572,6 +572,7 @@ type fakeCtl struct {
 	publishRefused bool
 	growErr        error
 	stopErr        error
+	statusErr      error // Status fails with this
 	boundaryHang   chan struct{}
 	boundaryDelay  time.Duration // Boundary sleeps this long, ignoring its context
 	dirty          int64
@@ -591,6 +592,9 @@ func (c *fakeCtl) up() {
 }
 
 func (c *fakeCtl) Status(context.Context) (blockd.Status, error) {
+	if c.statusErr != nil {
+		return blockd.Status{}, c.statusErr
+	}
 	fl := c.inFlight
 	if c.inFlightPolls > 0 {
 		c.inFlightPolls--
