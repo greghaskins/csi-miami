@@ -42,6 +42,22 @@ func (it *Item) GenerationFor(ctx context.Context, in intent.Intent, trigger str
 	return it.generate(ctx, v, it.state(in.VolumeID), trigger)
 }
 
+// Status is the block server's status for a staged volume, read without
+// freezing or changing anything. The reconciler's generation timers decide
+// from it (dirty bytes, the last successful publish); a server that does not
+// answer is item.ErrServerDown.
+func (it *Item) Status(ctx context.Context, in intent.Intent) (blockd.Status, error) {
+	v, err := it.volOf(in)
+	if err != nil {
+		return blockd.Status{}, err
+	}
+	st, err := it.status(ctx, v)
+	if err != nil {
+		return blockd.Status{}, fmt.Errorf("volume item %s: %w: %w", in.VolumeID, item.ErrServerDown, err)
+	}
+	return st, nil
+}
+
 // generate is one generation. Only the freeze and the boundary run under the
 // volume's freeze lock (one freeze at a time, and never a thaw of an adopted
 // mount inside one); the upload does not, because it takes as long as the

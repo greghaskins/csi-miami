@@ -100,7 +100,7 @@ const (
 // ErrGenerationSkipped is returned by Generation when a publish was already in
 // flight, so that no filesystem was frozen and nothing was done. It is not a
 // failure: the next trigger tries again.
-var ErrGenerationSkipped = errors.New("a publish is in flight; the generation is skipped")
+var ErrGenerationSkipped = item.ErrGenerationSkipped
 
 // Control is the part of the block server's client the item uses;
 // *blockd.Client implements it.
