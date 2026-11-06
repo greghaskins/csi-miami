@@ -29,6 +29,7 @@ import (
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -426,6 +427,10 @@ func sandboxProperties(sb Sandbox) []sdbus.Property {
 	}
 	if len(sb.DenySyscalls) > 0 {
 		props = append(props, sdbus.Property{Name: "SystemCallFilter", Value: godbus.MakeVariant(nameList{false, append([]string(nil), sb.DenySyscalls...)})})
+		// A denied call fails with EPERM. Without this it kills the process with
+		// SIGSYS, and a unit that restarts on failure then loops, re-pointing its
+		// device every time, on one wrong guess about what the process calls.
+		props = append(props, sdbus.Property{Name: "SystemCallErrorNumber", Value: godbus.MakeVariant(int32(unix.EPERM))})
 	}
 	if len(sb.AddressFamilies) > 0 {
 		props = append(props, sdbus.Property{Name: "RestrictAddressFamilies", Value: godbus.MakeVariant(nameList{true, append([]string(nil), sb.AddressFamilies...)})})

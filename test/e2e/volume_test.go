@@ -391,6 +391,7 @@ func TestVolumeServerKill(t *testing.T) {
 	ctx, cancel = e.withDeadline()
 	unitAfter, unitErr := blockdUnit(ctx, node, vol.PV)
 	startsAfter, startsErr := blockdStarts(ctx, node, vol.PV)
+	checkNoDeniedCalls(ctx, t, node, vol.PV)
 	cancel()
 	if unitErr != nil || startsErr != nil {
 		t.Fatalf("reading the unit after the kill: %v %v", unitErr, startsErr)
@@ -482,6 +483,7 @@ func TestVolumeNodeRebootReusesCache(t *testing.T) {
 	ctx, cancel = e.withDeadline()
 	out, err := nodeExec(ctx, node, "cat", probe)
 	starts, startsErr := blockdStarts(ctx, node, vol.PV)
+	checkNoDeniedCalls(ctx, t, node, vol.PV)
 	indexJSON, indexErr := nodeExec(ctx, node, "cat", cachePath(vol.PV)+"/index.json")
 	cancel()
 	if err != nil || strings.TrimSpace(out) != "reused" {

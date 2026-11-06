@@ -71,3 +71,17 @@ func TestNextSequenceRefusesAtTheMaximum(t *testing.T) {
 		t.Fatalf("nextSequence = %d, want a refusal at the maximum", seq)
 	}
 }
+
+// blockd resolves the store path itself: a symlink in the middle of it (the
+// class's subdirectory replaced by a link to a node directory) is refused.
+func TestNewServerRefusesAStorePathThroughASymlink(t *testing.T) {
+	cfg, _ := testConfig(t)
+	link := filepath.Join(t.TempDir(), "ns")
+	if err := os.Symlink(filepath.Dir(cfg.StoreDir), link); err != nil {
+		t.Fatal(err)
+	}
+	cfg.StoreDir = filepath.Join(link, filepath.Base(cfg.StoreDir))
+	if _, err := newServer(context.Background(), cfg, testLog()); err == nil {
+		t.Fatal("newServer opened a store through a symlink in its path")
+	}
+}

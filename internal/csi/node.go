@@ -223,6 +223,14 @@ const (
 	secretPreviousKey = "previousKey"
 )
 
+// minNote is the lower bound's part of a key-length message.
+func minNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" and at least %d", n)
+}
+
 // keysOf copies the encryption keys out of a request's Secrets. The caller
 // wipes the result. The keys go nowhere but the in-memory request of the
 // reconciler: not the intent, not a log line, not a reply. A key shorter than
@@ -230,17 +238,21 @@ const (
 // names the Secret entry and the length, never the value.
 func keysOf(secrets map[string]string) (reconcile.Keys, error) {
 	var k reconcile.Keys
+	// The lower bound is on the key alone: a volume formatted with a shorter
+	// key (before the bound existed) must still open and rotate, and rotation
+	// passes that old key as previousKey.
 	for _, e := range []struct {
 		entry string
 		dst   *[]byte
-	}{{secretKey, &k.Key}, {secretPreviousKey, &k.PreviousKey}} {
+		min   int
+	}{{secretKey, &k.Key, crypt.MinKeyLen}, {secretPreviousKey, &k.PreviousKey, 0}} {
 		v, ok := secrets[e.entry]
 		if !ok || v == "" {
 			continue
 		}
-		if err := crypt.CheckKey([]byte(v)); err != nil {
+		if len(v) < e.min || len(v) > crypt.MaxKeyLen {
 			k.Wipe()
-			return reconcile.Keys{}, invalidf("secret entry %q: the key is %d bytes; it must be %d to %d bytes (generate one with: openssl rand -base64 48)", e.entry, len(v), crypt.MinKeyLen, crypt.MaxKeyLen)
+			return reconcile.Keys{}, invalidf("secret entry %q: the key is %d bytes; it must be at most %d bytes%s (generate one with: openssl rand -base64 48)", e.entry, len(v), crypt.MaxKeyLen, minNote(e.min))
 		}
 		*e.dst = []byte(v)
 	}

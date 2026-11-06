@@ -1124,3 +1124,37 @@ func TestSymlinkInTheVolumePathStartsNoUnit(t *testing.T) {
 		t.Fatalf("files created behind the link: %v", ents)
 	}
 }
+
+// The attack on the node's own cache: a writer on the export replaces the
+// class's subdirectory with a link to the node's cache directory, which holds
+// a directory named exactly like the volume. The stage must not open that
+// directory as the store (it would create chunks/ in the cache, discard it and
+// format).
+func TestSubdirLinkedToTheCacheDirectoryIsNotTheStore(t *testing.T) {
+	e := newEnv(t)
+	cache := filepath.Join(e.cacheDir, filepath.Base(e.v.storeDir))
+	if err := os.MkdirAll(cache, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "index.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The volume's parent directory on the transport becomes a link to the
+	// cache directory's parent.
+	if err := os.RemoveAll(e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(e.cacheDir, e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.converge(); err == nil {
+		t.Fatal("Converge went on with the cache directory as the store")
+	}
+	if len(e.sd.units) != 0 {
+		t.Fatalf("a unit was started: %v", e.sd.units)
+	}
+	ents, _ := os.ReadDir(cache)
+	if len(ents) != 1 || ents[0].Name() != "index.json" {
+		t.Fatalf("the cache directory was touched: %v", ents)
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,6 +144,7 @@ func TestSmokeVolumeStack(t *testing.T) {
 		_ = it.Teardown(cctx, in, item.Observed{})
 		_ = sd.Stop(cctx, systemd.UnitName(name))
 	})
+	t.Cleanup(func() { checkUnit(t, systemd.UnitName(name), 0) })
 	cacheDir := filepath.Join(base, "cache", name)
 
 	// Stage: the first stage formats and mounts.
@@ -323,6 +326,7 @@ func TestSmokeOrphanDrain(t *testing.T) {
 		_ = it.Teardown(cctx, in, item.Observed{})
 		_ = sd.Stop(cctx, systemd.UnitName(name))
 	})
+	t.Cleanup(func() { checkUnit(t, systemd.UnitName(name), 0) })
 
 	if err := it.Converge(ctx, in, observed()); err != nil {
 		t.Fatalf("Converge: %v", err)
@@ -395,5 +399,34 @@ func TestSmokeOrphanDrain(t *testing.T) {
 	}
 	if err := it2.Teardown(ctx, in, item.Observed{}); err != nil {
 		t.Fatalf("final Teardown: %v", err)
+	}
+}
+
+// checkUnit looks at the block server's unit as the host's systemd ran it. Its
+// sandbox denies system calls, and a wrong guess about what the server calls
+// would show up as a denied call or, worse, a restart loop that re-points the
+// device each time: the journal must hold no sign of a denied call, and the
+// unit no restarts the test did not cause. The journal is logged when the test
+// has failed, since it is what says why the server did not serve.
+func checkUnit(t *testing.T, unit string, wantRestarts int) {
+	t.Helper()
+	out, err := exec.Command("journalctl", "-u", unit, "--no-pager", "-o", "cat").CombinedOutput() //nolint:gosec // a unit name this test made
+	if err != nil {
+		t.Errorf("reading the journal of %s: %v\n%s", unit, err, out)
+		return
+	}
+	if t.Failed() {
+		t.Logf("journal of %s:\n%s", unit, out)
+	}
+	for _, bad := range []string{"SIGSYS", "Bad system call", "seccomp"} {
+		if strings.Contains(string(out), bad) {
+			t.Errorf("the journal of %s mentions %q: the sandbox denied a system call the server needs\n%s", unit, bad, out)
+		}
+	}
+	// The unit is gone once stopped (it is collected), so the count is read only
+	// while it is still there.
+	nr, err := exec.Command("systemctl", "show", "-p", "NRestarts", "--value", unit).Output() //nolint:gosec // a unit name this test made
+	if got := strings.TrimSpace(string(nr)); err == nil && got != "" && got != strconv.Itoa(wantRestarts) {
+		t.Errorf("%s restarted %s times, the test caused %d", unit, got, wantRestarts)
 	}
 }

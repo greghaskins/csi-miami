@@ -375,6 +375,7 @@ func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
 		"ProtectKernelModules":  true, "ProtectKernelTunables": true, "RestrictSUIDSGID": true,
 		"LockPersonality": true, "RestrictNamespaces": uint64(0),
 		"SystemCallFilter":        nameList{false, []string{"@mount"}},
+		"SystemCallErrorNumber":   int32(1),
 		"RestrictAddressFamilies": nameList{true, []string{"AF_UNIX"}},
 	} {
 		if !reflect.DeepEqual(got[name], want) {

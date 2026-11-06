@@ -183,10 +183,9 @@ func TestNodeRejectsKeysOutsideTheBounds(t *testing.T) {
 	short := strings.Repeat("s", 31)
 	long := strings.Repeat("l", 4097)
 	for name, secrets := range map[string]map[string]string{
-		"short key":          {"key": short},
-		"long key":           {"key": long},
-		"short previous key": {"key": testKey, "previousKey": short},
-		"long previous key":  {"key": testKey, "previousKey": long},
+		"short key":         {"key": short},
+		"long key":          {"key": long},
+		"long previous key": {"key": testKey, "previousKey": long},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -224,5 +223,26 @@ func TestNodeAcceptsKeysAtTheBounds(t *testing.T) {
 		if _, err := newTestNode(t, rec, nil).NodeStageVolume(context.Background(), req); err != nil {
 			t.Fatalf("%d byte key: %v", n, err)
 		}
+	}
+}
+
+// Rotation passes the old key as previousKey, and a volume formatted before the
+// lower bound existed has a short one: it must reach the reconciler.
+func TestNodeAcceptsAShortPreviousKey(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRec{}
+	req := stageReq()
+	req.Secrets = map[string]string{"key": testKey, "previousKey": "short"}
+	if _, err := newTestNode(t, rec, nil).NodeStageVolume(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.stageKeys) != 1 || string(rec.stageKeys[0].previous) != "short" || string(rec.stageKeys[0].key) != testKey {
+		t.Errorf("stage keys = %q", rec.stageKeys)
+	}
+	// ...but the key itself still has the lower bound.
+	req = stageReq()
+	req.Secrets = map[string]string{"key": "short", "previousKey": testPrevious}
+	if _, err := newTestNode(t, &fakeRec{}, nil).NodeStageVolume(context.Background(), req); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a short key = %v, want InvalidArgument", err)
 	}
 }
