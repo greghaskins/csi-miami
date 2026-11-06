@@ -38,6 +38,11 @@ const (
 	// ReasonGenerationOverdue is a volume whose newest published generation
 	// is older than its maximum age while it holds unpublished writes.
 	ReasonGenerationOverdue = "GenerationOverdue"
+	// ReasonPublishRefused is a volume whose scheduled generation the store
+	// refused because the volume is no longer held by this node; the
+	// unpublished writes are kept. It is raised when the refusal begins, not
+	// on every tick.
+	ReasonPublishRefused = "PublishRefused"
 	// ReasonVolumeUnhealthy is a volume whose device failed its active probe
 	// twice in a row (probe.go). It is raised when the volume turns
 	// unhealthy, not on every pass.

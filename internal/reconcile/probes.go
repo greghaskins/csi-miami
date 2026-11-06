@@ -31,8 +31,20 @@ type ProbeOptions struct {
 	Failures int
 }
 
+// serverDown says the generation timers found the volume's block server not
+// answering at their latest status read: a read of its device would hang, and
+// the server's being down is the item's condition. No verdict yet is not down.
+func (p *pass) serverDown(id string) bool {
+	g := p.r.gens
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	st := g.vols[id]
+	return st != nil && st.served == ServedDown
+}
+
 // probeTick is the probe half of a pass, after the volumes were converged: a
-// volume that converged and whose item names a device gets a read started
+// volume whose stack is up (its stage may have failed in this pass: the pod
+// reads the device all the same) and whose item names a device gets a read started
 // unless one is in flight, and the verdict the earlier reads reached is put
 // in the volume's result, where the condition metric and the CSI node read
 // it. The reads run in goroutines of the prober's; nothing here waits for one,
@@ -48,7 +60,7 @@ func (p *pass) probeTick() {
 	for _, id := range sortedIDs(p.intents) {
 		in := p.intents[id]
 		res, ok := p.results[id]
-		if !ok || res.stage != nil || in.Kind != volume.KindVolume || in.Unstaging {
+		if !ok || in.Kind != volume.KindVolume || in.Unstaging || !p.stackUp(in, res) {
 			continue
 		}
 		if _, leaving := p.unstaging[id]; leaving {
@@ -59,7 +71,7 @@ func (p *pass) probeTick() {
 			continue
 		}
 		dev, stack, ok := pr.ProbeDevice(in)
-		if !ok {
+		if !ok || p.serverDown(id) {
 			continue
 		}
 		live[id] = struct{}{}
