@@ -448,7 +448,7 @@ func blockdSandbox(cacheDir, holdDir string) *systemd.Sandbox {
 			unix.CAP_SYS_ADMIN, unix.CAP_NET_ADMIN,
 			unix.CAP_DAC_OVERRIDE, unix.CAP_FOWNER,
 		},
-		AddressFamilies: []string{"AF_UNIX", "AF_NETLINK"},
+
 	}
 }
 

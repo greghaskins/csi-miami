@@ -419,11 +419,6 @@ func sandboxProperties(sb Sandbox) []sdbus.Property {
 		{Name: "ProtectHome", Value: godbus.MakeVariant("yes")},
 		{Name: "ReadWritePaths", Value: godbus.MakeVariant(append([]string(nil), sb.ReadWritePaths...))},
 		{Name: "CapabilityBoundingSet", Value: godbus.MakeVariant(mask)},
-		{Name: "ProtectKernelModules", Value: godbus.MakeVariant(true)},
-		{Name: "ProtectKernelTunables", Value: godbus.MakeVariant(true)},
-		{Name: "RestrictSUIDSGID", Value: godbus.MakeVariant(true)},
-		{Name: "LockPersonality", Value: godbus.MakeVariant(true)},
-		{Name: "RestrictNamespaces", Value: godbus.MakeVariant(uint64(0))}, // a bit mask of the namespaces still allowed: none,
 	}
 	if len(sb.DenySyscalls) > 0 {
 		props = append(props, sdbus.Property{Name: "SystemCallFilter", Value: godbus.MakeVariant(nameList{false, append([]string(nil), sb.DenySyscalls...)})})
