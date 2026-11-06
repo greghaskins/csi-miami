@@ -188,3 +188,55 @@ func TestOpenRootRefusesASymlinkInThePrefixButOperatorDoesNot(t *testing.T) {
 		t.Error("OpenRootOperator followed a symlink in the last element")
 	}
 }
+
+// symlinkedAncestor returns a mount point whose ancestor is a symlink (the
+// kubelet directory on a data disk), the real mount point behind it, and
+// registers the mount point as trusted.
+func symlinkedAncestor(t *testing.T) (mount, realMount string) {
+	t.Helper()
+	disk := t.TempDir()
+	realMount = filepath.Join(disk, "lib", "transports", "t1")
+	if err := os.MkdirAll(realMount, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "var")
+	link(t, filepath.Join(disk, "lib"), alias)
+	mount = filepath.Join(alias, "transports", "t1")
+	Trust(mount)
+	return mount, realMount
+}
+
+func TestASymlinkAboveTheMountPointIsAllowedBelowItIsNot(t *testing.T) {
+	t.Parallel()
+	mount, realMount := symlinkedAncestor(t)
+	if err := os.MkdirAll(filepath.Join(realMount, "ns", "pvc"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{mount, filepath.Join(mount, "ns"), filepath.Join(mount, "ns", "pvc")} {
+		d, err := OpenRoot(p)
+		if err != nil {
+			t.Errorf("OpenRoot(%s) through a symlink above the mount point: %v", p, err)
+			continue
+		}
+		_ = d.Close()
+		if err := CheckResolves(p); err != nil {
+			t.Errorf("CheckResolves(%s): %v", p, err)
+		}
+	}
+	// A link at any element below the mount point is refused, at the end or in
+	// the middle, and CheckResolves refuses it too.
+	node := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(node, "pvc"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link(t, node, filepath.Join(realMount, "evil"))
+	link(t, filepath.Join(realMount, "ns"), filepath.Join(realMount, "alias"))
+	for _, p := range []string{filepath.Join(mount, "evil"), filepath.Join(mount, "evil", "pvc"), filepath.Join(mount, "alias", "pvc")} {
+		if _, err := OpenRoot(p); err == nil {
+			t.Errorf("OpenRoot(%s) followed a symlink below the mount point", p)
+		}
+		if err := CheckResolves(p); err == nil {
+			t.Errorf("CheckResolves(%s) accepted a symlink below the mount point", p)
+		}
+	}
+}

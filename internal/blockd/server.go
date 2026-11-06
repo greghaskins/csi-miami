@@ -9,11 +9,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/cache"
 	"github.com/greghaskins/csi-miami/internal/chunk"
+	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
 // generationsKeep is how many manifests a publish keeps; the agreed flag set
@@ -85,6 +87,12 @@ func openServer(ctx context.Context, cfg Config, log *slog.Logger, resumeOnly bo
 	cfg = cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
+	}
+	// Everything below the mount point is on the shared export and is resolved
+	// without following a symlink (see safefs.Trust); links above it are the
+	// operator's.
+	if cfg.MountRoot != "" {
+		safefs.Trust(filepath.Clean(cfg.MountRoot))
 	}
 	store, err := chunk.Open(cfg.StoreDir)
 	if err != nil {

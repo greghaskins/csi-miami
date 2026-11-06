@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -59,12 +60,57 @@ type Dir struct {
 	f *os.File
 }
 
-// OpenRoot opens the directory at path, following no symlink in ANY element
-// of it. A path on a shared export has elements an untrusted writer chose (a
-// class's subdirectory, say), so a link in the middle must be refused as much
-// as one at the end; a path whose own prefix holds a symlink is refused too, so
-// callers pass the resolved path of a directory on the node (the transports
-// root is resolved at start).
+// The trust boundary is a transport's mount point: it is a local directory of
+// the node, and symlinks above it (/var/lib/kubelet on a data disk, say) are the
+// operator's. Everything below it is on the shared export and was named by a
+// writer there. Trust records a mount point; a path under one is then opened by
+// opening the mount point as the operating system resolves it and everything
+// below it with openat2 and RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS and
+// RESOLVE_NO_MAGICLINKS. A path under no trusted mount point has no such
+// boundary and is resolved with no symlink anywhere in it (it fails closed).
+var trusted struct {
+	mu    sync.RWMutex
+	roots map[string]struct{}
+}
+
+// Trust records mount, an absolute, cleaned path, as a mount point whose
+// ancestors may be symlinks. It is idempotent.
+func Trust(mount string) {
+	if !filepath.IsAbs(mount) || filepath.Clean(mount) != mount {
+		return
+	}
+	trusted.mu.Lock()
+	defer trusted.mu.Unlock()
+	if trusted.roots == nil {
+		trusted.roots = map[string]struct{}{}
+	}
+	trusted.roots[mount] = struct{}{}
+}
+
+// trustedRoot is the longest trusted mount point that path is, or is below, and
+// the part of path below it ("" when path is the mount point).
+func trustedRoot(path string) (mount, rel string, ok bool) {
+	trusted.mu.RLock()
+	defer trusted.mu.RUnlock()
+	for m := range trusted.roots {
+		if path != m && !strings.HasPrefix(path, m+"/") {
+			continue
+		}
+		if !ok || len(m) > len(mount) {
+			mount, ok = m, true
+		}
+	}
+	if ok {
+		rel = strings.TrimPrefix(strings.TrimPrefix(path, mount), "/")
+	}
+	return mount, rel, ok
+}
+
+// OpenRoot opens the directory at path, following no symlink below its
+// transport's mount point (see Trust), or anywhere in it when it is under no
+// trusted mount point. A path on a shared export has elements an untrusted
+// writer chose (a class's subdirectory, say), so a link in the middle must be
+// refused as much as one at the end.
 func OpenRoot(path string) (*Dir, error) { return openRoot(path, true) }
 
 // OpenRootOperator is OpenRoot for a path an operator typed at a command line
@@ -76,12 +122,16 @@ func OpenRootOperator(path string) (*Dir, error) { return openRoot(path, false) 
 func openRoot(path string, strict bool) (*Dir, error) {
 	var fd int
 	var err error
+	mount, rel, below := trustedRoot(path)
 	for {
-		if strict {
+		switch {
+		case !strict:
+			fd, err = unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		case below:
+			fd, err = openBelow(mount, rel)
+		default:
 			how := &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS}
 			fd, err = unix.Openat2(unix.AT_FDCWD, path, how)
-		} else {
-			fd, err = unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		}
 		if !errors.Is(err, unix.EINTR) {
 			break
@@ -96,9 +146,27 @@ func openRoot(path string, strict bool) (*Dir, error) {
 	return &Dir{f: os.NewFile(uintptr(fd), path)}, nil
 }
 
-// CheckResolves opens path the strict way and requires that it is the very
-// path the descriptor resolves to, so that a consumer that resolves the path
-// itself (systemd, for ReadWritePaths) lands where this process did.
+// openBelow opens the mount point as the system resolves it, then rel below it
+// without following a symlink.
+func openBelow(mount, rel string) (int, error) {
+	root, err := unix.Open(mount, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	if rel == "" {
+		return root, nil
+	}
+	defer func() { _ = unix.Close(root) }()
+	how := &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: resolveSafely}
+	return unix.Openat2(root, rel, how)
+}
+
+// CheckResolves opens path the way OpenRoot does and requires that the
+// descriptor's real path is the path itself: the real path of its mount point
+// with the rest appended (or, under no trusted mount point, path unchanged). A
+// consumer that resolves the path itself (systemd, for ReadWritePaths) then
+// lands where this process did, with only links above the mount point, which
+// are the operator's, allowed.
 func CheckResolves(path string) error {
 	if path != filepath.Clean(path) {
 		return &fs.PathError{Op: "resolve", Path: path, Err: errors.New("the path is not clean")}
@@ -112,7 +180,15 @@ func CheckResolves(path string) error {
 	if err != nil {
 		return err
 	}
-	if got != path {
+	want := path
+	if mount, rel, ok := trustedRoot(path); ok {
+		resolved, err := filepath.EvalSymlinks(mount)
+		if err != nil {
+			return err
+		}
+		want = filepath.Join(resolved, rel)
+	}
+	if got != want {
 		return &fs.PathError{Op: "resolve", Path: path, Err: errors.New("the path does not resolve to itself")}
 	}
 	return nil

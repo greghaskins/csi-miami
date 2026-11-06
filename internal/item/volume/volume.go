@@ -349,6 +349,7 @@ type vol struct {
 	in       intent.Intent
 	name     string // pvc-<uuid>
 	params   kinds.VolumeParams
+	mount    string // the transport's mount point, which storeDir is below
 	storeDir string // the volume's directory in the transport
 	holdDir  string // the directory holding its holder file: beside storeDir
 	cacheDir string
@@ -377,6 +378,10 @@ func (it *Item) volOf(in intent.Intent) (vol, error) {
 	if err != nil {
 		return vol{}, fmt.Errorf("volume item %s: %w", in.VolumeID, err)
 	}
+	mount, err := in.Transport.MountPoint(it.cfg.Root)
+	if err != nil {
+		return vol{}, fmt.Errorf("volume item %s: %w", in.VolumeID, err)
+	}
 	unit := systemd.UnitName(id.Name)
 	if unit == "" {
 		return vol{}, fmt.Errorf("volume item %s: %q is not a volume name", in.VolumeID, id.Name)
@@ -387,7 +392,7 @@ func (it *Item) volOf(in intent.Intent) (vol, error) {
 		bound = size
 	}
 	return vol{
-		in: in, name: id.Name, params: p, storeDir: storeDir, holdDir: filepath.Dir(storeDir),
+		in: in, name: id.Name, params: p, mount: mount, storeDir: storeDir, holdDir: filepath.Dir(storeDir),
 		cacheDir: filepath.Join(it.cfg.CacheDir, id.Name),
 		socket:   SocketPath(it.cfg.CacheDir, id.Name),
 		unit:     unit, stage: in.StagePath, size: size, chunk: p.ChunkSize, bound: bound,

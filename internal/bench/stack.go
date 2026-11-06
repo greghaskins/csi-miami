@@ -22,6 +22,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/crypt"
 	"github.com/greghaskins/csi-miami/internal/ext4"
 	"github.com/greghaskins/csi-miami/internal/holder"
+	"github.com/greghaskins/csi-miami/internal/safefs"
 	"github.com/greghaskins/csi-miami/internal/tool"
 )
 
@@ -252,7 +253,15 @@ func (b *built) nbd(ctx context.Context, o Options, work string, unmounted *bool
 	if err := os.MkdirAll(o.Store, 0o755); err != nil { //nolint:gosec // the operator's store directory
 		return err
 	}
-	base, err := os.MkdirTemp(o.Store, WorkPrefix)
+	// The operator's store directory is the trust boundary here, as a
+	// transport's mount point is for a node: the benchmark's own directories
+	// below it are opened without following a symlink.
+	mount, err := filepath.Abs(o.Store)
+	if err != nil {
+		return err
+	}
+	safefs.Trust(mount)
+	base, err := os.MkdirTemp(mount, WorkPrefix)
 	if err != nil {
 		return err
 	}
@@ -288,7 +297,7 @@ func (b *built) nbd(ctx context.Context, o Options, work string, unmounted *bool
 		return fmt.Errorf("the control socket path %s is too long for a unix socket; use a shorter --dir", control)
 	}
 	cmd := exec.Command(exe, "blockd", //nolint:gosec // the operator's own binary
-		"-volume", vol, "-store", volDir, "-cache-dir", cache, "-control", control,
+		"-volume", vol, "-mount", mount, "-store", volDir, "-cache-dir", cache, "-control", control,
 		"-size", strconv.FormatInt(size, 10), "-chunk-size", strconv.FormatInt(chunkSize, 10),
 		"-cache-bound", strconv.FormatInt(size, 10), "-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", node)
 	var logs lockedBuf

@@ -416,7 +416,7 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 		Description: "csi-miami block server for " + v.name,
 		ExecStart: []string{
 			it.binPath(), "blockd",
-			"-volume", v.name, "-store", v.storeDir, "-cache-dir", v.cacheDir, "-control", v.socket,
+			"-volume", v.name, "-mount", v.mount, "-store", v.storeDir, "-cache-dir", v.cacheDir, "-control", v.socket,
 			"-size", itoa(v.size), "-chunk-size", itoa(v.chunk), "-cache-bound", itoa(v.bound),
 			"-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", it.cfg.Node,
 		},

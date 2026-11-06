@@ -85,3 +85,34 @@ func TestNewServerRefusesAStorePathThroughASymlink(t *testing.T) {
 		t.Fatal("newServer opened a store through a symlink in its path")
 	}
 }
+
+// blockd is given the transport's mount point and trusts it, and links above
+// it, but not links below it.
+func TestNewServerThroughASymlinkAboveTheMountPoint(t *testing.T) {
+	cfg, _ := testConfig(t)
+	mount := filepath.Dir(cfg.StoreDir) // the test's "transport"
+	alias := filepath.Join(t.TempDir(), "kubelet")
+	if err := os.Symlink(filepath.Dir(mount), alias); err != nil {
+		t.Fatal(err)
+	}
+	cfg.MountRoot = filepath.Join(alias, filepath.Base(mount))
+	cfg.StoreDir = filepath.Join(cfg.MountRoot, filepath.Base(cfg.StoreDir))
+	s, err := newServer(context.Background(), cfg, testLog())
+	if err != nil {
+		t.Fatalf("newServer through a symlink above the mount point: %v", err)
+	}
+	_ = s.close()
+
+	// Below the mount point a link is refused.
+	node := t.TempDir()
+	if err := os.Symlink(node, filepath.Join(mount, "ns")); err != nil {
+		t.Fatal(err)
+	}
+	cfg.StoreDir = filepath.Join(cfg.MountRoot, "ns", "pvc-x")
+	if err := os.Mkdir(filepath.Join(node, "pvc-x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newServer(context.Background(), cfg, testLog()); err == nil {
+		t.Fatal("newServer followed a symlink below the mount point")
+	}
+}

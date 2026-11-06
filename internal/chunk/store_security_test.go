@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
 // The store is on a shared export, and a writer there is not trusted for
@@ -563,4 +565,37 @@ func TestOpenRefusesAnIntermediateSymlink(t *testing.T) {
 	} else {
 		_ = s.Close()
 	}
+}
+
+// The same store, reached through a symlink above its transport's mount point,
+// opens; a link below it still does not.
+func TestStoreThroughASymlinkAboveTheMountPoint(t *testing.T) {
+	t.Parallel()
+	disk := t.TempDir()
+	realMount := filepath.Join(disk, "lib", "transports", "t2")
+	if err := os.MkdirAll(filepath.Join(realMount, "ns", "pvc-x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "var")
+	if err := os.Symlink(filepath.Join(disk, "lib"), alias); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(alias, "transports", "t2")
+	safefs.Trust(mount)
+	s, err := Open(filepath.Join(mount, "ns", "pvc-x"))
+	if err != nil {
+		t.Fatalf("Open through a symlink above the mount point: %v", err)
+	}
+	_ = s.Close()
+	node := t.TempDir()
+	if err := os.Mkdir(filepath.Join(node, "pvc-x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(node, filepath.Join(realMount, "ns-b")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(filepath.Join(mount, "ns-b", "pvc-x")); err == nil {
+		t.Error("Open followed a symlink below the mount point")
+	}
+	empty(t, filepath.Join(node, "pvc-x"))
 }
