@@ -28,7 +28,7 @@ import (
 // The event reasons the volume item raises. They are defined here, and the
 // item's own constants are these, because the item imports this package.
 const (
-	ReasonPublishRefused  = "PublishRefused"
+	ReasonPublishRefused  = reconcile.ReasonPublishRefused
 	ReasonGenerationLost  = "GenerationLost"
 	ReasonServerRestarted = "ServerRestarted"
 )
