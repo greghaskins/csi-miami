@@ -42,6 +42,19 @@ The image is the artifact that ships, so take the binary from it. It is
 statically linked; the host needs `cryptsetup` and `e2fsprogs` (the image
 carries them too, but its entrypoint is the driver, not a shell).
 
+On a Kubernetes node, which runs containerd rather than Docker, use the
+node's own `ctr` (on k0s it is `k0s ctr`), as root:
+
+    k0s ctr -n k8s.io images pull --platform linux/arm64 ghcr.io/greghaskins/csi-miami:<tag>
+    mkdir -p /tmp/miami-img
+    k0s ctr -n k8s.io images mount ghcr.io/greghaskins/csi-miami:<tag> /tmp/miami-img
+    cp /tmp/miami-img/miami ./miami
+    k0s ctr -n k8s.io images unmount /tmp/miami-img
+    ./miami version
+
+Use `--platform linux/amd64` on an amd64 host. Where Docker is installed
+instead:
+
     docker create --name miami-bench ghcr.io/greghaskins/csi-miami:<tag>
     docker cp miami-bench:/miami ./miami
     docker rm miami-bench
