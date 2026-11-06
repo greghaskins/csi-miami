@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
@@ -222,19 +221,29 @@ func settle(t *testing.T, try func() error) error {
 func TestNFS3ResolverInFlightGuard(t *testing.T) {
 	t.Parallel()
 	hang := make(chan struct{})
+	started := make(chan struct{})
 	var calls atomic.Int32
 	res := resolver(func(_ context.Context, _ string) ([]net.IPAddr, error) {
 		if calls.Add(1) == 1 {
+			close(started)
 			<-hang
 		}
 		return ips("198.51.100.7"), nil
 	})
 	spec := Spec{Kind: KindNFS3, Server: "nas.example.com", Export: "/export"}
 	f := newFake(table(rootMount()))
-	tr := newTransport(t, spec, t.TempDir(), f, Options{Resolver: res, ResolveTimeout: 10 * time.Millisecond})
+	tr := newTransport(t, spec, t.TempDir(), f, Options{Resolver: res})
 
-	if err := tr.Mount(context.Background()); !errors.Is(err, mount.ErrTimeout) {
-		t.Fatalf("first Mount: got %v, want ErrTimeout", err)
+	// The first Mount is abandoned once the lookup is known to be running, not
+	// after a short timeout that a loaded machine can overrun before the lookup
+	// starts: the key is held when the caller gives up either way.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	if err := tr.Mount(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Mount: got %v, want the caller's cancellation", err)
 	}
 	// Polling while the lookup is stuck starts nothing.
 	for range 50 {
@@ -264,11 +273,12 @@ func TestLocalHostPathInFlightGuard(t *testing.T) {
 	t.Parallel()
 	fx := newLocalFixture(t)
 	hang := make(chan struct{})
+	started := make(chan struct{})
 	var calls atomic.Int32
 	opts := Options{
-		ResolveTimeout: 10 * time.Millisecond,
 		ResolveHostPath: func(p string) (string, error) {
 			if calls.Add(1) == 1 {
+				close(started)
 				<-hang
 			}
 			return ResolveDirectory(p)
@@ -279,8 +289,13 @@ func TestLocalHostPathInFlightGuard(t *testing.T) {
 	f := newFake(table(rootMount(), fx.bindOf(dir)))
 	tr := newTransport(t, spec, fx.root, f, opts)
 
-	if _, err := tr.Mounted(context.Background()); !errors.Is(err, mount.ErrTimeout) {
-		t.Fatalf("first Mounted: got %v, want ErrTimeout", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	if _, err := tr.Mounted(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Mounted: got %v, want the caller's cancellation", err)
 	}
 	// A reconciler polling Mounted every few seconds starts nothing new.
 	for range 200 {

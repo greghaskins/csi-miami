@@ -80,11 +80,32 @@ func TestDrainStartedServerOfAnotherVolumeGetsNothing(t *testing.T) {
 	e.ctl.up()
 	e.it.cfg.StartTimeout = 100 * time.Millisecond
 	orphans, _ := e.it.Orphans(bg)
-	if err := e.it.Drain(bg, orphans[0]); err == nil {
-		t.Fatal("Drain = nil")
+	err := e.it.Drain(bg, orphans[0])
+	if !errors.Is(err, errWrongServer) {
+		t.Fatalf("Drain = %v, want the wrong-server error", err)
 	}
 	e.rec.none(t, "ctl.Boundary", "ctl.Publish", "ctl.Stop")
 	if !e.cacheExists() {
 		t.Error("the cache was removed")
+	}
+}
+
+// A status that cannot be read leaves the server's identity unknown, so no
+// Stop request goes to it; the unit stop still happens, and a device the
+// server leaves behind is disconnected by the fallback, so nothing is stranded.
+func TestStopServerSendsNoStopWhenTheIdentityIsUnknown(t *testing.T) {
+	e := newEnv(t)
+	e.seedRunning()
+	e.ctl.statusErr = errors.New("status unreadable")
+	if err := e.it.unmountAndClose(bg, e.v, e.it.state(e.in.VolumeID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.it.stopServerAndUnit(bg, e.v); err != nil {
+		t.Fatalf("stopServerAndUnit = %v", err)
+	}
+	e.rec.none(t, "ctl.Stop")
+	e.rec.inOrder(t, "systemd.Stop", "nbd.Disconnect")
+	if _, ok, _ := e.it.findDevice(e.v); ok {
+		t.Error("the device is still there")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -154,6 +155,8 @@ func TestParseManifestRejectsUnknownFormat(t *testing.T) {
 		"empty":          "",
 		"bad time":       strings.Replace(good, "2026-11-03T10:30:00Z", "yesterday", 1),
 		"header late":    good + "# epoch 7\n",
+		"plus size":      regexp.MustCompile(`# size (\d+)`).ReplaceAllString(good, "# size +$1"),
+		"zero-led chunk": regexp.MustCompile(`# chunk (\d+)`).ReplaceAllString(good, "# chunk 0$1"),
 	} {
 		if _, err := ParseManifest(strings.NewReader(in)); !errors.Is(err, ErrManifestFormat) {
 			t.Errorf("%s: err = %v, want ErrManifestFormat", name, err)
@@ -179,9 +182,7 @@ func FuzzParseManifest(f *testing.F) {
 		}
 		again, err := ParseManifest(bytes.NewReader(m.Marshal()))
 		if err != nil {
-			// A volume name with a carriage return or similar may not survive
-			// Scanner line splitting; the parse itself must still not panic.
-			return
+			t.Fatalf("a manifest that parsed does not parse again after Marshal: %v", err)
 		}
 		if !bytes.Equal(again.Marshal(), m.Marshal()) {
 			t.Fatal("marshal is not stable")
@@ -347,7 +348,9 @@ func TestCurrentIsReadFresh(t *testing.T) {
 	s := openStore(t)
 	writeM(t, s, 1, 1, Sum([]byte("a")))
 	writeM(t, s, 1, 2, Sum([]byte("b")))
-	_ = s.Publish(ctx, "1.1")
+	if err := s.Publish(ctx, "1.1"); err != nil {
+		t.Fatal(err)
+	}
 	if got, _, _ := s.Current(ctx); got != "1.1" {
 		t.Fatal(got)
 	}
@@ -403,7 +406,9 @@ func TestManifestsSortByEpochThenSequence(t *testing.T) {
 	for _, k := range [][2]uint64{{2, 1}, {1, 10}, {1, 9}, {10, 1}, {1, 2}} {
 		writeM(t, s, k[0], k[1], h)
 	}
-	_ = os.WriteFile(filepath.Join(s.root, "manifests", "junk"), nil, 0o600)
+	if err := os.WriteFile(filepath.Join(s.root, "manifests", "junk"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	got, err := s.Manifests(context.Background())
 	want := []string{"1.2", "1.9", "1.10", "2.1", "10.1"}
 	if err != nil || !slices.Equal(got, want) {
@@ -429,7 +434,9 @@ func TestPruneKeepsNewestAndTheirChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmp := filepath.Join(filepath.Dir(s.ChunkPath(hs["old"])), ".tmp-young")
-	_ = os.WriteFile(tmp, []byte("x"), 0o600)
+	if err := os.WriteFile(tmp, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, _, err := s.Prune(ctx, 0); err == nil {
 		t.Fatal("keep 0 accepted")
@@ -457,6 +464,37 @@ func TestPruneKeepsNewestAndTheirChunks(t *testing.T) {
 	// A second run is a no-op.
 	if rm, rc, err := s.Prune(ctx, 1); err != nil || rm != 0 || rc != 0 {
 		t.Fatalf("second prune %d %d %v", rm, rc, err)
+	}
+}
+
+func TestPruneRemovesAStaleManifestTempFileButNotAYoungOne(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t)
+	h := Sum([]byte("a"))
+	if err := s.Put(ctx, h, strings.NewReader("a"), 1); err != nil {
+		t.Fatal(err)
+	}
+	writeM(t, s, 1, 1, h)
+	stale := filepath.Join(s.root, "manifests", ".tmp-1.2-old")
+	young := filepath.Join(s.root, "manifests", ".tmp-1.2-young")
+	for _, p := range []string{stale, young} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * staleTemp)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Prune(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Error("stale manifest temp file kept")
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Error("young manifest temp file removed")
 	}
 }
 

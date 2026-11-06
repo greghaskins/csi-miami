@@ -757,6 +757,9 @@ func (c *Cache) Sync() error {
 	return c.syncLocked()
 }
 
+// fdatasync is unix.Fdatasync; a test replaces it to see which chunks reach it.
+var fdatasync = unix.Fdatasync
+
 func (c *Cache) syncLocked() error {
 	if c.closed {
 		return os.ErrClosed
@@ -772,7 +775,7 @@ func (c *Cache) syncLocked() error {
 		}
 		// fdatasync, not fsync: the chunk's data (and the size set by a
 		// materialising truncate) must be durable, but its mtime need not be.
-		err = unix.Fdatasync(int(f.Fd()))
+		err = fdatasync(int(f.Fd()))
 		_ = f.Close()
 		if err != nil {
 			return err

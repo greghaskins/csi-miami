@@ -247,6 +247,12 @@ type markState struct {
 // NodeUnstage finds no record and answers OK. An unstage still unfinished
 // after MarkWarnAfter raises ReasonUnstageStuck once; the log line beside it
 // carries the error, which names the holder and the way out.
+//
+// The age survives a plugin restart (it is the record's UnstagingSince) but the
+// backoff does not: after a restart the gap starts again at MarkRetry and
+// doubles from there. A plugin that restarts more often than MarkRetryMax
+// therefore retries a stuck unstage a little more often than a steady one
+// would; the cost is a few extra attempts, so it is not persisted.
 func (p *pass) retryMarked(in intent.Intent) {
 	r := p.r
 	now := r.opts.Now()

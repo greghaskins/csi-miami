@@ -275,11 +275,6 @@ type Options struct {
 	// 1 minute, 10 minutes and 30 minutes.
 	MarkRetry, MarkRetryMax, MarkWarnAfter time.Duration
 
-	// Remediate permits the reconciler to repair what it finds wrong beyond
-	// converging intent (see the remediation task); false observes and reports
-	// only.
-	Remediate bool
-
 	// Generations are the defaults of the generation timers.
 	Generations GenerationOptions
 

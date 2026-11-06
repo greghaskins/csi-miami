@@ -197,7 +197,11 @@ func run(ctx context.Context, r tool.Runner, op string, argv []string, keys ...[
 	case 0:
 		return nil
 	case 2:
-		return fmt.Errorf("crypt: %s: %w", op, ErrBadKey)
+		// Exit 2 is "no keyslot matches" only for the operations that check a
+		// key; elsewhere it is another failure and keeps its text.
+		if op == "open" || op == "luksChangeKey" {
+			return fmt.Errorf("crypt: %s: %w", op, ErrBadKey)
+		}
 	}
 	return fmt.Errorf("crypt: %s: exit %d: %s", op, code, output(stdout, stderr))
 }

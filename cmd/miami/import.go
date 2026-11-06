@@ -318,7 +318,20 @@ func requireNewVolume(store string) error {
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	interrupted := len(ents) == 1 && ents[0].Name() == fmt.Sprintf("%d.%d", importEpoch, importSequence)
+	// What an interrupted import leaves: the import's own manifest, and the
+	// temporary files of a manifest write that did not finish.
+	own := fmt.Sprintf("%d.%d", importEpoch, importSequence)
+	var left []string
+	others := 0
+	for _, e := range ents {
+		switch {
+		case e.Name() == own, strings.HasPrefix(e.Name(), ".tmp-"+own+"-"):
+			left = append(left, filepath.Join(store, "manifests", e.Name()))
+		default:
+			others++
+		}
+	}
+	interrupted := others == 0 && len(left) > 0
 	if len(ents) > 0 && !interrupted {
 		return fmt.Errorf("%s already has manifests; refusing to import over a volume", store)
 	}
@@ -338,9 +351,8 @@ func requireNewVolume(store string) error {
 		}
 	}
 	if interrupted {
-		name := fmt.Sprintf("%d.%d", importEpoch, importSequence)
-		return fmt.Errorf("%s holds only manifests/%s, with no current and no holder: an earlier import was interrupted and is not resumed; remove %s and import again",
-			store, name, filepath.Join(store, "manifests", name))
+		return fmt.Errorf("%s holds only what an earlier import left (%s), with no current and no holder: that import was interrupted and is not resumed; remove it and import again",
+			store, strings.Join(left, ", "))
 	}
 	return nil
 }

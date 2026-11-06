@@ -108,14 +108,16 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte, zeroBase bool) erro
 	// — before touching anything — rather than invent a zero base for a chunk
 	// whose base is not zero; the caller fetches the base and retries.
 	residentFull := c.clean.has(i) || (isDirty && !isZero)
-	if !residentFull && base == nil && !zeroBase {
-		c.mu.Unlock()
-		return ErrNotResident
-	}
+	// A full cache is answered before a missing base is: the caller would fetch
+	// the base from the store only to be told ErrFull on the retry.
 	newCharge := !isDirty || isZero
 	if newCharge && c.dirtyBytes()+c.idx.Chunk > c.bound {
 		c.mu.Unlock()
 		return ErrFull
+	}
+	if !residentFull && base == nil && !zeroBase {
+		c.mu.Unlock()
+		return ErrNotResident
 	}
 	if newCharge && !c.clean.has(i) {
 		c.evictLocked(c.idx.Chunk)
