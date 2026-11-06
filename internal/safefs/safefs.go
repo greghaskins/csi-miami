@@ -28,6 +28,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -57,22 +59,63 @@ type Dir struct {
 	f *os.File
 }
 
-// OpenRoot opens the directory at path, following no symlink in its last
-// element. Whoever validates the path itself (as an absolute, cleaned path on
-// a mount of its own) does that before.
-func OpenRoot(path string) (*Dir, error) {
+// OpenRoot opens the directory at path, following no symlink in ANY element
+// of it. A path on a shared export has elements an untrusted writer chose (a
+// class's subdirectory, say), so a link in the middle must be refused as much
+// as one at the end; a path whose own prefix holds a symlink is refused too, so
+// callers pass the resolved path of a directory on the node (the transports
+// root is resolved at start).
+func OpenRoot(path string) (*Dir, error) { return openRoot(path, true) }
+
+// OpenRootOperator is OpenRoot for a path an operator typed at a command line
+// (miami import, miami restore): symlinks in the path's prefix are followed, as
+// any tool would, and only a symlink in the last element is refused. Nothing a
+// writer on the export can influence is opened this way.
+func OpenRootOperator(path string) (*Dir, error) { return openRoot(path, false) }
+
+func openRoot(path string, strict bool) (*Dir, error) {
 	var fd int
 	var err error
 	for {
-		fd, err = unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if strict {
+			how := &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS}
+			fd, err = unix.Openat2(unix.AT_FDCWD, path, how)
+		} else {
+			fd, err = unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		}
 		if !errors.Is(err, unix.EINTR) {
 			break
 		}
+	}
+	if errors.Is(err, unix.ENOSYS) {
+		return nil, ErrNoOpenat2
 	}
 	if err != nil {
 		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
 	}
 	return &Dir{f: os.NewFile(uintptr(fd), path)}, nil
+}
+
+// CheckResolves opens path the strict way and requires that it is the very
+// path the descriptor resolves to, so that a consumer that resolves the path
+// itself (systemd, for ReadWritePaths) lands where this process did.
+func CheckResolves(path string) error {
+	if path != filepath.Clean(path) {
+		return &fs.PathError{Op: "resolve", Path: path, Err: errors.New("the path is not clean")}
+	}
+	d, err := OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	got, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(d.fd()))
+	if err != nil {
+		return err
+	}
+	if got != path {
+		return &fs.PathError{Op: "resolve", Path: path, Err: errors.New("the path does not resolve to itself")}
+	}
+	return nil
 }
 
 // Close releases the descriptor. Files and Dirs got from d stay valid.

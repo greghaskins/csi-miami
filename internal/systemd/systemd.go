@@ -86,7 +86,12 @@ type Unit struct {
 //	ProtectSystem=strict  the whole file system is read-only except /dev,
 //	                      /proc and /sys, and ReadWritePaths;
 //	ProtectHome=yes       /home, /root and /run/user are empty;
-//	CapabilityBoundingSet only Capabilities can ever be held.
+//	CapabilityBoundingSet only Capabilities can ever be held;
+//	ProtectKernelModules, ProtectKernelTunables, RestrictSUIDSGID,
+//	LockPersonality, RestrictNamespaces  no module loading, no writes to
+//	                      /proc/sys or /sys, no setuid files, no personality
+//	                      change, no new namespaces;
+//	SystemCallFilter, RestrictAddressFamilies  see the fields.
 type Sandbox struct {
 	// ReadWritePaths are the existing paths the service may write below. There
 	// is no PrivateTmp: a cache or store directory may be under /tmp (the smoke
@@ -95,6 +100,18 @@ type Sandbox struct {
 	ReadWritePaths []string
 	// Capabilities are the capability numbers (unix.CAP_*) it may hold.
 	Capabilities []int
+	// DenySyscalls are the system calls or @groups that fail with EPERM
+	// (SystemCallFilter=~...). Empty means no filter.
+	DenySyscalls []string
+	// AddressFamilies are the socket families it may use (AF_UNIX, ...).
+	// Empty means no restriction.
+	AddressFamilies []string
+}
+
+// bus signature (bas): a flag and a list of names.
+type nameList struct {
+	Allow bool
+	Names []string
 }
 
 // State is what systemd reports about a unit. Present is false for a unit
@@ -395,13 +412,25 @@ func sandboxProperties(sb Sandbox) []sdbus.Property {
 	for _, c := range sb.Capabilities {
 		mask |= 1 << uint(c) //nolint:gosec // capability numbers are small constants
 	}
-	return []sdbus.Property{
+	props := []sdbus.Property{
 		{Name: "NoNewPrivileges", Value: godbus.MakeVariant(true)},
 		{Name: "ProtectSystem", Value: godbus.MakeVariant("strict")},
 		{Name: "ProtectHome", Value: godbus.MakeVariant("yes")},
 		{Name: "ReadWritePaths", Value: godbus.MakeVariant(append([]string(nil), sb.ReadWritePaths...))},
 		{Name: "CapabilityBoundingSet", Value: godbus.MakeVariant(mask)},
+		{Name: "ProtectKernelModules", Value: godbus.MakeVariant(true)},
+		{Name: "ProtectKernelTunables", Value: godbus.MakeVariant(true)},
+		{Name: "RestrictSUIDSGID", Value: godbus.MakeVariant(true)},
+		{Name: "LockPersonality", Value: godbus.MakeVariant(true)},
+		{Name: "RestrictNamespaces", Value: godbus.MakeVariant(true)},
 	}
+	if len(sb.DenySyscalls) > 0 {
+		props = append(props, sdbus.Property{Name: "SystemCallFilter", Value: godbus.MakeVariant(nameList{false, append([]string(nil), sb.DenySyscalls...)})})
+	}
+	if len(sb.AddressFamilies) > 0 {
+		props = append(props, sdbus.Property{Name: "RestrictAddressFamilies", Value: godbus.MakeVariant(nameList{true, append([]string(nil), sb.AddressFamilies...)})})
+	}
+	return props
 }
 
 func checkName(name string) error {

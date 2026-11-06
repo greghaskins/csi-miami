@@ -41,9 +41,16 @@ type Store struct {
 }
 
 // Open opens the store at root, which must exist, creating chunks/ and
-// manifests/ when absent. A symlink at root, chunks or manifests is refused.
-func Open(root string) (*Store, error) {
-	dir, err := safefs.OpenRoot(root)
+// manifests/ when absent. A symlink anywhere in root, or at chunks or
+// manifests, is refused.
+func Open(root string) (*Store, error) { return open(root, safefs.OpenRoot) }
+
+// OpenOperator is Open for a directory an operator named on a command line:
+// a symlink in the path's prefix is followed, as any tool would.
+func OpenOperator(root string) (*Store, error) { return open(root, safefs.OpenRootOperator) }
+
+func open(root string, openRoot func(string) (*safefs.Dir, error)) (*Store, error) {
+	dir, err := openRoot(root)
 	if err != nil {
 		return nil, fmt.Errorf("chunk: open store: %w", err)
 	}

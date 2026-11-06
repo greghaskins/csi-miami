@@ -70,6 +70,12 @@ func runRestore(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "miami restore: %v\n", err)
 		return 1
 	}
+	if m.Volume != filepath.Base(store) {
+		// Not an error: a copy of a store (an offsite backup, a snapshot) is
+		// often a renamed directory, and restoring it is the point. But a
+		// manifest that names another volume is worth a look.
+		_, _ = fmt.Fprintf(stderr, "miami restore: warning: the manifest is of volume %s, but the store directory is named %s\n", m.Volume, filepath.Base(store))
+	}
 	_, _ = fmt.Fprintf(stdout, "restored manifest %s of %s: %d bytes in %d chunks to %s\n", m.Name(), m.Volume, m.Size, len(m.Chunks), dest)
 	return 0
 }
@@ -121,7 +127,7 @@ type restoreHooks struct {
 // dest exists, so an existing file is never replaced. It never writes to the
 // store.
 func restoreVolume(ctx context.Context, store, dest, name string, h restoreHooks) (chunk.Manifest, error) {
-	s, err := chunk.OpenReadOnly(store)
+	s, err := chunk.OpenReadOnlyOperator(store)
 	if err != nil {
 		return chunk.Manifest{}, err
 	}

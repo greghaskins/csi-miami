@@ -12,8 +12,16 @@ import (
 // OpenReadOnly opens the store at root for reading only: unlike Open it
 // creates nothing, and refuses a directory that is not already a store. A
 // symlink at root, chunks or manifests is refused.
-func OpenReadOnly(root string) (*Store, error) {
-	dir, err := safefs.OpenRoot(root)
+func OpenReadOnly(root string) (*Store, error) { return openReadOnly(root, safefs.OpenRoot) }
+
+// OpenReadOnlyOperator is OpenReadOnly for a directory an operator named on a
+// command line: a symlink in the path's prefix is followed.
+func OpenReadOnlyOperator(root string) (*Store, error) {
+	return openReadOnly(root, safefs.OpenRootOperator)
+}
+
+func openReadOnly(root string, openRoot func(string) (*safefs.Dir, error)) (*Store, error) {
+	dir, err := openRoot(root)
 	if err != nil {
 		return nil, fmt.Errorf("chunk: open store: %w", err)
 	}

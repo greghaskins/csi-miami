@@ -146,3 +146,25 @@ func TestGrowRefusesASymlinkedDirectory(t *testing.T) {
 		t.Fatal("Read worked through a symlinked directory")
 	}
 }
+
+func TestIntermediateSymlinkIsRefused(t *testing.T) {
+	t.Parallel()
+	node := t.TempDir()
+	if err := os.Mkdir(filepath.Join(node, "x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "ns")
+	if err := os.Symlink(node, link); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(link, "x")
+	if _, err := Grow(dir, name, 4<<20); err == nil {
+		t.Error("Grow worked through a symlink in the path")
+	}
+	if _, _, err := Read(dir, name); err == nil {
+		t.Error("Read worked through a symlink in the path")
+	}
+	if ents, _ := os.ReadDir(filepath.Join(node, "x")); len(ents) != 0 {
+		t.Errorf("files created behind the link: %v", ents)
+	}
+}

@@ -122,3 +122,27 @@ func TestTakeoverAndReleaseLeaveALinkTargetAlone(t *testing.T) {
 		t.Fatalf("link target changed: %q", b)
 	}
 }
+
+// A symlink in the middle of the holder directory's path is refused for every
+// operation, and the probe file the age check makes is not created behind it.
+func TestIntermediateSymlinkInTheHolderDirectoryIsRefused(t *testing.T) {
+	newEnv(t)
+	node := t.TempDir()
+	link := filepath.Join(t.TempDir(), "ns")
+	if err := os.Symlink(node, link); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(link, "x")
+	if err := os.Mkdir(filepath.Join(node, "x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(ctx, dir, "v", "n1", Judgement{}); err == nil {
+		t.Error("Acquire worked through a symlinked directory in the path")
+	}
+	if _, err := Read(ctx, dir, "v"); err == nil {
+		t.Error("Read worked through a symlinked directory in the path")
+	}
+	if ents, _ := os.ReadDir(filepath.Join(node, "x")); len(ents) != 0 {
+		t.Errorf("files created behind the link: %v", ents)
+	}
+}

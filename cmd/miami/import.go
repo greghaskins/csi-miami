@@ -228,7 +228,7 @@ func importImage(ctx context.Context, f importFlags) (importResult, error) {
 	if err := os.Mkdir(f.store, 0o755); err != nil && !errors.Is(err, fs.ErrExist) { //nolint:gosec // shared store directory, read by restore tools
 		return r, err
 	}
-	s, err := chunk.Open(f.store)
+	s, err := chunk.OpenOperator(f.store)
 	if err != nil {
 		return r, err
 	}

@@ -530,3 +530,37 @@ func TestPruneSweepsStaleManifestTempFilesThroughTheDescriptor(t *testing.T) {
 	mustExist(t, filepath.Join(dir, m.Name()))
 	mustExist(t, old)
 }
+
+// A symlink in the middle of the store's path (a class's subdirectory on the
+// export pointing at a node directory) is refused, and nothing is created
+// behind it.
+func TestOpenRefusesAnIntermediateSymlink(t *testing.T) {
+	t.Parallel()
+	transport, node := t.TempDir(), t.TempDir()
+	if err := os.Mkdir(filepath.Join(node, "pvc-x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(node, filepath.Join(transport, "ns-b")); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(transport, "ns-b", "pvc-x")
+	if _, err := Open(path); err == nil {
+		t.Error("Open followed a symlinked subdirectory")
+	}
+	if _, err := OpenReadOnly(path); err == nil {
+		t.Error("OpenReadOnly followed a symlinked subdirectory")
+	}
+	if _, _, err := CurrentAt(context.Background(), path); err == nil {
+		t.Error("CurrentAt followed a symlinked subdirectory")
+	}
+	if _, err := ReadManifestAt(context.Background(), path, "1.1"); err == nil {
+		t.Error("ReadManifestAt followed a symlinked subdirectory")
+	}
+	empty(t, filepath.Join(node, "pvc-x"))
+	// The operator's variant follows a link in the prefix, still refusing the last.
+	if s, err := OpenOperator(path); err != nil {
+		t.Errorf("OpenOperator: %v", err)
+	} else {
+		_ = s.Close()
+	}
+}

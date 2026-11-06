@@ -363,7 +363,7 @@ func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
 		}
 	}
 	u := plain
-	u.Sandbox = &Sandbox{ReadWritePaths: []string{"/a", "/b"}, Capabilities: []int{0, 12, 21}}
+	u.Sandbox = &Sandbox{ReadWritePaths: []string{"/a", "/b"}, Capabilities: []int{0, 12, 21}, DenySyscalls: []string{"@mount"}, AddressFamilies: []string{"AF_UNIX"}}
 	got := map[string]any{}
 	for _, p := range properties(u) {
 		got[p.Name] = p.Value.Value()
@@ -372,6 +372,10 @@ func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
 		"NoNewPrivileges": true, "ProtectSystem": "strict", "ProtectHome": "yes",
 		"ReadWritePaths":        []string{"/a", "/b"},
 		"CapabilityBoundingSet": uint64(1<<0 | 1<<12 | 1<<21),
+		"ProtectKernelModules":  true, "ProtectKernelTunables": true, "RestrictSUIDSGID": true,
+		"LockPersonality": true, "RestrictNamespaces": true,
+		"SystemCallFilter":        nameList{false, []string{"@mount"}},
+		"RestrictAddressFamilies": nameList{true, []string{"AF_UNIX"}},
 	} {
 		if !reflect.DeepEqual(got[name], want) {
 			t.Errorf("%s = %v, want %v", name, got[name], want)

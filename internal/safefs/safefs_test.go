@@ -146,3 +146,45 @@ func TestLstatAndReadDirReportLinksAsLinks(t *testing.T) {
 		t.Fatalf("ReadDir = %v, %v", ents, err)
 	}
 }
+
+func TestCheckResolves(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "d"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link(t, filepath.Join(root, "d"), filepath.Join(root, "l"))
+	if err := CheckResolves(filepath.Join(root, "d")); err != nil {
+		t.Errorf("a plain directory: %v", err)
+	}
+	for _, p := range []string{filepath.Join(root, "l"), filepath.Join(root, "l", "."), filepath.Join(root, "missing")} {
+		if err := CheckResolves(p); err == nil {
+			t.Errorf("CheckResolves(%s) accepted", p)
+		}
+	}
+	// An unclean spelling of a plain path is not "itself".
+	if err := CheckResolves(filepath.Join(root, "d") + "/../d"); err == nil {
+		t.Error("an unclean path was accepted")
+	}
+}
+
+func TestOpenRootRefusesASymlinkInThePrefixButOperatorDoesNot(t *testing.T) {
+	t.Parallel()
+	target := t.TempDir()
+	if err := os.Mkdir(filepath.Join(target, "d"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	l := filepath.Join(t.TempDir(), "l")
+	link(t, target, l)
+	if _, err := OpenRoot(filepath.Join(l, "d")); err == nil {
+		t.Error("OpenRoot followed a symlink in the prefix")
+	}
+	d, err := OpenRootOperator(filepath.Join(l, "d"))
+	if err != nil {
+		t.Fatalf("OpenRootOperator: %v", err)
+	}
+	_ = d.Close()
+	if _, err := OpenRootOperator(l); err == nil {
+		t.Error("OpenRootOperator followed a symlink in the last element")
+	}
+}

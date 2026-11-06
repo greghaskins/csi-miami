@@ -1077,7 +1077,7 @@ func TestBlockdUnitIsSandboxed(t *testing.T) {
 	if !has[unix.CAP_SYS_ADMIN] || !has[unix.CAP_NET_ADMIN] {
 		t.Errorf("capabilities %v lack what the nbd calls need", sb.Capabilities)
 	}
-	for _, c := range []int{unix.CAP_SYS_MODULE, unix.CAP_SYS_PTRACE, unix.CAP_SYS_BOOT, unix.CAP_SETUID, unix.CAP_NET_RAW} {
+	for _, c := range []int{unix.CAP_SYS_MODULE, unix.CAP_SYS_PTRACE, unix.CAP_SYS_BOOT, unix.CAP_SETUID, unix.CAP_NET_RAW, unix.CAP_DAC_READ_SEARCH, unix.CAP_CHOWN, unix.CAP_SYS_RESOURCE} {
 		if has[c] {
 			t.Errorf("capability %d is granted", c)
 		}
@@ -1096,5 +1096,31 @@ func TestStartedUnitCarriesTheSandbox(t *testing.T) {
 	}
 	if !slices.Equal(sb.ReadWritePaths, []string{e.cacheDir, e.v.holdDir}) {
 		t.Errorf("ReadWritePaths = %v, want the cache directory and %s", sb.ReadWritePaths, e.v.holdDir)
+	}
+}
+
+// A symlink in the path of the volume's directory (a class's subdirectory on
+// the export pointing at a node directory) stops the stage before any unit
+// starts, since systemd would resolve ReadWritePaths through it.
+func TestSymlinkInTheVolumePathStartsNoUnit(t *testing.T) {
+	e := newEnv(t)
+	node := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(node, filepath.Base(e.v.storeDir)), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(node, e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.converge(); err == nil {
+		t.Fatal("Converge went on through a symlinked directory")
+	}
+	if len(e.sd.units) != 0 {
+		t.Fatalf("a unit was started: %v", e.sd.units)
+	}
+	if ents, _ := os.ReadDir(filepath.Join(node, filepath.Base(e.v.storeDir))); len(ents) != 0 {
+		t.Fatalf("files created behind the link: %v", ents)
 	}
 }

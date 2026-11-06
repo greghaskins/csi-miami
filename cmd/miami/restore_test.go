@@ -500,3 +500,31 @@ func TestRestoreSyncsTheOutputDirectoryAfterTheLink(t *testing.T) {
 		t.Fatalf("the real directory sync fails: %v", err)
 	}
 }
+
+// A manifest that names another volume than the store directory is restored
+// (a renamed copy of a store is the usual cause) with a warning.
+func TestRestoreWarnsWhenTheManifestIsOfAnotherVolume(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t) // the manifest says pvc-test; the directory is a temp name
+	ts.manifest(t, 1, 1, true, chunk.ZeroHash(testMiB))
+	out := filepath.Join(t.TempDir(), "v.img")
+	code, _, stderr := runMiami("restore", "-store", ts.dir, "-out", out)
+	if code != 0 || !strings.Contains(stderr, "warning") || !strings.Contains(stderr, "pvc-test") {
+		t.Fatalf("exit %d, stderr %q; want success with a warning naming the volume", code, stderr)
+	}
+}
+
+// An operator's path may pass through a symlink (a mount point alias).
+func TestRestoreFollowsASymlinkInTheOperatorsPath(t *testing.T) {
+	t.Parallel()
+	ts := newTestStore(t)
+	ts.manifest(t, 1, 1, true, chunk.ZeroHash(testMiB))
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(filepath.Dir(ts.dir), alias); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "v.img")
+	if code, _, stderr := runMiami("restore", "-store", filepath.Join(alias, filepath.Base(ts.dir)), "-out", out); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+}
