@@ -98,6 +98,16 @@ func TestExitCodeTwoIsErrBadKey(t *testing.T) {
 	if err := crypt.Rotate(ctx, bad(), "/dev/x", []byte("a"), []byte("b")); !errors.Is(err, crypt.ErrBadKey) {
 		t.Fatalf("Rotate err = %v, want ErrBadKey", err)
 	}
+	// Exit 2 means a wrong key only where a key is checked.
+	for name, f := range map[string]func(r *fake.Runner) error{
+		"Close":  func(r *fake.Runner) error { return crypt.Close(ctx, r, "n") },
+		"Resize": func(r *fake.Runner) error { return crypt.Resize(ctx, r, "n") },
+		"Format": func(r *fake.Runner) error { return crypt.Format(ctx, r, "/dev/x", []byte("k"), crypt.Params{}) },
+	} {
+		if err := f(bad()); err == nil || errors.Is(err, crypt.ErrBadKey) {
+			t.Fatalf("%s exit 2 err = %v, want an error that is not ErrBadKey", name, err)
+		}
+	}
 	other := &fake.Runner{Replies: []fake.Reply{{Code: 4, Stderr: "boom"}}}
 	err := crypt.Open(ctx, other, "/dev/x", "n", []byte("k"))
 	if err == nil || errors.Is(err, crypt.ErrBadKey) || !strings.Contains(err.Error(), "boom") {

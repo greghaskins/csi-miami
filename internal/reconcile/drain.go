@@ -1,7 +1,6 @@
 package reconcile
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -134,9 +133,6 @@ func (p *pass) drainVolume(d item.Drainer, in intent.Intent) error {
 	err = d.Drain(p.ctx, in)
 	if err != nil {
 		p.noteHung(dir, err)
-		if errors.Is(err, item.ErrUnstageIncomplete) {
-			return err
-		}
 	}
 	return err
 }

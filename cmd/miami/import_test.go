@@ -292,6 +292,29 @@ func TestImportInterruptedIsRefusedWithTheWayOut(t *testing.T) {
 	}
 }
 
+// A temporary file of the interrupted manifest write beside it, or alone, is
+// still an interrupted import: the refusal names what to remove.
+func TestImportInterruptedWithATempFileIsRefusedWithTheWayOut(t *testing.T) {
+	t.Parallel()
+	vol := volumeDir(t)
+	s, _ := chunk.Open(vol)
+	must(t, s.WriteManifest(context.Background(), chunk.Manifest{Volume: "pvc-1234", Size: testMiB, Chunk: testMiB, Chunks: []chunk.Hash{chunk.ZeroHash(testMiB)}, Sequence: 1}))
+	tmp := filepath.Join(vol, "manifests", ".tmp-0.1-123456")
+	must(t, os.WriteFile(tmp, []byte("partial"), 0o600))
+	code, _, stderr := runMiami("import", "-image", writeImage(t, ext4Image(int(testMiB))), "-store", vol, "-chunk-size", "1048576")
+	if code != 1 || !strings.Contains(stderr, "interrupted") || !strings.Contains(stderr, filepath.Join(vol, "manifests", "0.1")) || !strings.Contains(stderr, tmp) {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	must(t, os.Remove(tmp))
+	must(t, os.Remove(filepath.Join(vol, "manifests", "0.1")))
+	// Only a temp file: the manifest write never finished.
+	must(t, os.WriteFile(tmp, []byte("partial"), 0o600))
+	code, _, stderr = runMiami("import", "-image", writeImage(t, ext4Image(int(testMiB))), "-store", vol, "-chunk-size", "1048576")
+	if code != 1 || !strings.Contains(stderr, "interrupted") || !strings.Contains(stderr, tmp) {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+}
+
 func TestImportCapacityDerivesTheChunkSizeAndSizesTheDevice(t *testing.T) {
 	t.Parallel()
 	vol := volumeDir(t)
@@ -367,4 +390,23 @@ func TestImportRaceWithALiveHolderNeverRollsBack(t *testing.T) {
 		}
 	}
 	t.Logf("holder won %d of 60", raced)
+}
+
+// The block server serves only a manifest of its own volume, so an import whose
+// -volume is not the store directory's name is refused before anything is read
+// or written, and naming the directory itself is fine.
+func TestImportRefusesAVolumeNameThatIsNotTheDirectoryName(t *testing.T) {
+	t.Parallel()
+	img := writeImage(t, ext4Image(int(testMiB)))
+	vol := volumeDir(t)
+	code, _, stderr := runMiami("import", "-image", img, "-store", vol, "-volume", "pvc-00000000-0000-4000-8000-000000000002")
+	if code == 0 || !strings.Contains(stderr, "name of the store directory") {
+		t.Fatalf("code %d, stderr %q; want a refusal naming the directory", code, stderr)
+	}
+	if got := dirNames(t, vol); got != "" {
+		t.Fatalf("the refused import left %q behind", got)
+	}
+	if code, _, stderr := runMiami("import", "-image", img, "-store", vol, "-volume", filepath.Base(vol)); code != 0 {
+		t.Fatalf("-volume naming the directory: code %d, %s", code, stderr)
+	}
 }

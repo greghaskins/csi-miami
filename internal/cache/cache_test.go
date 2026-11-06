@@ -705,8 +705,16 @@ func TestPublishedChunkKeepsFsyncObligation(t *testing.T) {
 	if _, ok := c.unsynced[1]; !ok {
 		t.Fatal("published chunk dropped from the unsynced set before its bytes were fsynced")
 	}
+	// The test replaces a process-wide seam, so it does not run in parallel.
+	var synced int
+	old := fdatasync
+	fdatasync = func(fd int) error { synced++; return old(fd) }
+	t.Cleanup(func() { fdatasync = old })
 	if err := c.Sync(); err != nil {
 		t.Fatal(err)
+	}
+	if synced != 1 {
+		t.Fatalf("Sync fdatasynced %d chunk files, want the published chunk's 1", synced)
 	}
 	if len(c.unsynced) != 0 {
 		t.Fatal("Sync left obligations")

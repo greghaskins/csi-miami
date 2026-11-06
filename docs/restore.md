@@ -68,5 +68,6 @@ is refused. It needs no key and never opens the image.
   or an epoch claim, and `current` is created only if absent, so an import can
   never replace a volume that went live meanwhile.
 - An import killed part way is not resumed. If the directory holds only
-  `manifests/0.1`, with no `current` and no holder, the command says so;
-  remove `manifests/0.1` (chunks already stored are reused) and run it again.
+  `manifests/0.1` or a temporary file of its write (`manifests/.tmp-0.1-*`),
+  with no `current` and no holder, the command names what is left; remove it
+  (chunks already stored are reused) and run it again.

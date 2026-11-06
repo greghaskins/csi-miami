@@ -92,7 +92,7 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	fl.SetOutput(&out)
 	fl.StringVar(&f.image, "image", "", "the raw block image file to import, an absolute path (required)")
 	fl.StringVar(&f.store, "store", "", "the new volume's directory on the transport, an absolute path; its parent must exist (required)")
-	fl.StringVar(&f.volume, "volume", "", "the volume name recorded in the manifest (default: the store directory's name)")
+	fl.StringVar(&f.volume, "volume", "", "the volume name recorded in the manifest; it must be the store directory's name, which is also the default")
 	fl.Int64Var(&f.chunkSize, "chunk-size", 0, "chunk size in bytes, a power of two: the class's chunkSize (default: derived from the capacity, as the controller does for a class without one)")
 	fl.Int64Var(&f.capacity, "capacity", 0, "the PV's capacity in bytes (requests.storage); the device is the capacity rounded up to whole chunks, zero padded (default: the image size)")
 
@@ -120,6 +120,12 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	}
 	if f.volume == "" {
 		f.volume = filepath.Base(f.store)
+	}
+	// The block server refuses a manifest of another volume, so a store whose
+	// directory is not named for the volume could never be staged: refuse now.
+	if f.volume != filepath.Base(f.store) {
+		_, _ = fmt.Fprintf(stderr, "miami import: -volume %q must be the name of the store directory (%q): the volume's manifests are only served from a directory of that name\n", f.volume, filepath.Base(f.store))
+		return 2
 	}
 	if !volumeNameShape.MatchString(f.volume) {
 		_, _ = fmt.Fprintf(stderr, "miami import: -volume %q is not a valid volume name\n", f.volume)
@@ -319,7 +325,20 @@ func requireNewVolume(store string) error {
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	interrupted := len(ents) == 1 && ents[0].Name() == fmt.Sprintf("%d.%d", importEpoch, importSequence)
+	// What an interrupted import leaves: the import's own manifest, and the
+	// temporary files of a manifest write that did not finish.
+	own := fmt.Sprintf("%d.%d", importEpoch, importSequence)
+	var left []string
+	others := 0
+	for _, e := range ents {
+		switch {
+		case e.Name() == own, strings.HasPrefix(e.Name(), ".tmp-"+own+"-"):
+			left = append(left, filepath.Join(store, "manifests", e.Name()))
+		default:
+			others++
+		}
+	}
+	interrupted := others == 0 && len(left) > 0
 	if len(ents) > 0 && !interrupted {
 		return fmt.Errorf("%s already has manifests; refusing to import over a volume", store)
 	}
@@ -339,9 +358,8 @@ func requireNewVolume(store string) error {
 		}
 	}
 	if interrupted {
-		name := fmt.Sprintf("%d.%d", importEpoch, importSequence)
-		return fmt.Errorf("%s holds only manifests/%s, with no current and no holder: an earlier import was interrupted and is not resumed; remove %s and import again",
-			store, name, filepath.Join(store, "manifests", name))
+		return fmt.Errorf("%s holds only what an earlier import left (%s), with no current and no holder: that import was interrupted and is not resumed; remove it and import again",
+			store, strings.Join(left, ", "))
 	}
 	return nil
 }

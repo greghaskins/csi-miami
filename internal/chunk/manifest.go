@@ -44,6 +44,16 @@ func parseCanonicalUint(s string) (uint64, error) {
 	return v, nil
 }
 
+// parseCanonicalInt is parseCanonicalUint for a signed value: no sign, no
+// leading zeros, so a manifest has one spelling and Marshal reproduces it.
+func parseCanonicalInt(s string) (int64, error) {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || strconv.FormatInt(v, 10) != s {
+		return 0, fmt.Errorf("%w: a %d byte value is not a canonical decimal number", ErrManifestFormat, len(s))
+	}
+	return v, nil
+}
+
 // ParseManifestName splits "<epoch>.<sequence>", both canonical decimal.
 func ParseManifestName(s string) (epoch, seq uint64, err error) {
 	e, q, ok := strings.Cut(s, ".")
@@ -120,12 +130,12 @@ func ParseManifest(r io.Reader) (Manifest, error) {
 		}
 		h, err := ParseHash(line)
 		if err != nil {
-			return Manifest{}, bad("%v", err)
+			return Manifest{}, bad("%w", err)
 		}
 		m.Chunks = append(m.Chunks, h)
 	}
 	if err := sc.Err(); err != nil {
-		return Manifest{}, bad("%v", err)
+		return Manifest{}, bad("%w", err)
 	}
 	if first {
 		return Manifest{}, bad("empty")
@@ -136,7 +146,7 @@ func ParseManifest(r io.Reader) (Manifest, error) {
 		}
 	}
 	if err := CheckChunkSize(m.Size, m.Chunk); err != nil {
-		return Manifest{}, bad("%v", err)
+		return Manifest{}, bad("%w", err)
 	}
 	if m.Size%m.Chunk != 0 {
 		return Manifest{}, bad("size %d is not a whole number of %d byte chunks", m.Size, m.Chunk)
@@ -170,9 +180,9 @@ func (m *Manifest) setHeader(seen map[string]bool, key, val string) error {
 	case "sequence":
 		m.Sequence, err = parseCanonicalUint(val)
 	case "size":
-		m.Size, err = strconv.ParseInt(val, 10, 64)
+		m.Size, err = parseCanonicalInt(val)
 	case "chunk":
-		m.Chunk, err = strconv.ParseInt(val, 10, 64)
+		m.Chunk, err = parseCanonicalInt(val)
 	case "time":
 		m.Time, err = time.Parse(time.RFC3339, val)
 	}

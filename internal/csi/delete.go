@@ -177,7 +177,7 @@ func (c *Controller) removeHolderFiles(dir, name string) {
 	files = append(files, sizes...)
 	for _, f := range files {
 		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			c.log.Warn("could not remove a holder file of a deleted volume", "volume", name, "error", reason(err))
+			c.log.Warn("could not remove a file left beside a deleted volume", "volume", name, "file", filepath.Base(f), "error", reason(err))
 		}
 	}
 }
