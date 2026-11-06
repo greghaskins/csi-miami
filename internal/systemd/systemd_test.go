@@ -373,7 +373,7 @@ func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
 		"ReadWritePaths":        []string{"/a", "/b"},
 		"CapabilityBoundingSet": uint64(1<<0 | 1<<12 | 1<<21),
 		"ProtectKernelModules":  true, "ProtectKernelTunables": true, "RestrictSUIDSGID": true,
-		"LockPersonality": true, "RestrictNamespaces": true,
+		"LockPersonality": true, "RestrictNamespaces": uint64(0),
 		"SystemCallFilter":        nameList{false, []string{"@mount"}},
 		"RestrictAddressFamilies": nameList{true, []string{"AF_UNIX"}},
 	} {
