@@ -290,3 +290,15 @@ func TestWriteAtFullCacheRefuses(t *testing.T) {
 		t.Fatalf("WriteAt into a full cache = %v, want ErrFull", err)
 	}
 }
+
+// A write that needs a base the cache does not hold, into a full cache, is
+// ErrFull at once: the caller must not be sent to fetch a base it cannot use.
+func TestWriteAtFullCacheAnswersBeforeAskingForABase(t *testing.T) {
+	c := newSubCache(t, srChunk)
+	if err := c.WriteAt(0, 0, filled(srChunk, 1), nil, true); err != nil {
+		t.Fatalf("first WriteAt: %v", err)
+	}
+	if err := c.WriteAt(1, 0, filled(4096, 2), nil, false); !errors.Is(err, ErrFull) {
+		t.Fatalf("nil-base WriteAt of a non-resident chunk into a full cache = %v, want ErrFull", err)
+	}
+}

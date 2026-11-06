@@ -31,11 +31,6 @@ var volumeAccessModes = map[csi.VolumeCapability_AccessMode_Mode]bool{
 // volumeFsType is the file system of a volume of kind volume.
 const volumeFsType = "ext4"
 
-// capabilityProblem is capabilityProblemFor a directory volume.
-func capabilityProblem(c *csi.VolumeCapability) string {
-	return capabilityProblemFor(volume.KindDirectory, c)
-}
-
 // capabilityProblemFor returns why c is not a capability a volume of the
 // kind has, or "" if it is. A capability must be a mount capability (neither
 // kind is a block device) and have an access mode the kind supports. A

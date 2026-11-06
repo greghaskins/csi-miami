@@ -396,12 +396,16 @@ func TestDrainFenceUsesTheLargerOfTheIndexAndHeldEpoch(t *testing.T) {
 	}
 }
 
-// And a current above both is a fence even when the cache descends from it:
-// this node built the cache on a generation another acquisition published
-// (epoch 5), under an epoch-3 ownership that was then fenced.
-func TestDrainFencedByAGenerationAboveBothEpochsDiscards(t *testing.T) {
+// A defensive check, not a reachable state. The index is built at the epoch
+// held at stage, and its base is a generation published at that epoch or
+// before, so a base above the index's epoch cannot be written by this code.
+// reuse accepts a cache whose base is `current`, so if such an index ever
+// existed (a damaged or hand-made cache) the fence must still discard it
+// rather than publish over a newer generation. The test builds that index by
+// hand to keep the guard honest.
+func TestDrainDiscardsAnImpossibleIndexWhoseBaseIsAboveItsEpoch(t *testing.T) {
 	e := orphanEnv(t)
-	e.makeCache(3, "5.1", 3) // the cache's base is the epoch-5 manifest it was restaged from
+	e.makeCache(3, "5.1", 3) // impossible by construction: a base from epoch 5 under an epoch-3 index
 	e.curName = "5.1"
 	if err := e.it.Drain(bg, e.drainIntent(t)); err != nil {
 		t.Fatal(err)

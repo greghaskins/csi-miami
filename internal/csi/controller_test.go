@@ -17,6 +17,7 @@ import (
 	kubefake "github.com/greghaskins/csi-miami/internal/kube/fake"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 func TestNewControllerErrors(t *testing.T) {
@@ -706,17 +707,17 @@ func TestPublishAndUnpublish(t *testing.T) {
 	}
 }
 
-func TestCapabilityProblemIsEmptyForEveryAcceptedMode(t *testing.T) {
+func TestCapabilityProblemForIsEmptyForEveryAcceptedMode(t *testing.T) {
 	t.Parallel()
 	for mode, accepted := range acceptedAccessModes {
 		if !accepted {
 			continue
 		}
-		if p := capabilityProblem(mountCap(mode)); p != "" {
+		if p := capabilityProblemFor(volume.KindDirectory, mountCap(mode)); p != "" {
 			t.Errorf("%v: %s", mode, p)
 		}
 	}
-	if p := capabilityProblem(mountCap(csi.VolumeCapability_AccessMode_UNKNOWN)); p == "" {
+	if p := capabilityProblemFor(volume.KindDirectory, mountCap(csi.VolumeCapability_AccessMode_UNKNOWN)); p == "" {
 		t.Error("UNKNOWN access mode accepted")
 	}
 }

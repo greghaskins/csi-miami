@@ -292,6 +292,29 @@ func TestImportInterruptedIsRefusedWithTheWayOut(t *testing.T) {
 	}
 }
 
+// A temporary file of the interrupted manifest write beside it, or alone, is
+// still an interrupted import: the refusal names what to remove.
+func TestImportInterruptedWithATempFileIsRefusedWithTheWayOut(t *testing.T) {
+	t.Parallel()
+	vol := volumeDir(t)
+	s, _ := chunk.Open(vol)
+	must(t, s.WriteManifest(context.Background(), chunk.Manifest{Volume: "pvc-1234", Size: testMiB, Chunk: testMiB, Chunks: []chunk.Hash{chunk.ZeroHash(testMiB)}, Sequence: 1}))
+	tmp := filepath.Join(vol, "manifests", ".tmp-0.1-123456")
+	must(t, os.WriteFile(tmp, []byte("partial"), 0o600))
+	code, _, stderr := runMiami("import", "-image", writeImage(t, ext4Image(int(testMiB))), "-store", vol, "-chunk-size", "1048576")
+	if code != 1 || !strings.Contains(stderr, "interrupted") || !strings.Contains(stderr, filepath.Join(vol, "manifests", "0.1")) || !strings.Contains(stderr, tmp) {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	must(t, os.Remove(tmp))
+	must(t, os.Remove(filepath.Join(vol, "manifests", "0.1")))
+	// Only a temp file: the manifest write never finished.
+	must(t, os.WriteFile(tmp, []byte("partial"), 0o600))
+	code, _, stderr = runMiami("import", "-image", writeImage(t, ext4Image(int(testMiB))), "-store", vol, "-chunk-size", "1048576")
+	if code != 1 || !strings.Contains(stderr, "interrupted") || !strings.Contains(stderr, tmp) {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+}
+
 func TestImportCapacityDerivesTheChunkSizeAndSizesTheDevice(t *testing.T) {
 	t.Parallel()
 	vol := volumeDir(t)

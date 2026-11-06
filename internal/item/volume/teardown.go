@@ -221,7 +221,7 @@ func deviceNumbers(path string) (major, minor int, ok bool) {
 // fails is a Warn naming the device, because the device is what stays behind
 // if the unit stop does not take it down. It reads the server's status first
 // and sends nothing to a server that serves another volume, which is the
-// error returned.
+// error returned, and sends nothing when the status cannot be read.
 func (it *Item) stopServer(ctx context.Context, v vol) error {
 	device := -1
 	if dev, ok, err := it.findDevice(v); err == nil && ok {
@@ -235,10 +235,16 @@ func (it *Item) stopServer(ctx context.Context, v vol) error {
 		return nil
 	}
 	defer func() { _ = c.Close() }()
-	if st, err := c.Status(cctx); err == nil {
-		if err := it.identity(v, st); err != nil {
-			return err
-		}
+	st, err := c.Status(cctx)
+	if err != nil {
+		// Whose server this is is unknown, so it gets no request. The unit stop
+		// that follows still takes it down, and a device it leaves behind is
+		// disconnected there, after the checks that nothing uses it.
+		it.log.Warn("could not read the block server's status; not sending it the stop request", "volume", v.in.VolumeID, "device", device, "error", err)
+		return nil
+	}
+	if err := it.identity(v, st); err != nil {
+		return err
 	}
 	if err := c.Stop(cctx); err != nil {
 		it.log.Warn("the block server did not take the stop request", "volume", v.in.VolumeID, "device", device, "error", err)

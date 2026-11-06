@@ -49,7 +49,6 @@ type nodeConfig struct {
 	binDir        string
 	systemdSocket string
 	sharedDirs    stringList
-	remediate     bool
 
 	// The defaults of the generation timers, for a volume whose class sets none.
 	genInterval, genMaxAge, genTimeout time.Duration
@@ -104,7 +103,6 @@ func nodeFlags(fs *flag.FlagSet, cfg *nodeConfig) {
 	fs.DurationVar(&cfg.genInterval, "generation-interval", volkinds.DefaultGenerationEvery, "how often a volume with unpublished writes publishes a generation, unless its class sets generations.interval")
 	fs.DurationVar(&cfg.genMaxAge, "generation-max-age", volkinds.DefaultGenerationMaxAge, "how old the newest generation of a volume with unpublished writes may get before the volume is reported overdue, unless its class sets generations.maxAge")
 	fs.DurationVar(&cfg.genTimeout, "generation-timeout", reconcile.DefaultGenerationTimeout, "deadline of one generation, freeze to upload")
-	fs.BoolVar(&cfg.remediate, "remediate", false, "let the reconciler repair what it finds wrong beyond converging intent (off until remediation ships)")
 }
 
 // runNode parses the flags of `miami node` and serves CSI until SIGTERM or
@@ -226,7 +224,6 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		opts.Events = events
 	}
 	opts.CacheDir, opts.BinDir, opts.SystemdSocket = cfg.cacheDir, cfg.binDir, cfg.systemdSocket
-	opts.Remediate = cfg.remediate
 	// The prerequisites of the volume kind are probed now and on every pass;
 	// a node without them still serves directory volumes.
 	probe := newProber(prereq.Options{SystemdSocket: cfg.systemdSocket, CacheDir: cfg.cacheDir}, cacheLayoutErr(cfg), reg, log)

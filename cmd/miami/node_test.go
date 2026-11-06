@@ -38,7 +38,7 @@ func TestRunNodeFlags(t *testing.T) {
 				"-reconcile-interval", "-deadline", "-transport-idle", "-kubeconfig", "-no-events",
 				"-cache-dir", "-bin-dir", "<kubelet-dir>/plugins/miami.csi.greghaskins.com/bin",
 				"-systemd-socket", "/run/systemd/private", "-shared-dir", "<kubelet-dir>/plugins/miami.csi.greghaskins.com/cache",
-				"-remediate", "-generation-interval", "(default 5m0s)", "-generation-max-age", "(default 1h0m0s)", "-generation-timeout", "(default 5m0s)",
+				"-generation-interval", "(default 5m0s)", "-generation-max-age", "(default 1h0m0s)", "-generation-timeout", "(default 5m0s)",
 			},
 		},
 		{name: "unknown flag", args: []string{"-nope"}, wantCode: 2, wantStderr: []string{"flag provided but not defined: -nope"}},
