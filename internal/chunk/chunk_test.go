@@ -467,37 +467,6 @@ func TestPruneKeepsNewestAndTheirChunks(t *testing.T) {
 	}
 }
 
-func TestPruneRemovesAStaleManifestTempFileButNotAYoungOne(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	s := openStore(t)
-	h := Sum([]byte("a"))
-	if err := s.Put(ctx, h, strings.NewReader("a"), 1); err != nil {
-		t.Fatal(err)
-	}
-	writeM(t, s, 1, 1, h)
-	stale := filepath.Join(s.root, "manifests", ".tmp-1.2-old")
-	young := filepath.Join(s.root, "manifests", ".tmp-1.2-young")
-	for _, p := range []string{stale, young} {
-		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	old := time.Now().Add(-2 * staleTemp)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.Prune(ctx, 1); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(stale); err == nil {
-		t.Error("stale manifest temp file kept")
-	}
-	if _, err := os.Stat(young); err != nil {
-		t.Error("young manifest temp file removed")
-	}
-}
-
 func TestPruneChangesNothingWhenAKeptManifestIsUnreadable(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

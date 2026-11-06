@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 type blockdFlags struct {
 	volume     string
 	store      string
+	mount      string
 	cacheDir   string
 	control    string
 	size       int64
@@ -41,6 +43,7 @@ func runBlockd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("miami blockd", flag.ContinueOnError)
 	fs.SetOutput(&out)
 	fs.StringVar(&f.volume, "volume", "", "the volume name; also the nbd backend identifier (required)")
+	fs.StringVar(&f.mount, "mount", "", "the transport's mount point, an absolute path: -store is below it, and no symlink below it is followed (required)")
 	fs.StringVar(&f.store, "store", "", "the volume's directory on the transport (required)")
 	fs.StringVar(&f.cacheDir, "cache-dir", "", "the node-local cache directory (required)")
 	fs.StringVar(&f.control, "control", "", "the control socket to listen on (required)")
@@ -70,7 +73,9 @@ func runBlockd(args []string, stdout, stderr io.Writer) int {
 		bad bool
 	}{
 		{"-volume is required", f.volume == ""},
+		{"-mount is required", f.mount == ""},
 		{"-store is required", f.store == ""},
+		{"-store must be below -mount", f.mount != "" && f.store != "" && !strings.HasPrefix(f.store, strings.TrimSuffix(f.mount, "/")+"/")},
 		{"-cache-dir is required", f.cacheDir == ""},
 		{"-control is required", f.control == ""},
 		{"-node is required", f.node == ""},
@@ -87,6 +92,7 @@ func runBlockd(args []string, stdout, stderr io.Writer) int {
 
 	cfg := blockd.Config{
 		Volume:          f.volume,
+		MountRoot:       f.mount,
 		StoreDir:        f.store,
 		CacheDir:        f.cacheDir,
 		ControlSocket:   f.control,

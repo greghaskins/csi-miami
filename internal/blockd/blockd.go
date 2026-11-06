@@ -42,7 +42,8 @@ const (
 // Config is the whole configuration of one block server.
 type Config struct {
 	Volume        string // the volume name; also the nbd backend identifier
-	StoreDir      string // the volume's directory on the transport
+	MountRoot     string // the transport's mount point: local and trusted, as is everything above it; StoreDir is below it
+	StoreDir      string // the volume's directory on the transport, below MountRoot
 	CacheDir      string // the node-local cache directory
 	ControlSocket string // the unix socket the control service listens on
 

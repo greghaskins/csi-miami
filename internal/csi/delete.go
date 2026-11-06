@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -16,6 +17,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/safefs"
 	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -171,13 +173,26 @@ func (c *Controller) refuseHeldVolume(ctx context.Context, id volume.ID, dir str
 // deleted volume's directory: the holder file and its epoch claims, and the
 // size record. Best effort; the volume is gone either way.
 func (c *Controller) removeHolderFiles(dir, name string) {
-	parent := filepath.Dir(dir)
-	files, _ := filepath.Glob(filepath.Join(parent, name+".holder*"))
-	sizes, _ := filepath.Glob(filepath.Join(parent, name+".size*"))
-	files = append(files, sizes...)
-	for _, f := range files {
-		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			c.log.Warn("could not remove a file left beside a deleted volume", "volume", name, "file", filepath.Base(f), "error", reason(err))
+	// The parent is on the shared export: it is opened without following a
+	// symlink anywhere in its path, and the files are unlinked relative to it.
+	d, err := safefs.OpenRoot(filepath.Dir(dir))
+	if err != nil {
+		c.log.Warn("could not open the directory beside a deleted volume", "volume", name, "error", reason(err))
+		return
+	}
+	defer func() { _ = d.Close() }()
+	ents, err := d.ReadDir()
+	if err != nil {
+		c.log.Warn("could not list the directory beside a deleted volume", "volume", name, "error", reason(err))
+		return
+	}
+	for _, e := range ents {
+		n := e.Name()
+		if !strings.HasPrefix(n, name+".holder") && !strings.HasPrefix(n, name+".size") {
+			continue
+		}
+		if err := d.Unlink(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			c.log.Warn("could not remove a file left beside a deleted volume", "volume", name, "file", n, "error", reason(err))
 		}
 	}
 }

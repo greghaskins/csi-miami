@@ -92,7 +92,7 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	fl.SetOutput(&out)
 	fl.StringVar(&f.image, "image", "", "the raw block image file to import, an absolute path (required)")
 	fl.StringVar(&f.store, "store", "", "the new volume's directory on the transport, an absolute path; its parent must exist (required)")
-	fl.StringVar(&f.volume, "volume", "", "the volume name recorded in the manifest (default: the store directory's name)")
+	fl.StringVar(&f.volume, "volume", "", "the volume name recorded in the manifest; it must be the store directory's name, which is also the default")
 	fl.Int64Var(&f.chunkSize, "chunk-size", 0, "chunk size in bytes, a power of two: the class's chunkSize (default: derived from the capacity, as the controller does for a class without one)")
 	fl.Int64Var(&f.capacity, "capacity", 0, "the PV's capacity in bytes (requests.storage); the device is the capacity rounded up to whole chunks, zero padded (default: the image size)")
 
@@ -120,6 +120,12 @@ func runImport(args []string, stdout, stderr io.Writer) int {
 	}
 	if f.volume == "" {
 		f.volume = filepath.Base(f.store)
+	}
+	// The block server refuses a manifest of another volume, so a store whose
+	// directory is not named for the volume could never be staged: refuse now.
+	if f.volume != filepath.Base(f.store) {
+		_, _ = fmt.Fprintf(stderr, "miami import: -volume %q must be the name of the store directory (%q): the volume's manifests are only served from a directory of that name\n", f.volume, filepath.Base(f.store))
+		return 2
 	}
 	if !volumeNameShape.MatchString(f.volume) {
 		_, _ = fmt.Fprintf(stderr, "miami import: -volume %q is not a valid volume name\n", f.volume)
@@ -222,10 +228,11 @@ func importImage(ctx context.Context, f importFlags) (importResult, error) {
 	if err := os.Mkdir(f.store, 0o755); err != nil && !errors.Is(err, fs.ErrExist) { //nolint:gosec // shared store directory, read by restore tools
 		return r, err
 	}
-	s, err := chunk.Open(f.store)
+	s, err := chunk.OpenOperator(f.store)
 	if err != nil {
 		return r, err
 	}
+	defer func() { _ = s.Close() }()
 	hashes, err := putImage(ctx, s, img, r.imageSize, r.chunk, int(r.deviceSize/r.chunk))
 	if err != nil {
 		return r, err

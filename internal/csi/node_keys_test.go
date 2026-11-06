@@ -14,6 +14,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
@@ -173,5 +175,74 @@ func TestKeyNeverInLogsOrIntent(t *testing.T) {
 				t.Errorf("a key was not wiped after the call: %q", b)
 			}
 		}
+	}
+}
+
+func TestNodeRejectsKeysOutsideTheBounds(t *testing.T) {
+	t.Parallel()
+	short := strings.Repeat("s", 31)
+	long := strings.Repeat("l", 4097)
+	for name, secrets := range map[string]map[string]string{
+		"short key":         {"key": short},
+		"long key":          {"key": long},
+		"long previous key": {"key": testKey, "previousKey": long},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rec := &fakeRec{record: stagedRecord()}
+			n := newTestNode(t, rec, nil)
+			sreq := stageReq()
+			sreq.Secrets = secrets
+			_, err := n.NodeStageVolume(context.Background(), sreq)
+			preq := publishReq()
+			preq.Secrets = secrets
+			_, perr := n.NodePublishVolume(context.Background(), preq)
+			for _, e := range []error{err, perr} {
+				if status.Code(e) != codes.InvalidArgument {
+					t.Fatalf("code = %v (%v), want InvalidArgument", status.Code(e), e)
+				}
+				for _, v := range secrets {
+					if strings.Contains(e.Error(), v) {
+						t.Fatalf("error carries the key: %v", e)
+					}
+				}
+			}
+			if len(rec.stageKeys) != 0 || len(rec.publishKeys) != 0 {
+				t.Fatal("the reconciler was called with a bad key")
+			}
+		})
+	}
+}
+
+func TestNodeAcceptsKeysAtTheBounds(t *testing.T) {
+	t.Parallel()
+	for _, n := range []int{32, 4096} {
+		rec := &fakeRec{}
+		req := stageReq()
+		req.Secrets = map[string]string{"key": strings.Repeat("k", n)}
+		if _, err := newTestNode(t, rec, nil).NodeStageVolume(context.Background(), req); err != nil {
+			t.Fatalf("%d byte key: %v", n, err)
+		}
+	}
+}
+
+// Rotation passes the old key as previousKey, and a volume formatted before the
+// lower bound existed has a short one: it must reach the reconciler.
+func TestNodeAcceptsAShortPreviousKey(t *testing.T) {
+	t.Parallel()
+	rec := &fakeRec{}
+	req := stageReq()
+	req.Secrets = map[string]string{"key": testKey, "previousKey": "short"}
+	if _, err := newTestNode(t, rec, nil).NodeStageVolume(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.stageKeys) != 1 || string(rec.stageKeys[0].previous) != "short" || string(rec.stageKeys[0].key) != testKey {
+		t.Errorf("stage keys = %q", rec.stageKeys)
+	}
+	// ...but the key itself still has the lower bound.
+	req = stageReq()
+	req.Secrets = map[string]string{"key": "short", "previousKey": testPrevious}
+	if _, err := newTestNode(t, &fakeRec{}, nil).NodeStageVolume(context.Background(), req); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a short key = %v, want InvalidArgument", err)
 	}
 }

@@ -391,3 +391,22 @@ func TestImportRaceWithALiveHolderNeverRollsBack(t *testing.T) {
 	}
 	t.Logf("holder won %d of 60", raced)
 }
+
+// The block server serves only a manifest of its own volume, so an import whose
+// -volume is not the store directory's name is refused before anything is read
+// or written, and naming the directory itself is fine.
+func TestImportRefusesAVolumeNameThatIsNotTheDirectoryName(t *testing.T) {
+	t.Parallel()
+	img := writeImage(t, ext4Image(int(testMiB)))
+	vol := volumeDir(t)
+	code, _, stderr := runMiami("import", "-image", img, "-store", vol, "-volume", "pvc-00000000-0000-4000-8000-000000000002")
+	if code == 0 || !strings.Contains(stderr, "name of the store directory") {
+		t.Fatalf("code %d, stderr %q; want a refusal naming the directory", code, stderr)
+	}
+	if got := dirNames(t, vol); got != "" {
+		t.Fatalf("the refused import left %q behind", got)
+	}
+	if code, _, stderr := runMiami("import", "-image", img, "-store", vol, "-volume", filepath.Base(vol)); code != 0 {
+		t.Fatalf("-volume naming the directory: code %d, %s", code, stderr)
+	}
+}

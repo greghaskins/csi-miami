@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
 var (
@@ -24,33 +26,78 @@ var (
 	ErrNoCurrent = errors.New("chunk: no current manifest")
 )
 
-// Store is the directory of one volume on its transport.
+// maxCurrentBytes bounds what Store reads of `current`: a manifest name is two
+// 20-digit numbers, a dot and a newline.
+const maxCurrentBytes = 128
+
+// Store is the directory of one volume on its transport. The shared export is
+// not trusted for integrity: the store holds one descriptor on its root, opened
+// without following a symlink, and every access is relative to it and follows
+// no symlink (package safefs), so nothing on the export can point an access at
+// a file outside the store.
 type Store struct {
 	root string
+	dir  *safefs.Dir
 }
 
 // Open opens the store at root, which must exist, creating chunks/ and
-// manifests/ when absent.
-func Open(root string) (*Store, error) {
-	fi, err := os.Stat(root)
+// manifests/ when absent. A symlink anywhere in root, or at chunks or
+// manifests, is refused.
+func Open(root string) (*Store, error) { return open(root, safefs.OpenRoot) }
+
+// OpenOperator is Open for a directory an operator named on a command line:
+// a symlink in the path's prefix is followed, as any tool would.
+func OpenOperator(root string) (*Store, error) { return open(root, safefs.OpenRootOperator) }
+
+func open(root string, openRoot func(string) (*safefs.Dir, error)) (*Store, error) {
+	dir, err := openRoot(root)
 	if err != nil {
 		return nil, fmt.Errorf("chunk: open store: %w", err)
 	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("chunk: open store: %s is not a directory", root)
-	}
 	for _, d := range []string{"chunks", "manifests"} {
-		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil { //nolint:gosec // shared store directory, read by restore tools
+		sub, err := dir.EnsureSub(d, 0o755)
+		if err != nil {
+			_ = dir.Close()
 			return nil, fmt.Errorf("chunk: open store: %w", err)
 		}
+		_ = sub.Close()
 	}
-	return &Store{root: root}, nil
+	return &Store{root: root, dir: dir}, nil
+}
+
+// Close releases the store's descriptor.
+func (s *Store) Close() error { return s.dir.Close() }
+
+// CurrentAt is Store.Current for the store directory root, opened for just
+// that read: it creates nothing, and a root that does not exist is an error.
+func CurrentAt(ctx context.Context, root string) (name string, ok bool, err error) {
+	dir, err := safefs.OpenRoot(root)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = dir.Close() }()
+	return (&Store{root: root, dir: dir}).Current(ctx)
+}
+
+// ReadManifestAt is Store.ReadManifest for the store directory root, opened for
+// just that read: it creates nothing and does not require chunks/.
+func ReadManifestAt(ctx context.Context, root, name string) (Manifest, error) {
+	dir, err := safefs.OpenRoot(root)
+	if err != nil {
+		return Manifest{}, err
+	}
+	defer func() { _ = dir.Close() }()
+	return (&Store{root: root, dir: dir}).ReadManifest(ctx, name)
 }
 
 // ChunkPath is chunks/<aa>/<hash> under the root.
 func (s *Store) ChunkPath(h Hash) string {
+	return filepath.Join(s.root, chunkRel(h))
+}
+
+func chunkRel(h Hash) string {
 	hs := h.String()
-	return filepath.Join(s.root, "chunks", hs[:2], hs)
+	return "chunks/" + hs[:2] + "/" + hs
 }
 
 func (s *Store) manifestPath(name string) string { return filepath.Join(s.root, "manifests", name) }
@@ -63,13 +110,14 @@ func randSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Has reports whether the chunk is stored.
+// Has reports whether the chunk is stored. A name that is not a regular file
+// (a symlink, say) is not a chunk.
 func (s *Store) Has(h Hash) (bool, error) {
-	fi, err := os.Stat(s.ChunkPath(h))
+	fi, err := s.dir.Stat(chunkRel(h))
 	switch {
 	case err == nil:
 		return fi.Mode().IsRegular(), nil
-	case errors.Is(err, fs.ErrNotExist):
+	case errors.Is(err, fs.ErrNotExist), safefs.IsSymlinkError(err):
 		return false, nil
 	default:
 		return false, err
@@ -89,11 +137,11 @@ func (c ctxReader) Read(p []byte) (int, error) {
 }
 
 // writeTemp creates dir/<prefix><rand> exclusively, lets fill write it,
-// fsyncs and closes it, and returns its path; on any failure the file is
+// fsyncs and closes it, and returns its name; on any failure the file is
 // removed. The caller renames or links it into place.
-func writeTemp(dir, prefix string, fill func(f *os.File) error) (string, error) {
-	tmp := filepath.Join(dir, prefix+randSuffix())
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // shared store file, read by restore tools
+func writeTemp(dir *safefs.Dir, prefix string, fill func(f *os.File) error) (string, error) {
+	tmp := prefix + randSuffix()
+	f, err := dir.Create(tmp, 0o644)
 	if err != nil {
 		return "", err
 	}
@@ -105,23 +153,24 @@ func writeTemp(dir, prefix string, fill func(f *os.File) error) (string, error) 
 		err = cerr
 	}
 	if err != nil {
-		_ = os.Remove(tmp)
+		_ = dir.Unlink(tmp)
 		return "", err
 	}
 	return tmp, nil
 }
 
-// syncDir fsyncs a directory so a rename or link into it is durable.
-func syncDir(dir string) error {
-	d, err := os.Open(dir) //nolint:gosec // dir is built from the store root
+// fanDir opens chunks/<aa> for the chunk, creating it when create is set.
+func (s *Store) fanDir(h Hash, create bool) (*safefs.Dir, error) {
+	chunks, err := s.dir.Sub("chunks")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = d.Sync()
-	if cerr := d.Close(); err == nil {
-		err = cerr
+	defer func() { _ = chunks.Close() }()
+	fan := h.String()[:2]
+	if create {
+		return chunks.EnsureSub(fan, 0o755)
 	}
-	return err
+	return chunks.Sub(fan)
 }
 
 // Put stores the n bytes of r under h, verifying the hash while copying. It
@@ -134,11 +183,11 @@ func (s *Store) Put(ctx context.Context, h Hash, r io.Reader, n int64) error {
 	if ok, err := s.Has(h); err != nil || ok {
 		return err
 	}
-	final := s.ChunkPath(h)
-	dir := filepath.Dir(final)
-	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // shared store directory, read by restore tools
+	dir, err := s.fanDir(h, true)
+	if err != nil {
 		return err
 	}
+	defer func() { _ = dir.Close() }()
 	d := sha256.New()
 	tmp, err := writeTemp(dir, ".tmp-"+h.String()+"-", func(f *os.File) error {
 		got, err := io.Copy(io.MultiWriter(f, d), io.LimitReader(ctxReader{ctx, r}, n))
@@ -154,26 +203,50 @@ func (s *Store) Put(ctx context.Context, h Hash, r io.Reader, n int64) error {
 		return err
 	}
 	if !bytes.Equal(d.Sum(nil), h[:]) {
-		_ = os.Remove(tmp)
+		_ = dir.Unlink(tmp)
 		return fmt.Errorf("%w: put %s", ErrCorrupt, h)
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
+	if err := dir.Rename(tmp, dir, h.String()); err != nil {
+		_ = dir.Unlink(tmp)
 		return err
 	}
-	return syncDir(dir)
+	return dir.Sync()
 }
 
 // Get writes the chunk to w and verifies it against its name. The bytes reach
-// w before the verdict, so a caller must discard them on an error.
+// w before the verdict, so a caller must discard them on an error. The stored
+// file must be a regular file of at most MaxChunkSize bytes; GetExact is the
+// form that knows the size.
 func (s *Store) Get(ctx context.Context, h Hash, w io.Writer) error {
-	f, err := os.Open(s.ChunkPath(h))
+	return s.get(ctx, h, -1, w)
+}
+
+// GetExact is Get for a chunk that must be exactly size bytes: a stored file of
+// any other length is ErrCorrupt, before a byte of it is read.
+func (s *Store) GetExact(ctx context.Context, h Hash, size int64, w io.Writer) error {
+	return s.get(ctx, h, size, w)
+}
+
+func (s *Store) get(ctx context.Context, h Hash, size int64, w io.Writer) error {
+	limit := int64(MaxChunkSize)
+	if size >= 0 {
+		limit = size
+	}
+	f, n, err := s.dir.OpenRegular(chunkRel(h), limit)
 	if err != nil {
+		if errors.Is(err, safefs.ErrTooLarge) || errors.Is(err, safefs.ErrNotRegular) {
+			return fmt.Errorf("%w: get %s: %w", ErrCorrupt, h, err)
+		}
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	if size >= 0 && n != size {
+		return fmt.Errorf("%w: %s is %d bytes, want %d", ErrCorrupt, h, n, size)
+	}
 	d := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(w, d), ctxReader{ctx, f}); err != nil {
+	// Read no more than the size that was checked: the file can grow while it
+	// is read, and a longer read would not hash to the name anyway.
+	if _, err := io.Copy(io.MultiWriter(w, d), ctxReader{ctx, io.LimitReader(f, n)}); err != nil {
 		return err
 	}
 	if !bytes.Equal(d.Sum(nil), h[:]) {
@@ -184,12 +257,13 @@ func (s *Store) Get(ctx context.Context, h Hash, w io.Writer) error {
 
 // Current is the name in current. It opens the file fresh on every call so
 // that the client's attribute cache cannot hide a change; ok is false when
-// there is no current.
+// there is no current. The file must be a small regular file; what it holds is
+// never put in an error.
 func (s *Store) Current(ctx context.Context) (name string, ok bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
-	b, err := os.ReadFile(s.currentPath())
+	b, err := s.dir.ReadFile("current", maxCurrentBytes)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", false, nil
 	}
@@ -198,7 +272,7 @@ func (s *Store) Current(ctx context.Context) (name string, ok bool, err error) {
 	}
 	name = strings.TrimSpace(string(b))
 	if _, _, err := ParseManifestName(name); err != nil {
-		return "", false, err
+		return "", false, bad("current holds %d bytes that are not a manifest name", len(b))
 	}
 	return name, true, nil
 }
@@ -216,7 +290,7 @@ func (s *Store) ReadManifest(ctx context.Context, name string) (Manifest, error)
 	if err != nil {
 		return Manifest{}, err
 	}
-	f, err := os.Open(s.manifestPath(name))
+	f, _, err := s.dir.OpenRegular("manifests/"+name, maxManifestBytes)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -243,7 +317,11 @@ func (s *Store) WriteManifest(ctx context.Context, m Manifest) error {
 	if _, err := ParseManifest(bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("chunk: refusing to write: %w", err)
 	}
-	dir := filepath.Join(s.root, "manifests")
+	dir, err := s.dir.Sub("manifests")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
 	tmp, err := writeTemp(dir, ".tmp-"+m.Name()+"-", func(f *os.File) error {
 		_, err := f.Write(data)
 		return err
@@ -251,11 +329,23 @@ func (s *Store) WriteManifest(ctx context.Context, m Manifest) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(tmp) }()
-	if err := os.Link(tmp, s.manifestPath(m.Name())); err != nil {
+	defer func() { _ = dir.Unlink(tmp) }()
+	if err := dir.Link(tmp, dir, m.Name()); err != nil {
 		return err
 	}
-	return syncDir(dir)
+	return dir.Sync()
+}
+
+// manifestExists requires the named manifest to be a regular file in the store.
+func (s *Store) manifestExists(name string) error {
+	fi, err := s.dir.Stat("manifests/" + name)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("manifest %s: %w", name, safefs.ErrNotRegular)
+	}
+	return nil
 }
 
 // Publish makes the named manifest current: a temporary file renamed over
@@ -267,21 +357,21 @@ func (s *Store) Publish(ctx context.Context, name string) error {
 	if _, _, err := ParseManifestName(name); err != nil {
 		return err
 	}
-	if _, err := os.Stat(s.manifestPath(name)); err != nil {
+	if err := s.manifestExists(name); err != nil {
 		return err
 	}
-	tmp, err := writeTemp(s.root, ".current-", func(f *os.File) error {
+	tmp, err := writeTemp(s.dir, ".current-", func(f *os.File) error {
 		_, err := f.WriteString(name + "\n")
 		return err
 	})
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.currentPath()); err != nil {
-		_ = os.Remove(tmp)
+	if err := s.dir.Rename(tmp, s.dir, "current"); err != nil {
+		_ = s.dir.Unlink(tmp)
 		return err
 	}
-	return syncDir(s.root)
+	return s.dir.Sync()
 }
 
 type manifestKey struct {
@@ -290,14 +380,19 @@ type manifestKey struct {
 }
 
 func (s *Store) sortedManifests() ([]manifestKey, error) {
-	ents, err := os.ReadDir(filepath.Join(s.root, "manifests"))
+	dir, err := s.dir.Sub("manifests")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = dir.Close() }()
+	ents, err := dir.ReadDir()
 	if err != nil {
 		return nil, err
 	}
 	var ks []manifestKey
 	for _, e := range ents {
-		if e.IsDir() {
-			continue
+		if !e.Type().IsRegular() {
+			continue // directories, symlinks and strays are not manifests
 		}
 		ep, sq, err := ParseManifestName(e.Name())
 		if err != nil {
@@ -358,20 +453,20 @@ func (s *Store) EnsureZero(ctx context.Context, chunkSize int64) error {
 	if ok, err := s.Has(h); err != nil || ok {
 		return err
 	}
-	final := s.ChunkPath(h)
-	dir := filepath.Dir(final)
-	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // shared store directory, read by restore tools
+	dir, err := s.fanDir(h, true)
+	if err != nil {
 		return err
 	}
+	defer func() { _ = dir.Close() }()
 	tmp, err := writeTemp(dir, ".tmp-"+h.String()+"-", func(f *os.File) error { return f.Truncate(chunkSize) })
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
+	if err := dir.Rename(tmp, dir, h.String()); err != nil {
+		_ = dir.Unlink(tmp)
 		return err
 	}
-	return syncDir(dir)
+	return dir.Sync()
 }
 
 // PublishFirst makes the named manifest current only if there is no current:
@@ -386,19 +481,19 @@ func (s *Store) PublishFirst(ctx context.Context, name string) error {
 	if _, _, err := ParseManifestName(name); err != nil {
 		return err
 	}
-	if _, err := os.Stat(s.manifestPath(name)); err != nil {
+	if err := s.manifestExists(name); err != nil {
 		return err
 	}
-	tmp, err := writeTemp(s.root, ".current-", func(f *os.File) error {
+	tmp, err := writeTemp(s.dir, ".current-", func(f *os.File) error {
 		_, err := f.WriteString(name + "\n")
 		return err
 	})
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(tmp) }()
-	if err := os.Link(tmp, s.currentPath()); err != nil {
+	defer func() { _ = s.dir.Unlink(tmp) }()
+	if err := s.dir.Link(tmp, s.dir, "current"); err != nil {
 		return err
 	}
-	return syncDir(s.root)
+	return s.dir.Sync()
 }

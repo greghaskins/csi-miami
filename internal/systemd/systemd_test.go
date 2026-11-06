@@ -353,3 +353,33 @@ func TestStartWithADifferentExecStartIsErrExecStartDiffers(t *testing.T) {
 		t.Fatalf("a unit waiting to restart is not a different ExecStart: %v", err)
 	}
 }
+
+func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
+	plain := Unit{Name: UnitName(vol), ExecStart: []string{"/bin/true"}}
+	for _, p := range properties(plain) {
+		switch p.Name {
+		case "NoNewPrivileges", "ProtectSystem", "ProtectHome", "PrivateTmp", "ReadWritePaths", "CapabilityBoundingSet", "SystemCallFilter", "SystemCallErrorNumber", "RestrictAddressFamilies", "RestrictNamespaces", "LockPersonality", "ProtectKernelModules", "ProtectKernelTunables":
+			t.Errorf("an unsandboxed unit carries %s", p.Name)
+		}
+	}
+	u := plain
+	u.Sandbox = &Sandbox{ReadWritePaths: []string{"/a", "/b"}, Capabilities: []int{0, 12, 21}, DenySyscalls: []string{"@mount"}, AddressFamilies: []string{"AF_UNIX"}}
+	got := map[string]any{}
+	for _, p := range properties(u) {
+		got[p.Name] = p.Value.Value()
+	}
+	for name, want := range map[string]any{
+		"NoNewPrivileges": true, "ProtectSystem": "strict", "ProtectHome": "yes",
+		"ReadWritePaths":        []string{"/a", "/b"},
+		"CapabilityBoundingSet": uint64(1<<0 | 1<<12 | 1<<21),
+		"ProtectKernelModules":  true, "ProtectKernelTunables": true,
+		"LockPersonality": true, "RestrictNamespaces": uint64(0),
+		"SystemCallFilter":        nameList{false, []string{"@mount"}},
+		"SystemCallErrorNumber":   int32(1),
+		"RestrictAddressFamilies": nameList{true, []string{"AF_UNIX"}},
+	} {
+		if !reflect.DeepEqual(got[name], want) {
+			t.Errorf("%s = %v, want %v", name, got[name], want)
+		}
+	}
+}

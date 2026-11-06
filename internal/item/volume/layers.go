@@ -24,6 +24,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/nbd"
 	"github.com/greghaskins/csi-miami/internal/observe"
 	"github.com/greghaskins/csi-miami/internal/prereq"
+	"github.com/greghaskins/csi-miami/internal/safefs"
 	"github.com/greghaskins/csi-miami/internal/systemd"
 )
 
@@ -415,12 +416,40 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 		Description: "csi-miami block server for " + v.name,
 		ExecStart: []string{
 			it.binPath(), "blockd",
-			"-volume", v.name, "-store", v.storeDir, "-cache-dir", v.cacheDir, "-control", v.socket,
+			"-volume", v.name, "-mount", v.mount, "-store", v.storeDir, "-cache-dir", v.cacheDir, "-control", v.socket,
 			"-size", itoa(v.size), "-chunk-size", itoa(v.chunk), "-cache-bound", itoa(v.bound),
 			"-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", it.cfg.Node,
 		},
 		Restart:      "on-failure",
 		RestartDelay: RestartDelay,
+		Sandbox:      blockdSandbox(it.cfg.CacheDir, v.holdDir),
+	}
+}
+
+// blockdSandbox confines the block server, which runs as root on files from a
+// shared export. It writes in the node's cache directory (the volume's cache,
+// the lock file beside it and the control socket are all in it) and, on the
+// transport, below the directory that holds the volume's directory and its
+// holder file (the fencing check makes a probe file there); it reads everything
+// else.
+//
+// The capabilities are CAP_NET_ADMIN and CAP_SYS_ADMIN for the nbd netlink
+// calls and the device node, CAP_DAC_OVERRIDE and CAP_FOWNER for root's access
+// to files on the cache and the transport that other uids own. It calls
+// nothing that needs CAP_CHOWN or CAP_SYS_RESOURCE, nor CAP_DAC_READ_SEARCH
+// (which adds nothing over DAC_OVERRIDE and enables open_by_handle_at).
+// Because CAP_SYS_ADMIN could remount the read-only views, the system calls of
+// the mount, module, reboot, swap, raw I/O, clock, debug and obsolete groups
+// are denied.
+func blockdSandbox(cacheDir, holdDir string) *systemd.Sandbox {
+	return &systemd.Sandbox{
+		ReadWritePaths: []string{cacheDir, holdDir},
+		Capabilities: []int{
+			unix.CAP_SYS_ADMIN, unix.CAP_NET_ADMIN,
+			unix.CAP_DAC_OVERRIDE, unix.CAP_FOWNER,
+		},
+		DenySyscalls:    []string{"@mount", "@module", "@reboot", "@swap", "@raw-io", "@clock", "@debug", "@obsolete"},
+		AddressFamilies: []string{"AF_UNIX", "AF_NETLINK"},
 	}
 }
 
@@ -496,6 +525,15 @@ func (it *Item) ensureServer(ctx context.Context, v vol, st *vstate, h *holder.H
 		// server cannot re-point it without its cache, and this item never
 		// builds one for a device that exists: the volume waits for a person.
 		return nbd.Device{}, fmt.Errorf("volume item %s: %w: the volume's device exists but its cache does not", v.in.VolumeID, item.ErrServerDown)
+	}
+	// systemd resolves ReadWritePaths itself, so they must not be redirected: a
+	// symlink on the export in the path of the volume's directory would make a
+	// node directory writable in the unit. Both are opened without following a
+	// link anywhere and must resolve to themselves.
+	for _, p := range []string{v.holdDir, v.storeDir} {
+		if err := safefs.CheckResolves(p); err != nil {
+			return nbd.Device{}, fmt.Errorf("volume item %s: %w: %w", v.in.VolumeID, item.ErrServerDown, err)
+		}
 	}
 	err = it.cfg.Systemd.Start(ctx, it.unitFor(v, h))
 	switch {

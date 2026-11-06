@@ -584,6 +584,24 @@ func (e *env) rebootNode(t *testing.T, node string, pvs ...string) {
 	}
 }
 
+// checkNoDeniedCalls requires that the volume's block server, which runs in a
+// sandbox that denies system calls, shows no sign in its journal of having made
+// one: a wrong guess about what it calls would be a denied call (or, if the
+// filter killed instead of failing the call, a restart loop).
+func checkNoDeniedCalls(ctx context.Context, t *testing.T, node, pv string) {
+	t.Helper()
+	out, err := nodeExec(ctx, node, "journalctl", "-u", systemd.UnitName(pv), "--no-pager", "-o", "cat")
+	if err != nil {
+		t.Errorf("reading the journal of the block server of %s: %v", pv, err)
+		return
+	}
+	for _, bad := range []string{"SIGSYS", "Bad system call", "seccomp"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("the journal of the block server of %s mentions %q: the sandbox denied a system call it needs\n%s", pv, bad, out)
+		}
+	}
+}
+
 // blockdStarts are the "blockd serving" lines of a volume's block server in
 // the node's journal, in order; path= says how the device was got: connect for
 // a new device, reconfigure for one left in place (decision 51).

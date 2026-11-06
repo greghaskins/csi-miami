@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/greghaskins/csi-miami/internal/chunk"
 	"github.com/greghaskins/csi-miami/internal/deadline"
@@ -64,16 +63,11 @@ func (it *Item) raiseSize(ctx context.Context, v vol, vs *vstate, cur current) (
 // manifestSize reads the size recorded in the named manifest, 0 when the
 // manifest is not there.
 func (it *Item) manifestSize(ctx context.Context, v vol, name string) (int64, error) {
-	n, err := deadline.Run(ctx, it.cfg.Timeout, "reading the manifest "+name+" of "+v.name, &it.busy, "manifest\x00"+v.name, func(context.Context) (int64, error) {
-		f, err := os.Open(filepath.Join(v.storeDir, "manifests", name)) // #nosec G304 -- a manifest name that chunk.ParseManifestName accepted
+	n, err := deadline.Run(ctx, it.cfg.Timeout, "reading the manifest "+name+" of "+v.name, &it.busy, "manifest\x00"+v.name, func(ctx context.Context) (int64, error) {
+		m, err := chunk.ReadManifestAt(ctx, v.storeDir, name)
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil
 		}
-		if err != nil {
-			return 0, err
-		}
-		defer func() { _ = f.Close() }()
-		m, err := chunk.ParseManifest(f)
 		if err != nil {
 			return 0, err
 		}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/greghaskins/csi-miami/internal/safefs"
 	"github.com/greghaskins/csi-miami/internal/transport"
 )
 
@@ -132,6 +133,9 @@ func (c Context) Dir(root string, id ID) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// The mount point is where trust in the local file system ends: everything
+	// below it is on the transport (see safefs.Trust).
+	safefs.Trust(mount)
 	return filepath.Join(mount, c.Subdir, id.Name), nil
 }
 

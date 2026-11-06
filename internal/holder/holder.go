@@ -51,6 +51,7 @@ import (
 
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/lock"
+	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
 var (
@@ -125,7 +126,7 @@ var (
 	// statFile stats the kept descriptor, and removeFile unlinks the holder
 	// file: seams for tests of the failures and of the order Release works in.
 	statFile   = func(f *os.File) (os.FileInfo, error) { return f.Stat() }
-	removeFile = os.Remove
+	removeFile = removeIn
 )
 
 // SetHook installs fn as the hook called between the steps of Renew (point
@@ -153,9 +154,51 @@ func futimensNow(f *os.File) error {
 	return nil
 }
 
+const holderSuffix = ".holder"
+
 // Path is the holder file of the volume name in dir: beside the volume's
 // directory, not inside it.
-func Path(dir, name string) string { return filepath.Join(dir, name+".holder") }
+func Path(dir, name string) string { return filepath.Join(dir, name+holderSuffix) }
+
+// maxFileBytes bounds the holder file: a node name and an epoch in JSON, far
+// below it. A larger file is refused unread.
+const maxFileBytes = 4096
+
+// maxNodeLen is the longest node name a holder file may carry (a DNS name).
+const maxNodeLen = 253
+
+// validNode reports whether n looks like a node name. The name comes from a
+// file on the shared export and reaches error messages, so only a plain name
+// is accepted.
+func validNode(n string) bool {
+	if n == "" || len(n) > maxNodeLen {
+		return false
+	}
+	for i := 0; i < len(n); i++ {
+		c := n[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// openDir opens dir, the directory beside the volume's, without following a
+// symlink in its last element; every access to the holder's files goes through
+// the descriptor, so a link planted on the export is never followed.
+func openDir(dir string) (*safefs.Dir, error) { return safefs.OpenRoot(dir) }
+
+// removeIn unlinks the file at path, relative to its directory's descriptor.
+func removeIn(path string) error {
+	d, err := openDir(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return d.Unlink(filepath.Base(path))
+}
 
 func step[T any](ctx context.Context, key, what string, fn func() (T, error)) (T, error) {
 	return deadline.Run(ctx, CallTimeout, what, &calls, key, func(context.Context) (T, error) { return fn() })
@@ -196,7 +239,12 @@ func loadFile(ctx context.Context, dir, name string) (snapshot, *os.File, error)
 		f *os.File
 	}
 	r, err := step(ctx, path, "read the holder file", func() (result, error) {
-		f, err := os.Open(path) //nolint:gosec // built from a validated volume name
+		d, err := openDir(dir)
+		if err != nil {
+			return result{}, err
+		}
+		defer func() { _ = d.Close() }()
+		f, size, err := d.OpenRegular(name+holderSuffix, maxFileBytes)
 		if errors.Is(err, fs.ErrNotExist) {
 			return result{}, nil
 		}
@@ -213,19 +261,21 @@ func loadFile(ctx context.Context, dir, name string) (snapshot, *os.File, error)
 		if err != nil {
 			return result{}, err
 		}
-		b, err := io.ReadAll(io.LimitReader(f, 4096))
+		b, err := io.ReadAll(io.LimitReader(f, maxFileBytes))
 		if err != nil {
 			return result{}, err
 		}
 		s := snapshot{mtime: st.ModTime(), ok: true}
+		// What the file holds is never put in an error: it is whatever a writer
+		// on the export made it.
 		if err := json.Unmarshal(b, &s.file); err != nil {
-			return result{}, fmt.Errorf("the holder file is not valid: %w", err)
+			return result{}, fmt.Errorf("the holder file is not valid (%d bytes)", size)
 		}
 		// A holder file names a node at an epoch that starts at 1; an empty
-		// node or a zero epoch is corruption, not a usable holder and not an
-		// absence.
-		if s.Node == "" || s.Epoch == 0 {
-			return result{}, fmt.Errorf("the holder file is corrupt: node %q, epoch %d", s.Node, s.Epoch)
+		// or implausible node or a zero epoch is corruption, not a usable
+		// holder and not an absence.
+		if !validNode(s.Node) || s.Epoch == 0 {
+			return result{}, fmt.Errorf("the holder file is corrupt (%d bytes): it does not name a node and an epoch", size)
 		}
 		keep = true
 		return result{s, f}, nil
@@ -265,7 +315,12 @@ func writeTemp(ctx context.Context, dir, name string, content file) (string, err
 	}
 	b = append(b, '\n')
 	_, err = step(ctx, Path(dir, name), "write the holder file", func() (struct{}, error) {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // other nodes' users must read the holder file
+		d, err := openDir(dir)
+		if err != nil {
+			return struct{}{}, err
+		}
+		defer func() { _ = d.Close() }()
+		f, err := d.Create(filepath.Base(path), 0o644)
 		if err != nil {
 			return struct{}{}, err
 		}
@@ -273,7 +328,7 @@ func writeTemp(ctx context.Context, dir, name string, content file) (string, err
 		// Close is where an NFS client reports a failed write.
 		cerr := f.Close()
 		if err := errors.Join(werr, cerr); err != nil {
-			_ = os.Remove(path)
+			_ = d.Unlink(filepath.Base(path))
 			return struct{}{}, err
 		}
 		return struct{}{}, nil
@@ -287,7 +342,7 @@ func removeTemp(path string) {
 	ctx, cancel := context.WithTimeout(context.Background(), CallTimeout)
 	defer cancel()
 	_, _ = step(ctx, path, "remove a temporary holder file", func() (struct{}, error) {
-		err := os.Remove(path)
+		err := removeIn(path)
 		if errors.Is(err, fs.ErrNotExist) {
 			err = nil
 		}
@@ -297,16 +352,26 @@ func removeTemp(path string) {
 
 func rename(ctx context.Context, dir, name, tmp string) error {
 	_, err := step(ctx, Path(dir, name), "replace the holder file", func() (struct{}, error) {
-		return struct{}{}, os.Rename(tmp, Path(dir, name))
+		d, err := openDir(dir)
+		if err != nil {
+			return struct{}{}, err
+		}
+		defer func() { _ = d.Close() }()
+		return struct{}{}, d.Rename(filepath.Base(tmp), d, filepath.Base(Path(dir, name)))
 	})
 	return err
 }
 
 // link hard-links oldpath to newpath atomically; EEXIST (fs.ErrExist) means
-// the name already exists and the link did nothing.
-func link(ctx context.Context, key, what, oldpath, newpath string) error {
+// the name already exists and the link did nothing. Both are in dir.
+func link(ctx context.Context, key, what, dir, oldpath, newpath string) error {
 	_, err := step(ctx, key, what, func() (struct{}, error) {
-		return struct{}{}, os.Link(oldpath, newpath)
+		d, err := openDir(dir)
+		if err != nil {
+			return struct{}{}, err
+		}
+		defer func() { _ = d.Close() }()
+		return struct{}{}, d.Link(filepath.Base(oldpath), d, filepath.Base(newpath))
 	})
 	return err
 }
@@ -324,7 +389,12 @@ func claimPrefix(name string) string { return name + ".holder.epoch-" }
 func maxClaimedEpoch(ctx context.Context, dir, name string) (uint64, error) {
 	prefix := claimPrefix(name)
 	return step(ctx, Path(dir, name)+"\x00claims", "list the epoch claims", func() (uint64, error) {
-		ents, err := os.ReadDir(dir)
+		d, err := openDir(dir)
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = d.Close() }()
+		ents, err := d.ReadDir()
 		if err != nil {
 			return 0, err
 		}
@@ -351,7 +421,12 @@ func maxClaimedEpoch(ctx context.Context, dir, name string) (uint64, error) {
 func pruneClaims(ctx context.Context, dir, name string, keepFrom uint64) {
 	prefix := claimPrefix(name)
 	_, _ = step(ctx, Path(dir, name)+"\x00prune", "prune old epoch claims", func() (struct{}, error) {
-		ents, err := os.ReadDir(dir)
+		d, err := openDir(dir)
+		if err != nil {
+			return struct{}{}, nil
+		}
+		defer func() { _ = d.Close() }()
+		ents, err := d.ReadDir()
 		if err != nil {
 			return struct{}{}, nil
 		}
@@ -364,7 +439,7 @@ func pruneClaims(ctx context.Context, dir, name string, keepFrom uint64) {
 			if err != nil || v >= keepFrom {
 				continue
 			}
-			_ = os.Remove(filepath.Join(dir, n))
+			_ = d.Unlink(n)
 		}
 		return struct{}{}, nil
 	})
@@ -382,12 +457,15 @@ func (h *Holder) claimEpoch(ctx context.Context, floor uint64) (uint64, error) {
 			return 0, err
 		}
 		n := max(mx, floor) + 1
+		if n == 0 {
+			return 0, errors.New("the epoch counter is exhausted")
+		}
 		tmp, err := writeTemp(ctx, h.dir, h.name, file{Node: h.node, Epoch: n})
 		if err != nil {
 			return 0, err
 		}
 		cp := claimPath(h.dir, h.name, n)
-		err = link(ctx, cp, "claim the epoch", tmp, cp)
+		err = link(ctx, cp, "claim the epoch", h.dir, tmp, cp)
 		removeTemp(tmp)
 		if errors.Is(err, fs.ErrExist) {
 			floor = n // guarantee progress even if the listing lagged the claim
@@ -520,7 +598,7 @@ func (h *Holder) create(ctx context.Context) (*Holder, error) {
 	}
 	defer removeTemp(tmp)
 	hook("created")
-	err = link(ctx, Path(h.dir, h.name), "link the holder file", tmp, Path(h.dir, h.name))
+	err = link(ctx, Path(h.dir, h.name), "link the holder file", h.dir, tmp, Path(h.dir, h.name))
 	if errors.Is(err, fs.ErrExist) {
 		return nil, h.heldBy(ctx)
 	}
@@ -666,9 +744,15 @@ func (h *Holder) Renew(ctx context.Context) error {
 	// the inode it replaced (which a local file system still accepts): the name
 	// must still be ours after it.
 	after, err := step(ctx, Path(h.dir, h.name), "stat the holder file", func() (os.FileInfo, error) {
-		return os.Stat(Path(h.dir, h.name))
+		d, err := openDir(h.dir)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = d.Close() }()
+		return d.Stat(filepath.Base(Path(h.dir, h.name)))
 	})
-	if errors.Is(err, fs.ErrNotExist) {
+	// A name that became a link or vanished is not our inode.
+	if errors.Is(err, fs.ErrNotExist) || safefs.IsSymlinkError(err) {
 		return lose()
 	}
 	if err != nil {

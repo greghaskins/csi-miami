@@ -32,6 +32,29 @@ const (
 // the node-stage Secret, not a passphrase, so stretching only slows stage.
 const pbkdfIterations = "1000"
 
+// The bounds of a volume key, in bytes. A key shorter than MinKeyLen is too
+// guessable to protect a volume that sits on a shared server (the key is the
+// whole secret: the PBKDF2 cost is deliberately low because the key is a
+// high-entropy secret, not a password). A key longer than MaxKeyLen is refused
+// before it is written to a pipe, which holds 64 KiB and would block the
+// writer, and no real key is that long.
+const (
+	MinKeyLen = 32
+	MaxKeyLen = 4096
+)
+
+// ErrKeyLength is returned for a key outside [MinKeyLen, MaxKeyLen]. The
+// message states the bounds and the length, never the key.
+var ErrKeyLength = errors.New("crypt: a key must be between 32 and 4096 bytes")
+
+// CheckKey reports whether key has an acceptable length.
+func CheckKey(key []byte) error {
+	if len(key) < MinKeyLen || len(key) > MaxKeyLen {
+		return fmt.Errorf("%w (this one is %d)", ErrKeyLength, len(key))
+	}
+	return nil
+}
+
 // ErrBadKey is returned when cryptsetup rejects the key (exit code 2: no
 // keyslot matched).
 var ErrBadKey = errors.New("crypt: no keyslot matches the key")
@@ -184,6 +207,13 @@ func PayloadOffset(ctx context.Context, r tool.Runner, dev string) (int64, error
 }
 
 func run(ctx context.Context, r tool.Runner, op string, argv []string, keys ...[]byte) error {
+	// Only the upper bound is enforced here, because it is what keeps the pipe
+	// write from blocking; the lower bound is the CSI boundary's (CheckKey).
+	for _, k := range keys {
+		if len(k) > MaxKeyLen {
+			return fmt.Errorf("crypt: %s: %w", op, ErrKeyLength)
+		}
+	}
 	files, closeAll, err := keyFiles(keys)
 	if err != nil {
 		return fmt.Errorf("crypt: %s: %w", op, err)
@@ -207,8 +237,9 @@ func run(ctx context.Context, r tool.Runner, op string, argv []string, keys ...[
 }
 
 // keyFiles makes one pipe per key, already holding the key with its write end
-// closed, so the child reads it to EOF. A key is far below the pipe's
-// capacity, so the write never blocks.
+// closed, so the child reads it to EOF. A key is at most MaxKeyLen bytes, far
+// below the pipe's capacity, so the write never blocks; a longer one is refused
+// here too, for a caller that did not go through run.
 func keyFiles(keys [][]byte) (files []*os.File, closeAll func(), err error) {
 	closeAll = func() {
 		for _, f := range files {
@@ -216,6 +247,10 @@ func keyFiles(keys [][]byte) (files []*os.File, closeAll func(), err error) {
 		}
 	}
 	for _, k := range keys {
+		if len(k) > MaxKeyLen {
+			closeAll()
+			return nil, func() {}, ErrKeyLength
+		}
 		rd, wr, perr := os.Pipe()
 		if perr != nil {
 			closeAll()

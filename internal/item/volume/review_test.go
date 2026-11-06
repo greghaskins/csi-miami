@@ -1061,3 +1061,135 @@ func TestServerOutdatedComparesTheBinaryHash(t *testing.T) {
 		t.Error("a status with no hash (an older server) counts as outdated; it says nothing")
 	}
 }
+
+// The block server runs as root on a shared export: its unit is sandboxed to
+// the cache directory and the directory holding the volume and its holder
+// file, and holds only the capabilities it needs.
+func TestBlockdUnitIsSandboxed(t *testing.T) {
+	sb := blockdSandbox("/var/lib/x/cache", "/var/lib/x/transports/t")
+	if sb == nil || len(sb.ReadWritePaths) != 2 || sb.ReadWritePaths[0] != "/var/lib/x/cache" || sb.ReadWritePaths[1] != "/var/lib/x/transports/t" {
+		t.Fatalf("sandbox = %+v", sb)
+	}
+	has := map[int]bool{}
+	for _, c := range sb.Capabilities {
+		has[c] = true
+	}
+	if !has[unix.CAP_SYS_ADMIN] || !has[unix.CAP_NET_ADMIN] {
+		t.Errorf("capabilities %v lack what the nbd calls need", sb.Capabilities)
+	}
+	for _, c := range []int{unix.CAP_SYS_MODULE, unix.CAP_SYS_PTRACE, unix.CAP_SYS_BOOT, unix.CAP_SETUID, unix.CAP_NET_RAW, unix.CAP_DAC_READ_SEARCH, unix.CAP_CHOWN, unix.CAP_SYS_RESOURCE} {
+		if has[c] {
+			t.Errorf("capability %d is granted", c)
+		}
+	}
+}
+
+func TestStartedUnitCarriesTheSandbox(t *testing.T) {
+	e := newEnv(t)
+	e.mustConverge()
+	if len(e.sd.units) == 0 {
+		t.Fatal("no unit was started")
+	}
+	sb := e.sd.units[len(e.sd.units)-1].Sandbox
+	if sb == nil {
+		t.Fatal("the block server's unit is not sandboxed")
+	}
+	if !slices.Equal(sb.ReadWritePaths, []string{e.cacheDir, e.v.holdDir}) {
+		t.Errorf("ReadWritePaths = %v, want the cache directory and %s", sb.ReadWritePaths, e.v.holdDir)
+	}
+}
+
+// withSubdir puts the volume in a class subdirectory of its transport.
+func (e *env) withSubdir(sub string) {
+	e.t.Helper()
+	e.in.Subdir = sub
+	e.newItem()
+	var err error
+	if e.v, err = e.it.volOf(e.in); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := os.MkdirAll(e.v.storeDir, 0o750); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// A symlink below the transport's mount point (the class's subdirectory
+// replaced by a link to a node directory) stops the stage before any unit
+// starts, and nothing is created behind it.
+func TestSymlinkInTheVolumePathStartsNoUnit(t *testing.T) {
+	e := newEnv(t)
+	e.withSubdir("ns")
+	node := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(node, filepath.Base(e.v.storeDir)), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(node, e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.converge(); err == nil {
+		t.Fatal("Converge went on through a symlinked directory")
+	}
+	if len(e.sd.units) != 0 {
+		t.Fatalf("a unit was started: %v", e.sd.units)
+	}
+	if ents, _ := os.ReadDir(filepath.Join(node, filepath.Base(e.v.storeDir))); len(ents) != 0 {
+		t.Fatalf("files created behind the link: %v", ents)
+	}
+}
+
+// The attack on the node's own cache: a writer on the export replaces the
+// class's subdirectory with a link to the node's cache directory, which holds
+// a directory named exactly like the volume. The stage must not open that
+// directory as the store (it would create chunks/ in the cache, discard it and
+// format).
+func TestSubdirLinkedToTheCacheDirectoryIsNotTheStore(t *testing.T) {
+	e := newEnv(t)
+	e.withSubdir("ns")
+	cache := filepath.Join(e.cacheDir, filepath.Base(e.v.storeDir))
+	if err := os.MkdirAll(cache, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "index.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(e.cacheDir, e.v.holdDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.converge(); err == nil {
+		t.Fatal("Converge went on with the cache directory as the store")
+	}
+	if len(e.sd.units) != 0 {
+		t.Fatalf("a unit was started: %v", e.sd.units)
+	}
+	ents, _ := os.ReadDir(cache)
+	if len(ents) != 1 || ents[0].Name() != "index.json" {
+		t.Fatalf("the cache directory was touched: %v", ents)
+	}
+}
+
+// A symlink above the transport's mount point (the kubelet directory on a data
+// disk) is the operator's: the stage works, the unit starts, and it is given
+// the mount point and the store path.
+func TestStageThroughASymlinkAboveTheMountPoint(t *testing.T) {
+	e := newEnv(t)
+	alias := filepath.Join(t.TempDir(), "var-lib")
+	if err := os.Symlink(filepath.Dir(e.root), alias); err != nil {
+		t.Fatal(err)
+	}
+	e.root = filepath.Join(alias, filepath.Base(e.root))
+	e.withSubdir("ns")
+	e.mustConverge()
+	if len(e.sd.units) == 0 {
+		t.Fatal("no unit was started")
+	}
+	args := e.sd.units[len(e.sd.units)-1].ExecStart
+	if i := slices.Index(args, "-mount"); i < 0 || args[i+1] != e.v.mount || !strings.HasPrefix(e.v.storeDir, e.v.mount+"/") {
+		t.Errorf("the unit's arguments %v lack -mount %s", args, e.v.mount)
+	}
+}

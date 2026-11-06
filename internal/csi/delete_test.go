@@ -501,3 +501,32 @@ func TestDeleteVolumeOfALocalVolumeSucceedsAndDeletesNothing(t *testing.T) {
 		t.Errorf("handle of another volume: code = %v, want Unavailable", codeOf(err))
 	}
 }
+
+// The files left beside a deleted volume are removed relative to a descriptor
+// on their directory; a symlink in the middle of the path is not followed, so
+// a same-named file in the place it points to survives.
+func TestRemoveHolderFilesDoesNotFollowASymlinkedSubdir(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.create(nameB) // makes the transport's directory
+	outside := resolved(t, t.TempDir())
+	writeFile(t, filepath.Join(outside, nameA+".holder"), "x")
+	writeFile(t, filepath.Join(outside, nameA+".size"), "4\n")
+	link := filepath.Join(e.mountDir(), "teams")
+	mustSymlink(t, outside, link)
+	e.ctrl.removeHolderFiles(filepath.Join(link, nameA), nameA)
+	mustExist(t, filepath.Join(outside, nameA+".holder"))
+	mustExist(t, filepath.Join(outside, nameA+".size"))
+
+	// And in a plain directory they go, siblings' files stay.
+	plain := filepath.Join(e.mountDir(), "plain")
+	writeFile(t, filepath.Join(plain, nameA+".holder"), "x")
+	writeFile(t, filepath.Join(plain, nameA+".holder.epoch-3"), "x")
+	writeFile(t, filepath.Join(plain, nameA+".size"), "4\n")
+	writeFile(t, filepath.Join(plain, nameB+".holder"), "x")
+	e.ctrl.removeHolderFiles(filepath.Join(plain, nameA), nameA)
+	mustNotExist(t, filepath.Join(plain, nameA+".holder"))
+	mustNotExist(t, filepath.Join(plain, nameA+".holder.epoch-3"))
+	mustNotExist(t, filepath.Join(plain, nameA+".size"))
+	mustExist(t, filepath.Join(plain, nameB+".holder"))
+}

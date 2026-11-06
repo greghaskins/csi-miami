@@ -51,7 +51,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -350,6 +349,7 @@ type vol struct {
 	in       intent.Intent
 	name     string // pvc-<uuid>
 	params   kinds.VolumeParams
+	mount    string // the transport's mount point, which storeDir is below
 	storeDir string // the volume's directory in the transport
 	holdDir  string // the directory holding its holder file: beside storeDir
 	cacheDir string
@@ -378,6 +378,10 @@ func (it *Item) volOf(in intent.Intent) (vol, error) {
 	if err != nil {
 		return vol{}, fmt.Errorf("volume item %s: %w", in.VolumeID, err)
 	}
+	mount, err := in.Transport.MountPoint(it.cfg.Root)
+	if err != nil {
+		return vol{}, fmt.Errorf("volume item %s: %w", in.VolumeID, err)
+	}
 	unit := systemd.UnitName(id.Name)
 	if unit == "" {
 		return vol{}, fmt.Errorf("volume item %s: %q is not a volume name", in.VolumeID, id.Name)
@@ -388,7 +392,7 @@ func (it *Item) volOf(in intent.Intent) (vol, error) {
 		bound = size
 	}
 	return vol{
-		in: in, name: id.Name, params: p, storeDir: storeDir, holdDir: filepath.Dir(storeDir),
+		in: in, name: id.Name, params: p, mount: mount, storeDir: storeDir, holdDir: filepath.Dir(storeDir),
 		cacheDir: filepath.Join(it.cfg.CacheDir, id.Name),
 		socket:   SocketPath(it.cfg.CacheDir, id.Name),
 		unit:     unit, stage: in.StagePath, size: size, chunk: p.ChunkSize, bound: bound,
@@ -426,21 +430,7 @@ func storeCurrent(ctx context.Context, storeDir string) (string, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
-	if _, err := os.Stat(storeDir); err != nil {
-		return "", false, err
-	}
-	b, err := os.ReadFile(filepath.Join(storeDir, "current")) //nolint:gosec // the volume's own store directory
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	name := strings.TrimSpace(string(b))
-	if _, _, err := chunk.ParseManifestName(name); err != nil {
-		return "", false, err
-	}
-	return name, true, nil
+	return chunk.CurrentAt(ctx, storeDir)
 }
 
 // current is what the store's `current` says, read afresh: the epoch of the

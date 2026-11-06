@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -79,5 +80,91 @@ func TestGrowRefusesANonPositiveSize(t *testing.T) {
 	t.Parallel()
 	if _, err := Grow(t.TempDir(), name, 0); err == nil {
 		t.Fatal("Grow(0) succeeded")
+	}
+}
+
+// The record is on a shared export: a link or an oversized file there must not
+// be followed, and its content must not reach an error.
+func TestReadDoesNotFollowASymlinkOrEchoContent(t *testing.T) {
+	t.Parallel()
+	const secret = "TOPSECRET-token-abc"
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(target, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, Path(dir, name)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := Read(dir, name); err == nil || ok {
+		t.Fatalf("Read followed a symlink: %v, %v", ok, err)
+	} else if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error carries content: %v", err)
+	}
+	// Grow replaces the link, leaving the target alone... after refusing it:
+	// a record that cannot be read is never overwritten.
+	if _, err := Grow(dir, name, 4<<20); err == nil {
+		t.Fatal("Grow wrote over an unreadable record")
+	}
+	if b, _ := os.ReadFile(target); string(b) != secret+"\n" { //nolint:gosec // a test path
+		t.Fatalf("target changed: %q", b)
+	}
+}
+
+func TestReadIsSizeCappedAndRegularOnly(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.WriteFile(Path(dir, name), []byte(strings.Repeat("1", 1<<20)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Read(dir, name); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("oversize Read = %v, want ErrMalformed", err)
+	}
+	dir = t.TempDir()
+	if err := os.Mkdir(Path(dir, name), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Read(dir, name); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("directory Read = %v, want ErrMalformed", err)
+	}
+}
+
+func TestGrowRefusesASymlinkedDirectory(t *testing.T) {
+	t.Parallel()
+	target := t.TempDir()
+	l := filepath.Join(t.TempDir(), "export")
+	if err := os.Symlink(target, l); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Grow(l, name, 4<<20); err == nil {
+		t.Fatal("Grow wrote through a symlinked directory")
+	}
+	if ents, _ := os.ReadDir(target); len(ents) != 0 {
+		t.Fatalf("files created behind the link: %v", ents)
+	}
+	if _, _, err := Read(l, name); err == nil {
+		t.Fatal("Read worked through a symlinked directory")
+	}
+}
+
+func TestIntermediateSymlinkIsRefused(t *testing.T) {
+	t.Parallel()
+	node := t.TempDir()
+	if err := os.Mkdir(filepath.Join(node, "x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "ns")
+	if err := os.Symlink(node, link); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(link, "x")
+	if _, err := Grow(dir, name, 4<<20); err == nil {
+		t.Error("Grow worked through a symlink in the path")
+	}
+	if _, _, err := Read(dir, name); err == nil {
+		t.Error("Read worked through a symlink in the path")
+	}
+	if ents, _ := os.ReadDir(filepath.Join(node, "x")); len(ents) != 0 {
+		t.Errorf("files created behind the link: %v", ents)
 	}
 }

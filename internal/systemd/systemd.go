@@ -29,6 +29,7 @@ import (
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -72,6 +73,45 @@ type Unit struct {
 	Environment       []string
 	Restart           string
 	RestartDelay      time.Duration
+
+	// Sandbox, when set, confines the service (see Sandbox).
+	Sandbox *Sandbox
+}
+
+// Sandbox is the confinement of a unit whose process works on files an
+// untrusted writer can influence (the shared store) while running as root: a
+// flaw in how it handles them is then bounded by what the unit can reach.
+// systemd applies it with a private mount namespace:
+//
+//	NoNewPrivileges=yes   nothing it runs gains privileges;
+//	ProtectSystem=strict  the whole file system is read-only except /dev,
+//	                      /proc and /sys, and ReadWritePaths;
+//	ProtectHome=yes       /home, /root and /run/user are empty;
+//	CapabilityBoundingSet only Capabilities can ever be held;
+//	ProtectKernelModules, ProtectKernelTunables, LockPersonality,
+//	RestrictNamespaces    no module loading, no writes to /proc/sys or /sys,
+//	                      no personality change, no new namespaces;
+//	SystemCallFilter, RestrictAddressFamilies  see the fields.
+type Sandbox struct {
+	// ReadWritePaths are the existing paths the service may write below. There
+	// is no PrivateTmp: a cache or store directory may be under /tmp (the smoke
+	// tests put them there), which a private /tmp would hide, and the read-only
+	// file system already stops writes anywhere else.
+	ReadWritePaths []string
+	// Capabilities are the capability numbers (unix.CAP_*) it may hold.
+	Capabilities []int
+	// DenySyscalls are the system calls or @groups that fail with EPERM
+	// (SystemCallFilter=~...). Empty means no filter.
+	DenySyscalls []string
+	// AddressFamilies are the socket families it may use (AF_UNIX, ...).
+	// Empty means no restriction.
+	AddressFamilies []string
+}
+
+// bus signature (bas): a flag and a list of names.
+type nameList struct {
+	Allow bool
+	Names []string
 }
 
 // State is what systemd reports about a unit. Present is false for a unit
@@ -356,8 +396,47 @@ func properties(u Unit) []sdbus.Property {
 	if u.Restart != "" {
 		props = append(props, sdbus.Property{Name: "Restart", Value: godbus.MakeVariant(u.Restart)})
 	}
+	if u.Sandbox != nil {
+		props = append(props, sandboxProperties(*u.Sandbox)...)
+	}
 	if u.RestartDelay > 0 {
 		props = append(props, sdbus.Property{Name: "RestartUSec", Value: godbus.MakeVariant(uint64(u.RestartDelay / time.Microsecond))})
+	}
+	return props
+}
+
+// RestrictSUIDSGID is deliberately not set: its seccomp filter cannot inspect
+// the mode that openat2(2) takes in a struct, so it makes openat2 fail, and
+// the block server opens everything in the store with openat2. NoNewPrivileges
+// and the file system being read-only already keep a setuid file from helping.
+//
+// sandboxProperties are the D-Bus properties of a Sandbox. The capability
+// bounding set is a bit mask (CapabilityBoundingSet is a uint64 on the bus).
+func sandboxProperties(sb Sandbox) []sdbus.Property {
+	var mask uint64
+	for _, c := range sb.Capabilities {
+		mask |= 1 << uint(c) //nolint:gosec // capability numbers are small constants
+	}
+	props := []sdbus.Property{
+		{Name: "NoNewPrivileges", Value: godbus.MakeVariant(true)},
+		{Name: "ProtectSystem", Value: godbus.MakeVariant("strict")},
+		{Name: "ProtectHome", Value: godbus.MakeVariant("yes")},
+		{Name: "ReadWritePaths", Value: godbus.MakeVariant(append([]string(nil), sb.ReadWritePaths...))},
+		{Name: "CapabilityBoundingSet", Value: godbus.MakeVariant(mask)},
+		{Name: "ProtectKernelModules", Value: godbus.MakeVariant(true)},
+		{Name: "ProtectKernelTunables", Value: godbus.MakeVariant(true)},
+		{Name: "LockPersonality", Value: godbus.MakeVariant(true)},
+		{Name: "RestrictNamespaces", Value: godbus.MakeVariant(uint64(0))}, // a bit mask of the namespaces still allowed: none
+	}
+	if len(sb.DenySyscalls) > 0 {
+		props = append(props, sdbus.Property{Name: "SystemCallFilter", Value: godbus.MakeVariant(nameList{false, append([]string(nil), sb.DenySyscalls...)})})
+		// A denied call fails with EPERM. Without this it kills the process with
+		// SIGSYS, and a unit that restarts on failure then loops, re-pointing its
+		// device every time, on one wrong guess about what the process calls.
+		props = append(props, sdbus.Property{Name: "SystemCallErrorNumber", Value: godbus.MakeVariant(int32(unix.EPERM))})
+	}
+	if len(sb.AddressFamilies) > 0 {
+		props = append(props, sdbus.Property{Name: "RestrictAddressFamilies", Value: godbus.MakeVariant(nameList{true, append([]string(nil), sb.AddressFamilies...)})})
 	}
 	return props
 }
