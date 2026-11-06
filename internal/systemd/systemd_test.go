@@ -358,7 +358,7 @@ func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
 	plain := Unit{Name: UnitName(vol), ExecStart: []string{"/bin/true"}}
 	for _, p := range properties(plain) {
 		switch p.Name {
-		case "NoNewPrivileges", "ProtectSystem", "ProtectHome", "PrivateTmp", "ReadWritePaths", "CapabilityBoundingSet":
+		case "NoNewPrivileges", "ProtectSystem", "ProtectHome", "PrivateTmp", "ReadWritePaths", "CapabilityBoundingSet", "SystemCallFilter", "SystemCallErrorNumber", "RestrictAddressFamilies", "RestrictNamespaces", "LockPersonality", "ProtectKernelModules", "ProtectKernelTunables":
 			t.Errorf("an unsandboxed unit carries %s", p.Name)
 		}
 	}
@@ -372,7 +372,7 @@ func TestSandboxPropertiesAreSetOnlyWhenAsked(t *testing.T) {
 		"NoNewPrivileges": true, "ProtectSystem": "strict", "ProtectHome": "yes",
 		"ReadWritePaths":        []string{"/a", "/b"},
 		"CapabilityBoundingSet": uint64(1<<0 | 1<<12 | 1<<21),
-		"ProtectKernelModules":  true, "ProtectKernelTunables": true, "RestrictSUIDSGID": true,
+		"ProtectKernelModules":  true, "ProtectKernelTunables": true,
 		"LockPersonality": true, "RestrictNamespaces": uint64(0),
 		"SystemCallFilter":        nameList{false, []string{"@mount"}},
 		"SystemCallErrorNumber":   int32(1),

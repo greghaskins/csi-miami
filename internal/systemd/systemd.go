@@ -88,10 +88,9 @@ type Unit struct {
 //	                      /proc and /sys, and ReadWritePaths;
 //	ProtectHome=yes       /home, /root and /run/user are empty;
 //	CapabilityBoundingSet only Capabilities can ever be held;
-//	ProtectKernelModules, ProtectKernelTunables, RestrictSUIDSGID,
-//	LockPersonality, RestrictNamespaces  no module loading, no writes to
-//	                      /proc/sys or /sys, no setuid files, no personality
-//	                      change, no new namespaces;
+//	ProtectKernelModules, ProtectKernelTunables, LockPersonality,
+//	RestrictNamespaces    no module loading, no writes to /proc/sys or /sys,
+//	                      no personality change, no new namespaces;
 //	SystemCallFilter, RestrictAddressFamilies  see the fields.
 type Sandbox struct {
 	// ReadWritePaths are the existing paths the service may write below. There
@@ -406,6 +405,11 @@ func properties(u Unit) []sdbus.Property {
 	return props
 }
 
+// RestrictSUIDSGID is deliberately not set: its seccomp filter cannot inspect
+// the mode that openat2(2) takes in a struct, so it makes openat2 fail, and
+// the block server opens everything in the store with openat2. NoNewPrivileges
+// and the file system being read-only already keep a setuid file from helping.
+//
 // sandboxProperties are the D-Bus properties of a Sandbox. The capability
 // bounding set is a bit mask (CapabilityBoundingSet is a uint64 on the bus).
 func sandboxProperties(sb Sandbox) []sdbus.Property {
