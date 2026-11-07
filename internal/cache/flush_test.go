@@ -3,8 +3,10 @@ package cache
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -183,16 +185,15 @@ func TestSyncChunksSyncsOnlyItsChunkAndKeepsOthersObligations(t *testing.T) {
 	}
 }
 
-func TestSyncChunksOfNewlyDirtyChunkRecordsItInTheIndex(t *testing.T) {
+func TestSyncChunksOfNewlyDirtyChunkNeedsOnlyItsBytes(t *testing.T) {
 	c, dir := flCache(t)
-	wr(t, c, 3, 9) // never in an index on disk
+	wr(t, c, 3, 9) // acknowledged: the index, entry and size are already durable
 	l := watchSyncs(t)
 	if err := c.SyncChunks(3); err != nil {
 		t.Fatal(err)
 	}
-	d, dc, dr := l.index("data:3"), l.index("dir:c"), l.index("dir:root")
-	if d < 0 || dc < 0 || dr < 0 || d > dc || dc > dr {
-		t.Fatalf("order = %q, want data:3, dir:c, index", l)
+	if got := l.String(); got != "data:3" {
+		t.Fatalf("FUA issued %q, want only the chunk's fdatasync", got)
 	}
 	e, err := Open(crashCopy(t, dir), 1<<30)
 	if err != nil {
@@ -201,26 +202,6 @@ func TestSyncChunksOfNewlyDirtyChunkRecordsItInTheIndex(t *testing.T) {
 	defer func() { _ = e.Close() }()
 	if !equalU32(e.Index().Dirty, []uint32{3}) {
 		t.Fatalf("resumed dirty = %v, want [3]", e.Index().Dirty)
-	}
-}
-
-// A chunk whose index entry the timer already wrote, but whose directory
-// entry and bytes are not yet durable, still needs both at a FUA.
-func TestSyncChunksSyncsDirectoryEntryTheTimerLeftBehind(t *testing.T) {
-	c, _ := flCache(t)
-	wr(t, c, 3, 9)
-	c.mu.Lock()
-	err := c.flushLocked() // what the 100 ms timer does: the index, not the chunk
-	c.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := watchSyncs(t)
-	if err := c.SyncChunks(3); err != nil {
-		t.Fatal(err)
-	}
-	if got := l.String(); got != "data:3 dir:c" {
-		t.Fatalf("syncs = %q, want the chunk's fdatasync then its directory", got)
 	}
 }
 
@@ -442,4 +423,163 @@ func BenchmarkGuestFsync(b *testing.B) {
 	b.ReportMetric(float64(data)/float64(b.N), "fdatasync/op")
 	b.ReportMetric(float64(dirs)/float64(b.N), "dirsync/op")
 	b.ReportMetric(float64(c.indexWrites-writes)/float64(b.N), "index/op")
+}
+
+// A write that newly dirties a chunk is acknowledged only once an index naming
+// the chunk is on disk, so a process crash inside the 100 ms window cannot
+// leave an acknowledged write that Open then deletes as unindexed.
+func TestNewlyDirtyWriteIsNamedInIndexBeforeAck(t *testing.T) {
+	c, dir := flCache(t)
+	l := watchSyncs(t)
+	wr(t, c, 5, 5) // no Sync, no timer: the write's own ack carries the index
+	d, dc, dr := l.index("data:5"), l.index("dir:c"), l.index("dir:root")
+	if d < 0 || dc < 0 || dr < 0 || d > dc || dc > dr {
+		t.Fatalf("order = %q, want data:5, dir:c, then the index", l)
+	}
+	abandon(c)
+	e, err := Open(crashCopy(t, dir), 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close() }()
+	if !e.Has(5) || mustRead(t, e, 5)[0] != 5 {
+		t.Fatal("an acknowledged write to a new chunk did not survive a restart")
+	}
+}
+
+// Writes to several chunks that newly dirty together share one index write.
+func TestNewlyDirtyWritesGroupCommit(t *testing.T) {
+	c, _ := flCache(t)
+	const n = 6
+	var parked sync.WaitGroup
+	parked.Add(n)
+	c.gapHook = func() { parked.Done(); parked.Wait() } // all n have marked their chunk, none has committed
+	before := c.indexWrites
+	var done sync.WaitGroup
+	for i := uint32(0); i < n; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			if err := c.WriteAt(i, 0, filled(fl4k, byte(i+1)), nil, true); err != nil { //nolint:gosec // i < 6
+				t.Error(err)
+			}
+		}()
+	}
+	done.Wait()
+	c.gapHook = nil
+	if got := c.indexWrites - before; got != 1 {
+		t.Fatalf("%d newly dirty chunks took %d index writes, want 1", n, got)
+	}
+	if len(c.Index().Dirty) != n {
+		t.Fatalf("dirty = %v", c.Index().Dirty)
+	}
+}
+
+// A first write whose index commit failed was not acknowledged; its retry
+// finds the chunk dirty in memory and must still not be acknowledged until the
+// index names it.
+func TestRetryAfterFailedCommitStillCommits(t *testing.T) {
+	c, dir := flCache(t)
+	blocker := filepath.Join(dir, indexName+".tmp")
+	if err := os.Mkdir(blocker, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteAt(5, 0, filled(fl4k, 5), nil, true); err == nil {
+		t.Fatal("write acknowledged though its index could not be written")
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	wr(t, c, 5, 6) // chunk 5 is dirty in memory now; the retry must commit
+	e, err := Open(crashCopy(t, dir), 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = e.Close() }()
+	if !equalU32(e.Index().Dirty, []uint32{5}) {
+		t.Fatalf("acknowledged retry not in the index: %v", e.Index().Dirty)
+	}
+}
+
+// SetBoundary and ClearBoundary write the index through flushLocked, so they
+// too make new files durable before naming them.
+func TestBoundaryIndexWritesOrderFilesFirst(t *testing.T) {
+	c, _ := flCache(t)
+	if err := c.Insert(1, fill(1)); err != nil {
+		t.Fatal(err)
+	}
+	wr(t, c, 2, 2)
+	c.mu.Lock()
+	c.newFiles[2] = struct{}{} // as if the entry were still pending
+	c.mu.Unlock()
+	l := watchSyncs(t)
+	if _, err := c.SetBoundary(); err != nil {
+		t.Fatal(err)
+	}
+	if d, dc, dr := l.index("data:2"), l.index("dir:c"), l.index("dir:root"); d < 0 || dc < d || dr < dc {
+		t.Fatalf("SetBoundary order = %q", l)
+	}
+}
+
+// ClearBoundary(true) whose index write fails keeps the published chunks
+// pinned, so eviction cannot unlink what the on-disk index still calls dirty;
+// the next successful index write releases them.
+func TestClearBoundaryFailedFlushPinsUntilIndexWritten(t *testing.T) {
+	holdFlush(t)
+	c, dir := tmpCache(t, 2*testChunk)
+	mustWrite(t, c, 1, 1)
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SetBoundary(); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(dir, indexName+".tmp")
+	if err := os.Mkdir(blocker, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c.ClearBoundary(true)
+	for i := uint32(2); i < 5; i++ {
+		_ = c.Insert(i, fill(byte(i)))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "c", "1")); err != nil {
+		t.Fatalf("pinned chunk was evicted: %v", err)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.pinned) != 0 {
+		t.Fatal("pin survived a successful index write")
+	}
+}
+
+// BenchmarkSequentialFresh models a bulk write to a fresh volume: every chunk
+// is newly dirtied once, then one FLUSH. Each first touch now carries an index
+// write; this is the cost of that.
+func BenchmarkSequentialFresh(b *testing.B) {
+	const chunks = 64
+	p := filled(srChunk, 1)
+	for range b.N {
+		b.StopTimer()
+		c, err := Create(filepath.Join(b.TempDir(), "cache"), Index{Volume: "v", Size: chunks * srChunk, Chunk: srChunk}, 1<<30)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		for i := range uint32(chunks) {
+			if err := c.WriteAt(i, 0, p, nil, true); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := c.Sync(); err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		b.ReportMetric(float64(c.indexWrites), "index/run")
+		_ = c.Close()
+		b.StartTimer()
+	}
 }

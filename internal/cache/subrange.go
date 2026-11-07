@@ -141,6 +141,7 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte, zeroBase bool) erro
 	c.clean.remove(i)
 	delete(c.zero, i)
 	delete(c.pendingUnlink, i)
+	delete(c.pinned, i)
 	c.dirty[i] = struct{}{}
 	c.dirtiedLocked(i, newCharge) // newCharge: not dirty before, or dirty only as a trim
 	gap := c.gapHook
@@ -158,6 +159,10 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte, zeroBase bool) erro
 	// FLUSH — the one actually obligated to cover this write — fdatasyncs it.
 	c.mu.Lock()
 	c.unsynced[i] = struct{}{}
+	if err == nil {
+		// Before the acknowledgement: see commitNewlyDirtyLocked.
+		err = c.commitNewlyDirtyLocked(i)
+	}
 	c.mu.Unlock()
 	return err
 }
