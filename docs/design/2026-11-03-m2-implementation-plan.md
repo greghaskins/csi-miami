@@ -2,10 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Active. T1 to T20 are merged into `m2/design` (T15 was dropped, decision 53);
-T21 (e2e, PR #71) is merged and T22 (docs) is the PR that carries this edit. Gate G1
-(criterion 10) waits for the owner's Raspberry Pi run. The tables in sections 1
-and 5 say where each criterion and task stands.
+**Status:** Complete. Every task is merged into `m2/design` (T15 was dropped,
+decision 53), with the milestone-close review and security fixes (#73 to #77).
+Every exit criterion is met: 1 to 9, 6a and 11 in CI on both architectures,
+and 10 (gate G1) on a Raspberry Pi 4. The tables in sections 1 and 5 say where
+each criterion and task stands.
 **Created:** 2026-11-03
 **Spec:** `2026-11-03-chunk-backed-volumes-design.md` (the plan argues from
 it; executors read both). **Reads with:** `2026-10-30-architecture-brief.md`
@@ -155,7 +156,7 @@ with a reason.
 | 7 | green | `TestVolumeNodeRebootReusesCache` |
 | 8 | green | `TestVolumeRestoreDrill` |
 | 9 | green | `TestVolumeExpandOnline` |
-| 10 | **pending** the owner's Pi run (gate G1); `miami bench` and `docs/bench.md` are merged (T20) and CI runs the harness as a smoke on amd64 | `miami bench` |
+| 10 | **green**: gate G1 passed on a Raspberry Pi 4, store local and on nfs3, on the median of 5 rounds (decision 60), after the flush-path fix (#76); results on PR #41 | `miami bench` |
 | 11 | green; covered by CI on every PR: `static`, `unit`, `envtest`, `sanity` and `smoke` on both architectures, `deploy`, and the M1 e2e suite | `ci-ok` |
 
 **The kind gap in criterion 6.** Kind nodes share the runner's kernel, where a
@@ -492,7 +493,7 @@ with their task):
 | T17 | merged | #68 |
 | T18 | merged | #66 |
 | T19 | merged | #69 |
-| T20 | merged; gate G1 run pending | #70 |
+| T20 | merged; gate G1 passed (#76 flush fix, #77 median rule) | #70 |
 | T21 | merged | #71 |
 | T22 | in review | the PR carrying this table |
 
@@ -1053,7 +1054,7 @@ write and read; rm -rf), two rounds, prints a table and the ratio
 - [ ] Tests: `TestPhasesRunOnTmpDir`, `TestTableFormat`.
 - [ ] `hack/bench.sh`: runs `nbd` and `loop` on the host as root and prints
       both tables and the ratios; CI logs it (no threshold in CI).
-- [ ] **Gate G1 (owner, outside CI):** run the image's `miami bench --stack
+- [x] **Gate G1 (owner, outside CI):** run the image's `miami bench --stack
       nbd` and `--stack loop` on a Raspberry Pi 4 worker with `--store` on a
       local directory and again with `--store` on the nfs3 transport; attach
       both tables to PR #41. Pass: every phase within 1.5×. On failure, stop
