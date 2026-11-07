@@ -7,7 +7,7 @@ a NAS, attached storage, and self-hosted workloads.
 The goal: make bare-metal hardware behave like a proper Kubernetes storage
 layer. csi-miami is responsible for:
 
-1. **Flexibility** across directories and block volumes (blobs are a layout on a volume), local disks and a remote NAS.
+1. **Flexibility**: block volumes and blob stores, on a remote NAS with the live data cached on the node.
 2. **Strong RWO and RWX semantics**, available when a workload needs them.
 3. **Encryption at rest.**
 
@@ -31,10 +31,10 @@ projects run off the shelf.
 │                     │ bind mount           │
 │  ┌─ miami node (DaemonSet) ─────────────┐  │
 │  │  mounts the NAS export on the host   │  │
-│  │  directory: bind the subdirectory    │  │
 │  │  volume: ext4 ▶ dm-crypt ▶ nbd,      │  │
 │  │    served from a node-local cache    │  │
-│  │  encryption: LUKS2, on for volumes   │  │
+│  │  blob store: blobd (planned), S3-    │  │
+│  │    style objects as chunks on the NAS│  │
 │  └──────┬─────────────────────┬─────────┘  │
 │         │                     │            │
 │  ┌──────▼──────────┐          │            │
@@ -56,29 +56,31 @@ The `miami node` DaemonSet runs on every worker node and does all the mounting. 
 small `miami controller` Deployment creates and deletes volumes on the NAS.
 Details: [architecture brief](docs/design/2026-10-30-architecture-brief.md).
 
-A **directory** is a subdirectory of the NAS export bound straight into the pod.
+Applications choose between two kinds.
 
 A **volume** is a block device. The live data is on the node, in a cache; the NAS holds point-in-time **generations** of it, as content-addressed chunks plus a manifest naming them (`chunks/<aa>/<sha256>`, `manifests/<epoch>.<n>`, `current`). Each volume gets one `miami blockd` block server, a transient systemd unit on the host (`miami-blockd-<volume>.service`) that serves an nbd device from the cache and publishes a generation every few minutes, at a watermark of unpublished data, on request, and always at unstage. The plugin pod can restart, upgrade or crash without the device noticing; a killed block server is restarted by systemd and re-points the same device. A volume is encrypted (LUKS2) unless its class says `encryption: "off"`, so the chunks on the NAS are ciphertext. Operating one: [docs/operating-volumes.md](docs/operating-volumes.md). Design: [chunk-backed volumes](docs/design/2026-11-03-chunk-backed-volumes-design.md).
 
-## Four independent choices
+A **blob store** is an S3-style object store a pod talks to rather than mounts: `miami blobd`, a stateless service that keeps each object as content-addressed chunks on the NAS in the same store format, sealed with the store's key, and publishes it with one atomic link. Any number of blobd replicas write to one store with nothing to coordinate, because every chunk write is idempotent and every publish is atomic; a write is acknowledged only once it is on the NAS, and a node-local cache serves reads. It is a separate project with minimal S3 semantics (decision 61); nothing of it is built yet.
 
-Each StorageClass picks one option per dimension, in any combination the item type allows.
+Underneath both is one chunk format on the NAS, one backup (the NAS's own file-level copy of the chunk directories) and one restore drill. A third item, the **directory** (a subdirectory of the export bound into a pod), is internal: it is the substrate blobd's replicas mount, the non-holder side of RWX volumes in M3, and the hook for a non-Kubernetes file share later. It is not a class applications pick (decision 62; see "The directory kind" below).
 
-| Dimension | Options |
-|---|---|
-| Location | local disk, NAS (NFSv3). A volume's store must be on the NAS; its node-local data is a cache |
-| Item type | flat files in a directory, block volume (ext4 on an nbd device served from chunks; blobs are a layout on one) |
-| Sharing | single node (RWO), shared (RWX; directories only for now) |
-| Encryption | off, on (volumes only) |
+## Two kinds
+
+| | Volume | Blob store |
+|---|---|---|
+| What a pod gets | a disk: ext4 on a block device | an S3-style endpoint (`miami blobd`) |
+| Location | the NAS, cached on the node | the NAS, with a node-local read cache |
+| Sharing | one node (RWO); many nodes by re-export in M3 | shared by construction; scale blobd replicas |
+| Encryption | on by default, or off (`-plain`) | on by default, or off |
 
 ## Supported today
 
 | | Location | Sharing | Encryption |
 |---|---|---|---|
-| **Directories** | **local disk:** available<br>**NAS:** available | **single node:** available<br>**shared:** available | **off:** available<br>**on:** not supported |
-| **Volumes** | **local disk:** not supported<br>**NAS:** available | **single node:** available<br>**shared:** not yet (M3, re-export) | **off:** available (`-plain` classes)<br>**on:** available (the default) |
+| **Volumes** | **NAS:** available | **single node:** available<br>**shared:** not yet (M3, re-export) | **off:** available (`-plain` classes)<br>**on:** available (the default) |
+| **Blob stores** | **NAS:** planned | **shared:** planned | **off, on:** planned |
 
-"Available" means merged on `main` and covered by tests: unit, sanity and the kind end-to-end suite on both architectures. For volumes the end-to-end suite runs in the nfs3 variant, and the throughput gate (G1, `miami bench` on a Raspberry Pi 4) passed within 1.5x of a loop device on every phase. Blobs are not a kind: a content-addressed store is a layout an application keeps on a volume.
+"Available" means merged on `main` and covered by tests: unit, sanity and the kind end-to-end suite on both architectures. For volumes the end-to-end suite runs in the nfs3 variant, and the throughput gate (G1, `miami bench` on a Raspberry Pi 4) passed within 1.5x of a loop device on every phase. "Planned" is blobd, a separate project. The `local` transport (a volume on the node's own disk) is retired (decision 63): a volume lives on the NAS and is cached on the node, which is what lets it move between nodes.
 
 ## Installation
 
@@ -123,9 +125,7 @@ replacements:
 
 **Control planes.** The driver runs on worker nodes by default: a required node affinity on the node DaemonSet and the controller Deployment excludes nodes labelled `node-role.kubernetes.io/control-plane` or `node-role.kubernetes.io/master`. The DaemonSet tolerates every taint, so custom taints on workers do not keep it off. To run the driver on control planes, remove the affinity in your overlay with a JSON patch (the base kustomization.yaml has the snippet).
 
-**Local transport.** A `local` transport requires its host directory mounted into the node container. Add a volumeMount to the miami container with `mountPropagation: HostToContainer` and a hostPath volume to the pod spec.
-
-**Volume kind.** A node serves volumes only when it has what they need, probed on every pass and exported as `miami_node_capability{feature}`; a node missing one still serves directories, and a volume staged there waits with the `prerequisite-missing` condition.
+**Volume kind.** A node serves volumes only when it has what they need, probed on every pass and exported as `miami_node_capability{feature}`; a node missing one still serves the directory kind, and a volume staged there waits with the `prerequisite-missing` condition.
 
 | Feature | What the node needs |
 |---|---|
@@ -146,25 +146,23 @@ kubectl apply -k deploy/kustomize/base
 kubectl apply -k deploy/kustomize/examples
 ```
 
-Edit the examples first: in `miami-remote-dir-rwx.yaml`, `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rwo-plain.yaml` set `transport.server` and `transport.export` (nfs3); in `miami-local-dir-rwo.yaml` set `transport.path`.
+Edit the examples first: in `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rwo-plain.yaml` (and `miami-remote-dir-rwx.yaml`, the internal directory kind's class) set `transport.server` and `transport.export`. `miami-local-dir-rwo.yaml` is the retired `local` transport and goes with it (decision 63).
 
 ## StorageClass parameters
 
-**Naming.** A class is named `miami-<location>-<type>-<sharing>`, with a `-plain` suffix when a volume class is not encrypted. `type` is `dir` (a directory item) or `vol` (a block volume), `location` is `local` (the node's disk) or `remote` (a network server, NFSv3 today), and `sharing` is `rwo` (one node) or `rwx` (many nodes). A volume is encrypted by default, so the encrypted class has no suffix and the unencrypted one says so: `miami-remote-vol-rwo` and `miami-remote-vol-rwo-plain`. A directory has no encryption and no suffix. The examples are `miami-remote-dir-rwx` (a directory on NFSv3, many nodes), `miami-local-dir-rwo` (a directory on the node's disk, one node), `miami-remote-vol-rwo` (an encrypted volume on the NAS) and `miami-remote-vol-rwo-plain` (the same, unencrypted: the chunks on the NAS are plaintext ext4 blocks).
+**Naming.** A class is named `miami-<location>-<type>-<sharing>`, with a `-plain` suffix when a volume class is not encrypted. `type` is `vol` (a block volume; `dir` is the internal directory kind), `location` is `remote` (a network server, NFSv3 today; `local` is retired), and `sharing` is `rwo` (one node) or `rwx` (many nodes, M3). A volume is encrypted by default, so the encrypted class has no suffix and the unencrypted one says so: `miami-remote-vol-rwo` (an encrypted volume on the NAS) and `miami-remote-vol-rwo-plain` (the same, unencrypted: the chunks on the NAS are plaintext ext4 blocks).
 
 | Parameter | Values | Required | Meaning |
 |---|---|---|---|
-| `kind` | `directory`, `volume` | yes | Item type |
-| `transport.kind` | `nfs3`, `local` | yes | Transport type; a volume needs `nfs3` (`local` is refused: a chunk store on the node's own disk would only back up the node to itself) |
-| `transport.server` | IPv4 (lower case), hostname (lower case) | nfs3 | NFS server; IPv6 and ports not supported |
-| `transport.export` | absolute path | nfs3 | NFS export path |
-| `transport.path` | absolute path | local | Host path |
+| `kind` | `volume` (`directory` is internal, below) | yes | Item type |
+| `transport.kind` | `nfs3` | yes | Transport type. `local` is retired (decision 63) and refused for a volume: a chunk store on the node's own disk would only back up the node to itself |
+| `transport.server` | IPv4 (lower case), hostname (lower case) | yes | NFS server; IPv6 and ports not supported |
+| `transport.export` | absolute path | yes | NFS export path |
 | `subdir` | relative path with tokens | no | Prefix under the transport; `${pvc.namespace}` and `${pvc.name}` are expanded; elements must not be `..` or shaped like `pvc-<uuid>`. The volume's own name is always appended; default none |
-| `mode` | 1–4 octal digits | no | Mode of the volume's directory when created (default `0755`); `0777` (world-writable for root-squashed exports) and `2775` (setgid) are common; setuid (4–7 leading) is refused. An existing directory is adopted and never chmod'ed; upgrade every node plugin before setting this parameter |
 
-An unknown parameter is `InvalidArgument`, so a typo cannot silently mean the default. A directory item accepts access modes `SINGLE_NODE_WRITER`, `SINGLE_NODE_MULTI_WRITER`, `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY`. No `fsType` is accepted.
+An unknown parameter is `InvalidArgument`, so a typo cannot silently mean the default.
 
-**Parameters of `kind: volume`.** All optional; a directory class that sets one is refused.
+**Parameters of `kind: volume`.** All optional.
 
 | Parameter | Values | Default | Meaning |
 |---|---|---|---|
@@ -183,9 +181,15 @@ A volume is ext4 (`csi.storage.k8s.io/fstype: ext4`, or no `fsType` at all; any 
 
 **The key.** An encrypted class names a Secret in the claim's namespace for both the node-stage and the node-publish references (so a restage from a publish still has the key after a plugin restart); the examples use `miami-volume-key`. Its `key` entry is the key, byte for byte, and must be between 32 and 4096 bytes (a shorter or longer one is refused as `InvalidArgument` at stage and publish, naming the entry and its length, never the value); generate one with `openssl rand -base64 48`, and is read only to format and open the volume: it is held in memory, never written to the intent record, an event or a log, and never reaches the block server. Create the Secret before the first claim in a namespace, and do not delete it while volumes use the class. To rotate, set `previousKey` to the old value and `key` to the new one; at the next stage of each volume, if `key` does not open the volume and `previousKey` does, the keyslot is changed to `key` (`cryptsetup luksChangeKey`) and the volume opens. A volume that is already staged is not touched until it is next staged. Remove `previousKey` once every volume has been staged again. **Rotation changes a keyslot, not the master key.** `cryptsetup luksChangeKey` re-wraps the same volume (master) key under the new key; the data is not re-encrypted. Every older copy of the volume's header (older generations in the store, NAS snapshots, offsite copies) still opens with the old key, and anyone who held the old key and can read one of those copies can read the data. If a key may have been compromised, rotation is not enough: create a new volume with a new key and copy the data into it (mount both, copy, and delete the old volume and its snapshots and offsite copies), because only a new volume has a new master key. A missing key is the `key-required` condition (and a `KeyRequired` event); a key that matches neither is `bad-key`.
 
+## The directory kind (internal)
+
+`kind: directory` binds a subdirectory of the NAS export straight into the pod: no device, no cache, no daemon, no holder, no encryption and no fencing. It is kept as plumbing (decision 62), not as a product: blobd's replicas will mount their store this way, M3's RWX volumes mount the holder node's re-export this way, and a file share for something outside Kubernetes would too. Applications choose a volume. The example class `miami-remote-dir-rwx` stays for the driver's own use and its canary.
+
+What it accepts, for completeness: the transport parameters above, `subdir`, and `mode` (1 to 4 octal digits; the mode of the directory when created, default `0755`; `0777` for root-squashed exports and `2775` setgid are the common ones; setuid is refused; an existing directory is adopted and never chmod'ed). Access modes `SINGLE_NODE_WRITER`, `SINGLE_NODE_MULTI_WRITER`, `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY`; no `fsType`; a class that sets a volume parameter is refused. Its semantics are NFSv3's (see "Limitations"), and its cross-node locking is the helper below.
+
 ## Locking across nodes
 
-The kernel's `flock` does not work across nodes because the NFS mount uses `nolock`. Cross-node coordination uses `mkdir` and `O_EXCL`, which are server round-trips. The `miami lock` helper wraps these:
+Cross-node coordination on the directory kind: the kernel's `flock` does not work across nodes because the NFS mount uses `nolock`, so it uses `mkdir` and `O_EXCL`, which are server round-trips. The `miami lock` helper wraps these:
 
 ```sh
 miami lock acquire --dir <path> --name <lock> --holder <string>
@@ -217,20 +221,20 @@ The helper runs the command in its own process group. SIGTERM or SIGINT sent to 
 
 ## Limitations
 
-**Directories and transports**
+**The transport, and the directory kind**
 
 - **Close-to-open consistency on NFSv3.** Attribute cache is 30 seconds. A file or directory created on another node is seen on the next lookup; directory listings lag up to 30 seconds.
 - **No cross-node `flock` or `fcntl` locks.** The mount uses `nolock`. Use `miami lock` or `mkdir` with `O_EXCL`.
 - **Soft NFS mounts.** During an outage, I/O blocks up to 180 seconds, then fails with `ETIMEDOUT`. A program holding a file open across a server restart must check errors on `fsync` and `close` and write again. Requires Linux 5.3+ for `softerr`.
 - **ESTALE on server restart.** During the restart, directories answer `ESTALE` and recover when the server returns. A file held open across the window may not. The driver reports the condition (`miami_transport_up`, `miami_volume_condition`, `TransportUnavailable` event) and does not remediate in M1.
-- **Directories have none of the volume machinery.** A directory item has no encryption, fencing, expansion or exclusivity; those belong to the volume kind. There is no filesystem-image item (a loop device over a file on the NAS) and no opaque-blob kind: both are served by a volume.
-- **Transport options are fixed in code.** The NFSv3 profile (`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl`) and the `local` bind are not configurable per StorageClass.
-- **Mount-point checks and old profiles.** A `local` transport does not require its path to be a mount point, so a directory meant to be a separate disk is bound from whatever is there when the disk is not mounted; and a transport mounted by an older option profile is reported as a conflict until it is unmounted by hand.
-- **Local volumes are not deleted by the controller.** When a `local` volume is deleted, the controller succeeds and logs a warning. The directory remains on the node's disk and is not removed (the node-local tier handles removal in M4).
+- **The directory kind has none of the volume machinery.** No encryption, fencing, expansion or exclusivity; it is internal (decision 62). There is no filesystem-image item (a loop device over a file on the NAS): a volume replaced it. Blobs are the blob store, blobd, a separate project.
+- **Transport options are fixed in code.** The NFSv3 profile (`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl`) is not configurable per StorageClass.
+- **Old profiles.** A transport mounted by an older option profile is reported as a conflict until it is unmounted by hand.
+- **The `local` transport is retired** (decision 63). The code and the `miami-local-dir-rwo` example are removed in a follow-up; until then a `local` class still works for the directory kind only, is not deleted by the controller (the directory stays on the node's disk), and does not require its path to be a mount point.
 
 **Volumes**
 
-- **RWO only.** A volume mounts on one node at a time; the access modes are `SINGLE_NODE_WRITER` and `SINGLE_NODE_MULTI_WRITER`. RWX by re-export from the holder node is M3. No snapshots or clones (M4), no shrink, and the store must be on the NAS: `transport.kind: local` is refused.
+- **RWO only.** A volume mounts on one node at a time; the access modes are `SINGLE_NODE_WRITER` and `SINGLE_NODE_MULTI_WRITER`. RWX by re-export from the holder node is M3. No snapshots or clones (M4), no shrink, and the store is on the NAS.
 - **The node that holds a volume keeps it until it syncs it.** A volume moves to another node only after its holder has unstaged it cleanly: the final generation published, `current` re-read from the store and found to name it. No node takes a volume over because it is old or its node is NotReady (decision 52). A pod scheduled elsewhere waits as `holder-contended`, naming the holder. A node that is down keeps its volumes until it returns (it then drains any it no longer stages on its own) or an operator detaches them, which gives up whatever the holder had not published. The runbook is in [docs/operating-volumes.md](docs/operating-volumes.md).
 - **No automatic remediation.** The driver reports a failure (a condition, an event, a metric) and repairs nothing by deleting pods (decision 53). The one case left for a person: ext4 gone read-only after the cache filled with unpublished chunks while the store was unreachable; restart the pod once the store is back and the cache has drained.
 - **The store being down is survivable, up to the cache.** A pod keeps running on local data while the NAS is unreachable, and generations wait. Writes fail with I/O errors only when the cache is smaller than the volume and fills with unpublished chunks. What a node's death loses is bounded by what it had not published: at most one generation interval plus the publish time when the store is reachable, more when it is not.
