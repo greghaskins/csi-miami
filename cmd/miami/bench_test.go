@@ -61,7 +61,7 @@ func TestBenchCompareExit(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, stack string, secs int) string {
 		p := filepath.Join(dir, name)
-		body := `{"stack":"` + stack + `","rounds":1,"phases":[{"name":"p","seconds":[` + strconv.Itoa(secs) + `]}]}`
+		body := `{"stack":"` + stack + `","rounds":2,"phases":[{"name":"p","seconds":[9,` + strconv.Itoa(secs) + `]}]}`
 		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}

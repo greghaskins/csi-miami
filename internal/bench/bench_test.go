@@ -189,3 +189,65 @@ func TestReadReportsOrdersByStack(t *testing.T) {
 		t.Fatalf("ReadPair = %v %v %v", nbd.Stack, loop.Stack, err)
 	}
 }
+
+func TestMedian(t *testing.T) {
+	for _, c := range []struct {
+		in   []float64
+		want float64
+	}{
+		{[]float64{3}, 3},
+		{[]float64{5, 1, 3}, 3},
+		{[]float64{4, 1, 3, 2}, 2.5},
+	} {
+		if got := median(c.in); got != c.want {
+			t.Errorf("median(%v) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func rounds(stack string, secs ...float64) Report {
+	return Report{Stack: stack, Rounds: len(secs), SizeBytes: 8 << 30,
+		Phases: []PhaseResult{{Name: "a", Seconds: secs}}}
+}
+
+func TestCompareUsesMedianOfLaterRounds(t *testing.T) {
+	// Round 1 is warm-up and ignored; rounds 2..5 give 1, 2, 3, 9 for nbd
+	// (median 2.5) and 1 for loop.
+	c, err := Compare(rounds("nbd", 100, 9, 1, 3, 2), rounds("loop", 100, 1, 1, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := c.Rows[0]
+	if r.NBD != 2.5 || r.NBDMin != 1 || r.NBDMax != 9 || r.Loop != 1 || r.LoopMin != 1 || r.LoopMax != 1 {
+		t.Errorf("row = %+v", r)
+	}
+	if r.Ratio != 2.5 || r.Pass || c.Pass {
+		t.Errorf("ratio %v pass %v, want 2.5 fail", r.Ratio, r.Pass)
+	}
+	var b bytes.Buffer
+	c.WriteTable(&b)
+	for _, want := range []string{"median of rounds 2-5", "2.500", "1.000", "9.000", "FAIL"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("table lacks %q:\n%s", want, b.String())
+		}
+	}
+}
+
+func TestCompareFloorAppliesToMedians(t *testing.T) {
+	c, err := Compare(rounds("nbd", 1, 0.001, 0.04, 0.03), rounds("loop", 1, 0.002, 0.001, 0.001))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Rows[0].Ratio != 1 {
+		t.Errorf("ratio = %v, want 1 (both medians under the floor)", c.Rows[0].Ratio)
+	}
+}
+
+func TestCompareRefusesRoundMismatch(t *testing.T) {
+	if _, err := Compare(rounds("nbd", 1, 1, 1), rounds("loop", 1, 1)); err == nil || !strings.Contains(err.Error(), "rounds") {
+		t.Errorf("different round counts: err = %v", err)
+	}
+	if _, err := Compare(rounds("nbd", 1), rounds("loop", 1)); err == nil || !strings.Contains(err.Error(), "at least 2") {
+		t.Errorf("one round: err = %v", err)
+	}
+}

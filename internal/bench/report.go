@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -103,42 +104,72 @@ func ParseSize(s string) (int64, error) {
 	return n * mult, nil
 }
 
-// Row is one phase of a comparison, from the last round of each report.
+// Row is one phase of a comparison. NBD and Loop are the medians of rounds 2
+// to N; the Min and Max fields are the extremes of those rounds, so the noise
+// behind a median is visible.
 type Row struct {
-	Phase string  `json:"phase"`
-	NBD   float64 `json:"nbd_seconds"`
-	Loop  float64 `json:"loop_seconds"`
-	Ratio float64 `json:"ratio"`
-	Pass  bool    `json:"pass"`
+	Phase   string  `json:"phase"`
+	NBD     float64 `json:"nbd_seconds"`
+	NBDMin  float64 `json:"nbd_min"`
+	NBDMax  float64 `json:"nbd_max"`
+	Loop    float64 `json:"loop_seconds"`
+	LoopMin float64 `json:"loop_min"`
+	LoopMax float64 `json:"loop_max"`
+	Ratio   float64 `json:"ratio"`
+	Pass    bool    `json:"pass"`
 }
 
 // Comparison is gate G1 over two reports.
 type Comparison struct {
-	Rows []Row `json:"rows"`
-	Pass bool  `json:"pass"`
+	// Rounds is the round count of both reports; the figures use rounds 2 to it.
+	Rounds int   `json:"rounds"`
+	Rows   []Row `json:"rows"`
+	Pass   bool  `json:"pass"`
 }
 
-// Compare divides the nbd report's last-round seconds by the loop report's,
-// phase by phase.
+// median is the middle value of v, or the mean of the middle two when the
+// count is even. v is not modified and must not be empty.
+func median(v []float64) float64 {
+	s := slices.Clone(v)
+	slices.Sort(s)
+	n := len(s)
+	if n%2 == 1 {
+		return s[n/2]
+	}
+	return (s[n/2-1] + s[n/2]) / 2
+}
+
+// Compare divides the nbd report's median seconds by the loop report's, phase
+// by phase. Round 1 is warm-up; the median is over rounds 2 to N.
 func Compare(nbd, loop Report) (Comparison, error) {
 	if nbd.Stack != "nbd" || loop.Stack != "loop" {
 		return Comparison{}, fmt.Errorf("bench: comparing needs an nbd and a loop report, got %q and %q", nbd.Stack, loop.Stack)
 	}
+	if nbd.Rounds != loop.Rounds {
+		return Comparison{}, fmt.Errorf("bench: the reports have %d and %d rounds; run both with the same --rounds", nbd.Rounds, loop.Rounds)
+	}
+	if nbd.Rounds < 2 {
+		return Comparison{}, fmt.Errorf("bench: the reports have %d round; comparing needs at least 2 (round 1 is warm-up), use --rounds 5", nbd.Rounds)
+	}
 	if len(nbd.Phases) != len(loop.Phases) {
 		return Comparison{}, fmt.Errorf("bench: the reports have %d and %d phases; they were run at different scales", len(nbd.Phases), len(loop.Phases))
 	}
-	c := Comparison{Pass: true}
+	c := Comparison{Pass: true, Rounds: nbd.Rounds}
 	for i, n := range nbd.Phases {
 		l := loop.Phases[i]
 		if n.Name != l.Name {
 			return Comparison{}, fmt.Errorf("bench: phase %d is %q in one report and %q in the other; they were run at different scales", i+1, n.Name, l.Name)
 		}
-		if len(n.Seconds) == 0 || len(l.Seconds) == 0 {
-			return Comparison{}, fmt.Errorf("bench: phase %q has no timings", n.Name)
+		if len(n.Seconds) != nbd.Rounds || len(l.Seconds) != loop.Rounds {
+			return Comparison{}, fmt.Errorf("bench: phase %q does not have a timing for every round", n.Name)
 		}
-		nv := max(n.Seconds[len(n.Seconds)-1], FloorSeconds)
-		lv := max(l.Seconds[len(l.Seconds)-1], FloorSeconds)
-		row := Row{Phase: n.Name, NBD: n.Seconds[len(n.Seconds)-1], Loop: l.Seconds[len(l.Seconds)-1], Ratio: nv / lv}
+		ns, ls := n.Seconds[1:], l.Seconds[1:]
+		row := Row{
+			Phase: n.Name,
+			NBD:   median(ns), NBDMin: slices.Min(ns), NBDMax: slices.Max(ns),
+			Loop: median(ls), LoopMin: slices.Min(ls), LoopMax: slices.Max(ls),
+		}
+		row.Ratio = max(row.NBD, FloorSeconds) / max(row.Loop, FloorSeconds)
 		row.Pass = row.Ratio <= Threshold
 		c.Pass = c.Pass && row.Pass
 		c.Rows = append(c.Rows, row)
@@ -159,14 +190,14 @@ func (c Comparison) WriteTable(w io.Writer) {
 	for _, r := range c.Rows {
 		width = max(width, len(r.Phase))
 	}
-	_, _ = fmt.Fprintf(w, "round-2 seconds, nbd against loop (times under %.2f s count as %.2f s)\n\n", FloorSeconds, FloorSeconds)
-	_, _ = fmt.Fprintf(w, "%-*s  %8s  %8s  %6s  %s\n", width, "phase", "nbd", "loop", "ratio", "limit 1.5x")
+	_, _ = fmt.Fprintf(w, "median of rounds 2-%d, seconds, nbd against loop (medians under %.2f s count as %.2f s)\n\n", c.Rounds, FloorSeconds, FloorSeconds)
+	_, _ = fmt.Fprintf(w, "%-*s  %8s  %8s  %8s  %8s  %8s  %8s  %6s  %s\n", width, "phase", "nbd", "min", "max", "loop", "min", "max", "ratio", "limit 1.5x")
 	for _, r := range c.Rows {
 		v := "PASS"
 		if !r.Pass {
 			v = "FAIL"
 		}
-		_, _ = fmt.Fprintf(w, "%-*s  %8.3f  %8.3f  %6.2f  %s\n", width, r.Phase, r.NBD, r.Loop, r.Ratio, v)
+		_, _ = fmt.Fprintf(w, "%-*s  %8.3f  %8.3f  %8.3f  %8.3f  %8.3f  %8.3f  %6.2f  %s\n", width, r.Phase, r.NBD, r.NBDMin, r.NBDMax, r.Loop, r.LoopMin, r.LoopMax, r.Ratio, v)
 	}
 	v := "PASS"
 	if !c.Pass {

@@ -40,7 +40,7 @@ func runBench(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&dir, "dir", "", "an empty local directory: the loop image, the nbd cache, or the tree for none")
 	fs.StringVar(&store, "store", "", "an empty directory for the chunk store (nbd only), on the transport under test")
 	fs.StringVar(&size, "size", "8Gi", "device size (nbd and loop)")
-	fs.IntVar(&rounds, "rounds", 2, "rounds; the last one is the one compared")
+	fs.IntVar(&rounds, "rounds", 2, "rounds; round 1 is warm-up, --compare uses the median of the rest (use 5 for the gate)")
 	fs.StringVar(&scale, "scale", "full", "full (the design's phase sizes) or small (a quick run for CI)")
 	fs.StringVar(&outFile, "out", "", "also write the JSON report to this file")
 	fs.BoolVar(&asJSON, "json", false, "print the report as JSON")

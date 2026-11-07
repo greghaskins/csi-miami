@@ -5,7 +5,7 @@
 // The phases are the ones of the design's section 3.2 that need no external
 // tool. Each runs in a fresh directory on the stack's mount, the whole list
 // runs once per round, and the report keeps every round's seconds; the gate
-// reads the last round, as the table in 3.2 does.
+// reads the median of rounds 2 to N (decision 60).
 package bench
 
 import (
