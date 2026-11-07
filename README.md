@@ -75,10 +75,10 @@ Each StorageClass picks one option per dimension, in any combination the item ty
 
 | | Location | Sharing | Encryption |
 |---|---|---|---|
-| **Directories** | **local disk:** in progress<br>**NAS:** in progress | **single node:** in progress<br>**shared:** in progress | **off:** in progress<br>**on:** not supported |
-| **Volumes** | **local disk:** not supported<br>**NAS:** in progress | **single node:** in progress<br>**shared:** not yet (M3, re-export) | **off:** in progress (`-plain` classes)<br>**on:** in progress (the default) |
+| **Directories** | **local disk:** available<br>**NAS:** available | **single node:** available<br>**shared:** available | **off:** available<br>**on:** not supported |
+| **Volumes** | **local disk:** not supported<br>**NAS:** available | **single node:** available<br>**shared:** not yet (M3, re-export) | **off:** available (`-plain` classes)<br>**on:** available (the default) |
 
-"In progress" means merged on the M2 branch and covered by tests. The end-to-end suite for volumes passes on kind (both architectures, the nfs3 variant); only the throughput gate (G1, `miami bench` on a Raspberry Pi 4) is pending. Blobs are not a kind: a content-addressed store is a layout an application keeps on a volume.
+"Available" means merged on `main` and covered by tests: unit, sanity and the kind end-to-end suite on both architectures. For volumes the end-to-end suite runs in the nfs3 variant, and the throughput gate (G1, `miami bench` on a Raspberry Pi 4) passed within 1.5x of a loop device on every phase. Blobs are not a kind: a content-addressed store is a layout an application keeps on a volume.
 
 ## Installation
 
