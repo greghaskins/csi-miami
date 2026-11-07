@@ -895,7 +895,7 @@ left open or put differently.
     min and max of the rounds used and refuses reports whose round counts
     differ or that have fewer than two. The 0.05 s floor applies to the
     medians.
-61. **A rollback guard keeps a per-volume high-water mark outside the store**
+64. **A rollback guard keeps a per-volume high-water mark outside the store**
     (adds to 4.2 and 4.7; `2026-11-07-rollback-guard-design.md`). The newest
     published generation is recorded on the PV as
     `miami.csi.greghaskins.com/high-water`, and a stage whose data would be
@@ -908,7 +908,7 @@ left open or put differently.
     ValidatingAdmissionPolicy can narrow to the annotations the driver writes.
     An absent mark is no mark. Manifest signing is deferred until the export is
     shared with an untrusted party.
-62. **A deliberate rollback is accepted by exact generation** (adds to 4.5; same
+65. **A deliberate rollback is accepted by exact generation** (adds to 4.5; same
     document). The PV annotation `miami.csi.greghaskins.com/accept-generation`
     names the generation `current` holds and lets that one stage proceed; the
     next publish lands as a new higher generation. Generations newer than the

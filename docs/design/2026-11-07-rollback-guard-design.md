@@ -5,7 +5,7 @@
 **Reads with:** `2026-11-03-chunk-backed-volumes-design.md` (sections 4.2 to 4.7
 and decisions 36 to 60), `2026-10-30-architecture-brief.md`,
 `docs/operating-volumes.md`, `docs/restore.md`
-**Adds:** decisions 61 and 62, appended to the logs of the spec and the brief.
+**Adds:** decisions 64 and 65, appended to the logs of the spec and the brief.
 Nothing in the spec is rewritten.
 
 This addendum closes one gap the chunk-backed design leaves open: a volume's
@@ -61,7 +61,7 @@ volumes get a key for it at all, since today only an encrypted volume has one;
 that belongs to whichever decision introduces the shared export. It is not
 needed for anything below.
 
-## 4. Decision 61: the rollback guard
+## 4. Decision 64: the rollback guard
 
 ### 4.1 The mark
 
@@ -166,11 +166,11 @@ metadata.
 It can be narrowed anyway. A ValidatingAdmissionPolicy keyed on the plugin's
 ServiceAccount can require that the object's `spec` and `labels` equal the old
 object's and that the annotations differ only in the keys the driver writes
-(`high-water` here; the others in decision 62 are the operator's, not the
+(`high-water` here; the others in decision 65 are the operator's, not the
 plugin's). The base ships no admission policy (section 8 of the spec); the
 operating guide carries this one as an example for a cluster to adopt.
 
-## 5. Decision 62: deliberate rollback
+## 5. Decision 65: deliberate rollback
 
 Sometimes going back is the intent: a bad upgrade of the application, a
 corrupted database. The operator says so, exactly, as with force-detach:
