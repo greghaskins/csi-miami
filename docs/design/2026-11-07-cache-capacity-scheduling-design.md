@@ -1,6 +1,6 @@
 # Scheduling node-local cache capacity
 
-**Status:** Owner's questions settled 2026-11-07; awaiting approval of the document (decision 66)
+**Status:** Approved by the owner on 2026-11-07 (decision 66); the implementation plan follows
 **Created:** 2026-11-07
 **Reads with:** `2026-11-03-chunk-backed-volumes-design.md` (4.3, the cache; decisions 54, 59), `2026-10-30-architecture-brief.md` (decision log), `docs/operating-volumes.md` (node layout, monitoring)
 
@@ -127,7 +127,7 @@ allocatable from capacity for an extended resource.
 **The budget.** `budget = max(0, share × size(cacheFS) − reserve)`, where
 `size(cacheFS)` is the capacity of the file system holding the cache directory
 (`statfs` on `-cache-dir`), `share` is `-cache-budget-share` (default 0.5) and
-`reserve` is `-cache-budget-reserve` (default 10Gi). `-cache-budget` set to an
+`reserve` is `-cache-budget-reserve` (default 15Gi). `-cache-budget` set to an
 absolute value overrides the formula. A budget of zero, computed or explicit,
 is a real answer: the node advertises `0` and refuses every new volume, which
 is what a disk too small for any cache should do. Turning accounting off is a
@@ -383,8 +383,12 @@ conservatively.
    fail-open count is alerted on.
 2. The node plugin patches its own node's capacity, narrowed by the admission
    policy; the controller does not patch nodes.
-3. The base defaults are `share 0.5` and `reserve 10Gi`; the owner's overlay
-   may set an absolute `-cache-budget` per node.
+3. The base defaults are `share 0.5` and `reserve 15Gi`. The owner's overlay
+   sets absolute budgets: `-cache-budget 100Gi` on the 220 GiB workers and
+   `200Gi` on the two 466 GiB workers (with the defaults those would be about
+   95 and 218 GiB, and the 220 GiB nodes already carry 20 to 100 GiB of
+   other usage, so the absolute figures leave the kubelet's own eviction line
+   clear).
 4. Pods sharing one RWO claim on a node are counted conservatively.
 5. Pods that predate the rollout stay unaccounted until recreated; the stage
    check protects the node and the recording rule shows the gap.
