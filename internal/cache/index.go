@@ -163,7 +163,11 @@ func writeIndex(dir string, idx Index) error {
 	return syncDir(dir)
 }
 
-func syncDir(dir string) error {
+// syncDir is syncDirFile; a test replaces it to see which directories are
+// fsynced, and in what order relative to chunk and index writes.
+var syncDir = syncDirFile
+
+func syncDirFile(dir string) error {
 	d, err := os.Open(dir) // #nosec G304 -- the cache's own directory
 	if err != nil {
 		return err

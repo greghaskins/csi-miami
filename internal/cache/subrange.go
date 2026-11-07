@@ -142,7 +142,7 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte, zeroBase bool) erro
 	delete(c.zero, i)
 	delete(c.pendingUnlink, i)
 	c.dirty[i] = struct{}{}
-	c.markIndexLocked()
+	c.dirtiedLocked(i, newCharge) // newCharge: not dirty before, or dirty only as a trim
 	gap := c.gapHook
 	c.mu.Unlock()
 

@@ -277,19 +277,23 @@ func (b *backend) fetchOne(ctx context.Context, i uint32) error {
 // sub-chunk segment to a chunk the cache does not already hold first fetches
 // the base so the bytes it does not cover keep their value. A cache full of
 // dirty chunks fails the write with EIO rather than block, so the filesystem
-// goes read-only and no kernel thread waits on the transport. fua syncs the
-// cache before returning.
+// goes read-only and no kernel thread waits on the transport. fua makes the
+// chunks this write touched durable before returning; it leaves other writes'
+// fsync obligations for the FLUSH that owes them, which is what keeps a
+// journal commit's FLUSH-then-FUA from syncing everything twice.
 func (b *backend) WriteAt(p []byte, off int64, fua bool) (int, error) {
 	done := 0
+	var chunks []uint32
 	for done < len(p) {
 		i, intra, n := b.segment(off+int64(done), len(p)-done)
 		if err := b.writeSeg(i, intra, p[done:done+int(n)]); err != nil {
 			return done, err
 		}
+		chunks = append(chunks, i)
 		done += int(n)
 	}
 	if fua {
-		if err := b.cache.Sync(); err != nil {
+		if err := b.cache.SyncChunks(chunks...); err != nil {
 			return done, err
 		}
 	}
