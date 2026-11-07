@@ -1316,7 +1316,7 @@ text is kept and the decision wins.
 
 Pending: none that block M2.
 
-Decisions 51 to 59 were recorded while the M2 plan ran, in full in
+Decisions 51 to 60 were recorded while the M2 plan ran, and 61 to 63 after it closed, in full in
 `2026-11-03-chunk-backed-volumes-design.md` section 6 and folded into its
 section 4. Where they contradict a section above (4.5 takeover and its two
 clocks, 4.6 remediation, decision 8's fence timing), the section's text is kept
@@ -1372,6 +1372,41 @@ and the decision wins.
     min and max of the rounds used and refuses reports whose round counts
     differ or that have fewer than two. The 0.05 s floor applies to the
     medians.
+61. **Applications choose between two kinds, the volume and the blob store;
+    the directory is not one of them** (owner decision 2026-11-07; supersedes
+    the README's four independent choices and brief 4.1's three item types).
+    The volume is the disk: ext4 on a block device, on the NAS and cached on
+    the node, RWO (RWX by re-export in M3), encrypted or not. The blob store is
+    `miami blobd`, an S3-style endpoint a pod talks to rather than mounts: each
+    object is content-addressed chunks in the same store format, sealed with
+    the store's key and published by one atomic link, so any number of
+    stateless replicas write to one store with nothing to coordinate; a write
+    is acknowledged only once it is on the NAS (a write-behind cache would need
+    the holder, the epoch and the drain all over again), and a node-local cache
+    serves reads only. Sharing is therefore not a choice for a blob store, and
+    neither kind lives on a node's own disk. blobd is a separate project with
+    minimal S3 semantics; its design is not this document's. One chunk format,
+    one NAS-side backup and one restore drill serve both kinds. This supersedes
+    decision 48 (blobs as a layout on a volume, and the dropping of brief 5.3's
+    S3 service): the object service returns, as blobd over the chunk store
+    rather than over a volume. Whatever protects a volume's generations from
+    pruning and sets their retention (decision 64, the rollback guard) raises
+    the same questions for a blob store; answering them is blobd's design.
+62. **The directory kind is internal** (narrows brief 4.1 and M1's product
+    framing; drops the goals document's strong-RWO and encrypted directories).
+    It stays in the driver as plumbing, NAS-only, unfenced and unencrypted: the
+    substrate blobd's replicas mount, the non-holder side of M3's RWX volumes
+    (every other node mounts the holder's re-export and binds a subdirectory,
+    which is this item's transport layer), and the hook for a file share
+    outside Kubernetes later. Its StorageClass is not offered to applications;
+    the `miami-remote-dir-rwx` example remains for the driver's own use and its
+    canary. The `miami lock` helper stays with it.
+63. **The `local` transport is retired** (removes a dimension of brief 4.1).
+    Nothing uses a directory on a node's own disk, and the role of a node-local
+    class passes to volumes, which are NAS-backed and so can move between nodes.
+    The code, the `miami-local-dir-rwo` example and the controller's
+    "local volumes are not deleted" exception go in a follow-up change; until
+    then a `local` class works for the directory kind only.
 
 ## 10. Milestones
 
