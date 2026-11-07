@@ -1,6 +1,6 @@
 # Scheduling node-local cache capacity
 
-**Status:** Draft for the owner's approval (decision 66)
+**Status:** Owner's questions settled 2026-11-07; awaiting approval of the document (decision 66)
 **Created:** 2026-11-07
 **Reads with:** `2026-11-03-chunk-backed-volumes-design.md` (4.3, the cache; decisions 54, 59), `2026-10-30-architecture-brief.md` (decision log), `docs/operating-volumes.md` (node layout, monitoring)
 
@@ -378,20 +378,18 @@ capacity tracking is rejected (provisioning-time only; pins topology). The
 webhook fails open; RWX volumes wait for M3; shared RWO claims count
 conservatively.
 
-**Questions only the owner can decide** (the design assumes the first option of
-each):
-1. Failure policy `Ignore` (unaccounted pods possible while the webhook is
-   down, caught at stage) or `Fail` (no pod creation outside two namespaces
-   while the controller is down)?
-2. The node plugin patching its own node under the admission policy, or the
-   controller patching every node (one broader principal, no token trick)?
-3. Budget defaults for the base, `share 0.5` and `reserve 10Gi`, and whether
-   the owner's overlay sets an absolute `-cache-budget` per disk size instead.
-4. Accept the conservative double count for shared RWO claims (4.5)?
-5. Accept the transition gap for pre-existing pods, closed by rolling restarts
-   and watched by a recording rule (4.6)?
-6. TLS in the owner's cluster: cert-manager (a `Certificate` and the CA
-   injector) rather than the controller's self-signed default?
+**Settled by the owner (2026-11-07),** each as the design recommends:
+1. The webhook fails open (`Ignore`); the stage check is the net, and the
+   fail-open count is alerted on.
+2. The node plugin patches its own node's capacity, narrowed by the admission
+   policy; the controller does not patch nodes.
+3. The base defaults are `share 0.5` and `reserve 10Gi`; the owner's overlay
+   may set an absolute `-cache-budget` per node.
+4. Pods sharing one RWO claim on a node are counted conservatively.
+5. Pods that predate the rollout stay unaccounted until recreated; the stage
+   check protects the node and the recording rule shows the gap.
+6. The owner's cluster uses cert-manager and the CA injector; the base keeps
+   the self-signed default.
 
 ## 7. Left to the builder
 
