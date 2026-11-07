@@ -1407,6 +1407,27 @@ and the decision wins.
     The code, the `miami-local-dir-rwo` example and the controller's
     "local volumes are not deleted" exception go in a follow-up change; until
     then a `local` class works for the directory kind only.
+64. **A rollback guard keeps a per-volume high-water mark outside the store**
+    (adds to 4.2 and 4.7; `2026-11-07-rollback-guard-design.md`). The newest
+    published generation is recorded on the PV as
+    `miami.csi.greghaskins.com/high-water`, and a stage whose data would be
+    older than the mark is refused with the `rollback-detected` condition, a
+    `RollbackDetected` event and a message saying how to proceed, before any
+    cache is discarded; a reused cache at or above the mark is not refused. The
+    mark is written at a verified unstage and at most once per interval after a
+    publish (recommended; per-publish is the alternative, pending the owner).
+    The node role gains `patch` on persistentvolumes, which a
+    ValidatingAdmissionPolicy can narrow to the annotations the driver writes.
+    An absent mark is no mark. Manifest signing is deferred until the export is
+    shared with an untrusted party.
+65. **A deliberate rollback is accepted by exact generation** (adds to 4.5; same
+    document). The PV annotation `miami.csi.greghaskins.com/accept-generation`
+    names the generation `current` holds and lets that one stage proceed; the
+    next publish lands as a new higher generation. Generations newer than the
+    rollback point are held from pruning, recorded in
+    `miami.csi.greghaskins.com/held-generations`, until an operator removes the
+    annotation. Clone from a generation (M4) is the primary way to go back in
+    time and shares the pin mechanism.
 
 ## 10. Milestones
 
