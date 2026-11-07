@@ -82,14 +82,24 @@ The loop image is a sparse file of `--size` under `--dir`, so `--dir` needs
 that much free space (8 GiB for the runs below) while the loop run is in
 progress. It is removed at the end.
 
+## One folder per attempt
+
+Each attempt at the gate gets its own folders, named after the binary's
+version, so a rerun with a newer image never reuses or overwrites an earlier
+attempt's directories or results (`--out` refuses an existing file anyway).
+Set `V` once in the shell you run both runs from:
+
+    V=$(./miami version)       # e.g. x-b28161145cb4eba3
+    mkdir -p "g1-$V"           # the results of this attempt
+
 ## Run 1: store on a local directory
 
-    sudo mkdir -p /var/tmp/g1/dir /var/tmp/g1/store
-    sudo unshare --mount --propagation private sh -c '
-      ./miami bench --stack nbd  --dir /var/tmp/g1/dir/nbd  --store /var/tmp/g1/store --size 8Gi --out nbd-local.json
-      ./miami bench --stack loop --dir /var/tmp/g1/dir/loop --size 8Gi --out loop.json
-    '
-    ./miami bench --compare nbd-local.json loop.json
+    sudo mkdir -p "/var/tmp/g1/$V/dir" "/var/tmp/g1/$V/store"
+    sudo unshare --mount --propagation private sh -c "
+      ./miami bench --stack nbd  --dir /var/tmp/g1/$V/dir/nbd  --store /var/tmp/g1/$V/store --size 8Gi --out g1-$V/nbd-local.json
+      ./miami bench --stack loop --dir /var/tmp/g1/$V/dir/loop --size 8Gi --out g1-$V/loop.json
+    "
+    ./miami bench --compare "g1-$V/nbd-local.json" "g1-$V/loop.json"
 
 `--dir` is local disk in both runs: it holds the loop image, and the nbd
 stack's cache. `unshare` keeps every mount the bench makes out of the host's
@@ -104,18 +114,20 @@ an empty directory on it:
 
     sudo mkdir -p /mnt/g1-transport
     sudo mount -t nfs -o vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl <server>:<export> /mnt/g1-transport
-    sudo mkdir -p /mnt/g1-transport/g1
+    sudo mkdir -p "/mnt/g1-transport/g1-$V"
     sudo unshare --mount --propagation private ./miami bench --stack nbd \
-        --dir /var/tmp/g1/dir/nbd --store /mnt/g1-transport/g1 --size 8Gi --out nbd-nfs.json
-    ./miami bench --compare nbd-nfs.json loop.json
+        --dir "/var/tmp/g1/$V/dir/nbd" --store "/mnt/g1-transport/g1-$V" --size 8Gi --out "g1-$V/nbd-nfs.json"
+    ./miami bench --compare "g1-$V/nbd-nfs.json" "g1-$V/loop.json"
 
 The loop baseline is the same as in run 1 (local disk); only the nbd stack's
-store moves. Unmount the export and remove `g1` afterwards.
+store moves.
 
 The nbd run leaves its chunks under the store directory on the export, in a
 `miami-bench-*` directory, until you remove them. After the run, with the
-export still mounted: `sudo rm -rf /mnt/g1-transport/g1/miami-bench-*`, then
-unmount.
+export still mounted: `sudo rm -rf "/mnt/g1-transport/g1-$V"`, then unmount
+the export. The local `/var/tmp/g1/$V` folders are empty after a clean run;
+remove them with `sudo rm -rf "/var/tmp/g1/$V"`. Keep `g1-$V/` for the
+record.
 
 ## After a crash
 
