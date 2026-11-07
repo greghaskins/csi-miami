@@ -53,8 +53,7 @@ A MAC over each manifest, keyed from the volume key, would let a node tell a
 genuine manifest from a forged one. A replayed old manifest is genuine: it was
 signed when it was written and still verifies. Signing defends against a
 malicious writer on the export, who is outside the current threat model (the
-export is the owner's, and the threat model's exposure is a reader of the
-backup, which ciphertext already covers).
+export is the owner's).
 
 Manifest signing is therefore deferred until the export is shared with an
 untrusted party. The question to settle then is whether plain (unencrypted)
