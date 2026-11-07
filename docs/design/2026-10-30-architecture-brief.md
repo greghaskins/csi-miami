@@ -1386,7 +1386,12 @@ and the decision wins.
     serves reads only. Sharing is therefore not a choice for a blob store, and
     neither kind lives on a node's own disk. blobd is a separate project with
     minimal S3 semantics; its design is not this document's. One chunk format,
-    one NAS-side backup and one restore drill serve both kinds.
+    one NAS-side backup and one restore drill serve both kinds. This supersedes
+    decision 48 (blobs as a layout on a volume, and the dropping of brief 5.3's
+    S3 service): the object service returns, as blobd over the chunk store
+    rather than over a volume. Whatever protects a volume's generations from
+    pruning and sets their retention (decision 64, the rollback guard) raises
+    the same questions for a blob store; answering them is blobd's design.
 62. **The directory kind is internal** (narrows brief 4.1 and M1's product
     framing; drops the goals document's strong-RWO and encrypted directories).
     It stays in the driver as plumbing, NAS-only, unfenced and unencrypted: the
