@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,7 +17,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 // shutdownTimeout bounds the close of the HTTP server.
@@ -25,6 +28,10 @@ const shutdownTimeout = 5 * time.Second
 // requestBuckets are the bounds, in seconds, of the CSI request histogram:
 // from a metadata call to a stage that waits for a slow transport.
 var requestBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+
+// publishBuckets are the bounds, in seconds, of the generation histogram: a
+// freeze, a boundary and an upload, from a quiet volume to a slow transport.
+var publishBuckets = []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
 
 // reconcileBuckets are the bounds, in seconds, of the converge-pass histogram.
 var reconcileBuckets = []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60}
@@ -36,21 +43,43 @@ const (
 	NameTransports          = "miami_transports"
 	NameTransportUp         = "miami_transport_up"
 	NameVolumeCondition     = "miami_volume_condition"
+	NameVolumeProbeOK       = "miami_volume_probe_ok"
 	NameReconcileDuration   = "miami_reconcile_duration_seconds"
 	NameReconcileErrors     = "miami_reconcile_errors_total"
 	NameObservationTimeouts = "miami_observation_timeouts_total"
 	NameGarbageUnmounts     = "miami_garbage_unmounts_total"
 	NameIntentLoadFailures  = "miami_intent_load_failures"
+	NameNodeCapability      = "miami_node_capability"
 	NameCSIRequests         = "miami_csi_requests_total"
 	NameCSIRequestDuration  = "miami_csi_request_duration_seconds"
+
+	NameVolumesServed             = "miami_volumes_served"
+	NameGenerationAge             = "miami_generation_age_seconds"
+	NameGenerationDirty           = "miami_generation_dirty_bytes"
+	NameGenerationPublishDuration = "miami_generation_publish_duration_seconds"
+	NameGenerationPublishes       = "miami_generation_publishes_total"
+	NameCacheBytes                = "miami_cache_bytes"
+	NameChunkFetchDuration        = "miami_chunk_fetch_duration_seconds"
+	NameChunkFetchErrors          = "miami_chunk_fetch_errors_total"
 )
 
 // NodeFamilies are the families a node plugin serves: its reconciler's and the
 // two CSI request metrics.
 var NodeFamilies = []string{
 	NameIntents, NameTransports, NameTransportUp, NameVolumeCondition, NameReconcileDuration, NameReconcileErrors,
-	NameObservationTimeouts, NameGarbageUnmounts, NameIntentLoadFailures,
+	NameObservationTimeouts, NameGarbageUnmounts, NameIntentLoadFailures, NameNodeCapability,
 	NameCSIRequests, NameCSIRequestDuration,
+	NameVolumesServed, NameGenerationPublishDuration, NameGenerationPublishes,
+}
+
+// VolumeFamilies are the families with one series per staged volume of kind
+// volume, labelled volume=<PV name>. They are served by the node plugin like
+// NodeFamilies, but a node with no such volume has no series and so no family
+// in its scrape: a test that expects them checks them only where it has staged
+// a volume of that kind.
+var VolumeFamilies = []string{
+	NameVolumeProbeOK, NameGenerationAge, NameGenerationDirty, NameCacheBytes,
+	NameChunkFetchDuration, NameChunkFetchErrors,
 }
 
 // ControllerFamilies are the families the controller serves: the CSI request
@@ -71,16 +100,30 @@ type Registry struct {
 	transports      *prometheus.GaugeVec
 	transportUp     *prometheus.GaugeVec
 	volumeCondition *prometheus.GaugeVec
+	volumeProbeOK   *prometheus.GaugeVec
 	reconcileDur    prometheus.Histogram
 	reconcileErrs   *prometheus.CounterVec
 	obsTimeouts     *prometheus.CounterVec
 	garbage         prometheus.Counter
 	loadFailures    prometheus.Gauge
+	capability      *prometheus.GaugeVec
 	requests        *prometheus.CounterVec
 	requestDuration *prometheus.HistogramVec
+
+	volumesServed *prometheus.GaugeVec
+	genAge        *prometheus.GaugeVec
+	genDirty      *prometheus.GaugeVec
+	publishDur    prometheus.Histogram
+	publishes     *prometheus.CounterVec
+	cacheBytes    *prometheus.GaugeVec
+	fetches       *fetchCollector
 }
 
-var _ reconcile.Metrics = (*Registry)(nil)
+var (
+	_ reconcile.Metrics           = (*Registry)(nil)
+	_ reconcile.ProbeMetrics      = (*Registry)(nil)
+	_ reconcile.GenerationMetrics = (*Registry)(nil)
+)
 
 // Option configures New.
 type Option func(*options)
@@ -117,6 +160,9 @@ func New(opts ...Option) *Registry {
 	r.volumeCondition = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: NameVolumeCondition, Help: "Volumes staged on this node in each condition after the latest pass (ok, or what is wrong).",
 	}, []string{"condition"})
+	r.volumeProbeOK = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameVolumeProbeOK, Help: "Whether the volume's device answered its active probe (a direct read of its first sector): 1 it did, 0 it failed twice in a row. Volumes of kind volume only.",
+	}, []string{"volume"})
 	r.reconcileDur = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: NameReconcileDuration, Help: "Duration of one converge pass.", Buckets: reconcileBuckets,
 	})
@@ -132,6 +178,9 @@ func New(opts ...Option) *Registry {
 	r.loadFailures = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: NameIntentLoadFailures, Help: "Intent records that failed to load in the latest pass.",
 	})
+	r.capability = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameNodeCapability, Help: "Whether the node has what the volume kind needs, by feature: 1 present, 0 missing.",
+	}, []string{"feature"})
 	r.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: NameCSIRequests, Help: "Finished CSI calls, by method and gRPC code.",
 	}, []string{"method", "code"})
@@ -139,12 +188,38 @@ func New(opts ...Option) *Registry {
 		Name: NameCSIRequestDuration, Help: "Duration of CSI calls, by method.", Buckets: requestBuckets,
 	}, []string{"method"})
 
+	r.volumesServed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameVolumesServed, Help: "Staged volumes of kind volume by the state of their block server: serving, outdated-binary (answering, on an older binary) or down.",
+	}, []string{"state"})
+	r.genAge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameGenerationAge, Help: "Seconds since the volume's newest published generation (since the node first saw the volume, if its server has not published yet).",
+	}, []string{"volume"})
+	r.genDirty = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameGenerationDirty, Help: "Bytes the volume has written that no published generation holds.",
+	}, []string{"volume"})
+	r.publishDur = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: NameGenerationPublishDuration, Help: "Duration of a successful generation, freeze to upload.", Buckets: publishBuckets,
+	})
+	r.publishes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: NameGenerationPublishes, Help: "Finished generations by result: ok, refused (the fencing check said another node owns the volume) or failed. A generation skipped because another is running is not counted.",
+	}, []string{"result"})
+	r.cacheBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: NameCacheBytes, Help: "Bytes in the volume's node-local cache: clean (copies of chunks the store holds) or dirty (unpublished writes).",
+	}, []string{"volume", "state"})
+	r.fetches = newFetchCollector()
+
 	// The steps the reconciler reports are a fixed list (reconcile.Metrics), so
 	// their counters exist at zero from the start: a series that appears only
 	// at the first failure cannot be rated or alerted on before it.
 	// The same goes for every condition a volume can be in.
 	for _, c := range reconcile.Conditions {
 		r.volumeCondition.WithLabelValues(c)
+	}
+	for _, state := range reconcile.ServedStates {
+		r.volumesServed.WithLabelValues(state)
+	}
+	for _, res := range reconcile.PublishResults {
+		r.publishes.WithLabelValues(res)
 	}
 	for _, step := range ReconcileSteps {
 		r.reconcileErrs.WithLabelValues(step)
@@ -158,8 +233,9 @@ func New(opts ...Option) *Registry {
 	)
 	if o.reconciler {
 		r.reg.MustRegister(
-			r.intents, r.transports, r.transportUp, r.volumeCondition, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
-			r.garbage, r.loadFailures,
+			r.intents, r.transports, r.transportUp, r.volumeCondition, r.volumeProbeOK, r.reconcileDur, r.reconcileErrs, r.obsTimeouts,
+			r.garbage, r.loadFailures, r.capability,
+			r.volumesServed, r.genAge, r.genDirty, r.publishDur, r.publishes, r.cacheBytes, r.fetches,
 		)
 	}
 	return r
@@ -199,6 +275,86 @@ func (r *Registry) SetVolumeConditions(counts map[string]int) {
 	}
 }
 
+// SetVolumeProbe implements reconcile.ProbeMetrics: 1 for a volume whose
+// device answers its probe, 0 for one that does not. The label is the PV name;
+// an ID that does not name a volume is dropped, so the label is never a path.
+func (r *Registry) SetVolumeProbe(volumeID string, ok bool) {
+	id, err := volume.ParseID(volumeID)
+	if err != nil {
+		return
+	}
+	v := 0.0
+	if ok {
+		v = 1
+	}
+	r.volumeProbeOK.WithLabelValues(id.Name).Set(v)
+}
+
+// DeleteVolumeProbe implements reconcile.ProbeMetrics.
+func (r *Registry) DeleteVolumeProbe(volumeID string) {
+	if id, err := volume.ParseID(volumeID); err == nil {
+		r.volumeProbeOK.DeleteLabelValues(id.Name)
+	}
+}
+
+// volumeName returns the PV name of a volume ID, or false when the ID names
+// no volume: the {volume} label is a PV name and nothing else, never a path.
+func volumeName(volumeID string) (string, bool) {
+	id, err := volume.ParseID(volumeID)
+	if err != nil {
+		return "", false
+	}
+	return id.Name, true
+}
+
+// SetVolumeGeneration implements reconcile.GenerationMetrics.
+func (r *Registry) SetVolumeGeneration(volumeID string, g reconcile.VolumeGeneration) {
+	name, ok := volumeName(volumeID)
+	if !ok {
+		return
+	}
+	r.genAge.WithLabelValues(name).Set(g.Age.Seconds())
+	r.genDirty.WithLabelValues(name).Set(float64(g.DirtyBytes))
+	r.cacheBytes.WithLabelValues(name, "dirty").Set(float64(g.DirtyBytes))
+	r.cacheBytes.WithLabelValues(name, "clean").Set(float64(g.CleanBytes))
+	r.fetches.set(name, g.Fetch)
+}
+
+// DeleteVolumeGeneration implements reconcile.GenerationMetrics.
+func (r *Registry) DeleteVolumeGeneration(volumeID string) {
+	name, ok := volumeName(volumeID)
+	if !ok {
+		return
+	}
+	r.genAge.DeleteLabelValues(name)
+	r.genDirty.DeleteLabelValues(name)
+	r.cacheBytes.DeleteLabelValues(name, "dirty")
+	r.cacheBytes.DeleteLabelValues(name, "clean")
+	r.fetches.delete(name)
+}
+
+// ObservePublish implements reconcile.GenerationMetrics. A result that is not
+// one of reconcile.PublishResults is dropped. Only a successful generation's
+// duration is observed: a refusal or a failure ends early or at a deadline
+// and would blur what a publish costs.
+func (r *Registry) ObservePublish(result string, d time.Duration) {
+	if !slices.Contains(reconcile.PublishResults, result) {
+		return
+	}
+	r.publishes.WithLabelValues(result).Inc()
+	if result == reconcile.PublishOK {
+		r.publishDur.Observe(d.Seconds())
+	}
+}
+
+// SetVolumesServed implements reconcile.GenerationMetrics. Only the states the
+// reconciler names are set, so the label values are a fixed list.
+func (r *Registry) SetVolumesServed(counts map[string]int) {
+	for _, s := range reconcile.ServedStates {
+		r.volumesServed.WithLabelValues(s).Set(float64(counts[s]))
+	}
+}
+
 // ObserveReconcile implements reconcile.Metrics.
 func (r *Registry) ObserveReconcile(d time.Duration) { r.reconcileDur.Observe(d.Seconds()) }
 
@@ -210,6 +366,21 @@ func (r *Registry) IncObservationTimeout(op string) { r.obsTimeouts.WithLabelVal
 
 // IncGarbageUnmount implements reconcile.Metrics.
 func (r *Registry) IncGarbageUnmount() { r.garbage.Inc() }
+
+// SetCapability sets whether the node has a prerequisite feature (see
+// prereq.Features): 1 present, 0 missing. The label is the feature name and
+// nothing else, never a path or an address; a name that is not a feature is
+// dropped, so the label values are a fixed list.
+func (r *Registry) SetCapability(feature string, present bool) {
+	if !slices.Contains(prereq.Features, feature) {
+		return
+	}
+	v := 0.0
+	if present {
+		v = 1
+	}
+	r.capability.WithLabelValues(feature).Set(v)
+}
 
 // SetIntentLoadFailures implements reconcile.Metrics.
 func (r *Registry) SetIntentLoadFailures(n int) { r.loadFailures.Set(float64(n)) }

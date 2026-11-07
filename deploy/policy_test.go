@@ -167,6 +167,25 @@ type rule struct {
 	verbs           []string
 }
 
+// The generation timers read the publish annotation of a PV with a get, and
+// that is all the node may do to PVs: no list or watch (it asks for one
+// by name) and no write (an annotation is the operator's request, never the
+// node's).
+func TestNodeRoleReadsPVAnnotationsOnly(t *testing.T) {
+	t.Parallel()
+	var cr rbacv1.ClusterRole
+	base(t).get(t, "ClusterRole", "miami-node", &cr)
+	got := ruleSet(cr.Rules)
+	if !got["/persistentvolumes:get"] {
+		t.Error("the node cannot get PVs, so it cannot read the publish annotation")
+	}
+	for _, verb := range []string{"list", "watch", "create", "update", "patch", "delete", "*"} {
+		if got["/persistentvolumes:"+verb] {
+			t.Errorf("the node may %s PVs", verb)
+		}
+	}
+}
+
 func TestRBACRuleSets(t *testing.T) {
 	t.Parallel()
 	// The lists below are plan section 12. A change to either side must change
@@ -178,6 +197,8 @@ func TestRBACRuleSets(t *testing.T) {
 		{"miami-controller", []rule{
 			{"", "persistentvolumes", []string{"get", "list", "watch", "create", "patch", "delete"}},
 			{"", "persistentvolumeclaims", []string{"get", "list", "watch", "update"}},
+			// csi-resizer's only grant the others do not cover.
+			{"", "persistentvolumeclaims/status", []string{"patch"}},
 			{"storage.k8s.io", "storageclasses", []string{"get", "list", "watch"}},
 			{"storage.k8s.io", "volumeattachments", []string{"get", "list", "watch", "patch"}},
 			{"storage.k8s.io", "volumeattachments/status", []string{"patch"}},
@@ -186,7 +207,10 @@ func TestRBACRuleSets(t *testing.T) {
 			{"", "events", []string{"list", "watch", "create", "update", "patch"}},
 		}},
 		{"miami-node", []rule{
+			// The events' PV lookup, and the emergency detach's annotation read.
 			{"", "persistentvolumes", []string{"get"}},
+			// The taint of a holder's node (decision 52): read, never written.
+			{"", "nodes", []string{"get"}},
 		}},
 	}
 	r := base(t)
@@ -383,13 +407,6 @@ func TestBaseCreatesNoStorageClass(t *testing.T) {
 	}
 }
 
-type mount struct {
-	hostPath    string
-	hostType    corev1.HostPathType
-	mountPath   string
-	propagation corev1.MountPropagationMode
-}
-
 // checkNoControlPlaneAffinity asserts the required node affinity of decision
 // 35: one term whose expressions exclude the control-plane and master roles.
 func checkNoControlPlaneAffinity(t *testing.T, a *corev1.Affinity) {
@@ -513,45 +530,11 @@ func TestNodeDaemonSet(t *testing.T) {
 		t.Errorf("NODE_NAME must come from the downward API field spec.nodeName, got %+v", env)
 	}
 
-	// The node has exactly one hostPath: the kubelet directory, mounted whole
-	// and Bidirectional into the miami container.
-	if len(spec.Volumes) != 1 {
-		t.Errorf("the node has %d volumes, want only the kubelet directory", len(spec.Volumes))
-	}
-	hostPaths := map[string]corev1.Volume{}
+	// The host mounts, and the one emptyDir, are held exactly by
+	// TestNodeHostPaths.
 	for _, v := range spec.Volumes {
-		if v.HostPath == nil {
+		if v.HostPath == nil && v.Name != cryptsetupLock {
 			t.Errorf("volume %s is not a hostPath; the node needs no other kind", v.Name)
-			continue
-		}
-		hostPaths[v.Name] = v
-	}
-	got := map[string]mount{}
-	for _, vm := range m.VolumeMounts {
-		v, ok := hostPaths[vm.Name]
-		if !ok {
-			t.Errorf("miami mounts unknown volume %s", vm.Name)
-			continue
-		}
-		prop := corev1.MountPropagationNone
-		if vm.MountPropagation != nil {
-			prop = *vm.MountPropagation
-		}
-		typ := corev1.HostPathUnset
-		if v.HostPath.Type != nil {
-			typ = *v.HostPath.Type
-		}
-		got[v.HostPath.Path] = mount{v.HostPath.Path, typ, vm.MountPath, prop}
-	}
-	want := map[string]mount{
-		kubeletDir: {kubeletDir, corev1.HostPathDirectory, kubeletDir, corev1.MountPropagationBidirectional},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("miami host mounts:\n got %+v\nwant %+v", got, want)
-	}
-	for _, v := range spec.Volumes {
-		if v.HostPath != nil && (v.HostPath.Path == "/dev" || strings.HasPrefix(v.HostPath.Path, "/dev/")) {
-			t.Errorf("volume %s mounts the host /dev, which M1 does not need", v.Name)
 		}
 	}
 	// The sidecars' mounts carry no propagation.
@@ -630,8 +613,7 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 		var mounts []vm
 		for _, m := range c.VolumeMounts {
 			if m.Name != "kubelet-dir" {
-				t.Errorf("%s: mounts unknown volume %s", c.Name, m.Name)
-				continue
+				continue // the volume kind's host mounts, TestNodeHostPaths
 			}
 			mounts = append(mounts, vm{m.MountPath, m.SubPath})
 		}
@@ -646,9 +628,8 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 			}
 		}
 	}
-	if len(spec.Volumes) != 1 || spec.Volumes[0].Name != "kubelet-dir" || spec.Volumes[0].HostPath == nil ||
-		spec.Volumes[0].HostPath.Path != dir {
-		t.Errorf("volumes = %+v, want the one hostPath %s", spec.Volumes, dir)
+	if v := volumeNamed(spec, "kubelet-dir"); v == nil || v.HostPath == nil || v.HostPath.Path != dir {
+		t.Errorf("volume kubelet-dir = %+v, want the hostPath %s", v, dir)
 	}
 	// The node's defaults for the state, stage and transports roots live under
 	// --kubelet-dir; none may be overridden.
@@ -836,8 +817,7 @@ func TestControllerDeployment(t *testing.T) {
 			t.Errorf("%s: capabilities add = %v, want %v", c.Name, sc.Capabilities.Add, add)
 		}
 	}
-	// No resizer in M1.
-	if want := []string{"miami", "csi-provisioner", "csi-attacher", "livenessprobe"}; !reflect.DeepEqual(names, want) {
+	if want := []string{"miami", "csi-provisioner", "csi-attacher", "csi-resizer", "livenessprobe"}; !reflect.DeepEqual(names, want) {
 		t.Errorf("containers = %v, want %v", names, want)
 	}
 
@@ -862,6 +842,16 @@ func TestControllerDeployment(t *testing.T) {
 		if !hasArg(a.Args, x) {
 			t.Errorf("csi-attacher lacks %s", x)
 		}
+	}
+
+	r := container(t, spec, "csi-resizer")
+	for _, x := range []string{"--leader-election", "--csi-address=/csi/csi.sock", "--handle-volume-inuse-error=false", "--feature-gates=VolumeAttributesClass=false"} {
+		if !hasArg(r.Args, x) {
+			t.Errorf("csi-resizer lacks %s", x)
+		}
+	}
+	if !strings.HasPrefix(r.Image, "registry.k8s.io/sig-storage/csi-resizer:v2.3.0@sha256:") {
+		t.Errorf("csi-resizer image = %q, want v2.3.0 pinned by digest", r.Image)
 	}
 
 	// Both volumes are private to the pod.
@@ -984,10 +974,246 @@ func TestPortsDistinct(t *testing.T) {
 	}
 }
 
+func volumeNamed(spec corev1.PodSpec, name string) *corev1.Volume {
+	for i := range spec.Volumes {
+		if spec.Volumes[i].Name == name {
+			return &spec.Volumes[i]
+		}
+	}
+	return nil
+}
+
+// TestNodeHostPaths holds every host path the node mounts, and with each the
+// type, the mount path in the miami container, the propagation and whether it
+// is read-only. It is the privileged diff of the volume kind: a path added
+// here is a path the node plugin can reach on every host.
+func TestNodeHostPaths(t *testing.T) {
+	t.Parallel()
+	spec := node(t, base(t)).Spec.Template.Spec
+	type hp struct {
+		path      string
+		typ       corev1.HostPathType
+		mountPath string
+		prop      corev1.MountPropagationMode
+		readOnly  bool
+	}
+	want := map[string]hp{
+		// The kubelet directory, mounted whole; the cache and the binary copies
+		// live under it, so they need no hostPath of their own.
+		"kubelet-dir": {kubeletDir, corev1.HostPathDirectory, kubeletDir, corev1.MountPropagationBidirectional, false},
+		// nbd and device-mapper nodes appear after start.
+		"host-dev": {"/dev", corev1.HostPathDirectory, "/dev", corev1.MountPropagationHostToContainer, false},
+		// systemd's private socket, for the block servers' transient units.
+		"host-run-systemd": {"/run/systemd", corev1.HostPathDirectoryOrCreate, "/run/systemd", corev1.MountPropagationNone, true},
+		// The nbd devices' sysfs entries.
+		"host-sys": {"/sys", corev1.HostPathDirectory, "/sys", corev1.MountPropagationNone, true},
+	}
+
+	got := map[string]hp{}
+	for _, v := range spec.Volumes {
+		if v.Name == cryptsetupLock {
+			// Not a hostPath: checked below.
+			if v.EmptyDir == nil || v.EmptyDir.Medium != "" || v.EmptyDir.SizeLimit != nil {
+				t.Errorf("volume %s must be a plain emptyDir (container-local, on the node's disk): %+v", v.Name, v.VolumeSource)
+			}
+			continue
+		}
+		if v.HostPath == nil {
+			t.Errorf("volume %s is not a hostPath", v.Name)
+			continue
+		}
+		typ := corev1.HostPathUnset
+		if v.HostPath.Type != nil {
+			typ = *v.HostPath.Type
+		}
+		got[v.Name] = hp{path: v.HostPath.Path, typ: typ}
+	}
+	m := container(t, spec, "miami")
+	lockMounts := 0
+	for _, vm := range m.VolumeMounts {
+		if vm.Name == cryptsetupLock {
+			lockMounts++
+			if vm.MountPath != "/run/cryptsetup" || vm.ReadOnly || vm.SubPath != "" || vm.MountPropagation != nil {
+				t.Errorf("miami mounts %s wrongly: %+v (want a plain writable mount at /run/cryptsetup, cryptsetup's lock directory)", vm.Name, vm)
+			}
+			continue
+		}
+		h, ok := got[vm.Name]
+		if !ok {
+			t.Errorf("miami mounts unknown volume %s", vm.Name)
+			continue
+		}
+		h.mountPath, h.prop, h.readOnly = vm.MountPath, corev1.MountPropagationNone, vm.ReadOnly
+		if vm.MountPropagation != nil {
+			h.prop = *vm.MountPropagation
+		}
+		if vm.SubPath != "" {
+			t.Errorf("miami mount %s has subPath %q", vm.Name, vm.SubPath)
+		}
+		got[vm.Name] = h
+	}
+	if lockMounts != 1 {
+		t.Errorf("miami mounts %s %d times, want once", cryptsetupLock, lockMounts)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("node host paths:\n got %+v\nwant %+v", got, want)
+	}
+
+	// The volume kind's mounts reach the miami container only, and the host's
+	// process namespaces stay out of reach.
+	for _, c := range spec.Containers {
+		if c.Name == "miami" {
+			continue
+		}
+		for _, vm := range c.VolumeMounts {
+			if vm.Name != "kubelet-dir" {
+				t.Errorf("%s mounts %s; only the miami container mounts the host's /dev, /sys and /run/systemd", c.Name, vm.Name)
+			}
+		}
+	}
+	if spec.HostPID || spec.HostIPC {
+		t.Error("hostPID and hostIPC must stay off (decision 41: the block server is a systemd unit)")
+	}
+
+	// The cache and bin directories default under the kubelet directory, which
+	// is mounted at the same path in the container as on the host. Setting
+	// either would need a hostPath of its own, which this deploy does not have.
+	for _, f := range []string{"cache-dir", "bin-dir", "shared-dir", "systemd-socket"} {
+		for _, a := range m.Args {
+			if strings.HasPrefix(a, "--"+f+"=") {
+				t.Errorf("--%s is set (%s); the default is the contract", f, a)
+			}
+		}
+	}
+
+	// Privileged already, and nothing added: the volume kind's CAP_SYS_ADMIN
+	// comes from it.
+	sc := m.SecurityContext
+	if sc == nil || sc.Privileged == nil || !*sc.Privileged || sc.Capabilities != nil {
+		t.Errorf("miami securityContext = %+v, want privileged with no capabilities field", sc)
+	}
+}
+
+// TestNodeRBACExact: the node reads two cluster-scoped objects and writes
+// events in one namespace. Failures are reported, never remediated (decision
+// 53), so it has no say over pods, and no admission policy for remediation is
+// shipped.
+func TestNodeRBACExact(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var cr rbacv1.ClusterRole
+	r.get(t, "ClusterRole", "miami-node", &cr)
+	var role rbacv1.Role
+	r.get(t, "Role", "miami-node", &role)
+	all := ruleSet(append(append([]rbacv1.PolicyRule{}, cr.Rules...), role.Rules...))
+	want := map[string]bool{
+		"/persistentvolumes:get": true,
+		"/nodes:get":             true,
+		"/events:get":            true,
+		"/events:create":         true,
+		"/events:patch":          true,
+	}
+	if !reflect.DeepEqual(all, want) {
+		t.Errorf("node grants %v, want %v", all, want)
+	}
+	for k := range all {
+		if strings.Contains(k, "pods") {
+			t.Errorf("node grants %s", k)
+		}
+	}
+	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding", "MutatingAdmissionPolicy"} {
+		if n := r.names(kind); len(n) != 0 {
+			t.Errorf("the base ships %s %v; remediation was dropped", kind, n)
+		}
+	}
+
+	// The controller carries csi-resizer's rules (T16): its PVC update and
+	// status patch.
+	var ctl rbacv1.ClusterRole
+	r.get(t, "ClusterRole", "miami-controller", &ctl)
+	got := ruleSet(ctl.Rules)
+	for _, k := range []string{"/persistentvolumeclaims:update", "/persistentvolumeclaims/status:patch"} {
+		if !got[k] {
+			t.Errorf("controller lacks %s", k)
+		}
+	}
+}
+
+// exampleClass returns the example StorageClasses by name.
+func exampleClass(t *testing.T, name string) storagev1.StorageClass {
+	t.Helper()
+	var sc storagev1.StorageClass
+	render(t, "kustomize/examples").get(t, "StorageClass", name, &sc)
+	return sc
+}
+
+// TestExampleVolClassesSetBothSecretRefs: the encrypted volume class names its
+// key Secret for node-stage and node-publish alike, in the claim's namespace,
+// so a restage from a publish still has the key; the plain class names none.
+func TestExampleVolClassesSetBothSecretRefs(t *testing.T) {
+	t.Parallel()
+	enc := exampleClass(t, "miami-remote-vol-rwo").Parameters
+	for _, op := range []string{"node-stage", "node-publish"} {
+		if got := enc["csi.storage.k8s.io/"+op+"-secret-name"]; got == "" {
+			t.Errorf("encrypted class sets no %s secret name", op)
+		}
+		if got := enc["csi.storage.k8s.io/"+op+"-secret-namespace"]; got != "${pvc.namespace}" {
+			t.Errorf("%s secret namespace = %q, want ${pvc.namespace}", op, got)
+		}
+	}
+	if enc["csi.storage.k8s.io/node-stage-secret-name"] != enc["csi.storage.k8s.io/node-publish-secret-name"] {
+		t.Error("node-stage and node-publish name different Secrets")
+	}
+	if enc["encryption"] == "off" {
+		t.Error("the encrypted class turns encryption off")
+	}
+	plain := exampleClass(t, "miami-remote-vol-rwo-plain").Parameters
+	if plain["encryption"] != "off" {
+		t.Errorf("plain class encryption = %q, want off", plain["encryption"])
+	}
+	for k := range plain {
+		if strings.Contains(k, "secret") {
+			t.Errorf("plain class sets %s", k)
+		}
+	}
+}
+
+// TestExampleVolClassesSetExt4FsType: kubelet applies a pod's fsGroup only to a
+// PV with an fsType, and the provisioner sets one only from this parameter.
+// A directory has no filesystem to name, so its classes must not set it. The
+// volume classes allow expansion and set no takeoverTimeout (the node refuses
+// it).
+func TestExampleVolClassesSetExt4FsType(t *testing.T) {
+	t.Parallel()
+	r := render(t, "kustomize/examples")
+	for _, name := range r.names("StorageClass") {
+		sc := exampleClass(t, name)
+		fs, has := sc.Parameters["csi.storage.k8s.io/fstype"]
+		if sc.Parameters["kind"] == "volume" {
+			if fs != "ext4" {
+				t.Errorf("%s: fstype = %q, want ext4", name, fs)
+			}
+			if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
+				t.Errorf("%s: allowVolumeExpansion must be true", name)
+			}
+			if _, set := sc.Parameters["takeoverTimeout"]; set {
+				t.Errorf("%s sets takeoverTimeout", name)
+			}
+			if sc.Parameters["transport.kind"] != "nfs3" {
+				t.Errorf("%s: transport.kind = %q, want nfs3", name, sc.Parameters["transport.kind"])
+			}
+		} else if has {
+			t.Errorf("%s (a directory class) sets fstype %q", name, fs)
+		}
+	}
+}
+
+var exampleClassNames = []string{"miami-local-dir-rwo", "miami-remote-dir-rwx", "miami-remote-vol-rwo", "miami-remote-vol-rwo-plain"}
+
 func TestExampleStorageClasses(t *testing.T) {
 	t.Parallel()
 	r := render(t, "kustomize/examples")
-	if got, want := r.names("StorageClass"), []string{"miami-local-dir-rwo", "miami-remote-dir-rwx"}; !reflect.DeepEqual(got, want) {
+	if got, want := r.names("StorageClass"), exampleClassNames; !reflect.DeepEqual(got, want) {
 		t.Fatalf("storage classes = %v, want %v", got, want)
 	}
 	tests := []struct {
@@ -1000,6 +1226,19 @@ func TestExampleStorageClasses(t *testing.T) {
 		{"miami-remote-dir-rwx", storagev1.VolumeBindingImmediate, map[string]string{
 			"kind": "directory", "transport.kind": "nfs3", "transport.server": "192.0.2.10",
 			"transport.export": "/export", "subdir": "${pvc.namespace}/${pvc.name}"}},
+		//nolint:gosec // G101: Secret references of a StorageClass, not credentials.
+		{"miami-remote-vol-rwo", storagev1.VolumeBindingImmediate, map[string]string{
+			"kind": "volume", "transport.kind": "nfs3", "transport.server": "192.0.2.10",
+			"transport.export": "/export", "subdir": "${pvc.namespace}/${pvc.name}",
+			"csi.storage.k8s.io/fstype":                        "ext4",
+			"csi.storage.k8s.io/node-stage-secret-name":        "miami-volume-key",
+			"csi.storage.k8s.io/node-stage-secret-namespace":   "${pvc.namespace}",
+			"csi.storage.k8s.io/node-publish-secret-name":      "miami-volume-key",
+			"csi.storage.k8s.io/node-publish-secret-namespace": "${pvc.namespace}"}},
+		{"miami-remote-vol-rwo-plain", storagev1.VolumeBindingImmediate, map[string]string{
+			"kind": "volume", "encryption": "off", "transport.kind": "nfs3", "transport.server": "192.0.2.10",
+			"transport.export": "/export", "subdir": "${pvc.namespace}/${pvc.name}",
+			"csi.storage.k8s.io/fstype": "ext4"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1034,7 +1273,7 @@ func TestE2EOverlay(t *testing.T) {
 	t.Parallel()
 	b, o := base(t), overlay(t)
 
-	if got, want := o.names("StorageClass"), []string{"miami-local-dir-rwo", "miami-remote-dir-rwx"}; !reflect.DeepEqual(got, want) {
+	if got, want := o.names("StorageClass"), exampleClassNames; !reflect.DeepEqual(got, want) {
 		t.Errorf("overlay storage classes = %v, want %v", got, want)
 	}
 	norm := func(r rendered) map[string]any {
@@ -1060,6 +1299,7 @@ func TestE2EOverlay(t *testing.T) {
 				if ob.kind == "DaemonSet" {
 					spec := v["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
 					spec["volumes"] = without(spec["volumes"], localExport)
+					dropPluginOff(spec)
 				}
 			}
 			out[ob.kind+"/"+ob.name] = v
@@ -1077,6 +1317,30 @@ func TestE2EOverlay(t *testing.T) {
 		if !strings.HasPrefix(c.Image, driverImage+":") {
 			t.Errorf("%s: image = %q", role, c.Image)
 		}
+	}
+}
+
+// cryptsetupLock is the name of the node plugin's emptyDir for cryptsetup's
+// lock directory.
+const cryptsetupLock = "cryptsetup-lock"
+
+// pluginOffKey is the node label whose presence keeps the node plugin off a
+// node in the e2e overlay (the volume tests stop one plugin with it).
+const pluginOffKey = "miami-e2e/plugin-off"
+
+// dropPluginOff removes the e2e overlay's one extra node affinity expression
+// from a pod spec, and fails the comparison by leaving anything else.
+func dropPluginOff(spec map[string]any) {
+	terms, _, _ := nestedSlice(spec, "affinity", "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution", "nodeSelectorTerms")
+	for _, tm := range terms {
+		term := tm.(map[string]any)
+		var keep []any
+		for _, ex := range term["matchExpressions"].([]any) {
+			if ex.(map[string]any)["key"] != pluginOffKey {
+				keep = append(keep, ex)
+			}
+		}
+		term["matchExpressions"] = keep
 	}
 }
 

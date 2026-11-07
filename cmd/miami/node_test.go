@@ -36,6 +36,9 @@ func TestRunNodeFlags(t *testing.T) {
 				"Usage of miami node:", "-endpoint", "unix:///csi/csi.sock", "-node-id", "-kubelet-dir", "/var/lib/kubelet",
 				"-transports-root", "plugins/miami.csi.greghaskins.com/transports", "-state-dir", "-stage-root", "-metrics-addr", ":9810",
 				"-reconcile-interval", "-deadline", "-transport-idle", "-kubeconfig", "-no-events",
+				"-cache-dir", "-bin-dir", "<kubelet-dir>/plugins/miami.csi.greghaskins.com/bin",
+				"-systemd-socket", "/run/systemd/private", "-shared-dir", "<kubelet-dir>/plugins/miami.csi.greghaskins.com/cache",
+				"-generation-interval", "(default 5m0s)", "-generation-max-age", "(default 1h0m0s)", "-generation-timeout", "(default 5m0s)",
 			},
 		},
 		{name: "unknown flag", args: []string{"-nope"}, wantCode: 2, wantStderr: []string{"flag provided but not defined: -nope"}},
@@ -44,6 +47,13 @@ func TestRunNodeFlags(t *testing.T) {
 		{name: "zero deadline", args: []string{"-node-id=n", "-deadline=0s"}, wantCode: 2, wantStderr: []string{"-deadline must be positive"}},
 		{name: "zero interval", args: []string{"-node-id=n", "-reconcile-interval=0s"}, wantCode: 2, wantStderr: []string{"-reconcile-interval must be positive"}},
 		{name: "negative idle", args: []string{"-node-id=n", "-transport-idle=-1s"}, wantCode: 2, wantStderr: []string{"-transport-idle must not be negative"}},
+		{name: "the takeover timeout flag is gone", args: []string{"-node-id=n", "-takeover-timeout=5m"}, wantCode: 2, wantStderr: []string{"flag provided but not defined: -takeover-timeout"}},
+		{name: "the holder renew flag is gone", args: []string{"-node-id=n", "-holder-renew=5s"}, wantCode: 2, wantStderr: []string{"flag provided but not defined: -holder-renew"}},
+		{name: "relative shared dir", args: []string{"-node-id=n", "-shared-dir=x"}, wantCode: 2, wantStderr: []string{"-shared-dir must be an absolute path"}},
+		{name: "generation interval under the minimum", args: []string{"-node-id=n", "-generation-interval=10s"}, wantCode: 2, wantStderr: []string{"-generation-interval must be at least 1m0s"}},
+		{name: "generation max age under the interval", args: []string{"-node-id=n", "-generation-interval=10m", "-generation-max-age=5m"}, wantCode: 2, wantStderr: []string{"-generation-max-age must not be under -generation-interval"}},
+		{name: "zero generation timeout", args: []string{"-node-id=n", "-generation-timeout=0s"}, wantCode: 2, wantStderr: []string{"-generation-timeout must be positive"}},
+		{name: "relative cache dir", args: []string{"-node-id=n", "-cache-dir=c"}, wantCode: 2, wantStderr: []string{"-cache-dir must be an absolute path"}},
 		{name: "relative kubelet dir", args: []string{"-node-id=n", "-kubelet-dir=kubelet"}, wantCode: 2, wantStderr: []string{"-kubelet-dir must be an absolute path"}},
 	}
 	for _, tt := range tests {
@@ -94,6 +104,20 @@ func TestNodeConfigDefaultsFollowTheKubeletDir(t *testing.T) {
 	if c.transportsRoot != "/k/plugins/miami.csi.greghaskins.com/transports" {
 		t.Errorf("transports root default: %q", c.transportsRoot)
 	}
+	if c.binDir != "/k/plugins/miami.csi.greghaskins.com/bin" {
+		t.Errorf("bin dir default: %q", c.binDir)
+	}
+	if c.cacheDir != "/k/plugins/miami.csi.greghaskins.com/cache" {
+		t.Errorf("cache dir default: %q", c.cacheDir)
+	}
+	c = nodeConfig{kubeletDir: "/k", binDir: "/b", cacheDir: "/c"}.withDefaults()
+	if c.cacheDir != "/c" {
+		t.Errorf("an explicit cache dir changed: %q", c.cacheDir)
+	}
+	c = nodeConfig{kubeletDir: "/k", binDir: "/b"}.withDefaults()
+	if c.binDir != "/b" {
+		t.Errorf("an explicit bin dir changed: %q", c.binDir)
+	}
 	c = nodeConfig{kubeletDir: "/k", stateDir: "/s", stageRoot: "/r", transportsRoot: "/t"}.withDefaults()
 	if c.stateDir != "/s" || c.stageRoot != "/r" || c.transportsRoot != "/t" {
 		t.Errorf("explicit values changed: %q, %q, %q", c.stateDir, c.stageRoot, c.transportsRoot)
@@ -104,10 +128,17 @@ func TestServeNodeWithServesUntilTheContextEnds(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "csi.sock")
+	// Short, so that the control socket path fits; shared, so the layout passes.
+	cache, err := os.MkdirTemp("", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(cache) })
 	cfg := nodeConfig{
 		endpoint: "unix://" + sock, nodeID: "node-a", kubeletDir: dir,
 		transportsRoot: filepath.Join(dir, "transports"), metricsAddr: "127.0.0.1:0",
-		interval: time.Hour, deadline: time.Second,
+		interval: time.Hour, deadline: time.Second, cacheDir: cache, sharedDirs: []string{cache, dir},
+		genInterval: time.Minute, genMaxAge: time.Hour, genTimeout: time.Minute,
 	}.withDefaults()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -115,7 +146,7 @@ func TestServeNodeWithServesUntilTheContextEnds(t *testing.T) {
 	addr := make(chan string, 1)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	go func() {
-		done <- serveNodeWith(ctx, cfg, &fake.Mounter{}, nil, log, func(a string) { addr <- a })
+		done <- serveNodeWith(ctx, cfg, &fake.Mounter{}, nil, nil, log, func(a string) { addr <- a })
 	}()
 
 	var metricsAddr string
@@ -142,7 +173,7 @@ func TestServeNodeWithServesUntilTheContextEnds(t *testing.T) {
 		t.Errorf("GetPluginInfo = %v, %v", pi, err)
 	}
 	caps, err := csi.NewNodeClient(conn).NodeGetCapabilities(callCtx, &csi.NodeGetCapabilitiesRequest{})
-	if err != nil || len(caps.GetCapabilities()) != 2 {
+	if err != nil || len(caps.GetCapabilities()) != 4 {
 		t.Errorf("NodeGetCapabilities = %v, %v", caps, err)
 	}
 
@@ -154,7 +185,9 @@ func TestServeNodeWithServesUntilTheContextEnds(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	for _, want := range []string{`miami_csi_requests_total{code="OK",method="NodeGetInfo"} 1`, "miami_reconcile_duration_seconds_count", "go_goroutines"} {
+	for _, want := range []string{`miami_csi_requests_total{code="OK",method="NodeGetInfo"} 1`, "miami_reconcile_duration_seconds_count", "go_goroutines",
+		// The startup probe set one gauge per feature; this test's socket is absent.
+		`miami_node_capability{feature="cache-dir"} 1`, `miami_node_capability{feature="systemd-socket"} 0`} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("/metrics lacks %q", want)
 		}
@@ -182,6 +215,7 @@ func TestServeNodeWithErrors(t *testing.T) {
 	base := nodeConfig{
 		endpoint: "unix://" + filepath.Join(dir, "a.sock"), nodeID: "n", kubeletDir: dir,
 		transportsRoot: filepath.Join(dir, "t"), deadline: time.Second, interval: time.Hour,
+		cacheDir: filepath.Join(dir, "cache"),
 	}
 	with := func(f func(*nodeConfig)) nodeConfig { c := base; f(&c); return c.withDefaults() }
 	tests := []struct {
@@ -198,7 +232,7 @@ func TestServeNodeWithErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if err := serveNodeWith(context.Background(), tt.cfg, &fake.Mounter{}, nil, log, nil); err == nil {
+			if err := serveNodeWith(context.Background(), tt.cfg, &fake.Mounter{}, nil, nil, log, nil); err == nil {
 				t.Error("no error")
 			}
 		})

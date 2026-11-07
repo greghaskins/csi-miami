@@ -196,5 +196,68 @@ func TestEnvtestPVPaths(t *testing.T) {
 	})
 }
 
+// TestNodeStatusReads reads Nodes and a PV's force-detach annotation from a
+// real API server: the taint with each effect, readiness, the annotation as
+// set and as absent, and the absence of a node or a PV (decision 52).
+func TestNodeStatusReads(t *testing.T) {
+	c, cfg := startAPIServer(t)
+	ctx := context.Background()
+	core, err := corev1client.NewForConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name string, taints []corev1.Taint, ready corev1.ConditionStatus) {
+		t.Helper()
+		n, err := core.Nodes().Create(ctx, &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       corev1.NodeSpec{Taints: taints},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		n.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: ready}}
+		if _, err := core.Nodes().UpdateStatus(ctx, n, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("plain", nil, corev1.ConditionTrue)
+	mk("down", []corev1.Taint{{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoExecute}}, corev1.ConditionUnknown)
+	mk("oos-noexecute", []corev1.Taint{{Key: kube.OutOfServiceTaint, Value: "nodeshutdown", Effect: corev1.TaintEffectNoExecute}}, corev1.ConditionFalse)
+	mk("oos-noschedule", []corev1.Taint{{Key: kube.OutOfServiceTaint, Effect: corev1.TaintEffectNoSchedule}}, corev1.ConditionTrue)
+
+	for _, tc := range []struct {
+		node       string
+		ready, oos bool
+	}{
+		{"plain", true, false},
+		{"down", false, false},
+		{"oos-noexecute", false, true},
+		{"oos-noschedule", true, true},
+	} {
+		got, err := c.NodeStatus(ctx, tc.node)
+		if err != nil || got.Ready != tc.ready || got.OutOfService != tc.oos {
+			t.Errorf("%s: %+v, %v; want ready %t out-of-service %t", tc.node, got, err, tc.ready, tc.oos)
+		}
+	}
+	if _, err := c.NodeStatus(ctx, "nobody"); !errors.Is(err, kube.ErrNodeNotFound) {
+		t.Errorf("a missing node: %v, want ErrNodeNotFound", err)
+	}
+
+	const name = "pvc-00000000-0000-4000-8000-0000000000a1"
+	pv := apiPV(name, "volume:"+name, map[string]string{"miami/kind": "volume"})
+	pv.Annotations = map[string]string{kube.AnnotationForceDetach: "node-a@3"}
+	createPV(t, cfg, pv)
+	if v, err := c.PVAnnotation(ctx, name, kube.AnnotationForceDetach); err != nil || v != "node-a@3" {
+		t.Errorf("PVAnnotation = %q, %v", v, err)
+	}
+	createPV(t, cfg, apiPV("pvc-00000000-0000-4000-8000-0000000000a2", "volume:pvc-00000000-0000-4000-8000-0000000000a2", map[string]string{"miami/kind": "volume"}))
+	if v, err := c.PVAnnotation(ctx, "pvc-00000000-0000-4000-8000-0000000000a2", kube.AnnotationForceDetach); err != nil || v != "" {
+		t.Errorf("PVAnnotation of an unannotated PV = %q, %v", v, err)
+	}
+	if _, err := c.PVAnnotation(ctx, "pvc-00000000-0000-4000-8000-0000000000a3", kube.AnnotationForceDetach); !errors.Is(err, kube.ErrNotFound) {
+		t.Errorf("PVAnnotation of a missing PV = %v, want not found", err)
+	}
+}
+
 // mountID is the directory name of the nfs3 transport under <root>/transports.
 func mountID() string { return nfsSpec.ID() }

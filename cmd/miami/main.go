@@ -1,6 +1,8 @@
 // Command miami is the csi-miami driver: one binary with a subcommand per
 // role. The controller and the node serve CSI (controller.go, node.go); lock
-// is the helper that serializes writers to a directory item (lock.go).
+// is the helper that serializes writers to a directory item (lock.go); restore
+// and import move a volume's image out of and into its chunk store (restore.go,
+// import.go).
 package main
 
 import (
@@ -20,7 +22,11 @@ const usage = `usage: miami <command>
 commands:
   node        run the node plugin
   controller  run the controller plugin
+  blockd      run the per-volume block server
   lock        run the lock helper
+  bench       measure a device stack (gate G1)
+  restore     assemble a volume's image from its chunk store
+  import      write a raw image file as a new volume's first generation
   version     print the build version
 `
 
@@ -47,8 +53,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runController(args[1:], stdout, stderr)
 	case "node":
 		return runNode(args[1:], stdout, stderr)
+	case "blockd":
+		return runBlockd(args[1:], stdout, stderr)
 	case "lock":
 		return runLock(args[1:], stdout, stderr)
+	case "bench":
+		return runBench(args[1:], stdout, stderr)
+	case "restore":
+		return runRestore(args[1:], stdout, stderr)
+	case "import":
+		return runImport(args[1:], stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "miami: unknown command %q\n\n%s", args[0], usage)
 		return 2

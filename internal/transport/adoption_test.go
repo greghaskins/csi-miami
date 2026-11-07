@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
@@ -221,19 +221,29 @@ func settle(t *testing.T, try func() error) error {
 func TestNFS3ResolverInFlightGuard(t *testing.T) {
 	t.Parallel()
 	hang := make(chan struct{})
+	started := make(chan struct{})
 	var calls atomic.Int32
 	res := resolver(func(_ context.Context, _ string) ([]net.IPAddr, error) {
 		if calls.Add(1) == 1 {
+			close(started)
 			<-hang
 		}
 		return ips("198.51.100.7"), nil
 	})
 	spec := Spec{Kind: KindNFS3, Server: "nas.example.com", Export: "/export"}
 	f := newFake(table(rootMount()))
-	tr := newTransport(t, spec, t.TempDir(), f, Options{Resolver: res, ResolveTimeout: 10 * time.Millisecond})
+	tr := newTransport(t, spec, t.TempDir(), f, Options{Resolver: res})
 
-	if err := tr.Mount(context.Background()); !errors.Is(err, mount.ErrTimeout) {
-		t.Fatalf("first Mount: got %v, want ErrTimeout", err)
+	// The first Mount is abandoned once the lookup is known to be running, not
+	// after a short timeout that a loaded machine can overrun before the lookup
+	// starts: the key is held when the caller gives up either way.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	if err := tr.Mount(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Mount: got %v, want the caller's cancellation", err)
 	}
 	// Polling while the lookup is stuck starts nothing.
 	for range 50 {
@@ -263,11 +273,12 @@ func TestLocalHostPathInFlightGuard(t *testing.T) {
 	t.Parallel()
 	fx := newLocalFixture(t)
 	hang := make(chan struct{})
+	started := make(chan struct{})
 	var calls atomic.Int32
 	opts := Options{
-		ResolveTimeout: 10 * time.Millisecond,
 		ResolveHostPath: func(p string) (string, error) {
 			if calls.Add(1) == 1 {
+				close(started)
 				<-hang
 			}
 			return ResolveDirectory(p)
@@ -278,8 +289,13 @@ func TestLocalHostPathInFlightGuard(t *testing.T) {
 	f := newFake(table(rootMount(), fx.bindOf(dir)))
 	tr := newTransport(t, spec, fx.root, f, opts)
 
-	if _, err := tr.Mounted(context.Background()); !errors.Is(err, mount.ErrTimeout) {
-		t.Fatalf("first Mounted: got %v, want ErrTimeout", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	if _, err := tr.Mounted(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Mounted: got %v, want the caller's cancellation", err)
 	}
 	// A reconciler polling Mounted every few seconds starts nothing new.
 	for range 200 {
@@ -333,5 +349,47 @@ func TestMountPointIsNotCreatedThroughASymlink(t *testing.T) {
 				t.Errorf("calls = %+v", c)
 			}
 		})
+	}
+}
+
+// A mount made before the profile had noacl is still this driver's: it is
+// adopted, not reported foreign, and the drift is logged once.
+func TestNFS3AdoptsMountWithoutNoacl(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir, _ := nfsSpec.MountPoint(root)
+	m := kernelNFS3(t, dir) // the kernel fixture predates noacl
+	if slices.Contains(m.SuperOptions, "noacl") {
+		t.Fatal("the fixture already has noacl")
+	}
+	var logs strings.Builder
+	f := newFake(table(rootMount(), m))
+	tr := newTransport(t, nfsSpec, root, f, Options{Log: slog.New(slog.NewTextHandler(&logs, nil))})
+
+	if got, err := tr.Mounted(context.Background()); err != nil || !got {
+		t.Fatalf("Mounted = %v, %v; want adopted", got, err)
+	}
+	for range 3 {
+		if err := tr.Mount(context.Background()); err != nil {
+			t.Fatalf("Mount: %v", err)
+		}
+	}
+	if c := kernelCalls(f); len(c) != 0 {
+		t.Errorf("adoption called the kernel: %+v", c)
+	}
+	if n := strings.Count(logs.String(), "without noacl"); n != 1 {
+		t.Errorf("the drift was logged %d times, want once:\n%s", n, logs.String())
+	}
+
+	// A mount that has it is adopted without a word.
+	with := kernelNFS3(t, dir)
+	with.SuperOptions = append(slices.Clone(with.SuperOptions), "noacl")
+	var quiet strings.Builder
+	root2 := t.TempDir()
+	dir2, _ := nfsSpec.MountPoint(root2)
+	with.MountPoint = dir2
+	tr2 := newTransport(t, nfsSpec, root2, newFake(table(rootMount(), with)), Options{Log: slog.New(slog.NewTextHandler(&quiet, nil))})
+	if err := tr2.Mount(context.Background()); err != nil || quiet.Len() != 0 {
+		t.Errorf("a mount with noacl: err %v, log %q", err, quiet.String())
 	}
 }

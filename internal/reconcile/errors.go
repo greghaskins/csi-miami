@@ -37,6 +37,8 @@ import (
 //	 4. ErrUnknownVolume                          ClassNotFound          NotFound
 //	 5. ErrStageConflict, ErrPublishConflict,     ClassFailedPrecondition FailedPrecondition
 //	    ErrTransportConflict, ErrItemNotDirectory,
+//	    ErrPrerequisiteMissing, ErrKeyRequired,
+//	    ErrBadKey, ErrPublishRefused,
 //	    mount.ErrConflict, mount.ErrNotResolved,
 //	    errTargetGone (a publish whose target's
 //	    parent directory is gone, seen only as the
@@ -44,6 +46,8 @@ import (
 //	 6. ErrSuperseded                             ClassAborted           Aborted
 //	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
 //	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
+//	    ErrHolderContended, ErrServerDown,
+//	    ErrUnstageIncomplete, ErrReleasePending,
 //	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, mount.ErrChanged
 //	    (a mount replaced between judgement and unmount), ErrStopped, EBUSY,
 //	    ESTALE (a stale NFS handle: the server restarted)
@@ -115,13 +119,14 @@ func Classify(err error) Class {
 		return ClassNotFound
 	case errors.Is(err, ErrStageConflict), errors.Is(err, ErrPublishConflict), errors.Is(err, ErrTransportConflict),
 		errors.Is(err, ErrItemNotDirectory), errors.Is(err, mount.ErrConflict), errors.Is(err, mount.ErrNotResolved),
+		errors.Is(err, ErrPrerequisiteMissing), errors.Is(err, ErrKeyRequired), errors.Is(err, ErrBadKey), errors.Is(err, ErrPublishRefused),
 		errors.Is(err, errTargetGone):
 		return ClassFailedPrecondition
 	case errors.Is(err, ErrSuperseded):
 		return ClassAborted
 	case errors.Is(err, mount.ErrTimeout):
 		return ClassDeadlineExceeded
-	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy), errors.Is(err, mount.ErrChanged),
+	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrHolderContended), errors.Is(err, ErrServerDown), errors.Is(err, ErrUnstageIncomplete), errors.Is(err, ErrReleasePending), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy), errors.Is(err, mount.ErrChanged),
 		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY), errors.Is(err, syscall.ESTALE):
 		return ClassUnavailable
 	default:
@@ -167,6 +172,40 @@ var (
 	// ErrItemNotDirectory is returned when the volume's path in its transport
 	// exists and is not a directory.
 	ErrItemNotDirectory = item.ErrItemNotDirectory
+
+	// ErrPrerequisiteMissing is the item's: the node lacks a feature the
+	// volume needs (see package item). The other errors of the volume kind
+	// below are the item's too, each its own condition (Condition*) and class.
+	ErrPrerequisiteMissing = item.ErrPrerequisiteMissing
+
+	// ErrHolderContended is returned when another node holds the volume.
+	ErrHolderContended = item.ErrHolderContended
+
+	// ErrServerDown is returned when the volume's block server is not serving.
+	ErrServerDown = item.ErrServerDown
+
+	// ErrKeyRequired is returned when the volume needs a key the request did
+	// not carry.
+	ErrKeyRequired = item.ErrKeyRequired
+
+	// ErrBadKey is returned when the key does not open the volume.
+	ErrBadKey = item.ErrBadKey
+
+	// ErrUnstageIncomplete is returned by an unstage that cannot yet prove the
+	// volume's last writes are in the store; it is retryable.
+	ErrUnstageIncomplete = item.ErrUnstageIncomplete
+
+	// ErrReleasePending is returned when the data is settled and only the
+	// release of the holder file failed; it is retryable.
+	ErrReleasePending = item.ErrReleasePending
+
+	// ErrGenerationOverdue is the condition of a volume whose newest
+	// generation is older than its maximum age; it is reported, not returned.
+	ErrGenerationOverdue = item.ErrGenerationOverdue
+
+	// ErrPublishRefused is returned when the store refuses the volume's
+	// generations because it is no longer ours.
+	ErrPublishRefused = item.ErrPublishRefused
 
 	// ErrUnknownVolume is returned by Publish for a volume that has no intent
 	// on this node, that is, one that was never staged or was unstaged.

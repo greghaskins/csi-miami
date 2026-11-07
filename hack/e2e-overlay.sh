@@ -8,7 +8,8 @@
 #
 #   --image       the driver image: name:tag or name@sha256:<digest>
 #   --nfs-server  an IPv4 address (decision 21); replaces transport.server of
-#                 StorageClass miami-remote-dir-rwx. Omitted: the placeholder stays.
+#                 each remote StorageClass (miami-remote-dir-rwx and the two
+#                 miami-remote-vol-rwo classes). Omitted: the placeholder stays.
 #   --out         an existing, empty directory to write kustomization.yaml in
 #
 # The deploy check (hack/kind.sh) and the end-to-end tests both use it.
@@ -68,12 +69,14 @@ fi
       exit 2
     fi
     echo "patches:"
-    echo "  - target:"
-    echo "      kind: StorageClass"
-    echo "      name: miami-remote-dir-rwx"
-    echo "    patch: |-"
-    echo "      - op: replace"
-    echo "        path: /parameters/transport.server"
-    echo "        value: \"${server}\""
+    for class in miami-remote-dir-rwx miami-remote-vol-rwo miami-remote-vol-rwo-plain; do
+      echo "  - target:"
+      echo "      kind: StorageClass"
+      echo "      name: ${class}"
+      echo "    patch: |-"
+      echo "      - op: replace"
+      echo "        path: /parameters/transport.server"
+      echo "        value: \"${server}\""
+    done
   fi
 } > "$out/kustomization.yaml"

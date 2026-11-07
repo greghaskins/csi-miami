@@ -22,6 +22,14 @@
 // YAML of the claims, volumes, attachments and pods, the events and each
 // node's mount table to the artifact directory.
 //
+// The volume kind's tests (volume_*_test.go, exit criteria 1 to 9 and 6a of the
+// M2 plan) run in the nfs3 variant only and skip for the local one. They also
+// use the runner's own tools, which are in the same kernel as the kind nodes:
+// dmesg for the hung-task check, cryptsetup, losetup, e2fsck and mount to open
+// a volume restored from the NAS directory, and the netlink disconnect of an
+// nbd device and the removal of a dm-crypt mapping, which stand in for the
+// reset of the kernel that a reboot is.
+//
 // The test shells out to docker for exactly these reasons: to read a node's
 // mount table, list and read a node's files, restart a node, look at the NFS
 // server container's export, and stop and start that container (the server

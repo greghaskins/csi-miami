@@ -186,3 +186,45 @@ func TestCleanDropsThePathButKeepsTheCause(t *testing.T) {
 		})
 	}
 }
+
+func TestProbeClockReadsAndRemoves(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	before := time.Now().Add(-time.Minute)
+	got, err := ProbeClock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Before(before) || got.After(time.Now().Add(time.Minute)) {
+		t.Errorf("ProbeClock = %v, want about now", got)
+	}
+	if left := names(t, dir); len(left) != 0 {
+		t.Errorf("ProbeClock left %v behind", left)
+	}
+	if _, err := ProbeClock(filepath.Join(dir, "missing")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("ProbeClock in a missing directory = %v, want ErrNotExist", err)
+	}
+}
+
+// The probe file is made through a descriptor on the directory, opened without
+// following a symlink anywhere in its path.
+func TestProbeDoesNotFollowASymlinkInThePath(t *testing.T) {
+	t.Parallel()
+	node := t.TempDir()
+	if err := os.Mkdir(filepath.Join(node, "x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "ns")
+	if err := os.Symlink(node, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ProbeClock(filepath.Join(link, "x")); err == nil {
+		t.Error("the probe worked through a symlink in the path")
+	}
+	if ents, _ := os.ReadDir(filepath.Join(node, "x")); len(ents) != 0 {
+		t.Errorf("files created behind the link: %v", ents)
+	}
+	if _, err := ProbeClock(filepath.Join(node, "x")); err != nil {
+		t.Errorf("a plain directory: %v", err)
+	}
+}

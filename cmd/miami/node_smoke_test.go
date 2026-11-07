@@ -100,7 +100,8 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 	cfg := nodeConfig{
 		endpoint: "unix://" + sock, nodeID: "smoke-node", kubeletDir: filepath.Join(base, "kubelet"),
 		transportsRoot: filepath.Join(base, "miami"), metricsAddr: "127.0.0.1:0",
-		interval: time.Hour, deadline: 10 * time.Second,
+		interval: time.Hour, deadline: 10 * time.Second, cacheDir: filepath.Join(base, "c"), sharedDirs: []string{base},
+		genInterval: time.Minute, genMaxAge: time.Hour, genTimeout: time.Minute,
 	}.withDefaults()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,7 +109,7 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 	done := make(chan error, 1)
 	ready := make(chan string, 1)
 	go func() {
-		done <- serveNodeWith(ctx, cfg, mount.New(cfg.deadline), nil, slog.New(slog.NewTextHandler(&logs, nil)), func(a string) { ready <- a })
+		done <- serveNodeWith(ctx, cfg, mount.New(cfg.deadline), nil, nil, slog.New(slog.NewTextHandler(&logs, nil)), func(a string) { ready <- a })
 	}()
 	var addr string
 	select {
@@ -198,9 +199,18 @@ func TestSmokeNodeStagesPublishesAndReportsMetrics(t *testing.T) {
 		`miami_csi_requests_total{code="OK",method="NodeGetVolumeStats"} 1`,
 		`miami_intent_load_failures 0`,
 		`miami_garbage_unmounts_total 0`,
+		// The volume kind's families that exist on every node, at zero. The
+		// per-volume ones (metrics.VolumeFamilies) have a series only where a
+		// volume of that kind is staged, which this test does not do.
+		`miami_volumes_served{state="serving"} 0`,
+		`miami_volumes_served{state="outdated-binary"} 0`,
+		`miami_volumes_served{state="down"} 0`,
+		`miami_generation_publishes_total{result="ok"} 0`,
+		`miami_generation_publishes_total{result="refused"} 0`,
+		`miami_generation_publishes_total{result="failed"} 0`,
 	)
 	for _, name := range []string{
-		"miami_reconcile_duration_seconds_count", "miami_csi_request_duration_seconds_count",
+		"miami_reconcile_duration_seconds_count", "miami_generation_publish_duration_seconds_count", "miami_csi_request_duration_seconds_count",
 		`miami_reconcile_errors_total{step="item"} 0`, `miami_observation_timeouts_total{op="transport"} 0`,
 		"go_goroutines", "process_resident_memory_bytes",
 	} {

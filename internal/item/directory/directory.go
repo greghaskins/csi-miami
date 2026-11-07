@@ -128,6 +128,16 @@ func (d *Item) PublishSource(in intent.Intent) (string, error) {
 	return dir, nil
 }
 
+// PublishRoot is the transport's mount point: the item directory is bound
+// from beneath it.
+func (d *Item) PublishRoot(in intent.Intent) (string, error) {
+	root, err := in.Transport.MountPoint(d.cfg.Root)
+	if err != nil {
+		return "", fmt.Errorf("directory item %s: %w", in.VolumeID, err)
+	}
+	return root, nil
+}
+
 // Converge clears the stage path, checks the item directory, and mounts
 // nothing:
 //

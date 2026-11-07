@@ -1,0 +1,23 @@
+# Named miami-LOCATION-TYPE-SHARING[-plain]: the -plain suffix marks a volume
+# with encryption "off": ext4 directly on the block device, so the chunks on
+# the server are plaintext and the class needs no Secret. See
+# miami-remote-vol-rwo.yaml for the encrypted default.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: miami-remote-vol-rwo-plain
+provisioner: miami.csi.greghaskins.com
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+parameters:
+  kind: volume
+  encryption: "off"
+  transport.kind: nfs3
+  transport.server: 192.0.2.10
+  transport.export: /export
+  # Optional: a prefix under the export, one directory per namespace and claim.
+  subdir: ${pvc.namespace}/${pvc.name}
+  # kubelet applies a pod's fsGroup to a volume only when the PV carries a
+  # filesystem type, and the provisioner sets one only from this parameter.
+  csi.storage.k8s.io/fstype: ext4
