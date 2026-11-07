@@ -51,8 +51,8 @@ const DefaultListDeadline = 10 * time.Second
 
 // Controller is the CSI controller service for directory volumes.
 //
-// Everything it does not list in its capabilities (GetCapacity, snapshots,
-// expansion and the rest) is Unimplemented.
+// Everything it does not list in its capabilities (GetCapacity, snapshots
+// and the rest) is Unimplemented.
 type Controller struct {
 	csi.UnimplementedControllerServer
 
@@ -100,6 +100,9 @@ func NewController(o ControllerOptions) (*Controller, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	if o.Transport.Log == nil {
+		o.Transport.Log = log
+	}
 	deadline := o.Deadline
 	if deadline <= 0 {
 		deadline = DefaultListDeadline
@@ -117,7 +120,7 @@ func NewController(o ControllerOptions) (*Controller, error) {
 }
 
 // ControllerGetCapabilities reports CREATE_DELETE_VOLUME,
-// PUBLISH_UNPUBLISH_VOLUME and LIST_VOLUMES.
+// PUBLISH_UNPUBLISH_VOLUME, LIST_VOLUMES and EXPAND_VOLUME.
 func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	rpc := func(t csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
 		return &csi.ControllerServiceCapability{Type: &csi.ControllerServiceCapability_Rpc{
@@ -128,6 +131,7 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 		rpc(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME),
 		rpc(csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME),
 		rpc(csi.ControllerServiceCapability_RPC_LIST_VOLUMES),
+		rpc(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME),
 	}}, nil
 }
 
@@ -137,7 +141,7 @@ func (c *Controller) ControllerGetCapabilities(context.Context, *csi.ControllerG
 // The volume ID is <kind>:<name> with the name the provisioner chose
 // (pvc-<uuid>, which is also the PV's name). The request is validated before
 // anything is touched: StorageClass parameters (volume.NewContext), the
-// capabilities (mount access only, no fsType, an accepted access mode), the
+// capabilities (mount access only, an accepted access mode, and the kind's fsType), the
 // capacity range and, for a local transport, the node. For an nfs3 transport
 // the transport is then mounted under the controller's root and the directory
 // made with mkdir -p semantics, never through a symlink, with the StorageClass's
@@ -164,14 +168,14 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 	if req.GetName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
 	}
-	if err := checkCapabilities(req.GetVolumeCapabilities()); err != nil {
-		return nil, err
-	}
 	if req.GetVolumeContentSource() != nil {
 		return nil, status.Error(codes.InvalidArgument, "creating a volume from a snapshot or another volume is not supported")
 	}
 	vctx, err := volume.NewContext(req.GetParameters())
 	if err != nil {
+		return nil, err
+	}
+	if err := checkCapabilitiesFor(vctx.Kind, req.GetVolumeCapabilities()); err != nil {
 		return nil, err
 	}
 	id, err := volume.NewID(vctx.Kind, req.GetName())
@@ -181,6 +185,18 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 	capacity, err := requiredBytes(req.GetCapacityRange())
 	if err != nil {
 		return nil, err
+	}
+	if vctx.Kind == volume.KindVolume {
+		// The size is rounded up to whole chunks and recorded in the
+		// context; the volume's directory is all that is made here, and the
+		// first stage formats it.
+		if vctx, err = vctx.WithSize(capacity); err != nil {
+			return nil, err
+		}
+		capacity = vctx.Volume.Size
+		if limit := req.GetCapacityRange().GetLimitBytes(); limit > 0 && capacity > limit {
+			return nil, status.Errorf(codes.OutOfRange, "the size rounded up to whole %d byte chunks (%d) exceeds the limit", vctx.Volume.ChunkSize, capacity)
+		}
 	}
 	var topology []*csi.Topology
 	if vctx.Transport.Kind == transport.KindLocal {
@@ -272,7 +288,7 @@ func requestedNode(r *csi.TopologyRequirement) (string, error) {
 }
 
 // ValidateVolumeCapabilities confirms the requested capabilities when every
-// one is a mount capability with an accepted access mode and no fsType, and
+// one is a mount capability with an accepted access mode and the kind's fsType, and
 // otherwise says which is not in the message. A volume ID that this driver
 // could not have issued is NotFound. The controller keeps no record of the
 // volumes it made, so a well-formed ID is not looked up.
@@ -283,11 +299,12 @@ func (c *Controller) ValidateVolumeCapabilities(_ context.Context, req *csi.Vali
 	if len(req.GetVolumeCapabilities()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
-	if _, err := parseVolumeID(req.GetVolumeId()); err != nil {
+	id, err := parseVolumeID(req.GetVolumeId())
+	if err != nil {
 		return nil, status.Error(codes.NotFound, "no such volume")
 	}
 	for _, vc := range req.GetVolumeCapabilities() {
-		if p := capabilityProblem(vc); p != "" {
+		if p := capabilityProblemFor(id.Kind, vc); p != "" {
 			return &csi.ValidateVolumeCapabilitiesResponse{Message: p}, nil
 		}
 	}
@@ -312,11 +329,12 @@ func (c *Controller) ControllerPublishVolume(_ context.Context, req *csi.Control
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
-	if p := capabilityProblem(req.GetVolumeCapability()); p != "" {
-		return nil, status.Error(codes.InvalidArgument, p)
-	}
-	if _, err := parseVolumeID(req.GetVolumeId()); err != nil {
+	id, err := parseVolumeID(req.GetVolumeId())
+	if err != nil {
 		return nil, status.Error(codes.NotFound, "no such volume")
+	}
+	if p := capabilityProblemFor(id.Kind, req.GetVolumeCapability()); p != "" {
+		return nil, status.Error(codes.InvalidArgument, p)
 	}
 	return &csi.ControllerPublishVolumeResponse{}, nil
 }

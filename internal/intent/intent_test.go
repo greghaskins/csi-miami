@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
@@ -289,5 +290,55 @@ func TestEnsureItemRoundTrip(t *testing.T) {
 	}
 	if err := back.UnmarshalJSON(raw); err != nil || !back.EnsureItem {
 		t.Fatalf("round trip: %v, %v", back.EnsureItem, err)
+	}
+}
+
+// Unstaging is informational like EnsureItem: it round-trips, is absent when
+// false, and a record without it reads false.
+func TestUnstagingRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := sample("pvc-00000000-0000-4000-8000-000000000001")
+	raw, err := in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "unstaging") {
+		t.Errorf("a false mark is in the record: %s", raw)
+	}
+	in.Unstaging = true
+	raw, err = in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Intent
+	if err := back.UnmarshalJSON(raw); err != nil || !back.Unstaging {
+		t.Fatalf("round trip: %v, %v", back.Unstaging, err)
+	}
+}
+
+// UnstagingSince round-trips, is absent when zero, and a record without it
+// reads as zero.
+func TestUnstagingSinceRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := sample("pvc-00000000-0000-4000-8000-000000000001")
+	raw, err := in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "unstagingSince") {
+		t.Errorf("a zero start is in the record: %s", raw)
+	}
+	var back Intent
+	if err := back.UnmarshalJSON(raw); err != nil || !back.UnstagingSince.IsZero() {
+		t.Fatalf("a record without it: %v, %v", back.UnstagingSince, err)
+	}
+	in.Unstaging = true
+	in.UnstagingSince = time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	raw, err = in.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := back.UnmarshalJSON(raw); err != nil || !back.UnstagingSince.Equal(in.UnstagingSince) {
+		t.Fatalf("round trip: %v, %v", back.UnstagingSince, err)
 	}
 }

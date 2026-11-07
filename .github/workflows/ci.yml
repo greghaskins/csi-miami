@@ -193,7 +193,9 @@ jobs:
   # The mount, observe, transport, reconcile and node-command packages against the real kernel,
   # natively on each architecture: hack/smoke.sh builds each package's smoke
   # tests and runs them as root under `unshare --mount --propagation
-  # private`, so nothing they mount outlives or escapes them. sudo gets the pinned Go through PATH. A failing
+  # private`, so nothing they mount outlives or escapes them. Its last step
+  # builds the image for the runner's architecture and prints the versions of
+  # the cryptsetup and mkfs.ext4 it carries. sudo gets the pinned Go through PATH. A failing
   # run uploads the mountinfo lines for the test's own temporary paths.
   smoke:
     name: smoke (${{ matrix.arch }})
@@ -220,7 +222,14 @@ jobs:
       - name: Run the smoke tests as root
         env:
           SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/smoke
+          SMOKE_REQUIRE_TOOLS: "1"
         run: sudo -E env "PATH=$PATH" make smoke
+      # Gate G1's harness on the real kernel: the nbd and the loop stack at a
+      # small scale, tables logged, no threshold (the gate is the owner's run on
+      # a Raspberry Pi, see docs/bench.md).
+      - name: Log the gate G1 bench
+        if: matrix.arch == 'amd64'
+        run: sudo -E env "PATH=$PATH" hack/bench.sh --scale small --size 2Gi --no-threshold
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
@@ -486,7 +495,7 @@ jobs:
   # The driver on kind, end to end (hack/e2e-kind.sh, test/e2e): a cluster of
   # one control plane and two workers, the image the build job pushed for this
   # architecture (the content tag, pulled and loaded into the nodes, never
-  # pulled by them), and exit criteria 1 to 6 of the plan as Go tests driven
+  # pulled by them), and exit criteria 1 to 6 of the M1 plan as Go tests driven
   # through the API: two pods on two nodes share an nfs3 volume, a local volume
   # lives on one node, delete removes (nfs3) or leaves (local) the directory,
   # also across a controller restart, a node plugin restart changes nothing, a
@@ -497,12 +506,21 @@ jobs:
   # node plugin and changes none of the mounts. A failing
   # run uploads what the tests dumped (driver logs, YAML, events, mountinfo),
   # the test output, kind's logs and the NFS server's output.
+  #
+  # The nfs3 legs also run the volume kind's tests (exit criteria 1 to 9 and
+  # 6a of the M2 plan): ext4 semantics, a reschedule, a node plugin restart, a
+  # block server kill, a NAS outage longer than the major timeout with no hung
+  # task in the kernel log, takeover by the out-of-service taint and by the
+  # force-detach annotation, an orphan drain, a node reboot that reuses the
+  # cache, the restore drill and an online expansion. They need the nbd and
+  # dm-crypt modules on the runner (hack/e2e-kind.sh loads them) and
+  # cryptsetup and e2fsprogs for the restore drill.
   e2e-kind:
     name: e2e-kind (${{ matrix.transport }}, ${{ matrix.arch }})
     needs: [changes, build]
     if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: read
@@ -548,6 +566,13 @@ jobs:
           printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
           docker pull "$image"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
+      # The volume tests restore a volume on the runner and check it there
+      # (hack/e2e-kind.sh checks for the tools; the nfs3 legs need these two).
+      - name: Install cryptsetup and e2fsprogs
+        if: matrix.transport == 'nfs3'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cryptsetup-bin e2fsprogs
       - name: Run the kind end-to-end tests
         env:
           E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-kind

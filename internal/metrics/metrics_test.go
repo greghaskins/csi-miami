@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/blockd"
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 // family returns the metric family called name, or nil.
@@ -149,7 +153,8 @@ func TestVolumeConditionHasEveryConditionAtZeroAndNoOtherLabel(t *testing.T) {
 		got[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
 	}
 	want := []string{"ok", "unresponsive", "transport-unavailable", "transport-conflict", "stage-conflict",
-		"publish-conflict", "item-missing", "item-not-directory", "failed"}
+		"publish-conflict", "item-missing", "item-not-directory", "failed",
+		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused", "probe-failed"}
 	if len(got) != len(want) {
 		t.Errorf("series = %v, want exactly %v", got, want)
 	}
@@ -370,6 +375,7 @@ func TestFamilyListsMatchTheRegistry(t *testing.T) {
 	node.SetTransport("local", "abc", true)
 	node.SetTransportUp("local", "abc", true)
 	node.ObserveReconcile(time.Millisecond)
+	node.SetCapability(prereq.FeatureNBD, true)
 	node.requests.WithLabelValues("NodeStageVolume", "OK").Inc()
 	node.requestDuration.WithLabelValues("NodeStageVolume").Observe(0.001)
 	check("the node registry", served(node), NodeFamilies)
@@ -378,4 +384,256 @@ func TestFamilyListsMatchTheRegistry(t *testing.T) {
 	ctrl.requests.WithLabelValues("CreateVolume", "OK").Inc()
 	ctrl.requestDuration.WithLabelValues("CreateVolume").Observe(0.001)
 	check("the controller registry", served(ctrl), ControllerFamilies)
+}
+
+func TestCapabilityGauges(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	r.SetCapability(prereq.FeatureNBD, true)
+	r.SetCapability(prereq.FeatureAdiantum, false)
+	r.SetCapability("/run/systemd/private", false) // not a feature: dropped, never a label
+	if v := sample(t, r, NameNodeCapability, map[string]string{"feature": "nbd"}).GetGauge().GetValue(); v != 1 {
+		t.Errorf("nbd = %v, want 1", v)
+	}
+	if v := sample(t, r, NameNodeCapability, map[string]string{"feature": "adiantum"}).GetGauge().GetValue(); v != 0 {
+		t.Errorf("adiantum = %v, want 0", v)
+	}
+	f := family(t, r, NameNodeCapability)
+	if n := len(f.GetMetric()); n != 2 {
+		t.Errorf("%d series, want 2 (a non-feature name must be dropped)", n)
+	}
+	// A feature that comes back flips to 1.
+	r.SetCapability(prereq.FeatureAdiantum, true)
+	if v := sample(t, r, NameNodeCapability, map[string]string{"feature": "adiantum"}).GetGauge().GetValue(); v != 1 {
+		t.Errorf("adiantum after it came back = %v, want 1", v)
+	}
+	// Without the reconciler's family the gauge is not exposed.
+	if family(t, New(), NameNodeCapability) != nil {
+		t.Error("the controller registry serves the capability family")
+	}
+}
+
+// The probe gauge is per volume, one series each, and a volume that is no
+// longer staged loses its series. It is not in NodeFamilies: a node with no
+// volume of kind volume has no series, and a family list means "served on every
+// node".
+func TestVolumeProbeOKGauge(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	const a, b = "volume:pvc-00000000-0000-4000-8000-00000000000a", "volume:pvc-00000000-0000-4000-8000-00000000000b"
+	r.SetVolumeProbe(a, true)
+	r.SetVolumeProbe(b, false)
+	want := func(vol string, v float64) {
+		t.Helper()
+		m := sample(t, r, NameVolumeProbeOK, map[string]string{"volume": vol})
+		if got := m.GetGauge().GetValue(); got != v {
+			t.Errorf("%s = %v, want %v", vol, got, v)
+		}
+	}
+	want("pvc-00000000-0000-4000-8000-00000000000a", 1)
+	want("pvc-00000000-0000-4000-8000-00000000000b", 0)
+	r.DeleteVolumeProbe(b)
+	if n := len(family(t, r, NameVolumeProbeOK).GetMetric()); n != 1 {
+		t.Errorf("%d series after a delete, want 1", n)
+	}
+	r.SetVolumeProbe("not a volume id", true) // dropped: the label is a PV name or nothing
+	if n := len(family(t, r, NameVolumeProbeOK).GetMetric()); n != 1 {
+		t.Errorf("%d series after a bad ID, want 1", n)
+	}
+}
+
+const (
+	genVolA = "volume:pvc-00000000-0000-4000-8000-00000000000a"
+	genVolB = "volume:pvc-00000000-0000-4000-8000-00000000000b"
+	pvA     = "pvc-00000000-0000-4000-8000-00000000000a"
+	pvB     = "pvc-00000000-0000-4000-8000-00000000000b"
+)
+
+// The families that have a series on every node are in NodeFamilies, from the
+// start; the per-volume ones are in VolumeFamilies and appear with a volume.
+func TestFamiliesRegistered(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	for _, name := range []string{NameVolumesServed, NameGenerationPublishDuration, NameGenerationPublishes} {
+		if !slices.Contains(NodeFamilies, name) {
+			t.Errorf("%s is not in NodeFamilies", name)
+		}
+		if family(t, r, name) == nil {
+			t.Errorf("%s has no series on a fresh node registry", name)
+		}
+	}
+	for _, name := range VolumeFamilies {
+		if slices.Contains(NodeFamilies, name) {
+			t.Errorf("%s is per volume and must not be in NodeFamilies", name)
+		}
+		if family(t, r, name) != nil {
+			t.Errorf("%s has a series on a node with no volume", name)
+		}
+	}
+	for _, s := range reconcile.ServedStates {
+		if v := sample(t, r, NameVolumesServed, map[string]string{"state": s}).GetGauge().GetValue(); v != 0 {
+			t.Errorf("served %s = %v at start", s, v)
+		}
+	}
+	for _, s := range reconcile.PublishResults {
+		if v := sample(t, r, NameGenerationPublishes, map[string]string{"result": s}).GetCounter().GetValue(); v != 0 {
+			t.Errorf("publishes %s = %v at start", s, v)
+		}
+	}
+	// Once a volume reports, every per-volume family has its series.
+	r.SetVolumeProbe(genVolA, true)
+	r.SetVolumeGeneration(genVolA, reconcile.VolumeGeneration{Fetch: blockd.FetchStats{Buckets: make([]uint64, len(blockd.FetchBuckets))}})
+	for _, name := range VolumeFamilies {
+		if family(t, r, name) == nil {
+			t.Errorf("%s has no series for a reporting volume", name)
+		}
+	}
+	// The controller serves none of them.
+	c := New()
+	for _, name := range slices.Concat(NodeFamilies, VolumeFamilies) {
+		if strings.HasPrefix(name, "miami_generation") || strings.HasPrefix(name, "miami_chunk") || name == NameVolumesServed || name == NameCacheBytes {
+			if family(t, c, name) != nil {
+				t.Errorf("the controller serves %s", name)
+			}
+		}
+	}
+}
+
+func TestVolumeGenerationGauges(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	cum := make([]uint64, len(blockd.FetchBuckets))
+	for i := 3; i < len(cum); i++ {
+		cum[i] = 4 // four fetches, all within the fourth bound and up
+	}
+	r.SetVolumeGeneration(genVolA, reconcile.VolumeGeneration{
+		Age: 90 * time.Second, DirtyBytes: 4096, CleanBytes: 8192,
+		Fetch: blockd.FetchStats{Count: 4, Errors: 1, Sum: 0.5, Buckets: cum},
+	})
+	r.SetVolumeGeneration(genVolB, reconcile.VolumeGeneration{Fetch: blockd.FetchStats{Buckets: make([]uint64, len(blockd.FetchBuckets))}})
+	gauge := func(name string, labels map[string]string) float64 {
+		t.Helper()
+		return sample(t, r, name, labels).GetGauge().GetValue()
+	}
+	if v := gauge(NameGenerationAge, map[string]string{"volume": pvA}); v != 90 {
+		t.Errorf("age = %v", v)
+	}
+	if v := gauge(NameGenerationDirty, map[string]string{"volume": pvA}); v != 4096 {
+		t.Errorf("dirty = %v", v)
+	}
+	if v := gauge(NameCacheBytes, map[string]string{"volume": pvA, "state": "dirty"}); v != 4096 {
+		t.Errorf("cache dirty = %v", v)
+	}
+	if v := gauge(NameCacheBytes, map[string]string{"volume": pvA, "state": "clean"}); v != 8192 {
+		t.Errorf("cache clean = %v", v)
+	}
+	if v := sample(t, r, NameChunkFetchErrors, map[string]string{"volume": pvA}).GetCounter().GetValue(); v != 1 {
+		t.Errorf("fetch errors = %v", v)
+	}
+	h := sample(t, r, NameChunkFetchDuration, map[string]string{"volume": pvA}).GetHistogram()
+	if h.GetSampleCount() != 4 || h.GetSampleSum() != 0.5 || len(h.GetBucket()) != len(blockd.FetchBuckets) {
+		t.Errorf("fetch histogram = count %d sum %v buckets %d", h.GetSampleCount(), h.GetSampleSum(), len(h.GetBucket()))
+	}
+	// A later status replaces the figures; it does not add series.
+	r.SetVolumeGeneration(genVolA, reconcile.VolumeGeneration{Age: time.Second, Fetch: blockd.FetchStats{Buckets: make([]uint64, len(blockd.FetchBuckets))}})
+	if v := gauge(NameGenerationAge, map[string]string{"volume": pvA}); v != 1 {
+		t.Errorf("age after an update = %v", v)
+	}
+	if n := len(family(t, r, NameGenerationAge).GetMetric()); n != 2 {
+		t.Errorf("%d age series, want 2", n)
+	}
+}
+
+// Series end with the volume, in every per-volume family.
+func TestVolumeGenerationSeriesAreDeletedWhenTheVolumeLeaves(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	zero := blockd.FetchStats{Buckets: make([]uint64, len(blockd.FetchBuckets))}
+	r.SetVolumeGeneration(genVolA, reconcile.VolumeGeneration{Fetch: zero})
+	r.SetVolumeGeneration(genVolB, reconcile.VolumeGeneration{Fetch: zero})
+	r.DeleteVolumeGeneration(genVolA)
+	for _, name := range []string{NameGenerationAge, NameGenerationDirty, NameCacheBytes, NameChunkFetchDuration, NameChunkFetchErrors} {
+		f := family(t, r, name)
+		if f == nil {
+			t.Fatalf("%s vanished with one volume left", name)
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "volume" && l.GetValue() == pvA {
+					t.Errorf("%s still has a series for the deleted volume", name)
+				}
+			}
+		}
+	}
+	r.DeleteVolumeGeneration(genVolB)
+	for _, name := range VolumeFamilies {
+		if family(t, r, name) != nil {
+			t.Errorf("%s has series after every volume left", name)
+		}
+	}
+}
+
+// Every {volume} label is a PV name and nothing else: an ID that does not
+// name a volume is dropped, a path in particular.
+func TestVolumeLabelIsAPVName(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	zero := blockd.FetchStats{Buckets: make([]uint64, len(blockd.FetchBuckets))}
+	for _, id := range []string{"", "not a volume id", "/var/lib/kubelet/x", "volume:/var/lib/x", "volume:pvc-xyz", "directory:pvc-00000000-0000-4000-8000-00000000000a"} {
+		r.SetVolumeGeneration(id, reconcile.VolumeGeneration{Fetch: zero})
+	}
+	r.SetVolumeGeneration(genVolA, reconcile.VolumeGeneration{Fetch: zero})
+	r.SetVolumeProbe(genVolA, true)
+	for _, name := range VolumeFamilies {
+		f := family(t, r, name)
+		if f == nil {
+			t.Fatalf("%s has no series", name)
+		}
+		vols := map[string]bool{}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "volume" {
+					vols[l.GetValue()] = true
+					if !volume.IsPVName(l.GetValue()) {
+						t.Errorf("%s has volume label %q, not a PV name", name, l.GetValue())
+					}
+				}
+			}
+		}
+		if len(vols) != 1 {
+			t.Errorf("%s has series for %v, want only the valid volume's", name, vols)
+		}
+	}
+}
+
+func TestPublishAndServedMetrics(t *testing.T) {
+	t.Parallel()
+	r := New(WithReconciler())
+	r.ObservePublish(reconcile.PublishOK, 2*time.Second)
+	r.ObservePublish(reconcile.PublishOK, time.Second)
+	r.ObservePublish(reconcile.PublishRefused, time.Second)
+	r.ObservePublish(reconcile.PublishFailed, time.Second)
+	r.ObservePublish("skipped", time.Second) // not an outcome: dropped
+	for res, want := range map[string]float64{"ok": 2, "refused": 1, "failed": 1} {
+		if v := sample(t, r, NameGenerationPublishes, map[string]string{"result": res}).GetCounter().GetValue(); v != want {
+			t.Errorf("publishes %s = %v, want %v", res, v, want)
+		}
+	}
+	if n := len(family(t, r, NameGenerationPublishes).GetMetric()); n != 3 {
+		t.Errorf("%d result series, want 3", n)
+	}
+	// The duration is of the successful ones.
+	h := sample(t, r, NameGenerationPublishDuration, map[string]string{}).GetHistogram()
+	if h.GetSampleCount() != 2 || h.GetSampleSum() != 3 {
+		t.Errorf("duration = count %d sum %v, want 2 and 3", h.GetSampleCount(), h.GetSampleSum())
+	}
+	r.SetVolumesServed(map[string]int{"serving": 2, "down": 1, "other": 9})
+	for state, want := range map[string]float64{"serving": 2, "outdated-binary": 0, "down": 1} {
+		if v := sample(t, r, NameVolumesServed, map[string]string{"state": state}).GetGauge().GetValue(); v != want {
+			t.Errorf("served %s = %v, want %v", state, v, want)
+		}
+	}
+	if n := len(family(t, r, NameVolumesServed).GetMetric()); n != 3 {
+		t.Errorf("%d state series, want 3", n)
+	}
 }

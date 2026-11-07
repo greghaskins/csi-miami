@@ -74,6 +74,11 @@ var sanitySkips = []string{
 	// The controller accepts any node on publish, by design (the volumes need
 	// no attachment), so it cannot tell that a node does not exist.
 	`ControllerPublishVolume should fail when the node does not exist`,
+	// Expansion is advertised for the volume kind, and the suite provisions
+	// directories, which have no size to grow and keep answering Unimplemented.
+	// Expansion of a volume is proved by the unit tests of the controller, the
+	// node and the item, and by the e2e.
+	`ExpandVolume`,
 }
 
 // provisionerName maps a name the suite chose to the pvc-<uuid> name the

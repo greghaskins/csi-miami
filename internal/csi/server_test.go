@@ -38,7 +38,9 @@ func TestIdentity(t *testing.T) {
 	}
 	var got []csi.PluginCapability_Service_Type
 	for _, c := range caps.GetCapabilities() {
-		got = append(got, c.GetService().GetType())
+		if c.GetService() != nil {
+			got = append(got, c.GetService().GetType())
+		}
 	}
 	want := []csi.PluginCapability_Service_Type{
 		csi.PluginCapability_Service_CONTROLLER_SERVICE,
@@ -165,7 +167,7 @@ func TestServerServesAndStops(t *testing.T) {
 		t.Fatalf("GetPluginInfo = %v, %v", info, err)
 	}
 	caps, err := csi.NewControllerClient(conn).ControllerGetCapabilities(ctx, &csi.ControllerGetCapabilitiesRequest{})
-	if err != nil || len(caps.GetCapabilities()) != 3 {
+	if err != nil || len(caps.GetCapabilities()) != 4 {
 		t.Fatalf("ControllerGetCapabilities = %v, %v", caps, err)
 	}
 	// The node service was not registered.

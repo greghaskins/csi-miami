@@ -1,10 +1,13 @@
 package reconcile
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
+	"github.com/greghaskins/csi-miami/internal/blockd"
 	"github.com/greghaskins/csi-miami/internal/item"
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/transport"
 )
 
@@ -25,9 +28,28 @@ const (
 	// ReasonTransportUnavailable is a volume whose transport could not be
 	// observed or mounted.
 	ReasonTransportUnavailable = "TransportUnavailable"
+	// ReasonUnstageStuck is an unstage that has been retrying for a long time
+	// without finishing (an item's retryable teardown error); the log line
+	// beside it carries the cause and the way out.
+	ReasonUnstageStuck = "UnstageStuck"
 	// ReasonGarbageUnmounted is a mount the reconciler removed because no
 	// intent claims it.
 	ReasonGarbageUnmounted = "GarbageUnmounted"
+	// ReasonGenerationOverdue is a volume whose newest published generation
+	// is older than its maximum age while it holds unpublished writes.
+	ReasonGenerationOverdue = "GenerationOverdue"
+	// ReasonPublishRefused is a volume whose scheduled generation the store
+	// refused because the volume is no longer held by this node; the
+	// unpublished writes are kept. It is raised when the refusal begins, not
+	// on every tick.
+	ReasonPublishRefused = "PublishRefused"
+	// ReasonVolumeUnhealthy is a volume whose device failed its active probe
+	// twice in a row (probe.go). It is raised when the volume turns
+	// unhealthy, not on every pass.
+	ReasonVolumeUnhealthy = "VolumeUnhealthy"
+	// ReasonKeyRequired is a volume that must be formatted or opened and was
+	// not given a key.
+	ReasonKeyRequired = "KeyRequired"
 )
 
 // Metrics is the seam to the metrics registry (plan section 10). The
@@ -77,6 +99,76 @@ type Events interface {
 	Event(volumeID, reason string)
 }
 
+// ProbeMetrics is implemented by a Metrics that also exposes the result of
+// the active probe, by volume. The reconciler uses it when it is there.
+type ProbeMetrics interface {
+	// SetVolumeProbe sets whether the volume's latest finished probes were
+	// healthy.
+	SetVolumeProbe(volumeID string, ok bool)
+	// DeleteVolumeProbe removes the volume's series, for a volume that is no
+	// longer staged.
+	DeleteVolumeProbe(volumeID string)
+}
+
+// The states of a volume's block server, as GenerationMetrics.SetVolumesServed
+// counts them.
+const (
+	// ServedServing is a server that answers its status and runs the binary
+	// the node would start now.
+	ServedServing = "serving"
+	// ServedOutdatedBinary is a server that answers but runs an older binary
+	// (it keeps serving until the volume is unstaged; see decision 51).
+	ServedOutdatedBinary = "outdated-binary"
+	// ServedDown is a server that does not answer its status.
+	ServedDown = "down"
+)
+
+// ServedStates lists the states, so that a metric can create them at zero.
+var ServedStates = []string{ServedServing, ServedOutdatedBinary, ServedDown}
+
+// The outcomes of a generation, as GenerationMetrics.ObservePublish takes
+// them. A generation skipped because another publish is running is not one:
+// that publish is counted when it finishes.
+const (
+	PublishOK      = "ok"
+	PublishRefused = "refused"
+	PublishFailed  = "failed"
+)
+
+// PublishResults lists the outcomes, so that a metric can create them at zero.
+var PublishResults = []string{PublishOK, PublishRefused, PublishFailed}
+
+// VolumeGeneration is what the generation timers know of one volume's
+// unpublished writes and cache, from its block server's status.
+type VolumeGeneration struct {
+	// Age is the time since the newest successful publish, or since the timers
+	// first saw the volume when the server has not published yet.
+	Age time.Duration
+	// DirtyBytes are the unpublished writes; CleanBytes the cached copies of
+	// chunks the store already holds.
+	DirtyBytes, CleanBytes int64
+	// Fetch is the server's account of its fetches from the store.
+	Fetch blockd.FetchStats
+}
+
+// GenerationMetrics is implemented by a Metrics that also exposes the volume
+// kind's generations. The reconciler uses it when it is there. Every volume
+// argument is a volume ID (volume:<PV name>).
+type GenerationMetrics interface {
+	// SetVolumeGeneration sets the volume's figures from its latest status.
+	SetVolumeGeneration(volumeID string, g VolumeGeneration)
+	// DeleteVolumeGeneration removes the volume's figures, for a volume that
+	// is no longer staged or whose server does not answer.
+	DeleteVolumeGeneration(volumeID string)
+	// ObservePublish counts one finished generation by outcome (PublishOK,
+	// PublishRefused or PublishFailed); d is how long it took, freeze to
+	// upload.
+	ObservePublish(result string, d time.Duration)
+	// SetVolumesServed sets the number of staged volumes in each state of
+	// ServedStates, zero included.
+	SetVolumesServed(counts map[string]int)
+}
+
 type noopMetrics struct{}
 
 func (noopMetrics) SetIntents(string, int)              {}
@@ -92,6 +184,31 @@ func (noopMetrics) SetIntentLoadFailures(int)           {}
 type noopEvents struct{}
 
 func (noopEvents) Event(string, string) {}
+
+// AnnotationPublish is the PV annotation that asks for a generation now: any
+// value the node has not seen for the volume requests exactly one.
+const AnnotationPublish = "miami.csi.greghaskins.com/publish"
+
+// GenerationOptions are the generation timers' settings for a volume whose own
+// parameters leave them unset (a volume's record carries its StorageClass's
+// values, which win).
+type GenerationOptions struct {
+	// Interval is how often a volume with unpublished writes publishes a
+	// generation. Zero means volume.DefaultGenerationEvery; anything under
+	// volume.MinGenerationInterval is refused by New.
+	Interval time.Duration
+	// MaxAge is how old the newest published generation of a volume with
+	// unpublished writes may get before the volume is reported overdue. Zero
+	// means volume.DefaultGenerationMaxAge; it must not be under Interval.
+	MaxAge time.Duration
+	// Timeout is the deadline of one generation, freeze to upload. Zero means
+	// DefaultGenerationTimeout.
+	Timeout time.Duration
+}
+
+// DefaultGenerationTimeout bounds one generation goroutine: more than the
+// volume item's own publish deadline.
+const DefaultGenerationTimeout = 5 * time.Minute
 
 // Options configure a Reconciler. TransportsRoot and StageRoot are required;
 // everything else has a usable zero value.
@@ -138,6 +255,39 @@ type Options struct {
 	Metrics Metrics
 	Events  Events
 
-	// Now is the clock for the idle timeout. Nil means time.Now.
+	// Prereq probes the node's prerequisites for the volume kind (see package
+	// prereq). It is called once per pass, must not block, and its report is
+	// what layer 1 of the volume item reads. Nil means no probe: nothing is
+	// reported missing.
+	Prereq func(context.Context) prereq.Report
+
+	// CacheDir is the directory volume caches live under, BinDir the directory
+	// the per-hash copies of the binary go in, and SystemdSocket systemd's
+	// private socket; all three are read by the volume item.
+	CacheDir      string
+	BinDir        string
+	SystemdSocket string
+
+	// MarkRetry is the delay before the reconciler first retries the teardown
+	// of a volume whose unstage began and has not finished, MarkRetryMax the
+	// longest the delay grows to (it doubles), and MarkWarnAfter how long such
+	// an unstage may go on before ReasonUnstageStuck is raised. Zero means
+	// 1 minute, 10 minutes and 30 minutes.
+	MarkRetry, MarkRetryMax, MarkWarnAfter time.Duration
+
+	// Generations are the defaults of the generation timers.
+	Generations GenerationOptions
+
+	// Probe, when set, turns on the active probe of volumes whose item can
+	// name a device to read (see Probed); nil probes nothing.
+	Probe *ProbeOptions
+
+	// PVAnnotation reads one annotation of the PV named pv ("" when it has
+	// none), for AnnotationPublish. Nil means no volume can request a
+	// generation. An error is not a request. The node's role needs only get on
+	// persistentvolumes for it.
+	PVAnnotation func(ctx context.Context, pv, key string) (string, error)
+
+	// Now is the clock for the idle timeout and the generation timers. Nil means time.Now.
 	Now func() time.Time
 }

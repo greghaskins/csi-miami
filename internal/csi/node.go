@@ -13,6 +13,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/chunk"
+	"github.com/greghaskins/csi-miami/internal/crypt"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/reconcile"
@@ -31,12 +33,15 @@ const DefaultStatsTimeout = 10 * time.Second
 // not have). NodeBackend is the production implementation; tests give the
 // service a fake.
 type nodeReconciler interface {
-	Stage(ctx context.Context, in intent.Intent) error
+	StageWith(ctx context.Context, in intent.Intent, keys reconcile.Keys) error
 	Unstage(ctx context.Context, volumeID string) error
-	Publish(ctx context.Context, volumeID string, p intent.Publish) error
+	PublishWith(ctx context.Context, volumeID string, p intent.Publish, keys reconcile.Keys) error
 	Unpublish(ctx context.Context, volumeID, targetPath string) error
 	// Get returns the volume's intent and whether there is one.
 	Get(volumeID string) (intent.Intent, bool, error)
+	// Expand raises the size the volume's record asks for and waits for the
+	// volume to be brought to it.
+	Expand(ctx context.Context, volumeID string, size int64) error
 }
 
 // NodeBackend is the production nodeReconciler: the reconciler for the
@@ -180,7 +185,8 @@ func requireID(s string) (volume.ID, error) {
 	return id, nil
 }
 
-// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME and GET_VOLUME_STATS.
+// NodeGetCapabilities reports STAGE_UNSTAGE_VOLUME, GET_VOLUME_STATS,
+// VOLUME_CONDITION (see conditioner) and EXPAND_VOLUME.
 func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	rpc := func(t csi.NodeServiceCapability_RPC_Type) *csi.NodeServiceCapability {
 		return &csi.NodeServiceCapability{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: t}}}
@@ -188,6 +194,8 @@ func (n *Node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesRequ
 	return &csi.NodeGetCapabilitiesResponse{Capabilities: []*csi.NodeServiceCapability{
 		rpc(csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME),
 		rpc(csi.NodeServiceCapability_RPC_GET_VOLUME_STATS),
+		rpc(csi.NodeServiceCapability_RPC_VOLUME_CONDITION),
+		rpc(csi.NodeServiceCapability_RPC_EXPAND_VOLUME),
 	}}, nil
 }
 
@@ -201,11 +209,54 @@ func (n *Node) NodeGetInfo(context.Context, *csi.NodeGetInfoRequest) (*csi.NodeG
 }
 
 // singleCapability checks the one capability of a node request.
-func singleCapability(c *csi.VolumeCapability) error {
-	if p := capabilityProblem(c); p != "" {
+func singleCapability(kind volume.Kind, c *csi.VolumeCapability) error {
+	if p := capabilityProblemFor(kind, c); p != "" {
 		return invalidf("volume_capability: %s", p)
 	}
 	return nil
+}
+
+// Secret keys of the node-stage and node-publish Secrets that carry the
+// encryption keys.
+const (
+	secretKey         = "key"
+	secretPreviousKey = "previousKey"
+)
+
+// minNote is the lower bound's part of a key-length message.
+func minNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" and at least %d", n)
+}
+
+// keysOf copies the encryption keys out of a request's Secrets. The caller
+// wipes the result. The keys go nowhere but the in-memory request of the
+// reconciler: not the intent, not a log line, not a reply. A key shorter than
+// crypt.MinKeyLen or longer than crypt.MaxKeyLen is InvalidArgument; the error
+// names the Secret entry and the length, never the value.
+func keysOf(secrets map[string]string) (reconcile.Keys, error) {
+	var k reconcile.Keys
+	// The lower bound is on the key alone: a volume formatted with a shorter
+	// key (before the bound existed) must still open and rotate, and rotation
+	// passes that old key as previousKey.
+	for _, e := range []struct {
+		entry string
+		dst   *[]byte
+		min   int
+	}{{secretKey, &k.Key, crypt.MinKeyLen}, {secretPreviousKey, &k.PreviousKey, 0}} {
+		v, ok := secrets[e.entry]
+		if !ok || v == "" {
+			continue
+		}
+		if len(v) < e.min || len(v) > crypt.MaxKeyLen {
+			k.Wipe()
+			return reconcile.Keys{}, invalidf("secret entry %q: the key is %d bytes; it must be at most %d bytes%s (generate one with: openssl rand -base64 48)", e.entry, len(v), crypt.MaxKeyLen, minNote(e.min))
+		}
+		*e.dst = []byte(v)
+	}
+	return k, nil
 }
 
 // NodeStageVolume records the volume as staged and waits for it to be staged
@@ -224,7 +275,7 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	if capability == nil {
 		return nil, invalidf("volume_capability is required")
 	}
-	if err := singleCapability(capability); err != nil {
+	if err := singleCapability(id.Kind, capability); err != nil {
 		return nil, err
 	}
 	vc, err := volume.DecodeContext(req.GetVolumeContext())
@@ -245,13 +296,14 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 		StagePath:  req.GetStagingTargetPath(),
 		AccessMode: capability.GetAccessMode().GetMode().String(),
 		MountFlags: capability.GetMount().GetMountFlags(),
+		Volume:     vc.Volume,
 	}
 
 	prev, ok, err := n.rec.Get(in.VolumeID)
 	if err != nil {
 		return nil, nodeStatus(fmt.Errorf("%w: reading the record of %s: %w", reconcile.ErrIntentsUnknown, in.VolumeID, err))
 	}
-	if ok && (prev.Context() != vc || prev.StagePath != in.StagePath) {
+	if ok && (!prev.Context().Equal(vc) || prev.StagePath != in.StagePath) {
 		return nil, status.Errorf(codes.AlreadyExists, "volume %s is already staged with another volume context or staging path", in.VolumeID)
 	}
 	// The node may create a local volume's directory at its first stage
@@ -261,7 +313,12 @@ func (n *Node) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequ
 	} else {
 		in.EnsureItem = vc.Transport.Kind == transport.KindLocal
 	}
-	if err := n.rec.Stage(ctx, in); err != nil {
+	keys, err := keysOf(req.GetSecrets())
+	if err != nil {
+		return nil, err
+	}
+	defer keys.Wipe()
+	if err := n.rec.StageWith(ctx, in, keys); err != nil {
 		return nil, nodeStatus(err)
 	}
 	return &csi.NodeStageVolumeResponse{}, nil
@@ -301,13 +358,13 @@ func (n *Node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolume
 	if capability == nil {
 		return nil, invalidf("volume_capability is required")
 	}
-	if err := singleCapability(capability); err != nil {
-		return nil, err
-	}
 	// An ID this driver could not have issued names no staged volume.
 	id, err := volume.ParseID(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "volume %q is not staged on this node", req.GetVolumeId())
+	}
+	if err := singleCapability(id.Kind, capability); err != nil {
+		return nil, err
 	}
 
 	rec, ok, err := n.rec.Get(id.String())
@@ -323,7 +380,12 @@ func (n *Node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolume
 	// A reader-only volume is never published read-write, whatever the CO
 	// sends: the access mode the volume was staged with decides.
 	readOnly := req.GetReadonly() || readerOnly(rec.AccessMode)
-	err = n.rec.Publish(ctx, id.String(), intent.Publish{TargetPath: req.GetTargetPath(), ReadOnly: readOnly})
+	keys, err := keysOf(req.GetSecrets())
+	if err != nil {
+		return nil, err
+	}
+	defer keys.Wipe()
+	err = n.rec.PublishWith(ctx, id.String(), intent.Publish{TargetPath: req.GetTargetPath(), ReadOnly: readOnly}, keys)
 	if err != nil {
 		return nil, nodeStatus(err)
 	}
@@ -368,9 +430,10 @@ func (n *Node) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVo
 // (a statfs that fails or times out) fails the call with the code of its class
 // (DeadlineExceeded for a timeout, Unavailable for a busy path, Internal for
 // an unexpected errno), so that a wedged transport is counted as the failure it
-// is. The CSI specification this driver is built against (v1.13) has removed
-// the VolumeCondition field of this response, so there is nowhere to report an
-// abnormal condition alongside an answer.
+// is. The answer carries the volume's VolumeCondition. That field is alpha: it
+// exists at the pinned spec version (v1.12.0) and v1.13 removes it in favour of
+// the volume-health API, which is why the pin stays. The kubelet acts on it
+// only with the CSIVolumeHealth feature gate enabled.
 func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, invalidf("volume_id is required")
@@ -398,7 +461,15 @@ func (n *Node) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeSta
 		n.log.Warn("volume stats: the file system could not be read", "volume_id", id.String(), "reason", reason(err), "error", err.Error())
 		return nil, nodeStatus(fmt.Errorf("volume stats of %s: %w", id, err))
 	}
-	return &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}, nil
+	resp := &csi.NodeGetVolumeStatsResponse{Usage: usageOf(st)}
+	// The condition is the active probe's verdict on the volume's device. A
+	// directory volume has no probe and reports normal. The alpha API is
+	// read by the kubelet only with the CSIVolumeHealth gate on.
+	if c, ok := n.rec.(conditioner); ok {
+		abnormal, msg := c.VolumeCondition(id.String())
+		resp.VolumeCondition = &csi.VolumeCondition{Abnormal: abnormal, Message: msg}
+	}
+	return resp, nil
 }
 
 // hasPath reports whether p is one of the volume's publish targets.
@@ -420,4 +491,67 @@ func usageOf(st unix.Statfs_t) []*csi.VolumeUsage {
 		{Unit: csi.VolumeUsage_BYTES, Available: avail * bsize, Total: total * bsize, Used: (total - free) * bsize},
 		{Unit: csi.VolumeUsage_INODES, Available: ffree, Total: files, Used: files - ffree},
 	}
+}
+
+// conditioner is implemented by a node reconciler that knows whether a
+// volume's device answers its active probe. The node service asks it when the
+// reconciler can say.
+type conditioner interface {
+	// VolumeCondition returns whether the volume is abnormal and why, in fixed
+	// text that names no path.
+	VolumeCondition(volumeID string) (abnormal bool, message string)
+}
+
+// NodeExpandVolume grows a staged volume of kind volume online: the reconciler
+// raises the volume's record and the item brings the stack to it, in order the
+// block server's device, the encryption mapping and the mounted file system.
+// The size is rounded up to whole chunks. A size below the volume's current
+// one (the larger of the context's and any earlier growth) is OutOfRange; a
+// size equal to it is a success that still runs a pass, which finishes a grow
+// that was interrupted. It returns the size the volume has. A directory has
+// no size: Unimplemented.
+func (n *Node) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	id, err := requireID(req.GetVolumeId())
+	if err != nil {
+		return nil, err
+	}
+	if err := cleanAbs("volume_path", req.GetVolumePath()); err != nil {
+		return nil, err
+	}
+	r := req.GetCapacityRange()
+	if r.GetRequiredBytes() <= 0 {
+		return nil, invalidf("a required size is required")
+	}
+	if _, err := requiredBytes(r); err != nil {
+		return nil, err
+	}
+	if id.Kind != volume.KindVolume {
+		return nil, status.Error(codes.Unimplemented, "only a volume of kind volume can be expanded")
+	}
+	in, ok, err := n.rec.Get(id.String())
+	if err != nil {
+		return nil, nodeStatus(fmt.Errorf("%w: reading the record of %s: %w", reconcile.ErrIntentsUnknown, id.String(), err))
+	}
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "volume %s is not staged on this node", id.String())
+	}
+	if in.Volume == nil || in.Volume.ChunkSize <= 0 {
+		return nil, status.Errorf(codes.FailedPrecondition, "the record of volume %s has no chunk size", id.String())
+	}
+	want := chunk.RoundUp(r.GetRequiredBytes(), in.Volume.ChunkSize)
+	if limit := r.GetLimitBytes(); limit > 0 && want > limit {
+		return nil, status.Errorf(codes.OutOfRange, "the size rounded up to whole %d byte chunks (%d) exceeds the limit", in.Volume.ChunkSize, want)
+	}
+	// The intent is the floor this node can check without I/O: the size record
+	// and the manifest may hold more, but the item never lowers the size below
+	// any of them (raiseSize), so a request under those is a no-op and cannot
+	// shrink the volume. ControllerExpandVolume has already refused to shrink
+	// below the record, and kubelet calls it first.
+	if cur := max(in.Volume.Size, in.GrownSize); want < cur {
+		return nil, status.Errorf(codes.OutOfRange, "the volume is %d bytes and does not shrink to %d", cur, want)
+	}
+	if err := n.rec.Expand(ctx, id.String(), want); err != nil {
+		return nil, nodeStatus(err)
+	}
+	return &csi.NodeExpandVolumeResponse{CapacityBytes: want}, nil
 }

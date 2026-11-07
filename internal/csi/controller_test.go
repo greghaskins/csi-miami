@@ -17,6 +17,7 @@ import (
 	kubefake "github.com/greghaskins/csi-miami/internal/kube/fake"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
+	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
 func TestNewControllerErrors(t *testing.T) {
@@ -66,6 +67,7 @@ func TestControllerGetCapabilities(t *testing.T) {
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME:     true,
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME: true,
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES:             true,
+		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME:            true,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("capabilities = %v, want %v", got, want)
@@ -86,9 +88,6 @@ func TestUnadvertisedCallsAreUnimplemented(t *testing.T) {
 	}
 	if _, err := e.ctrl.CreateSnapshot(ctx, &csi.CreateSnapshotRequest{}); codeOf(err) != codes.Unimplemented {
 		t.Errorf("CreateSnapshot code = %v, want Unimplemented", codeOf(err))
-	}
-	if _, err := e.ctrl.ControllerExpandVolume(ctx, &csi.ControllerExpandVolumeRequest{}); codeOf(err) != codes.Unimplemented {
-		t.Errorf("ControllerExpandVolume code = %v, want Unimplemented", codeOf(err))
 	}
 }
 
@@ -708,17 +707,17 @@ func TestPublishAndUnpublish(t *testing.T) {
 	}
 }
 
-func TestCapabilityProblemIsEmptyForEveryAcceptedMode(t *testing.T) {
+func TestCapabilityProblemForIsEmptyForEveryAcceptedMode(t *testing.T) {
 	t.Parallel()
 	for mode, accepted := range acceptedAccessModes {
 		if !accepted {
 			continue
 		}
-		if p := capabilityProblem(mountCap(mode)); p != "" {
+		if p := capabilityProblemFor(volume.KindDirectory, mountCap(mode)); p != "" {
 			t.Errorf("%v: %s", mode, p)
 		}
 	}
-	if p := capabilityProblem(mountCap(csi.VolumeCapability_AccessMode_UNKNOWN)); p == "" {
+	if p := capabilityProblemFor(volume.KindDirectory, mountCap(csi.VolumeCapability_AccessMode_UNKNOWN)); p == "" {
 		t.Error("UNKNOWN access mode accepted")
 	}
 }

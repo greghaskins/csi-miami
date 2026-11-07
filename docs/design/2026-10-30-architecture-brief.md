@@ -1227,6 +1227,143 @@ Recorded:
 
 Pending: none that block M1.
 
+Decisions 36 to 50 are the M2 design pass, recorded in full with their
+measurements in `2026-11-03-chunk-backed-volumes-design.md`; the one-line
+forms here are the log. Where they contradict a section above, the section's
+text is kept and the decision wins.
+
+36. **The `volume` kind replaces the image item (M2 design, 2026-11-03)**:
+    ext4 over dm-crypt over a chunk-backed nbd device whose live data is on
+    the node and whose point-in-time generations are on the transport. No
+    kernel filesystem is ever stacked over NFS: a loop's flush is an `fsync`
+    of its backing file that waits uninterruptibly on NFS writeback, which the
+    hung-task detector reports past 120 s on a soft mount and which wedges
+    until the server returns on a hard one. The image item of 4.1, 4.4 and
+    section 10 is not built; its one justification, metadata write throughput
+    (a directory on the NAS evaluated pays about 38 ms per file create, a
+    local filesystem does not), is served by the local store. Supersedes the
+    opening of section 1.
+37. **Encryption on by default for every `volume`**, LUKS2 with Adiantum,
+    keyslot rotation and the key over `/dev/fd` as in 4.7; the class-name
+    suffix flips to `-plain` for the exception, and decision 35's `-crypt`
+    token is withdrawn unused.
+38. **No FUSE layer and no second ciphertext format.** A FUSE crypt layer was
+    measured viable over NFS and rejected for a local store (five to fifteen
+    times on metadata-heavy phases); rclone's crypt format was rejected because
+    it cannot rewrite a block in place. Lesson 8's one inherent cost, daemon
+    lifetime across plugin restarts, is recorded with its mitigations (a
+    transient systemd service, or `hostPID`); FUSE is no longer rejected
+    wholesale, it has no use left here. Amends lesson 8 and decision 6's
+    reasoning, not its outcome.
+39. **Generations are the backup unit**: a freeze of milliseconds, a chunk-
+    level copy-on-write boundary in the server's cache, upload of the dirty
+    chunks under their SHA-256 names, a manifest, then `current` by rename;
+    retained by count on the transport. The NAS's file-level incremental mirror
+    then uploads only new chunks, and every restorable state is one the
+    workload could have crashed at. Supersedes 5.1's reasoning (a changing
+    image re-uploads whole) while confirming decision 12.
+40. **Restore needs coreutils and cryptsetup**: verify chunks by name,
+    concatenate in manifest order, `cryptsetup open`, mount. Nothing of the
+    driver's in the path.
+41. **The block server is a transient systemd service** started over the
+    host's private socket, executing a copy of the driver binary placed under
+    the kubelet plugin directory; its lifetime is the volume's stage, its
+    upgrade is the volume's next stage, and the plugin pod can restart freely.
+    No `hostPID`. A node without systemd cannot stage a `volume`.
+42. **nbd, in Go, in the one binary** (`miami blockd`), hot path without
+    allocations, gated by throughput against a loop device on a Pi (within
+    1.5× on every phase of the metadata benchmark); `ublk` with its Rust
+    library is the named fallback and is not built.
+43. **The local cache is deleted at unstage**, after the final generation;
+    returning to a node fetches again. Cache bound and chunk size are class
+    parameters; a cache smaller than the volume runs lazily, and when it fills
+    with unpublishable dirty chunks writes fail rather than block.
+44. **No era target**: the server is the write path and tracks the dirty set
+    itself, persisted in the cache so a restarted server resumes with
+    unpublished data intact.
+45. **Fencing is the holder epoch carried in every manifest** and re-checked
+    against the holder file before `current` is renamed. The ext4 shutdown
+    ioctl and the TCP reset of 4.5 and decision 8 are not built, because
+    nothing a stale holder writes reaches the shared store except through a
+    token-checked publish. The takeover timeout is no longer bound to the NFS
+    major timeout (decision 30's M2 note is moot) and defaults to 5 m. The
+    one-round-trip window of decision 32's kind remains and is documented.
+46. **`noacl` joins the nfs3 profile**: the NAS evaluated answers the NFSv3
+    ACL sideband with EPERM, which makes GNU coreutils `install -m`, `sed -i`
+    and `cp` fail on a directory item. Unlike decisions 30 and 34, a transport
+    mounted without it is adopted, not reported foreign, because its absence
+    breaks nothing the driver fences on; the drift is logged once.
+47. **Backup membership is the export** (decision 12 confirmed by the backup
+    trial): the backed-up export is selected whole, once, since the mirror
+    keeps only the selected folder's basename above it; a scratch export is
+    never selected; holder-file churn costs one small object per run and is
+    accepted.
+48. **Blobs are a layout on a `volume`, not a kind**; 5.3's S3 service is
+    dropped. The application owns the hash, the write-then-rename and the
+    integrity check, and is its namespace's credential gate.
+49. **SMB is closed**: the NAS evaluated offers SMB 3.1.1 without persistent
+    handles or the POSIX extensions; measured, its creates are five times
+    faster than NFSv3 but fsync-per-file is identical, SQLite fails on its
+    first statement, and exec bits, symlinks and FIFOs are lost. Section 8 of
+    the goals document is answered.
+50. **Milestones re-planned**: M2 `volume` RWO with generations, gated by
+    throughput and by an NAS outage e2e with no hung task; M3 RWX by re-export
+    (4.9 with `volume` in the image's place); M4 snapshots and clones from
+    manifests; node-local persistent with `miami move` (5.2) dropped since every
+    volume is mobile; read-only generation followers, encrypted shared
+    directories and lazy fetch outside the server unscheduled. Supersedes
+    section 10.
+
+Pending: none that block M2.
+
+Decisions 51 to 59 were recorded while the M2 plan ran, in full in
+`2026-11-03-chunk-backed-volumes-design.md` section 6 and folded into its
+section 4. Where they contradict a section above (4.5 takeover and its two
+clocks, 4.6 remediation, decision 8's fence timing), the section's text is kept
+and the decision wins.
+
+51. **A restarted block server re-points the same nbd device** (supersedes the
+    recovery shape of 41): a new `miami
+    blockd` for a volume whose device still exists sends `NBD_CMD_RECONFIGURE`
+    with the new socket and the same backend identifier, so the device, the
+    dm-crypt mapping and the ext4 mount survive; a restart needs no pod
+    deletion, no `e2fsck` and no key. Liveness is the unit's main process
+    answering on the volume's control socket, not the sysfs pid.
+52. **A volume moves only after a verified final sync** (supersedes the timed
+    takeover of 4.5 and its conditions 3 and 4, decision 8's takeover timeout
+    `T`, and narrows 43). The holder is released only by a clean unstage; a
+    pod elsewhere waits as `holder-contended`; no node takes a holder over
+    because it is old or its node is NotReady. A node that returns with a held
+    volume it no longer stages drains it itself. The emergency detach, which
+    abandons what the holder had not published, is an operator act: the PV
+    annotation `miami.csi.greghaskins.com/force-detach` naming the holder's
+    exact `<node>@<epoch>`, or the `node.kubernetes.io/out-of-service` taint
+    on its node. The epoch fence (45) is unchanged. `takeoverTimeout` is
+    refused as a class parameter, and `DeleteVolume` is refused while any
+    holder file exists.
+53. **No automatic remediation in M2; failures are reported** (narrows 4.6's
+    remediation package and drops its admission policy and opt-out flag). The
+    one case left for a pod deletion, ext4 read-only after the cache filled
+    while the store was unreachable, is reported through the probe, an event
+    and a metric with a message to restart the pod; the driver holds no
+    pod-delete permission.
+54. **The cache and binary copies live under the kubelet directory** (amends
+    the design's 4.3): no hostPath of their own; `-cache-dir`, `-bin-dir` and
+    `-shared-dir` move them within the directories the container and host both
+    see.
+55. **"Publish now" is a PV annotation** the node reads, not a PVC annotation a
+    controller relays.
+56. **Overdue is a condition and an event, and not a `VolumeCondition`**; the
+    `VolumeCondition` is the active probe's alone.
+57. **A surviving cache is reused on `current`'s epoch or base**, never on the
+    epoch the node holds now.
+58. **The mapping is opened with `--disable-keyring`**, so `cryptsetup resize`
+    needs no passphrase; the spec module is pinned at v1.12.0 to keep the alpha
+    `VolumeCondition` field until the kubelet adopts the volume-health API.
+59. **The cache-full case is signalled by dirty bytes and the overdue
+    condition, not reliably by `VolumeCondition`** (clarifies 53): the probe
+    reads one sector, which a full cache that still holds it serves.
+
 ## 10. Milestones
 
 1. **M1, directory items on NFSv3 and local**: the binary, controller and

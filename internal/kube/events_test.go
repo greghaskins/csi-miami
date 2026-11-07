@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"k8s.io/client-go/rest"
+
+	"github.com/greghaskins/csi-miami/internal/reconcile"
 )
 
 const (
@@ -199,7 +201,7 @@ func TestEventMessagesAreFixedPerReason(t *testing.T) {
 		}
 		a.mu.Unlock()
 	}
-	if got := eventMessage("Surprise", "node-a"); !strings.Contains(got, "Surprise") || !strings.Contains(got, "node-a") {
+	if got := eventMessage("Surprise", "node-a", ""); !strings.Contains(got, "Surprise") || !strings.Contains(got, "node-a") {
 		t.Errorf("an unknown reason gives %q", got)
 	}
 }
@@ -303,5 +305,81 @@ func TestNewEventRecorderNeedsAConfig(t *testing.T) {
 	t.Parallel()
 	if _, err := NewEventRecorder(nil, RecorderOptions{}); err == nil {
 		t.Error("no error for a nil config")
+	}
+}
+
+// An emergency detach is a Warning that names what was abandoned, and two
+// abandonments of the same volume are two events.
+func TestEmergencyDetachEventCarriesTheDetail(t *testing.T) {
+	a := newEventsAPI()
+	r := newRecorder(t, a, 8)
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, "abandoned node-b@3: the PV's force-detach annotation names the holder")
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, "abandoned node-c@5: the holder's node carries the taint\n\x00")
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, "abandoned node-b@3: the PV's force-detach annotation names the holder")
+	drain(r)
+	if len(a.events) != 2 {
+		t.Fatalf("%d events stored, want 2 (a repeat bumps the count)", len(a.events))
+	}
+	var seen []string
+	for _, ev := range a.events {
+		if ev["type"] != "Warning" || ev["reason"] != reconcile.ReasonEmergencyDetach {
+			t.Errorf("event = %v", ev)
+		}
+		msg, _ := ev["message"].(string)
+		if strings.ContainsAny(msg, "\n\x00") {
+			t.Errorf("control characters in %q", msg)
+		}
+		seen = append(seen, msg)
+	}
+	joined := strings.Join(seen, "|")
+	for _, want := range []string{"node-b@3", "node-c@5", "force-detach annotation", "node-a"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("messages %q lack %q", joined, want)
+		}
+	}
+}
+
+func TestEventDetailIsBounded(t *testing.T) {
+	a := newEventsAPI()
+	r := newRecorder(t, a, 8)
+	r.EventDetail(volumeID, reconcile.ReasonEmergencyDetach, strings.Repeat("x", 5000))
+	drain(r)
+	for _, ev := range a.events {
+		if msg, _ := ev["message"].(string); len(msg) > 600 {
+			t.Errorf("message is %d bytes", len(msg))
+		}
+	}
+}
+
+// Every reason a volume can raise has text of its own, fixed, naming the node
+// and nothing else: no path, no key, no error. The type says whether a person
+// should look.
+func TestEventTextFixedPerReason(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		reason  string
+		typ     string
+		message string
+	}{
+		{reconcile.ReasonVolumeUnhealthy, "Warning", "the volume's device on node node-a did not answer two reads of its first sector; the volume is reported abnormal. Restart the volume's pod once the store is reachable and the cache has drained: the file system stays read-only until it is remounted"},
+		{reconcile.ReasonKeyRequired, "Warning", "the volume on node node-a needs an encryption key that the stage request did not carry"},
+		{reconcile.ReasonGenerationOverdue, "Warning", "the volume's newest generation is older than its maximum age and node node-a holds unpublished writes"},
+		{ReasonPublishRefused, "Warning", "the store refused a generation of this volume from node node-a because the volume is no longer held by that node; see the node plugin's log"},
+		{ReasonGenerationLost, "Warning", "unpublished writes of this volume were discarded on node node-a; see the node plugin's log"},
+		{ReasonServerRestarted, "Normal", "the volume's block server was restarted on node node-a; its device and mounts were kept"},
+		{reconcile.ReasonEmergencyDetach, "Warning", "an emergency detach was carried out by node node-a"},
+	}
+	for _, c := range cases {
+		if got := eventMessage(c.reason, "node-a", ""); got != c.message {
+			t.Errorf("%s message = %q, want %q", c.reason, got, c.message)
+		}
+		if got := eventType(c.reason); got != c.typ {
+			t.Errorf("%s type = %s, want %s", c.reason, got, c.typ)
+		}
+		for _, bad := range []string{"/", "key=", "error"} {
+			if strings.Contains(c.message, bad) {
+				t.Errorf("%s message %q contains %q", c.reason, c.message, bad)
+			}
+		}
 	}
 }

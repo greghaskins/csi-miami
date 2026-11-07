@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/greghaskins/csi-miami/internal/transport"
@@ -88,6 +89,19 @@ type Intent struct {
 	// ignores it and so never creates: no Version bump.
 	EnsureItem bool
 
+	// Unstaging says an unstage of the volume has begun and not finished: the
+	// reconciler does not converge a volume with the mark (no remount, no
+	// fsck, no generation) until a Stage or a Publish for it clears it. The
+	// unstage itself retries under it. Informational for a version 1 reader.
+	Unstaging bool
+
+	// UnstagingSince is when the mark was first set, on the node's wall clock
+	// (zero when unset). It lets the warning for an unstage that does not
+	// finish count across restarts of the plugin. Cleared with the mark.
+	// Informational for a version 1 reader, which ignores it; a record without
+	// it reads as zero, which counts from the first time it is seen.
+	UnstagingSince time.Time
+
 	// Generation counts the writes of the record: the store sets it to one
 	// more than the record it replaces (1 for a new record, whatever the
 	// caller put here), on every Save and Update. It tells a record that was
@@ -97,6 +111,23 @@ type Intent struct {
 	// written before the field existed reads as 0. It is not part of what
 	// the record says should be true.
 	Generation uint64
+
+	// Volume holds the parameters of a volume of kind volume, nil for a
+	// directory. A version 1 reader ignores it (it never learns of a volume
+	// kind), so adding it needs no Version bump; a directory record has none
+	// and its bytes are unchanged.
+	Volume *volume.VolumeParams
+	// Epoch is the holder epoch the node acquired the volume at, 0 for a
+	// record with none. Informational for a version 1 reader.
+	Epoch uint64
+	// GrownSize is the size in bytes a NodeExpandVolume asked this volume to
+	// grow to, 0 for none. It is outside Volume on purpose: Volume mirrors
+	// the volume context, which is immutable, and a repeated stage compares
+	// against it. The item takes the largest of Volume.Size, GrownSize and the
+	// store's own records, so the size only ever rises. The reconciler keeps
+	// it across a repeated stage and the store drops it with the record at
+	// unstage. Informational for a version 1 reader.
+	GrownSize int64
 }
 
 // ID returns the volume ID in the record, split into kind and name. It
@@ -114,7 +145,7 @@ func (in Intent) ID() (volume.ID, error) {
 // Context returns the volume context the record mirrors: its kind, transport
 // subdir and mode.
 func (in Intent) Context() volume.Context {
-	return volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir, Mode: in.Mode}
+	return volume.Context{Kind: in.Kind, Transport: in.Transport, Subdir: in.Subdir, Mode: in.Mode, Volume: in.Volume}
 }
 
 // Validate reports whether the Intent is a structurally sound record, which
@@ -149,6 +180,9 @@ func (in Intent) Validate() error {
 	}
 	if kind != in.Kind {
 		return errors.New("kind does not match the kind of volumeID")
+	}
+	if (in.Kind == volume.KindVolume) != (in.Volume != nil) {
+		return errors.New("volume parameters are required for kind volume and allowed for no other kind")
 	}
 	if len(Escape(in.VolumeID)) > maxEscapedIDLen {
 		return errors.New("volumeID is too long to be a file name")

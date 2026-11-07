@@ -87,6 +87,14 @@ func (e *env) dump(t *testing.T, ns string) {
 	add("PersistentVolumeClaims in "+ns, pvcs, err)
 	testPods, err := e.Client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 	add("Pods in "+ns, testPods, err)
+	if err == nil {
+		for _, p := range testPods.Items {
+			b, lerr := e.Client.CoreV1().Pods(ns).GetLogs(p.Name, &corev1.PodLogOptions{}).DoRaw(ctx)
+			if lerr == nil {
+				write("pod-"+p.Name+".log", b)
+			}
+		}
+	}
 	pvs, err := e.Client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	add("PersistentVolumes", pvs, err)
 	vas, err := e.Client.StorageV1().VolumeAttachments().List(ctx, metav1.ListOptions{})
@@ -121,6 +129,35 @@ func (e *env) dump(t *testing.T, ns string) {
 			note("mountinfo of "+nd.Name, err)
 			write("mountinfo-"+nd.Name+".txt", []byte(out))
 		}
+	}
+	// What the volume kind leaves on a node and on the runner: the nbd
+	// devices and their nodes in /dev, the block server units and their
+	// journal, and the kernel log (shared by the nodes and the runner).
+	if nodesErr == nil && e.Transport == transportNFS3 {
+		var diag bytes.Buffer
+		for _, nd := range nodes.Items {
+			fmt.Fprintf(&diag, "==== node %s\n", nd.Name)
+			for _, cmd := range []string{
+				"ls -l /dev/nbd* /dev/mapper/ 2>&1 | head -60",
+				"for f in /sys/block/nbd*; do echo $f pid=$(cat $f/pid 2>&1) backend=$(cat $f/backend 2>&1) size=$(cat $f/size 2>&1); done",
+				"systemctl list-units --all 'miami-blockd-*' --no-pager 2>&1 | head -30",
+				"journalctl -u 'miami-blockd-*' --no-pager -n 80 2>&1",
+				"ls -lR /var/lib/kubelet/plugins/miami.csi.greghaskins.com/cache 2>&1 | head -60",
+			} {
+				out, err := nodeExec(ctx, nd.Name, "sh", "-c", cmd)
+				fmt.Fprintf(&diag, "---- %s\n%s", cmd, out)
+				if err != nil {
+					fmt.Fprintf(&diag, "(error: %v)\n", err)
+				}
+			}
+		}
+		if out, err := kernelLog(); err == nil {
+			fmt.Fprintf(&diag, "==== runner kernel log (tail)\n%s\n", tailLines(out, 80))
+		}
+		if out, err := run(ctx, "sh", "-c", "for d in /dev/nbd*; do [ -b $d ] && echo $d && cryptsetup --debug isLuks $d 2>&1 | tail -15; echo exit=$?; done"); err == nil {
+			fmt.Fprintf(&diag, "==== cryptsetup isLuks on the runner\n%s\n", out)
+		}
+		write("volume-diagnostics.txt", diag.Bytes())
 	}
 	if len(problems) > 0 {
 		write("errors.txt", []byte(strings.Join(problems, "\n")+"\n"))

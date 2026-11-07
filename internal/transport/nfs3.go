@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 
@@ -44,9 +46,12 @@ const nfs3Flags = unix.MS_NOATIME | unix.MS_NOSUID | unix.MS_NODEV
 //	nolock                locks are node-local; no NLM, no lockd state to hang
 //	lookupcache=positive  never cache a negative lookup
 //	actimeo=30            attribute cache of 30s; close-to-open still holds
+//	noacl                 no NFSACL sideband (a server without it answers
+//	                      EPERM to the ACL calls); a volume's files are the
+//	                      driver's own, so no ACL is lost
 //
 // There is no hard, and no fallback to soft. addr= is added by nfs3Data.
-const nfs3Profile = "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30"
+const nfs3Profile = "vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl"
 
 // nfs3Data renders the data string of mount(2): the profile and the address
 // of the server, resolved by the driver so that no helper is needed.
@@ -93,6 +98,11 @@ var nfs3SuperOptions = []string{
 	"acregmax=30",
 	"acdirmax=30",
 }
+
+// noacl is deliberately not in nfs3SuperOptions: a mount made before the
+// profile had it keeps working, because nothing the driver fences on depends
+// on it. Adopting such a mount is logged once (noteNoaclDrift).
+const nfs3Noacl = "noacl"
 
 // nfs3Forbidden are bare super option tokens that change what the profile
 // means, so a mount that has one is not this driver's mount even when every
@@ -200,6 +210,7 @@ func (n *nfs3) Mount(ctx context.Context) error {
 	v := n.judgeTable(t)
 	switch v.state {
 	case StateOurs:
+		n.noteNoaclDrift(v.top)
 		return nil
 	case StateForeign, StateHidden:
 		return n.conflict(v)
@@ -220,6 +231,27 @@ func (n *nfs3) Mount(ctx context.Context) error {
 		return fmt.Errorf("nfs3 mount of %s: the kernel has no NFS client (ENODEV); load the nfs module on the node: %w", n.source, err)
 	}
 	return err
+}
+
+// noaclDriftLogged holds the mount points whose adoption without noacl has
+// been logged, so that the message appears once per mount point per process
+// and not on every Mount.
+var noaclDriftLogged sync.Map
+
+// noteNoaclDrift logs, once, that an adopted mount lacks noacl.
+func (n *nfs3) noteNoaclDrift(top observe.Mount) {
+	if slices.Contains(top.SuperOptions, nfs3Noacl) {
+		return
+	}
+	if _, seen := noaclDriftLogged.LoadOrStore(n.dir, true); seen {
+		return
+	}
+	log := n.opts.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Info("adopting an nfs3 mount made without noacl; it stays as it is until the node's transport is remounted",
+		"transport", n.spec.Canonical(), "mount_point", n.dir)
 }
 
 // addr returns the address for the addr= option. The driver is IPv4 only: an

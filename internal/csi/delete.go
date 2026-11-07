@@ -7,14 +7,17 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/safefs"
 	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -106,6 +109,12 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 		return nil, unavailable("the directory of volume %q cannot be computed, so nothing is deleted: %v", id.Name, err)
 	}
 
+	if vctx.Kind == volume.KindVolume {
+		if err := c.refuseHeldVolume(ctx, id, dir, pv); err != nil {
+			return nil, err
+		}
+	}
+
 	removed, err := blocking(ctx, &c.ops, tr.Dir(), dir, func() (bool, error) {
 		return removeItemDir(ctx, c.mounter, tr.Dir(), dir, id.Name)
 	})
@@ -115,9 +124,77 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 		}
 		return nil, asStatus(err)
 	}
+	if vctx.Kind == volume.KindVolume {
+		c.removeHolderFiles(dir, id.Name)
+	}
 	c.seen.forget(id.Name)
 	c.log.Info("volume deleted", "volume_id", id.String(), "directory_existed", removed)
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// refuseHeldVolume returns Unavailable while any holder file exists beside the
+// directory of the volume of kind volume, however old it is (decision 52): a
+// holder file means a node still owns unsynced data, and that node, even if
+// it is down, drains it when it returns. Deleting the volume would remove
+// chunks it still owns. The provisioner retries until the node unstages or
+// drains the volume.
+//
+// The emergency detach is the way through: the PV's annotation
+// kube.AnnotationForceDetach, when its value is exactly "<node>@<epoch>" of
+// the holder file read now. A value that does not match (a stale epoch,
+// another node, empty) is ignored and the delete is refused. The abandonment
+// is logged before anything is removed, so it is on record if the removal
+// fails half way.
+func (c *Controller) refuseHeldVolume(ctx context.Context, id volume.ID, dir string, pv *kube.PV) error {
+	info, err := holder.Read(ctx, filepath.Dir(dir), id.Name)
+	if err != nil {
+		if ctx.Err() != nil {
+			return contextStatus(ctx.Err())
+		}
+		return unavailable("cannot read the holder of volume %q, so nothing is deleted: %v", id.Name, reason(err))
+	}
+	if !info.Present {
+		return nil
+	}
+	want := info.DetachValue()
+	if got, ok := pv.Annotations[kube.AnnotationForceDetach]; ok && info.DetachMatches(got) {
+		c.log.Warn("emergency detach: the unsynced data of the holder is abandoned and the volume is deleted", "volume_id", id.String(), "node", info.Node, "epoch", info.Epoch)
+		return nil
+	}
+	note := ""
+	if _, ok := pv.Annotations[kube.AnnotationForceDetach]; ok {
+		note = fmt.Sprintf(" (the %s annotation did not match %q)", kube.AnnotationForceDetach, want)
+	}
+	return unavailable("volume %q is held by node %q at epoch %d%s; it is deleted only after that node unstages or drains it, or after an operator force-detaches it by setting the PV annotation %s to %q",
+		id.Name, info.Node, info.Epoch, note, kube.AnnotationForceDetach, want)
+}
+
+// removeHolderFiles removes what a holder and an expansion leave beside a
+// deleted volume's directory: the holder file and its epoch claims, and the
+// size record. Best effort; the volume is gone either way.
+func (c *Controller) removeHolderFiles(dir, name string) {
+	// The parent is on the shared export: it is opened without following a
+	// symlink anywhere in its path, and the files are unlinked relative to it.
+	d, err := safefs.OpenRoot(filepath.Dir(dir))
+	if err != nil {
+		c.log.Warn("could not open the directory beside a deleted volume", "volume", name, "error", reason(err))
+		return
+	}
+	defer func() { _ = d.Close() }()
+	ents, err := d.ReadDir()
+	if err != nil {
+		c.log.Warn("could not list the directory beside a deleted volume", "volume", name, "error", reason(err))
+		return
+	}
+	for _, e := range ents {
+		n := e.Name()
+		if !strings.HasPrefix(n, name+".holder") && !strings.HasPrefix(n, name+".size") {
+			continue
+		}
+		if err := d.Unlink(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			c.log.Warn("could not remove a file left beside a deleted volume", "volume", name, "file", n, "error", reason(err))
+		}
+	}
 }
 
 // contextOfPV extracts the volume context from the PV of the volume id, and
@@ -138,6 +215,13 @@ func (c *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 //     volume.NewContext produces and repairs nothing, and the kind matches the
 //     ID.
 func contextOfPV(pv *kube.PV, id volume.ID) (volume.Context, error) {
+	return contextOfPVFor(pv, id, true)
+}
+
+// contextOfPVFor is contextOfPV, with the reclaim policy checked only when
+// mustDelete is set: it is a deletion's safeguard, and an expansion is as good
+// on a PV the cluster means to keep.
+func contextOfPVFor(pv *kube.PV, id volume.ID, mustDelete bool) (volume.Context, error) {
 	if pv.Name != id.Name {
 		return volume.Context{}, errors.New("the PV returned has another name")
 	}
@@ -150,7 +234,7 @@ func contextOfPV(pv *kube.PV, id volume.ID) (volume.Context, error) {
 	if pv.VolumeHandle != id.String() {
 		return volume.Context{}, errors.New("the PV's volume handle is not the requested volume ID")
 	}
-	if pv.ReclaimPolicy != reclaimDelete {
+	if mustDelete && pv.ReclaimPolicy != reclaimDelete {
 		return volume.Context{}, errors.New("the PV's reclaim policy is not Delete")
 	}
 	vctx, err := volume.DecodeContext(pv.VolumeAttributes)

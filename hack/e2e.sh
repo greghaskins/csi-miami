@@ -93,7 +93,7 @@ go build -o "$dir/miami" ./cmd/miami
 # tests to run" and exit 0, so each test must be listed first. TestE2ELockChild
 # is the node the lock test starts; it is not run by name here.
 listed="$("$dir/transport.test" -test.list '^TestE2E')"
-for name in TestE2ENFS3 TestE2ENFS3Lock TestE2ELockChild; do
+for name in TestE2ENFS3 TestE2ENFS3Lock TestE2ENFS3HolderTwoClients TestE2ELockChild; do
   if ! grep -qx "$name" <<<"$listed"; then
     echo "e2e: the e2e build of internal/transport does not list $name" >&2
     exit 1
@@ -107,10 +107,10 @@ MIAMI_E2E_MIAMI="$dir/miami" \
 SMOKE_ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-}" \
 SMOKE_PARENT_MNT_NS="$(readlink /proc/self/ns/mnt)" \
 unshare --mount --propagation private \
-  "$dir/transport.test" -test.run '^(TestE2ENFS3|TestE2ENFS3Lock)$' -test.v -test.count=1 -test.timeout=15m | tee "$dir/e2e.log"
+  "$dir/transport.test" -test.run '^(TestE2ENFS3|TestE2ENFS3Lock|TestE2ENFS3HolderTwoClients)$' -test.v -test.count=1 -test.timeout=15m | tee "$dir/e2e.log"
 
 # Every test above passed by name; a run that matched nothing would also exit 0.
-for name in TestE2ENFS3 TestE2ENFS3Lock; do
+for name in TestE2ENFS3 TestE2ENFS3Lock TestE2ENFS3HolderTwoClients; do
   if ! grep -Eq "^--- PASS: ${name} " "$dir/e2e.log"; then
     echo "e2e: ${name} did not report a pass" >&2
     exit 1

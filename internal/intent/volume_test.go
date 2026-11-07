@@ -1,0 +1,174 @@
+package intent
+
+import (
+	"flag"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/greghaskins/csi-miami/internal/transport"
+	"github.com/greghaskins/csi-miami/internal/volume"
+)
+
+var updateGolden = flag.Bool("update-volume-golden", false, "rewrite testdata/v1_volume.json")
+
+// volumeIntent is the Intent that testdata/v1_volume.json encodes.
+func volumeIntent() Intent {
+	const pv = "pvc-0a1b2c3d-1111-2222-3333-444455556666"
+	return Intent{
+		Version:  Version,
+		VolumeID: "volume:" + pv,
+		Kind:     volume.KindVolume,
+		Transport: transport.Spec{
+			Kind:   transport.KindNFS3,
+			Server: "nfs.example.com",
+			Export: "/export/data",
+		},
+		StagePath:  "/var/lib/kubelet/plugins/example/stage/" + pv,
+		AccessMode: "SINGLE_NODE_WRITER",
+		Epoch:      3,
+		Volume: &volume.VolumeParams{
+			ChunkSize: 4 << 20, CacheSize: 1 << 30, Size: 1 << 30,
+			Encryption: true, Cipher: "xchacha12,aes-adiantum-plain64", KeySize: 256,
+			Generations: volume.GenerationParams{
+				Interval: 5 * time.Minute, MaxAge: time.Hour, Keep: 3, DirtyWatermark: 512 << 20,
+			},
+		},
+	}
+}
+
+func TestVolumeIntentLoads(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join("testdata", "v1_volume.json")
+	if *updateGolden {
+		s, dir := openStore(t)
+		mustSave(t, s, volumeIntent())
+		b, err := os.ReadFile(filepath.Join(dir, Escape(volumeIntent().VolumeID)+".json")) // #nosec G304 -- test file
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, b, 0o600); err != nil { // #nosec G306 G703 -- testdata
+			t.Fatal(err)
+		}
+	}
+	golden, err := os.ReadFile(path) // #nosec G304 -- testdata
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, dir := openStore(t)
+	want := stored(volumeIntent())
+	if err := os.WriteFile(filepath.Join(dir, Escape(want.VolumeID)+".json"), golden, 0o600); err != nil { // #nosec G703 -- a test file in a temp dir
+		t.Fatal(err)
+	}
+	got := mustLoad(t, s)
+	if len(got.Failures) != 0 || !reflect.DeepEqual(got.Intents[want.VolumeID], want) {
+		t.Fatalf("loaded %+v, failures %v; want %+v", got.Intents, got.Failures, want)
+	}
+	// Saving the same intent writes the golden bytes.
+	s2, dir2 := openStore(t)
+	mustSave(t, s2, volumeIntent())
+	written, err := os.ReadFile(filepath.Join(dir2, Escape(want.VolumeID)+".json")) // #nosec G304 -- test file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) != string(golden) {
+		t.Fatalf("Save wrote\n%s\nbut the golden file holds\n%s", written, golden)
+	}
+}
+
+// TestIntentGoldenBytesUnchanged: a directory record carries neither the
+// volume nor the epoch field, so the version 1 golden bytes stay as they
+// were.
+func TestIntentGoldenBytesUnchanged(t *testing.T) {
+	t.Parallel()
+	b, err := goldenIntent().MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"volume"`, `"epoch"`} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("a directory record has %s: %s", key, b)
+		}
+	}
+	s, dir := openStore(t)
+	mustSave(t, s, goldenIntent())
+	written, err := os.ReadFile(filepath.Join(dir, Escape(goldenIntent().VolumeID)+".json")) // #nosec G304 -- test file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) != string(readGolden(t)) {
+		t.Fatalf("the directory record's bytes changed:\n%s", written)
+	}
+}
+
+func TestVolumeKindNeedsVolumeParams(t *testing.T) {
+	t.Parallel()
+	in := volumeIntent()
+	in.Volume = nil
+	if in.Validate() == nil {
+		t.Error("a volume record without parameters validates")
+	}
+	d := goldenIntent()
+	d.Volume = volumeIntent().Volume
+	if d.Validate() == nil {
+		t.Error("a directory record with volume parameters validates")
+	}
+}
+
+// A record written before decision 52 carries a takeoverTimeout; it still
+// loads, and rewriting it drops the key.
+func TestVolumeIntentWithALegacyTakeoverTimeoutLoads(t *testing.T) {
+	t.Parallel()
+	s, dir := openStore(t)
+	in := volumeIntent()
+	mustSave(t, s, in)
+	path := s.Path(in.VolumeID)
+	b, err := os.ReadFile(path) //nolint:gosec // the test store's own file
+	if err != nil {
+		t.Fatal(err)
+	}
+	patched := strings.Replace(string(b), `"keep": 3,`, `"keep": 3,
+      "takeoverTimeout": 1800000000000,`, 1)
+	if patched == string(b) {
+		t.Fatalf("the record has no keep field to patch:\n%s", b)
+	}
+	if err := os.WriteFile(path, []byte(patched), 0o600); err != nil { //nolint:gosec // the test store's own file
+		t.Fatal(err)
+	}
+	got, ok, err := s.Get(in.VolumeID)
+	if err != nil || !ok || got.Volume == nil || got.Volume.Size != in.Volume.Size {
+		t.Fatalf("Get = %+v, %v, %v", got.Volume, ok, err)
+	}
+	mustSave(t, s, got)
+	rewritten, _ := os.ReadFile(path) //nolint:gosec // the test store's own file
+	if strings.Contains(string(rewritten), "takeoverTimeout") {
+		t.Error("a rewrite kept the legacy key")
+	}
+	_ = dir
+}
+
+func TestGrownSizeRoundTripsAndIsAbsentWhenZero(t *testing.T) {
+	t.Parallel()
+	s, dir := openStore(t)
+	in := volumeIntent()
+	in.GrownSize = 2 << 30
+	mustSave(t, s, in)
+	got, ok, err := s.Get(in.VolumeID)
+	if err != nil || !ok || got.GrownSize != 2<<30 {
+		t.Fatalf("Get = %+v, %v, %v; want GrownSize %d", got, ok, err, int64(2<<30))
+	}
+	// A volume that was never grown writes the bytes it always did.
+	s2, dir2 := openStore(t)
+	mustSave(t, s2, volumeIntent())
+	b, err := os.ReadFile(filepath.Join(dir2, Escape(in.VolumeID)+".json")) // #nosec G304 -- test file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "grownSize") {
+		t.Errorf("a never-grown record mentions grownSize:\n%s", b)
+	}
+	_ = dir
+}

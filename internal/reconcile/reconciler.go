@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/item/directory"
 	"github.com/greghaskins/csi-miami/internal/mount"
+	"github.com/greghaskins/csi-miami/internal/probe"
 	"github.com/greghaskins/csi-miami/internal/transport"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -45,7 +47,34 @@ type request struct {
 	kind   reqKind
 	volume string
 	target string // reqPublish and reqUnpublish: the publish target path
+	keys   Keys   // reqStage and reqPublish: a copy, wiped when the request is finished with
 	done   chan error
+}
+
+// Keys are the encryption keys that arrive with a stage or publish request, from
+// the node-stage Secret. They exist only in memory: they are never written to
+// an intent record, a log line, a unit's command line or an RPC reply. The
+// reconciler works from its own copy and wipes it when the request is
+// finished with (answered, refused or abandoned at shutdown); the caller wipes
+// the slices it passed.
+type Keys struct {
+	// Key opens the volume (and formats it at its first stage).
+	Key []byte
+	// PreviousKey, when set, is the key the volume was last opened with, for a
+	// rotation to Key.
+	PreviousKey []byte
+}
+
+// Wipe zeroes both keys and drops them.
+func (k *Keys) Wipe() {
+	clear(k.Key)
+	clear(k.PreviousKey)
+	k.Key, k.PreviousKey = nil, nil
+}
+
+// clone returns a copy that shares nothing with k.
+func (k Keys) clone() Keys {
+	return Keys{Key: bytes.Clone(k.Key), PreviousKey: bytes.Clone(k.PreviousKey)}
 }
 
 // Reconciler is the node agent's converge loop. Build one with New, start it
@@ -97,15 +126,24 @@ type Reconciler struct {
 
 	// Loop-only state: touched by runPass and Run, never by a request.
 	transports  map[transport.Spec]transport.Transport
-	lastTargets map[string]targetInfo // publish targets of the previous pass
-	drops       map[string]dropped    // targets to unmount once they are no longer claimed
-	idleSince   map[string]time.Time  // unreferenced transport dir → first pass that saw it
-	lastErr     map[string]string     // volume → text of its last error, for dedup
-	reported    map[string]string     // transport dir → kind, for the metrics seam
-	up          map[string]bool       // transport dir → whether it answered its last probe, to log changes
-	kinds       map[string]struct{}   // intent kinds reported, so a kind that empties reads 0
-	failedLoad  map[string]struct{}   // load-failure paths already logged
-	warned      map[string]string     // path → kind of the failure last logged at warn level
+	lastTargets map[string]targetInfo  // publish targets of the previous pass
+	drops       map[string]dropped     // targets to unmount once they are no longer claimed
+	idleSince   map[string]time.Time   // unreferenced transport dir → first pass that saw it
+	lastErr     map[string]string      // volume → text of its last error, for dedup
+	marked      map[string]*markState  // volume → retry state of an unstage that has not finished
+	orphans     map[string]*drainState // volume → retry state of a drain that has not finished (drain.go)
+	drainDue    bool                   // the next pass drains orphans: the start pass and the timer passes
+	gens        *generations           // the generation timers (generation.go)
+	probes      *probe.Prober          // the active probe (probes.go), nil when off
+	probeNote   sync.Map               // volume → note on why its probe failed, read by VolumeCondition
+	probeStack  map[string]uint64      // volume → stack number the probe state belongs to
+	probeBad    map[string]bool        // volume → whether its probe state was last reported abnormal
+	stopMargin  time.Duration          // added to the items' freeze bound when Run waits for generations
+	reported    map[string]string      // transport dir → kind, for the metrics seam
+	up          map[string]bool        // transport dir → whether it answered its last probe, to log changes
+	kinds       map[string]struct{}    // intent kinds reported, so a kind that empties reads 0
+	failedLoad  map[string]struct{}    // load-failure paths already logged
+	warned      map[string]string      // path → kind of the failure last logged at warn level
 	// starts and ends count the passes begun and finished. Nothing in the loop
 	// reads them; tests use them to wait for a pass that began after a point,
 	// which the metrics seam cannot say.
@@ -169,6 +207,18 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 	if opts.StatTimeout <= 0 {
 		opts.StatTimeout = DefaultStatTimeout
 	}
+	if opts.MarkRetry <= 0 {
+		opts.MarkRetry = time.Minute
+	}
+	if opts.MarkRetryMax <= 0 {
+		opts.MarkRetryMax = 10 * time.Minute
+	}
+	if opts.MarkWarnAfter <= 0 {
+		opts.MarkWarnAfter = 30 * time.Minute
+	}
+	if err := opts.Generations.validate(); err != nil {
+		return nil, err
+	}
 	r := &Reconciler{
 		store:       store,
 		m:           m,
@@ -183,6 +233,12 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 		drops:       map[string]dropped{},
 		idleSince:   map[string]time.Time{},
 		lastErr:     map[string]string{},
+		marked:      map[string]*markState{},
+		orphans:     map[string]*drainState{},
+		gens:        newGenerations(),
+		probeBad:    map[string]bool{},
+		probeStack:  map[string]uint64{},
+		stopMargin:  defaultStopMargin,
 		reported:    map[string]string{},
 		up:          map[string]bool{},
 		kinds:       map[string]struct{}{},
@@ -201,6 +257,9 @@ func New(store *intent.Store, m mount.Mounter, opts Options) (*Reconciler, error
 	}
 	if r.opts.Now == nil {
 		r.opts.Now = time.Now
+	}
+	if o := opts.Probe; o != nil {
+		r.probes = probe.New(probe.Options{Read: o.Read, Timeout: o.Timeout, Failures: o.Failures, Now: r.opts.Now})
 	}
 	items := opts.Items
 	if items == nil {
@@ -263,6 +322,12 @@ func strictlyBelow(dir, path string) bool { return path != dir && within(dir, pa
 // unmount them as targets no intent claims. A record that stays unreadable is
 // for a person to repair or remove; every pass says so (see garbage.go).
 func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
+	return r.StageWith(ctx, in, Keys{})
+}
+
+// StageWith is Stage for a request that carries encryption keys (see Keys). The
+// keys are not part of the intent and are not recorded.
+func (r *Reconciler) StageWith(ctx context.Context, in intent.Intent, keys Keys) error {
 	if in.Version == 0 {
 		in.Version = intent.Version
 	}
@@ -304,6 +369,9 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 			// caller that read it earlier must not give the permission back
 			// after the loop took it.
 			merged.EnsureItem = rec.EnsureItem
+			// A repeated stage carries the PV's immutable size; the growth
+			// the node has been asked for since is not undone by it.
+			merged.GrownSize = max(merged.GrownSize, rec.GrownSize)
 		}
 		*rec = merged
 		return nil
@@ -314,7 +382,49 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 		}
 		return fmt.Errorf("recording the intent of %s: %w", in.VolumeID, err)
 	}
-	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID})
+	return r.await(ctx, &request{kind: reqStage, volume: in.VolumeID, keys: keys.clone()})
+}
+
+// Expand raises the size the volume's record asks for to size (a whole number
+// of chunks, in bytes) and waits for a pass to bring the volume to it. The
+// record only ever rises: a size at or below the one it has changes nothing,
+// and the pass still runs, which finishes a grow an earlier call left half
+// done. The record keeps the size when the pass fails, so the next pass tries
+// again. Only a volume of kind volume has a size to raise; a volume with no
+// intent is ErrUnknownVolume.
+func (r *Reconciler) Expand(ctx context.Context, volumeID string, size int64) error {
+	if size <= 0 {
+		return fmt.Errorf("%w: the size %d is not positive", ErrInvalidRequest, size)
+	}
+	id, err := volume.ParseID(volumeID)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	if id.Kind != volume.KindVolume {
+		return fmt.Errorf("%w: only a volume of kind %s has a size", ErrInvalidRequest, volume.KindVolume)
+	}
+	unlock, err := r.locks.lock(ctx, volumeID)
+	if err != nil {
+		return fmt.Errorf("waiting for volume %s: %w", volumeID, err)
+	}
+	defer unlock()
+	err = r.store.Update(volumeID, func(in *intent.Intent) error {
+		if in.VolumeID == "" {
+			return fmt.Errorf("%w: %s", ErrUnknownVolume, volumeID)
+		}
+		if size <= in.GrownSize {
+			return errNoChange
+		}
+		in.GrownSize = size
+		return nil
+	})
+	if err != nil && !errors.Is(err, errNoChange) {
+		if errors.Is(err, ErrUnknownVolume) {
+			return err
+		}
+		return fmt.Errorf("recording the size of %s: %w", volumeID, err)
+	}
+	return r.await(ctx, &request{kind: reqStage, volume: volumeID})
 }
 
 // Publish adds a publish (a target path and its read-only flag) to the
@@ -344,6 +454,12 @@ func (r *Reconciler) Stage(ctx context.Context, in intent.Intent) error {
 // the entry is pruned. A caller that stays for the answer and gets a conflict
 // has the entry removed.
 func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publish) error {
+	return r.PublishWith(ctx, volumeID, p, Keys{})
+}
+
+// PublishWith is Publish for a request that carries encryption keys (see Keys),
+// which a restage after a lost mapping needs. The keys are not recorded.
+func (r *Reconciler) PublishWith(ctx context.Context, volumeID string, p intent.Publish, keys Keys) error {
 	if err := r.checkTargetPath("publish", p.TargetPath); err != nil {
 		return err
 	}
@@ -384,10 +500,23 @@ func (r *Reconciler) Publish(ctx context.Context, volumeID string, p intent.Publ
 		in.Publishes = append(in.Publishes, p)
 		return nil
 	})
+	if err == nil {
+		err = r.store.Update(volumeID, func(in *intent.Intent) error {
+			if !in.Unstaging {
+				return errNoChange
+			}
+			in.Unstaging = false // a publish means kubelet wants the volume again
+			in.UnstagingSince = time.Time{}
+			return nil
+		})
+		if errors.Is(err, errNoChange) {
+			err = nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("recording the publish of %s: %w", volumeID, err)
 	}
-	err = r.await(ctx, &request{kind: reqPublish, volume: volumeID, target: p.TargetPath})
+	err = r.await(ctx, &request{kind: reqPublish, volume: volumeID, target: p.TargetPath, keys: keys.clone()})
 	if errors.Is(err, ErrPublishConflict) && !existed {
 		// The record must only name targets the driver bound. The intent is
 		// written before the wait so that a caller that gives up still
@@ -607,6 +736,19 @@ func (r *Reconciler) Unstage(ctx context.Context, volumeID string) error {
 		r.nudge()
 		return nil
 	}
+	// Mark the record before the pass: an unstage that cannot finish (decision
+	// 52 retries it) must not be undone by the passes in between, which would
+	// fsck, remount and publish a volume kubelet is taking away.
+	if err := r.store.Update(volumeID, func(in *intent.Intent) error {
+		if in.VolumeID == "" || in.Unstaging {
+			return errNoChange
+		}
+		in.Unstaging = true
+		in.UnstagingSince = r.opts.Now() // kept across retries; the stuck warning counts from it
+		return nil
+	}); err != nil && !errors.Is(err, errNoChange) {
+		return fmt.Errorf("recording the unstage of %s: %w", volumeID, err)
+	}
 	return r.await(ctx, &request{kind: reqUnstage, volume: volumeID})
 }
 
@@ -616,6 +758,7 @@ func (r *Reconciler) await(ctx context.Context, req *request) error {
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
+		req.keys.Wipe()
 		return ErrStopped
 	}
 	r.queue = append(r.queue, req)
@@ -663,9 +806,16 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	r.started = true
 	r.mu.Unlock()
 	defer r.stop()
+	defer r.waitForGenerations()
+	if r.probes != nil {
+		// A read on a dead device is not waited for: it ends when the kernel
+		// gives the device back, and the process may exit before.
+		defer r.probes.Close()
+	}
 
 	ticks, stopTicks := r.newTicker(r.opts.Interval)
 	defer stopTicks()
+	r.drainDue = true
 	for {
 		r.runPass(ctx, r.take())
 		select {
@@ -673,6 +823,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			return nil
 		case <-r.wake:
 		case <-ticks:
+			r.drainDue = true
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -688,6 +839,7 @@ func (r *Reconciler) stop() {
 	r.queue = nil
 	r.mu.Unlock()
 	for _, req := range q {
+		req.keys.Wipe()
 		req.done <- ErrStopped
 	}
 }

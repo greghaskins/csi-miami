@@ -15,6 +15,10 @@
 #   hack/e2e-overlay.sh --image <ref> [--nfs-server <ipv4>] --out <dir>
 #   kubectl apply -k <dir>
 #
+# The node plugin also stays off a node labelled miami-e2e/plugin-off, which is
+# how the volume tests stop one plugin (the DaemonSet controller removes the
+# pod, and starts it again when the label goes) without touching the other.
+#
 #   image       the driver image reference (name:tag or name@digest); it
 #               replaces the `images:` entry below.
 #   nfs server  the IPv4 address of the NFS server container; it replaces
@@ -74,3 +78,12 @@ patches:
                 hostPath:
                   path: /export
                   type: DirectoryOrCreate
+  - target:
+      kind: DaemonSet
+      name: miami-node
+    patch: |-
+      - op: add
+        path: /spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/-
+        value:
+          key: miami-e2e/plugin-off
+          operator: DoesNotExist

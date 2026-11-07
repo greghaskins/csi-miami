@@ -4,3 +4,5 @@
 !go.sum
 !cmd/
 !internal/
+!hack/image-closure.sh
+!hack/tools.txt

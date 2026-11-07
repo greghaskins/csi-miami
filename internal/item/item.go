@@ -9,6 +9,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/mount"
 	"github.com/greghaskins/csi-miami/internal/observe"
+	"github.com/greghaskins/csi-miami/internal/prereq"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -19,6 +20,26 @@ import (
 type Observed struct {
 	// Mounts is /proc/self/mountinfo, in full.
 	Mounts observe.Table
+
+	// Prereq is the node's prerequisite report of this pass, the zero report
+	// (nothing missing) when no probe is configured. Only the volume kind
+	// reads it.
+	Prereq prereq.Report
+
+	// Keys are the encryption keys of the stage or publish request this pass
+	// is answering, empty on a pass no request caused. They live in memory
+	// for the pass: the reconciler wipes them when the request is finished
+	// with, so an Item must not keep a reference to either slice.
+	Keys Keys
+}
+
+// Keys are the encryption keys a request carried; see Observed.Keys.
+type Keys struct {
+	// Key opens the volume (and formats it at its first stage).
+	Key []byte
+	// PreviousKey, when set, is the key the volume was last opened with, for a
+	// rotation to Key.
+	PreviousKey []byte
 }
 
 // Item makes one kind of volume real between its transport and its publish
@@ -56,6 +77,15 @@ type Item interface {
 	// nothing.
 	PublishSource(in intent.Intent) (string, error)
 
+	// PublishRoot is the directory PublishSource lies beneath, and the root
+	// the publish bind is resolved beneath (Mounter.Bind): the source is
+	// opened relative to it with no symlink, mount point or ".." able to lead
+	// out. For a directory item it is the transport's mount point; for a
+	// volume item it is the stage path, the mount that is the source itself. It
+	// is never empty: there is no host-wide resolution of a publish source. It
+	// decides from the intent alone and touches nothing.
+	PublishRoot(in intent.Intent) (string, error)
+
 	// Teardown undoes Converge: afterwards nothing the Item made is mounted at
 	// the stage path, and what the Item made below it is gone. It is a no-op
 	// when there is nothing to undo, and it never detaches lazily, so a busy
@@ -88,6 +118,60 @@ var (
 	// driver makes none there, and kubelet's reference check would see it.
 	// It wraps mount.ErrConflict. Nothing is changed.
 	ErrStageConflict = fmt.Errorf("the stage path is mounted from something else: %w", mount.ErrConflict)
+)
+
+// The errors of the volume kind. Each is one condition of the reconciler.
+var (
+	// ErrPrerequisiteMissing is returned, before anything is started or
+	// created, when the node lacks a feature the volume needs (the nbd
+	// module, device-mapper, the Adiantum cipher, systemd's socket, a
+	// writable cache directory). A person has to change the node.
+	ErrPrerequisiteMissing = errors.New("the node lacks a prerequisite of the volume")
+
+	// ErrHolderContended is returned when another node holds the volume and
+	// may not be taken over (yet), or when our own ownership was lost. It is
+	// retryable.
+	ErrHolderContended = errors.New("the volume is held by another node")
+
+	// ErrServerDown is returned when the block server of the volume is not
+	// serving: its unit is not running, restarting or not answering. It is
+	// retryable.
+	ErrServerDown = errors.New("the volume's block server is not serving")
+
+	// ErrKeyRequired is returned when the volume must be formatted or opened
+	// and the request carried no key.
+	ErrKeyRequired = errors.New("the volume needs an encryption key and the request carried none")
+
+	// ErrBadKey is returned when the key (and the previous key, if any) does
+	// not open the volume.
+	ErrBadKey = errors.New("the encryption key does not open the volume")
+
+	// ErrUnstageIncomplete is returned by Teardown when the volume's last
+	// writes are not verifiably in the store yet: a publish still in flight,
+	// the final generation failed, the store does not name it, or the server
+	// still holds dirty chunks. The server, the cache and the holder are left
+	// as they were so the unstage can be retried (decision 52). Retryable.
+	ErrUnstageIncomplete = errors.New("the unstage cannot yet prove the volume's last writes are in the store")
+
+	// ErrReleasePending is returned when the volume's data is settled (in the
+	// store, or given up) and its cache is gone, and only the removal of the
+	// holder file failed. It is retried by itself and nothing is unproven: it
+	// is Unavailable, like ErrUnstageIncomplete, but says nothing about writes.
+	ErrReleasePending = errors.New("the holder file could not be released yet")
+
+	// ErrGenerationOverdue is the condition of a volume whose newest published
+	// generation is older than generations.maxAge. It is reported, not an error
+	// of Converge.
+	ErrGenerationOverdue = errors.New("the volume's newest generation is overdue")
+
+	// ErrGenerationSkipped is returned by a volume item's Generation when a
+	// publish was already in flight, so that no file system was frozen and
+	// nothing was done. It is not a failure: the next trigger tries again.
+	ErrGenerationSkipped = errors.New("a publish is in flight; the generation is skipped")
+
+	// ErrPublishRefused is the condition of a volume whose generations the
+	// store refuses because the volume is no longer ours.
+	ErrPublishRefused = errors.New("the store refuses the volume's generations: it is no longer ours")
 )
 
 // ErrNoOpenat2 is returned when the kernel has no openat2(2) (before Linux
@@ -183,4 +267,20 @@ func UnmountIf(ctx context.Context, m mount.Mounter, mountPoint string, owned Ow
 		return fmt.Errorf("%w: another mount is stacked at %s and is left in place", conflict, mountPoint)
 	}
 	return nil
+}
+
+// Drainer is implemented by an item kind whose node-local state can outlive
+// its intent record: a crash, then the volume's pod moves, leaves a cache that
+// holds writes no one else has. The reconciler drains such a volume itself
+// (decision 52), because the holder file keeps every other node off it.
+//
+// Orphans lists the intents the kind recorded for volumes with surviving
+// node-local state; the reconciler drops those that have an intent record
+// and calls Drain, with the volume's transport mounted, for the rest. Drain
+// either finishes the volume (nil), leaves it exactly as it is and says why
+// (an error, to be retried), or finds it is not this node's to drain (nil with
+// nothing touched). Both run on the reconciler's loop.
+type Drainer interface {
+	Orphans(ctx context.Context) ([]intent.Intent, error)
+	Drain(ctx context.Context, in intent.Intent) error
 }

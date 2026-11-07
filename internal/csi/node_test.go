@@ -1,6 +1,7 @@
 package csi
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -37,10 +38,17 @@ type fakeRec struct {
 	calls     []string
 	staged    []intent.Intent
 	published []intent.Publish
-	record    *intent.Intent
-	getErr    error
-	err       error // returned by every request
+	// The keys each request carried, copied before the handler wipes them.
+	stageKeys, publishKeys []fakeKeys
+	record                 *intent.Intent
+	getErr                 error
+	abnormal               bool // answered by VolumeCondition
+	abnormalMsg            string
+	err                    error // returned by every request
+	expanded               []int64
 }
+
+func (f *fakeRec) VolumeCondition(string) (bool, string) { return f.abnormal, f.abnormalMsg }
 
 func (f *fakeRec) note(s string) {
 	f.mu.Lock()
@@ -48,10 +56,11 @@ func (f *fakeRec) note(s string) {
 	f.calls = append(f.calls, s)
 }
 
-func (f *fakeRec) Stage(_ context.Context, in intent.Intent) error {
+func (f *fakeRec) StageWith(_ context.Context, in intent.Intent, keys reconcile.Keys) error {
 	f.note("stage")
 	f.mu.Lock()
 	f.staged = append(f.staged, in)
+	f.stageKeys = append(f.stageKeys, fakeKeys{bytes.Clone(keys.Key), bytes.Clone(keys.PreviousKey)})
 	f.mu.Unlock()
 	return f.err
 }
@@ -61,16 +70,25 @@ func (f *fakeRec) Unstage(_ context.Context, id string) error {
 	return f.err
 }
 
-func (f *fakeRec) Publish(_ context.Context, id string, p intent.Publish) error {
+func (f *fakeRec) PublishWith(_ context.Context, id string, p intent.Publish, keys reconcile.Keys) error {
 	f.note("publish " + id)
 	f.mu.Lock()
 	f.published = append(f.published, p)
+	f.publishKeys = append(f.publishKeys, fakeKeys{bytes.Clone(keys.Key), bytes.Clone(keys.PreviousKey)})
 	f.mu.Unlock()
 	return f.err
 }
 
 func (f *fakeRec) Unpublish(_ context.Context, id, target string) error {
 	f.note("unpublish " + id + " " + target)
+	return f.err
+}
+
+func (f *fakeRec) Expand(_ context.Context, id string, size int64) error {
+	f.note("expand " + id)
+	f.mu.Lock()
+	f.expanded = append(f.expanded, size)
+	f.mu.Unlock()
 	return f.err
 }
 
@@ -170,7 +188,7 @@ func TestNodeGetInfoAndCapabilities(t *testing.T) {
 	for _, c := range caps.GetCapabilities() {
 		got = append(got, c.GetRpc().GetType())
 	}
-	want := []csi.NodeServiceCapability_RPC_Type{csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS}
+	want := []csi.NodeServiceCapability_RPC_Type{csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS, csi.NodeServiceCapability_RPC_VOLUME_CONDITION, csi.NodeServiceCapability_RPC_EXPAND_VOLUME}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("capabilities = %v, want %v", got, want)
 	}
@@ -680,3 +698,6 @@ func TestNodeStageEnsureItem(t *testing.T) {
 		})
 	}
 }
+
+// fakeKeys is a copy of the keys a request carried.
+type fakeKeys struct{ key, previous []byte }

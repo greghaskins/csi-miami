@@ -105,4 +105,25 @@ scrape() {
 scrape controller 9811
 scrape node 9810
 
+# The volume kind's host mounts: the node's own probe dials systemd's private
+# socket through the /run/systemd mount and writes a file in the cache
+# directory, and exports the result. A kind node runs systemd, so both must be
+# present; nbd and device-mapper depend on the runner's kernel and are not
+# asserted here (the end-to-end tests skip when they are absent).
+for pod in $(kubectl -n "$ns" get pods -l app.kubernetes.io/component=node -o jsonpath='{.items[*].metadata.name}'); do
+  base="/api/v1/namespaces/${ns}/pods/${pod}:9810/proxy"
+  for feature in systemd-socket cache-dir; do
+    end=$((SECONDS + metrics_deadline))
+    # A captured body, not a pipe: grep -q leaving early can SIGPIPE kubectl.
+    until body="$(kubectl get --raw "${base}/metrics")" && grep -q "^miami_node_capability{feature=\"${feature}\"} 1$" <<<"$body"; do
+      if [ "$SECONDS" -gt "$end" ]; then
+        echo "kind: $pod does not report the $feature capability after ${metrics_deadline}s" >&2
+        exit 1
+      fi
+      sleep 1
+    done
+    echo "kind: $pod reports the $feature capability"
+  done
+done
+
 echo "kind: deploy check passed"

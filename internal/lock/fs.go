@@ -8,8 +8,9 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"time"
+
+	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
 // fsys is the file system as the lock sees it: one method per server round
@@ -108,8 +109,16 @@ func (osFS) ModTime(path string) (time.Time, error) {
 }
 
 func (osFS) Probe(dir, name string) (time.Time, error) {
-	tmp := filepath.Join(dir, "."+name+".probe-"+randomSuffix())
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // the path is built from a validated lock name
+	// The probe file is made through a descriptor on dir opened without
+	// following a symlink anywhere in its path: dir is on the shared export,
+	// where a link in the middle would send the file elsewhere on the node.
+	d, err := safefs.OpenRoot(dir)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = d.Close() }()
+	tmp := "." + name + ".probe-" + randomSuffix()
+	f, err := d.Create(tmp, 0o600)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -119,7 +128,7 @@ func (osFS) Probe(dir, name string) (time.Time, error) {
 		mtime = st.ModTime()
 	}
 	closeErr := f.Close()
-	removeErr := os.Remove(tmp)
+	removeErr := d.Unlink(tmp)
 	if errors.Is(removeErr, fs.ErrNotExist) {
 		removeErr = nil
 	}
@@ -232,3 +241,11 @@ func (d *osDir) Same(path string) (bool, error) {
 }
 
 func (d *osDir) Close() error { return unix.Close(d.fd) }
+
+// ProbeClock returns the current time on the clock of the server that holds
+// dir: it creates a file there, reads the modification time the server gave
+// it and removes the file. Clocks differ between nodes, so anything that
+// compares a file's age on a shared export reads "now" through this, never
+// from time.Now. The probe file is a hidden name in dir and does not outlive
+// the call.
+func ProbeClock(dir string) (time.Time, error) { return osFS{}.Probe(dir, "clock") }

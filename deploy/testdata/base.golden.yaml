@@ -57,6 +57,12 @@ rules:
   - watch
   - update
 - apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims/status
+  verbs:
+  - patch
+- apiGroups:
   - storage.k8s.io
   resources:
   - storageclasses
@@ -115,6 +121,12 @@ rules:
   - ""
   resources:
   - persistentvolumes
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - nodes
   verbs:
   - get
 ---
@@ -344,6 +356,40 @@ spec:
           name: socket-dir
       - args:
         - --csi-address=/csi/csi.sock
+        - --leader-election
+        - --leader-election-namespace=$(POD_NAMESPACE)
+        - --resize-timeout=60s
+        - --handle-volume-inuse-error=false
+        - --feature-gates=VolumeAttributesClass=false
+        - --v=2
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        image: registry.k8s.io/sig-storage/csi-resizer:v2.3.0@sha256:48fb3deb93cd848e3c8998b6368f4322c93bb5ce4a90d1307b6dda0dbefb9a0e
+        name: csi-resizer
+        resources:
+          limits:
+            cpu: 200m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 32Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsUser: 0
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - mountPath: /csi
+          name: socket-dir
+      - args:
+        - --csi-address=/csi/csi.sock
         - --http-endpoint=:9813
         - --v=2
         image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0@sha256:19f2cf2f40e1987c7943945deca5f65cd4e4bf5cc0657fc78a5df131861578e8
@@ -449,6 +495,17 @@ spec:
         - mountPath: /var/lib/kubelet
           mountPropagation: Bidirectional
           name: kubelet-dir
+        - mountPath: /dev
+          mountPropagation: HostToContainer
+          name: host-dev
+        - mountPath: /run/systemd
+          name: host-run-systemd
+          readOnly: true
+        - mountPath: /sys
+          name: host-sys
+          readOnly: true
+        - mountPath: /run/cryptsetup
+          name: cryptsetup-lock
       - args:
         - --csi-address=/csi/csi.sock
         - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
@@ -522,6 +579,20 @@ spec:
           path: /var/lib/kubelet
           type: Directory
         name: kubelet-dir
+      - hostPath:
+          path: /dev
+          type: Directory
+        name: host-dev
+      - hostPath:
+          path: /run/systemd
+          type: DirectoryOrCreate
+        name: host-run-systemd
+      - hostPath:
+          path: /sys
+          type: Directory
+        name: host-sys
+      - emptyDir: {}
+        name: cryptsetup-lock
   updateStrategy:
     rollingUpdate:
       maxUnavailable: 1

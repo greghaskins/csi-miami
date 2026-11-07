@@ -15,6 +15,17 @@
 # nothing), run, and its output checked for a pass of every variant this
 # transport must run. The cluster and the server are removed at the end.
 #
+# The nfs3 run also runs the tests of the volume kind (exit criteria 1 to 9 of
+# the M2 plan). A volume is ext4 over dm-crypt over an nbd device served by a
+# block server that runs as a systemd unit, and the kind nodes are containers
+# that run systemd and share the runner's kernel, so the runner needs the nbd
+# and dm-crypt modules. They are loaded before the cluster is made, with the
+# nbd devices created up front (a privileged container gets the device nodes
+# that exist when it starts, and nothing makes a node for a device made later).
+# The tests also use the runner's own tools: dmesg (the hung-task check),
+# cryptsetup, losetup, e2fsck and mount (the restore drill), and the driver's
+# binary, which this script builds, for `miami restore`.
+#
 # On failure E2E_ARTIFACT_DIR (if set) receives what the tests wrote (the
 # driver pods' logs, YAML, events and mountinfo of the failed test), the test
 # output, kind's logs, both pods' logs and each node's mountinfo, and the NFS
@@ -82,6 +93,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ "$transport" = nfs3 ]; then
+  # nbds_max devices exist from the start; the module may already be loaded
+  # with none (the first `modprobe` wins), in which case it is reloaded.
+  modprobe nbd nbds_max=16 max_part=0
+  if [ ! -e /dev/nbd0 ]; then
+    rmmod nbd
+    modprobe nbd nbds_max=16 max_part=0
+  fi
+  modprobe dm_crypt
+  # The ciphers of the default class are loaded by the kernel on demand; load
+  # them here so that a missing one fails the run before the cluster exists.
+  modprobe adiantum || true
+  for dev in /dev/nbd0 /dev/mapper/control; do
+    if [ ! -e "$dev" ]; then
+      echo "e2e: $dev does not exist on the runner; the volume tests need the nbd and dm-crypt modules" >&2
+      exit 1
+    fi
+  done
+  for tool in cryptsetup losetup e2fsck mount dmesg; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "e2e: $tool not found on the runner (the volume tests use it)" >&2
+      exit 1
+    fi
+  done
+  # The hung-task detector is what the NAS outage test reads: it must be on,
+  # report every stuck task, and check often enough to see one within the
+  # outage. The threshold stays at the kernel's usual 120 seconds.
+  if ! sysctl -w kernel.hung_task_timeout_secs=120 kernel.hung_task_check_interval_secs=10 kernel.hung_task_warnings=-1; then
+    echo "e2e: the runner's kernel has no hung-task detector; the NAS outage test would be blind" >&2
+    exit 1
+  fi
+  go build -o "$kind_work/miami" ./cmd/miami
+fi
+
 kind_create
 
 server=""
@@ -105,6 +150,7 @@ go test -c -tags e2e -o "$kind_work/e2e.test" ./test/e2e
 # The tests every transport runs a variant of, and the ones only nfs3 runs.
 # A listing that lacks one means a rename or a build tag would pass by running
 # nothing.
+volume_tests=()
 if [ "$transport" = nfs3 ]; then
   expected=(
     TestTwoPodsOnTwoNodesSeeEachOthersWrites
@@ -114,6 +160,20 @@ if [ "$transport" = nfs3 ]; then
     TestMetrics
     TestNFSServerRestart
     TestLockSerializesPodsAndBreaksAStaleLock
+  )
+  # The volume kind's tests have no variant subtests: they run for nfs3 only
+  # and skip for local, so a pass of the test itself is the check.
+  volume_tests=(
+    TestVolumeExt4Semantics
+    TestVolumeSurvivesReschedule
+    TestVolumePluginRestart
+    TestVolumeServerKill
+    TestVolumeNASOutageNoHungTask
+    TestVolumeTakeover
+    TestVolumeOrphanDrain
+    TestVolumeNodeRebootReusesCache
+    TestVolumeRestoreDrill
+    TestVolumeExpandOnline
   )
 else
   expected=(
@@ -126,7 +186,7 @@ else
   )
 fi
 listed="$("$kind_work/e2e.test" -test.list '^Test')"
-for name in "${expected[@]}"; do
+for name in "${expected[@]}" "${volume_tests[@]}"; do
   if ! grep -qx "$name" <<<"$listed"; then
     echo "e2e: the e2e build of test/e2e does not list $name" >&2
     exit 1
@@ -138,6 +198,8 @@ export MIAMI_E2E_TIMEOUT="${MIAMI_E2E_TIMEOUT:-150s}"
 export MIAMI_E2E_TRANSPORT="$transport"
 export MIAMI_E2E_KIND_CLUSTER="$cluster"
 export MIAMI_E2E_ARTIFACT_DIR="$artifacts"
+export MIAMI_E2E_REPO="$PWD"
+export MIAMI_E2E_MIAMI="$kind_work/miami"
 if [ "$transport" = nfs3 ]; then
   export MIAMI_E2E_STORAGE_CLASS="miami-remote-dir-rwx"
   export MIAMI_E2E_NFS_SERVER="$server"
@@ -146,7 +208,20 @@ else
   export MIAMI_E2E_STORAGE_CLASS="miami-local-dir-rwo"
 fi
 
-"$kind_work/e2e.test" -test.v -test.count=1 -test.failfast -test.timeout=40m 2>&1 | tee "$log"
+run_args=(-test.v -test.count=1 -test.timeout=100m)
+if [ "${E2E_FAILFAST:-1}" != 0 ]; then
+  run_args+=(-test.failfast)
+fi
+if [ -n "${E2E_RUN:-}" ]; then
+  run_args+=("-test.run=${E2E_RUN}")
+fi
+started=$SECONDS
+"$kind_work/e2e.test" "${run_args[@]}" 2>&1 | tee "$log"
+echo "e2e: the tests took $((SECONDS - started)) seconds"
+if [ -n "${E2E_RUN:-}" ]; then
+  echo "e2e: E2E_RUN is set; the pass of every expected test was not checked" >&2
+  exit 0
+fi
 
 # Every test above ran the variant for this transport and passed; a test that
 # found nothing to run for it would also exit 0.
@@ -156,4 +231,17 @@ for name in "${expected[@]}"; do
     exit 1
   fi
 done
-echo "e2e: all ${#expected[@]} criteria passed for ${transport}"
+for name in "${volume_tests[@]}"; do
+  if ! grep -Eq "^--- PASS: ${name} " "$log"; then
+    echo "e2e: ${name} did not pass" >&2
+    exit 1
+  fi
+done
+# Both modes of the takeover test, not only the parent.
+for sub in out-of-service-taint force-detach-annotation; do
+  if [ "${#volume_tests[@]}" -gt 0 ] && ! grep -Eq "^    --- PASS: TestVolumeTakeover/${sub} " "$log"; then
+    echo "e2e: TestVolumeTakeover/${sub} did not pass" >&2
+    exit 1
+  fi
+done
+echo "e2e: all $((${#expected[@]} + ${#volume_tests[@]})) criteria passed for ${transport}"
