@@ -49,8 +49,12 @@ node's own `ctr` (on k0s it is `k0s ctr`), as root:
     mkdir -p /tmp/miami-img
     k0s ctr -n k8s.io images mount ghcr.io/greghaskins/csi-miami:<tag> /tmp/miami-img
     cp /tmp/miami-img/miami ./miami
-    k0s ctr -n k8s.io images unmount /tmp/miami-img
+    k0s ctr -n k8s.io images unmount --rm /tmp/miami-img
     ./miami version
+
+`--rm` drops the snapshot `images mount` created; without it the next mount at
+the same path fails with "already exists" and `cp` silently keeps the previous
+binary. Always check that `./miami version` prints the tag you pulled.
 
 Use `--platform linux/amd64` on an amd64 host. Where Docker is installed
 instead:
