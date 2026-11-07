@@ -583,23 +583,23 @@ func holdFlush(t *testing.T) {
 	t.Cleanup(func() { flushDelay = old })
 }
 
-func TestCrashBeforeIndexFlushLosesWriteNotStaleClean(t *testing.T) {
+// A write is acknowledged only once an index naming its chunk is on disk, so a
+// crash after the ack finds the chunk dirty with the new bytes, never the stale
+// clean copy the write replaced and never nothing.
+func TestCrashAfterAckedWriteKeepsItNotStaleClean(t *testing.T) {
 	holdFlush(t)
 	c, dir := tmpCache(t, 1<<30)
 	if err := c.Insert(3, fill(3)); err != nil {
 		t.Fatal(err)
 	}
-	mustWrite(t, c, 3, 9) // clean-resident chunk rewritten; index not yet flushed
+	mustWrite(t, c, 3, 9) // clean-resident chunk rewritten and acknowledged
 	d, err := Open(crashCopy(t, dir), 1<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = d.Close() }()
-	if d.Has(3) {
-		t.Fatal("unindexed chunk file adopted as clean")
-	}
-	if err := d.Read(3, AlignedBuffer(testChunk)); !errors.Is(err, ErrMiss) {
-		t.Fatalf("Read = %v, want ErrMiss", err)
+	if !equalU32(d.Index().Dirty, []uint32{3}) || !bytes.Equal(mustRead(t, d, 3), fill(9)) {
+		t.Fatalf("acknowledged write lost or stale: %+v", d.Index())
 	}
 }
 

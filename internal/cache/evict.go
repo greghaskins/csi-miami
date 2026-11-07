@@ -31,11 +31,12 @@ func (l *lru) remove(i uint32) {
 	}
 }
 
-// oldest returns the least recently used chunk.
-func (l *lru) oldest() (uint32, bool) {
-	e := l.order.Back()
-	if e == nil {
-		return 0, false
+// oldestWhere returns the least recently used chunk that ok accepts.
+func (l *lru) oldestWhere(ok func(uint32) bool) (uint32, bool) {
+	for e := l.order.Back(); e != nil; e = e.Prev() {
+		if i := e.Value.(uint32); ok(i) {
+			return i, true
+		}
 	}
-	return e.Value.(uint32), true
+	return 0, false
 }

@@ -19,9 +19,21 @@
 // owning one request slot per in-flight write.
 //
 // Durability: the index is rewritten, atomically, within 100 ms of a change
-// to the dirty set, and at once by Sync and SetBoundary. A write that has not
-// been followed by Sync may be lost, or torn at sector granularity, by a
-// crash, which is the contract of a block device between flushes.
+// to its content (the dirty or zero set, the boundary, the size, the base),
+// at once by Sync and SetBoundary, and before the acknowledgement of any write
+// that newly dirties a chunk (so a restart under a live device never finds an
+// acknowledged chunk file the index does not name). A write that has not been followed by
+// Sync may be lost, or torn at sector granularity, by a crash, which is the
+// contract of a block device between flushes.
+//
+// What Sync and SyncChunks (a FLUSH and a FUA write) owe before they return:
+// every chunk file they cover has had its bytes fdatasynced; every directory
+// entry that makes a dirty chunk's file findable is durable; and the index
+// on disk names every chunk that holds data not yet in the store. They are
+// ordered bytes, then directory entry, then index: an index never names a
+// chunk whose file a crash could lose, and a resumed cache never treats a
+// dirty chunk as clean. They owe nothing else, so they do nothing else: a
+// write to a chunk the on-disk index already names dirty rewrites no index.
 package cache
 
 import (
@@ -72,7 +84,24 @@ type Cache struct {
 	clean    *lru
 	lruMu    sync.Mutex // guards clean's order where readers hold only mu.RLock
 	scratch  []byte
+	// unsynced is the fsync obligation set: chunks with writes the next FLUSH
+	// must fdatasync. A chunk is added after its pwrite, and removed only by
+	// the fdatasync that covers it (or when its file is gone); publishing a
+	// chunk does not remove it.
 	unsynced map[uint32]struct{}
+	// idxChunks holds the chunks whose state in the index (dirty, zero) has
+	// changed since the last index write: the on-disk index is not known to
+	// match memory for them. A FUA write to any other chunk finds the on-disk
+	// index already right for it.
+	idxChunks map[uint32]struct{}
+	// pinned holds chunks ClearBoundary published whose index write failed:
+	// the on-disk index still calls them dirty, so they stay in the clean LRU
+	// (readable) but are not evicted until an index write succeeds.
+	pinned map[uint32]struct{}
+	// newFiles holds the chunks made dirty since the last fsync of c/. Their
+	// directory entries (a create, or the reuse of a clean chunk's file whose
+	// rename was never fsynced) are not known durable.
+	newFiles map[uint32]struct{}
 	// pendingUnlink holds trimmed chunks whose c/<i> is removed once an index
 	// recording them as Zero is on disk; a Write cancels it.
 	pendingUnlink map[uint32]struct{}
@@ -106,6 +135,7 @@ func newCache(dir string, idx Index, bound int64) *Cache {
 		dir: dir, bound: bound, idx: idx,
 		dirty: map[uint32]struct{}{}, zero: map[uint32]struct{}{},
 		bcopy: map[uint32]struct{}{}, clean: newLRU(), unsynced: map[uint32]struct{}{}, pendingUnlink: map[uint32]struct{}{},
+		idxChunks: map[uint32]struct{}{}, pinned: map[uint32]struct{}{}, newFiles: map[uint32]struct{}{},
 	}
 }
 
@@ -154,10 +184,13 @@ func Create(dir string, idx Index, bound int64) (*Cache, error) {
 	return c, nil
 }
 
-// Open resumes the cache in dir from its index. It returns ErrNoIndex when
-// there is none and an error wrapping ErrCorrupt when the index or the chunk
-// files disagree with it. The caller compares Index() with the geometry it
-// expects.
+// Open resumes the cache in dir from its index. Only the index is trusted:
+// a chunk file it does not name is deleted, which loses nothing the guest was
+// told is safe, because a write that newly dirties a chunk is not acknowledged
+// until an index naming the chunk is on disk (see WriteAt). It returns
+// ErrNoIndex when there is none and an error wrapping ErrCorrupt when the
+// index or the chunk files disagree with it. The caller compares Index() with
+// the geometry it expects.
 func Open(dir string, bound int64) (*Cache, error) {
 	idx, err := readIndex(dir)
 	if err != nil {
@@ -189,6 +222,18 @@ func Open(dir string, bound int64) (*Cache, error) {
 		return nil, err
 	}
 	c.evictLocked(0)
+	// A resumed chunk's bytes, size and directory entry are durable only if
+	// the previous process (or a FLUSH it served) made them so, and this
+	// process cannot tell. Under a surviving device (decision 51) the guest's
+	// next FLUSH is acknowledged by this server, so it owes every one of them:
+	// seed the obligations a fresh process would otherwise not have, or that
+	// FLUSH would be acknowledged with no syscall at all.
+	for v := range c.dirty {
+		if _, isZero := c.zero[v]; !isZero {
+			c.unsynced[v] = struct{}{}
+			c.newFiles[v] = struct{}{}
+		}
+	}
 	return c, nil
 }
 
@@ -425,7 +470,7 @@ func (c *Cache) Used() int64 {
 // fit under the bound, or no clean chunk is left.
 func (c *Cache) evictLocked(extra int64) {
 	for c.usedBytes()+extra > c.bound {
-		i, ok := c.clean.oldest()
+		i, ok := c.clean.oldestWhere(func(i uint32) bool { _, held := c.pinned[i]; return !held })
 		if !ok {
 			return
 		}
@@ -466,10 +511,47 @@ func (c *Cache) Write(i uint32, buf []byte) error {
 	c.clean.remove(i)
 	delete(c.zero, i)
 	delete(c.pendingUnlink, i)
+	delete(c.pinned, i)
 	c.dirty[i] = struct{}{}
 	c.unsynced[i] = struct{}{}
+	c.dirtiedLocked(i, !isDirty || isZero)
+	return c.commitNewlyDirtyLocked(i)
+}
+
+// commitNewlyDirtyLocked makes chunk i's dirty state durable in the index
+// before the write that caused it is acknowledged, when it is new. Without it a
+// crash inside the 100 ms index window leaves a chunk file the index does not
+// name; Open deletes it (it cannot tell a dirty chunk from a clean copy of the
+// store), and a guest whose device survived a blockd restart loses a write it
+// was told was accepted, then has its next FLUSH acknowledged. flushLocked
+// orders it: the new files' bytes, then c/, then the index. It is one index
+// write for every chunk newly dirtied since the last, so writes that queue
+// for c.mu behind the first share its write and find idxChunks already clear.
+// A write to a chunk already dirty and already named in the index does none.
+func (c *Cache) commitNewlyDirtyLocked(i uint32) error {
+	// Keyed on the index state, not on this write being the first: a first
+	// write whose commit failed was not acknowledged, and its retry finds the
+	// chunk already dirty in memory but still unnamed on disk.
+	if _, pending := c.idxChunks[i]; !pending {
+		return nil // a concurrent write's commit already named it
+	}
+	return c.flushLocked()
+}
+
+// dirtiedLocked records that a write made chunk i dirty. newlyDirty is true
+// when it was not dirty before, or was dirty only as a trim: then the index
+// content changes (i joins Dirty, or leaves Zero) and i's file, which may have
+// just been created or reused from a clean copy, needs its directory entry
+// fsynced. A write to a chunk that was already dirty with a file changes
+// neither, and must not mark the index: that is what keeps a guest's repeated
+// fsync of the same journal or file from rewriting index.json each time.
+func (c *Cache) dirtiedLocked(i uint32, newlyDirty bool) {
+	if !newlyDirty {
+		return
+	}
+	c.idxChunks[i] = struct{}{}
+	c.newFiles[i] = struct{}{}
 	c.markIndexLocked()
-	return nil
 }
 
 // Insert stores chunk i as a clean copy of what the store holds, evicting
@@ -627,6 +709,7 @@ func (c *Cache) ClearBoundary(published bool) {
 	if c.boundary == nil {
 		return
 	}
+	var pubChunks []uint32
 	if published {
 		for i := range c.boundary {
 			if _, rewritten := c.bcopy[i]; rewritten {
@@ -638,6 +721,7 @@ func (c *Cache) ClearBoundary(published bool) {
 				continue
 			}
 			c.clean.touch(i)
+			pubChunks = append(pubChunks, i)
 		}
 	}
 	c.boundary = nil
@@ -646,6 +730,12 @@ func (c *Cache) ClearBoundary(published bool) {
 	if c.flushLocked() == nil {
 		c.removeBoundaryFiles()
 	} else {
+		// The index on disk still calls the published chunks dirty, so a
+		// crash must still find their files: pin them against eviction until
+		// an index write succeeds.
+		for _, i := range pubChunks {
+			c.pinned[i] = struct{}{}
+		}
 		c.armLocked() // retry; stale copies are wiped by the next SetBoundary
 	}
 }
@@ -675,6 +765,7 @@ func (c *Cache) MarkZero(i uint32) error {
 	delete(c.unsynced, i)
 	c.dirty[i] = struct{}{}
 	c.zero[i] = struct{}{}
+	c.idxChunks[i] = struct{}{} // a trim has no file, so no newFiles entry
 	c.markIndexLocked()
 	return nil
 }
@@ -703,6 +794,9 @@ func (c *Cache) Grow(size int64) error {
 func (c *Cache) SetBase(base string, epoch uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.idx.Base == base && c.idx.Epoch == epoch {
+		return
+	}
 	c.idx.Base, c.idx.Epoch = base, epoch
 	c.markIndexLocked()
 }
@@ -734,10 +828,28 @@ func (c *Cache) flushLocked() error {
 	if !c.idxDirty {
 		return nil
 	}
+	// The index must not name a chunk whose file a power cut could lose, or
+	// Open would refuse the whole cache over it: make the entries and sizes of
+	// the files made dirty since the last c/ fsync durable first. Their bytes
+	// are the FLUSH's business, and unsynced is left alone since a write's
+	// pwrite may be in flight.
+	if len(c.newFiles) > 0 {
+		for i := range c.newFiles {
+			if err := c.fdatasyncChunkFile(i); err != nil {
+				return err
+			}
+		}
+		if err := c.syncChunkDirLocked(); err != nil {
+			return err
+		}
+	}
 	if err := writeIndex(c.dir, c.snapshot()); err != nil {
 		return err
 	}
 	c.idxDirty = false
+	clear(c.idxChunks)
+	clear(c.pinned)
+
 	c.indexWrites++
 	for i := range c.pendingUnlink {
 		_ = os.Remove(c.cpath(i)) // best effort: Open drops a file left for a Zero chunk
@@ -750,40 +862,114 @@ func (c *Cache) flushLocked() error {
 	return nil
 }
 
-// Sync makes every dirty chunk file and the index durable.
+// Sync makes every dirty chunk file and the index durable (a FLUSH).
 func (c *Cache) Sync() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.syncLocked()
 }
 
+// SyncChunks makes the bytes of the given chunks durable, and whatever the
+// index needs to resume them (a FUA write). It does not touch other chunks'
+// obligations: they stay in the unsynced set for the next FLUSH, which is the
+// one obligated to cover them. When a chunk's dirty state is not yet in the
+// on-disk index it does exactly what Sync does, because the index it would
+// write names every dirty chunk and so needs every dirty chunk's file durable
+// first; otherwise it is an fdatasync per chunk, plus the c/ directory when
+// one of them was created since it was last fsynced.
+func (c *Cache) SyncChunks(chunks ...uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return os.ErrClosed
+	}
+	needDir := false
+	for _, i := range chunks {
+		if _, pending := c.idxChunks[i]; pending {
+			return c.syncLocked()
+		}
+		if _, fresh := c.newFiles[i]; fresh {
+			needDir = true
+		}
+	}
+	for _, i := range chunks {
+		if err := c.syncChunkLocked(i); err != nil {
+			return err
+		}
+	}
+	if needDir {
+		return c.syncChunkDirLocked()
+	}
+	return nil
+}
+
 // fdatasync is unix.Fdatasync; a test replaces it to see which chunks reach it.
 var fdatasync = unix.Fdatasync
+
+// syncChunkLocked fdatasyncs chunk i if it owes a sync, and clears the
+// obligation only once the fdatasync has succeeded. The lock is held across
+// it, so a write to i cannot slip its obligation in between (WriteAt records
+// it after its pwrite, under this lock) and be erased with the old one.
+func (c *Cache) syncChunkLocked(i uint32) error {
+	if _, owed := c.unsynced[i]; !owed {
+		return nil
+	}
+	if err := c.fdatasyncChunkFile(i); err != nil {
+		return err
+	}
+	delete(c.unsynced, i)
+	return nil
+}
+
+// fdatasyncChunkFile fdatasyncs chunk i's file; a file that is gone (evicted
+// after publish, or unlinked by a trim) has nothing to sync.
+func (c *Cache) fdatasyncChunkFile(i uint32) error {
+	f, err := os.OpenFile(c.cpath(i), os.O_RDONLY, 0) // #nosec G304 -- the cache's own directory
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// fdatasync, not fsync: the chunk's data (and the size set by a
+	// materialising truncate) must be durable, but its mtime need not be.
+	err = fdatasync(int(f.Fd()))
+	_ = f.Close()
+	return err
+}
+
+// syncChunkDirLocked fsyncs c/ and so every directory entry made so far.
+func (c *Cache) syncChunkDirLocked() error {
+	if err := syncDir(filepath.Join(c.dir, "c")); err != nil {
+		return err
+	}
+	clear(c.newFiles)
+	return nil
+}
 
 func (c *Cache) syncLocked() error {
 	if c.closed {
 		return os.ErrClosed
 	}
-	for i := range c.unsynced {
-		f, err := os.OpenFile(c.cpath(i), os.O_RDONLY, 0) // #nosec G304 -- the cache's own directory
-		if errors.Is(err, os.ErrNotExist) {
-			delete(c.unsynced, i)
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		// fdatasync, not fsync: the chunk's data (and the size set by a
-		// materialising truncate) must be durable, but its mtime need not be.
-		err = fdatasync(int(f.Fd()))
-		_ = f.Close()
-		if err != nil {
-			return err
-		}
-		delete(c.unsynced, i)
+	// Nothing owed: no write since the last sync, no directory entry, and an
+	// index that matches memory. idxDirty is false only after a complete,
+	// fsynced index write, so this cannot hide a change.
+	if len(c.unsynced) == 0 && len(c.newFiles) == 0 && !c.idxDirty {
+		return nil
 	}
-	if err := syncDir(filepath.Join(c.dir, "c")); err != nil {
-		return err
+	for i := range c.unsynced {
+		if err := c.syncChunkLocked(i); err != nil {
+			return err
+		}
+	}
+	// c/ is fsynced only when a dirty chunk's file was created or adopted
+	// since the last time. Unlinks (eviction, a trim's deferred unlink) need
+	// no fsync: Open removes files the index does not name, and a Zero chunk's
+	// file.
+	if len(c.newFiles) > 0 {
+		if err := c.syncChunkDirLocked(); err != nil {
+			return err
+		}
 	}
 	return c.flushLocked()
 }
