@@ -361,7 +361,12 @@ volume serves the volume as an nbd device backed by a local chunk cache:
   base manifest the cache was built from and the dirty chunk list, so a server
   restarted on the same node after a crash resumes with its unpublished dirty
   chunks intact. This is why the brief's era target is not needed (decision
-  44).
+  44). A write that newly dirties a chunk is acknowledged only after an index
+  naming that chunk is on disk (the chunk file's bytes, then its directory
+  entry, then the index), so a block server restarted under a live device
+  (decision 51) never drops a write the guest was told it accepted; writes to
+  a chunk the index already names dirty rewrite nothing, and a flush syncs
+  only the chunks written since the last one.
 - **A cache that survives a node reboot.** The unit and the stage are gone
   but the directory remains. The next stage of that volume on that node reuses
   it when `current` on the transport proves nothing newer was published: it
