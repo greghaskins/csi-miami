@@ -1363,6 +1363,15 @@ and the decision wins.
 59. **The cache-full case is signalled by dirty bytes and the overdue
     condition, not reliably by `VolumeCondition`** (clarifies 53): the probe
     reads one sector, which a full cache that still holds it serves.
+60. **Gate G1 judges each phase on the median of rounds 2 to N, run on a quiet
+    node** (amends 3.2's "the second round is the one compared"). Round 1 is
+    warm-up; the figure per phase and stack is the median of the remaining
+    rounds (the mean of the middle two when the count is even), so with two
+    rounds it is round 2 as before. Run-to-run noise on the Pi is about 50%,
+    so the gate runs `--rounds 5` on both stacks, and `--compare` shows the
+    min and max of the rounds used and refuses reports whose round counts
+    differ or that have fewer than two. The 0.05 s floor applies to the
+    medians.
 
 ## 10. Milestones
 

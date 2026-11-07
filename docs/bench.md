@@ -13,8 +13,8 @@ output. That proves the harness works; it says nothing about the Pi.
 ## What it measures
 
 Eight phases, each timed, run in a fresh directory on the stack's mount; the
-whole list runs for two rounds (`--rounds`) and the second round is the one
-compared.
+whole list runs for `--rounds` rounds (default 2). Round 1 is warm-up; each
+phase is judged on the median of rounds 2 to N (with two rounds, round 2).
 
 | Phase | What it does |
 |---|---|
@@ -82,6 +82,13 @@ The loop image is a sparse file of `--size` under `--dir`, so `--dir` needs
 that much free space (8 GiB for the runs below) while the loop run is in
 progress. It is removed at the end.
 
+## Quiet the node first
+
+Run-to-run noise on a small board is about 50%, so a busy node can fail the
+gate on its own. Before either run: cordon the node, move noisy pods off it,
+and check that free memory (`free -m`) is well above the cache and the page
+cache the bench will use. Then run every bench with `--rounds 5`.
+
 ## One folder per attempt
 
 Each attempt at the gate gets its own folders, named after the binary's
@@ -96,8 +103,8 @@ Set `V` once in the shell you run both runs from:
 
     sudo mkdir -p "/var/tmp/g1/$V/dir" "/var/tmp/g1/$V/store"
     sudo unshare --mount --propagation private sh -c "
-      ./miami bench --stack nbd  --dir /var/tmp/g1/$V/dir/nbd  --store /var/tmp/g1/$V/store --size 8Gi --out g1-$V/nbd-local.json
-      ./miami bench --stack loop --dir /var/tmp/g1/$V/dir/loop --size 8Gi --out g1-$V/loop.json
+      ./miami bench --stack nbd  --dir /var/tmp/g1/$V/dir/nbd  --store /var/tmp/g1/$V/store --size 8Gi --rounds 5 --out g1-$V/nbd-local.json
+      ./miami bench --stack loop --dir /var/tmp/g1/$V/dir/loop --size 8Gi --rounds 5 --out g1-$V/loop.json
     "
     ./miami bench --compare "g1-$V/nbd-local.json" "g1-$V/loop.json"
 
@@ -116,7 +123,7 @@ an empty directory on it:
     sudo mount -t nfs -o vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl <server>:<export> /mnt/g1-transport
     sudo mkdir -p "/mnt/g1-transport/g1-$V"
     sudo unshare --mount --propagation private ./miami bench --stack nbd \
-        --dir "/var/tmp/g1/$V/dir/nbd" --store "/mnt/g1-transport/g1-$V" --size 8Gi --out "g1-$V/nbd-nfs.json"
+        --dir "/var/tmp/g1/$V/dir/nbd" --store "/mnt/g1-transport/g1-$V" --size 8Gi --rounds 5 --out "g1-$V/nbd-nfs.json"
     ./miami bench --compare "g1-$V/nbd-nfs.json" "g1-$V/loop.json"
 
 The loop baseline is the same as in run 1 (local disk); only the nbd stack's
@@ -145,10 +152,11 @@ remove the `miami-bench-*` directories under `--dir` and `--store`.
 
 ## Reading the result
 
-`--compare` prints one row per phase, the nbd and loop seconds of round 2, the
-ratio, and PASS or FAIL against 1.5x, then a last line `G1: PASS` or `G1:
+`--compare` prints one row per phase, the nbd and loop median seconds of
+rounds 2 to N with the min and max of those rounds beside each, the ratio, and PASS or FAIL against 1.5x, then a last line `G1: PASS` or `G1:
 FAIL`. The exit status is 0 on PASS, 1 on FAIL and 3 when the files cannot be
-compared (for example two runs at different `--scale`).
+compared (for example two runs at different `--scale`, with different
+`--rounds`, or with fewer than two rounds).
 
 **G1 passes when both comparisons print `G1: PASS`.** One FAIL row in either
 comparison fails the gate. Run 2 is the one that matters for the shipped
