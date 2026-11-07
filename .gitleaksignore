@@ -732,3 +732,122 @@ c4c905b923e854f36830b42623d5947070bad12f:ai-noreply-email:6
 9a610136ee7ce4af699162feb9af5a741792bc94:ai-noreply-email:6
 # Put the location before the type in StorageClass names
 bda700b34aed0fa75cbae35cfa4839579fce6f9b:ai-noreply-email:9
+
+# Messages of milestone 2 commits (merged to main with PR 41) that carry an AI
+# co-author trailer with a noreply address, which the ai-noreply-email rule
+# did not exist to catch when they were written (in history order, with their
+# subjects). Added on the M2 branch just before its merge, at the owner's
+# direction, so the merge keeps these exact commits.
+# Design M2: chunk-backed volumes with generations
+0bba261e56260bfa70706542d0a8e3a668ec7e1e:ai-noreply-email:18
+# Plan M2: chunk-backed volumes
+e2ac30db69648cc492de8b568766b35f2a12af13:ai-noreply-email:14
+# Pin mdlayher/genetlink and mdlayher/netlink
+599946cf43e0cbd45d4f7db43a223ead58b20e92:ai-noreply-email:8
+# Add the exec seam for cryptsetup and e2fsprogs
+de3b31da3bb3adaf852eeb2d4643da21517a82af:ai-noreply-email:8
+# Add a tools stage carrying cryptsetup and e2fsprogs to the image
+56bb88595809e0fca7ec88a38d98737d1b18c9d0:ai-noreply-email:8
+# Pin the tools stage to the alpine:3.24 index digest
+b67189114ccce0d16723b15c1d3665cb0f446d80:ai-noreply-email:6
+# Run the image's tools in the smoke job
+5a75c36230372a527a773c5cd33a857d13faefb4:ai-noreply-email:7
+# Add internal/nbd: protocol server, netlink device client, sysfs observer
+50c8f22c84e2821159e2939467fa03eb8ca61423:ai-noreply-email:26
+# Add the chunk store and manifest format
+42e3b0660fc288f9634d07b3083adcf83b00a6d2:ai-noreply-email:11
+# Make the closure script copy with plain mkdir and cp
+78c2c4ef417859e86c96109fd479bb167cc346d2:ai-noreply-email:7
+# Name the backend when reconfiguring an nbd device
+f5557985a1b787cf7ff3d1d1f940922e1e4f3472:ai-noreply-email:9
+# Install e2fsprogs-extra for resize2fs
+22abe12ee467747c09cf24cbf5284f6532e435d7:ai-noreply-email:6
+# Link resize2fs into /sbin
+e45e5ee4cd03055b9727b33b74e1b70d0d060052:ai-noreply-email:6
+# Record the extra files in the fake runner
+ff012f8e010b69eb8817547fcb40c1babb73d9d2:ai-noreply-email:9
+# Fail the closure build on an unresolved library; start all four tools
+053864ccc4f446124bda689a0278fbcf46b0365c:ai-noreply-email:8
+# Pin go-systemd v22.7.0 and godbus v5.1.0
+970b32393ac0c2ed077b12310aba76bc13075672:ai-noreply-email:8
+# Add the transient systemd unit manager
+ce4915738513ca2cf1000c0fc90f0608034d2e26:ai-noreply-email:15
+# Add the node-local chunk cache
+12277953685732bcbbe0c3e39b25526c21b149ba:ai-noreply-email:10
+# Check the resize2fs banner instead of a version flag
+339b0ab1f051f5ddaf1d7390a513cd7f400b2cb4:ai-noreply-email:7
+# Report the context's deadline from Connect, not the socket's
+3b7572fa92a22817fcd191ba39a3bbd81affd68e:ai-noreply-email:12
+# Fix cache crash-ordering defects found in review
+6b93fec28de765bf70bb2fe2b118f4e6b325a51a:ai-noreply-email:14
+# Read MainPID from the Service interface
+4a0f211713cb6407c728a7a1303e8090cbb3cc19:ai-noreply-email:10
+# Export the lock's probe-file clock
+12cea3c3268b7c9c7e633d214e03c85275fd716d:ai-noreply-email:7
+# Batch MarkZero's index writes and defer its unlink
+f13e41b909f6a70e3c2737dfbce78b51421976ed:ai-noreply-email:11
+# Re-dial a lost systemd connection and bound the handshake
+454411481e31c1ae1d76a9a51a09466ad462f7b6:ai-noreply-email:17
+# Add the holder file with epochs and the takeover judgement
+471b86daecd1576ee2ecefb1b5741db7e5c97360:ai-noreply-email:12
+# End Serve cleanly when a reply is lost after NBD_CMD_DISC
+a569483c28fcc0d98c345482858f05c1a467d568:ai-noreply-email:12
+# Re-run CI after a registry read-after-push miss
+43f3885919c3dfea303f5978ccdb9e2422f0dc1a:ai-noreply-email:7
+# Add internal/crypt: LUKS2 through the exec seam
+76135ca04bbadf4585f1b035f6466156a61836ba:ai-noreply-email:7
+# Add internal/ext4: mkfs, fsck, resize and freeze
+e0c193d56ed08af387d0b2588df08a5a110cf81d:ai-noreply-email:7
+# Smoke-test the LUKS2 and ext4 layers on loop devices
+46bfba54985fcc1e4af11ac4bfcbfe344a672f3e:ai-noreply-email:8
+# Reject a non-positive takeover timeout and apply the two-clock rule to every timed takeover
+6cfc3db0a13bd510d24e197606d4466e4aeade76:ai-noreply-email:14
+# Bind the takeover to the judged holder, re-check at the rename, and make epochs durable
+992fa114e611aa3a0eeb860ce75e06589331e2e0:ai-noreply-email:29
+# Open LUKS2 mappings without the kernel keyring
+5390462a072b30eebddb4aecb48e3a77c2d81f6e:ai-noreply-email:8
+# Add the volume kind to internal/volume
+7ed2a40a5fcd887d94f829282a4c2d7dfe07b4c2:ai-noreply-email:11
+# Let the intent record carry a volume's parameters and epoch
+b0947962b91d131c42356099e23955101368ad7e:ai-noreply-email:7
+# Add noacl to the nfs3 profile
+8866d0b3f07e2c64f038c21cc253ebe23d1aa61f:ai-noreply-email:8
+# Serve the volume kind from the controller
+5639760b1804ba2c99305161fd8af845af49cd97:ai-noreply-email:11
+# Close the freeze descriptor before the smoke unmounts
+89c71b3a1cfc56ab122e0a66d17b362b32fccedc:ai-noreply-email:6
+# Carry takeoverTimeout to DeleteVolume and drop the premature expand capability
+1e681d1dceb45dcb77c776b9f53b960849fe2e3a:ai-noreply-email:12
+# Serve a volume as an nbd device over a chunk cache
+f998fcd9851f2820127ae9cd89ba8a61670e1379:ai-noreply-email:22
+# Test the block server and run its smoke test in CI
+3e0c77f1f35e167a75fcfecdc0d1fded8534bfd6:ai-noreply-email:16
+# Plumb node-stage keys, add node flags and a prerequisite probe
+27bbca519d2373e529b81684676338bebdd97b1c:ai-noreply-email:13
+# Make the block server react to a dead serve, and harden the smoke
+1590c891339542d54ea86b1123c1aaf2484b95cd:ai-noreply-email:16
+# Take the smoke device index from control Status, not a sysfs scan
+16876484e49e9c681f1db9cd2e8c7a7c3cc6a474:ai-noreply-email:14
+# cache: 4096-aligned sub-range I/O on the per-chunk files
+052f7f3c5032bebf9adaad6b1e5b5eb5f2b82d11:ai-noreply-email:22
+# blockd: fix the sequence, boundary resume, device match and status
+1b5b1498938324ce9ffebf8530b7dfbbc1f04fdf:ai-noreply-email:31
+# Holder: add Adopt and per-volume deadline keys
+613e3e881a076323c583cdf50c3472a6e3d108e0:ai-noreply-email:9
+# cache: record a sub-range write's fsync obligation after the pwrite
+3ccd578df7ac9fb9423cff9e238b9ed7bf21d574:ai-noreply-email:18
+# Prereq: detect Adiantum by AF_ALG bind, not /proc/crypto
+28e27e333085269aee7e993d2a3805bd42e7b293:ai-noreply-email:10
+# cache: establish a chunk's base before the dirty mark, truncate stale bytes
+eb377660c3760e1df1ce40735636e693169d58bd:ai-noreply-email:22
+# blockd: pass the fetched base, serve cold reads from a full cache, non-blocking Boundary
+19d2cfb189e3970f171ff5585e0d07ab2742181a:ai-noreply-email:19
+# cache: refuse a nil base for a non-resident non-zero chunk (ErrNotResident)
+915107909351f6c6273d6c05a5ccae45fe1157e8:ai-noreply-email:21
+# cache: a trimmed chunk's own zero state wins over the caller's base
+e75c0d0265bb6878e2d2fb4da64bcbcf3b9d7f63:ai-noreply-email:20
+# Retrigger CI for the round-5 head
+ed10a57fe313fa7185791a444a6a6c4ca380b201:ai-noreply-email:6
+# The plan text of one milestone 2 commit quoted the same trailer as a rule
+# for commit messages (removed from the plan since).
+e2ac30db69648cc492de8b568766b35f2a12af13:docs/design/2026-11-03-m2-implementation-plan.md:ai-noreply-email:40
