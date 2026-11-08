@@ -330,15 +330,15 @@ func (stateFails) State(context.Context, string) (systemd.State, error) {
 func TestOwnRecordFromAFailedFirstStageIsNotCountedTwice(t *testing.T) {
 	e := newEnv(t)
 	e.budgetOf(testFootprint) // exactly this volume
-	real := e.it.cfg.Systemd
-	e.it.cfg.Systemd = stateFails{real}
+	orig := e.it.cfg.Systemd
+	e.it.cfg.Systemd = stateFails{orig}
 	if err := e.converge(); err == nil || errors.Is(err, item.ErrCacheBudgetExceeded) {
 		t.Fatalf("first Converge = %v, want the bus error", err)
 	}
 	if !e.drainRecordExists() {
 		t.Fatal("the failed stage left no drain record, so the test proves nothing")
 	}
-	e.it.cfg.Systemd = real
+	e.it.cfg.Systemd = orig
 	e.mustConverge()
 }
 
@@ -389,12 +389,12 @@ func TestRestageAfterAFailedReleaseIsNotCountedTwice(t *testing.T) {
 func TestCommittedCountsGrownVolumeAtItsGrownSize(t *testing.T) {
 	e := newEnv(t)
 	name := e.otherRecord(t, 1, nil)
-	b, err := os.ReadFile(name)
+	b, err := os.ReadFile(name) //nolint:gosec // a file in the test's temporary tree
 	if err != nil {
 		t.Fatal(err)
 	}
 	grown := strings.Replace(string(b), "{\n", fmt.Sprintf("{\n  \"grownSize\": %d,\n", 3*testSize), 1)
-	if err := os.WriteFile(name, []byte(grown), 0o600); err != nil {
+	if err := os.WriteFile(name, []byte(grown), 0o600); err != nil { //nolint:gosec // as above
 		t.Fatal(err)
 	}
 	n, count, err := e.it.Committed(bg)
