@@ -72,10 +72,6 @@ const (
 	// refused) or error (anything else).
 	NameCachePatchFailures = "miami_cache_capacity_patch_failures_total"
 
-	// NameCacheFenceOK is 1 while the admission policy that narrows the node
-	// plugin's nodes/status grant is in force, 0 when a probe found it not.
-	NameCacheFenceOK = "miami_cache_fence_ok"
-
 	// NameCacheFenceState is the verdict of the last fence probe, one series
 	// per state with exactly one at 1: fenced, unfenced or unknown (the probe
 	// could not tell, so the node advertises nothing; also the state before
@@ -140,7 +136,6 @@ type Registry struct {
 
 	cacheBudget, cacheCommitted, cacheFSSize, cacheFSFree prometheus.Gauge
 	cachePatchFailures                                    *prometheus.CounterVec
-	cacheFenceOK                                          prometheus.Gauge
 	cacheFenceState                                       *prometheus.GaugeVec
 }
 
@@ -247,7 +242,6 @@ func New(opts ...Option) *Registry {
 	r.cachePatchFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: NameCachePatchFailures, Help: "Failed patches or clears of this node's advertised cache capacity, by reason: denied (the API server answered 403 or 422, so RBAC or the admission policy refused), unknown (a fence probe that could not tell) or error. A budget the node computes but cannot advertise leaves pods pending.",
 	}, []string{"reason"})
-	r.cacheFenceOK = gauge(NameCacheFenceOK, "1 when the last fence probe found the admission policy that narrows this node plugin's nodes/status patch in force; 0 when it found it not, and 0 while the verdict is unknown (the node then advertises nothing). Use miami_cache_fence_state to tell the two apart.")
 	r.cacheFenceState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: NameCacheFenceState, Help: "The verdict of the node's last fence probe, one series per state with exactly one at 1: fenced, unfenced (the admission policy does not fence this node plugin) or unknown (the probe could not tell, e.g. the policy was renamed or the API server failed). The node advertises only while fenced.",
 	}, []string{"state"})
@@ -287,7 +281,7 @@ func New(opts ...Option) *Registry {
 		)
 	}
 	if o.cacheCapacity {
-		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree, r.cachePatchFailures, r.cacheFenceOK, r.cacheFenceState)
+		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree, r.cachePatchFailures, r.cacheFenceState)
 	}
 	return r
 }
@@ -321,15 +315,6 @@ func (r *Registry) SetCacheFenceState(state string) {
 		}
 		r.cacheFenceState.WithLabelValues(s).Set(v)
 	}
-}
-
-// SetCacheFenceOK sets the fence gauge (see cachecap.CapacityMetrics).
-func (r *Registry) SetCacheFenceOK(ok bool) {
-	v := 0.0
-	if ok {
-		v = 1
-	}
-	r.cacheFenceOK.Set(v)
 }
 
 // SetCacheCommitted sets the committed gauge (see cachecap.CapacityMetrics).

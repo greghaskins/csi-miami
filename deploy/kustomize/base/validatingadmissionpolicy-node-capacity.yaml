@@ -8,13 +8,14 @@
 #   [node-name]  the bound token's node-name is the node being updated, so a
 #                compromised plugin on one node cannot write another's;
 #   [capacity]   status.capacity differs from the old one in no key but the
-#                cache resource (a key may be added, changed or removed);
+#                cache resource (a key may be added, changed or removed). The
+#                node's fence-probe key may also be removed, so a leftover
+#                one can be cleaned up; adding or changing it stays denied,
+#                which is what the probe relies on;
 #   [status]     every other field of status is unchanged;
 #   [metadata]   so are labels, annotations, finalizers, ownerReferences
-#                (the status endpoint resets spec, not metadata).
-#                managedFields is deliberately not held still: the API server
-#                rewrites it on every patch, so an equality rule would deny
-#                the plugin's own; it is bookkeeping and carries no authority.
+#                (the status endpoint resets spec, not metadata), and the
+#                server-side-apply entries of managedFields.
 #
 # [metadata] also holds still every managedFields entry whose operation is
 # Apply, so a compromised plugin cannot forge, alter or drop another manager's
@@ -55,7 +56,7 @@
 # start, and every -cache-fence-probe-interval (10 minutes), it tries a
 # patch this policy must deny; if the patch is allowed it logs an error naming
 # this policy and its subject, removes what it wrote, sets
-# miami_cache_fence_ok to 0, and advertises nothing until a probe is denied.
+# miami_cache_fence_state to unfenced, and advertises nothing until a probe is denied.
 # The probe recognises only this policy's own denial (the API server's text
 # "ValidatingAdmissionPolicy 'miami-node-capacity' ... denied request:
 # [capacity]"), so an overlay must keep the policy and its binding named
@@ -88,6 +89,8 @@ spec:
       expression: "'miami.csi.greghaskins.com/cache'"
     - name: newCap
       expression: "has(object.status.capacity) ? object.status.capacity : {}"
+    - name: probeKey
+      expression: "'miami.csi.greghaskins.com/fence-probe'"
     - name: oldCap
       expression: "has(oldObject.status.capacity) ? oldObject.status.capacity : {}"
   validations:
@@ -102,7 +105,7 @@ spec:
       message: "[capacity] the node plugin may change only the miami.csi.greghaskins.com/cache key of status.capacity"
       expression: >-
         variables.newCap.all(k, k == variables.key || (k in variables.oldCap && variables.oldCap[k] == variables.newCap[k])) &&
-        variables.oldCap.all(k, k == variables.key || k in variables.newCap)
+        variables.oldCap.all(k, k == variables.key || k == variables.probeKey || k in variables.newCap)
     - reason: Forbidden
       message: "[status] the node plugin may not change any field of status but capacity"
       expression: >-

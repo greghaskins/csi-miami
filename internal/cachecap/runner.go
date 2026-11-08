@@ -97,10 +97,8 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 	r.probedAt, r.verdict = r.now(), state
 	switch state {
 	case Fenced:
-		r.metrics.SetCacheFenceOK(true)
 		r.metrics.SetCacheFenceState("fenced")
 	case Unfenced:
-		r.metrics.SetCacheFenceOK(false)
 		r.metrics.SetCacheFenceState("unfenced")
 		subject := "unknown"
 		if s, ok := r.nc.(interface{ Subject() string }); ok {
@@ -118,9 +116,7 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 		}
 		return nil
 	default:
-		// Unknown reads 0 in miami_cache_fence_ok, shows as its own state, and
-		// is counted under its own reason, not as a denial.
-		r.metrics.SetCacheFenceOK(false)
+		// Unknown shows as its own state and is counted under its own reason, not as a denial.
 		r.metrics.SetCacheFenceState("unknown")
 		if perr != nil {
 			r.metrics.IncCachePatchFailure(PatchUnknown)
@@ -239,8 +235,6 @@ func (r *Runner) Run(ctx context.Context) {
 				r.log.Warn("cache capacity advertisement failed; will retry", "error", err)
 				r.warnedUnknown = r.verdict == FenceUnknown
 			}
-		} else if r.verdict != FenceUnknown {
-			r.warnedUnknown = false
 		}
 		if r.verdict != FenceUnknown {
 			r.warnedUnknown = false

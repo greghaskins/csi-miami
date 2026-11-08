@@ -166,7 +166,7 @@ spec:
     reason: Forbidden
   - expression: variables.newCap.all(k, k == variables.key || (k in variables.oldCap
       && variables.oldCap[k] == variables.newCap[k])) && variables.oldCap.all(k, k
-      == variables.key || k in variables.newCap)
+      == variables.key || k == variables.probeKey || k in variables.newCap)
     message: '[capacity] the node plugin may change only the miami.csi.greghaskins.com/cache
       key of status.capacity'
     reason: Forbidden
@@ -215,6 +215,8 @@ spec:
     name: key
   - expression: 'has(object.status.capacity) ? object.status.capacity : {}'
     name: newCap
+  - expression: '''miami.csi.greghaskins.com/fence-probe'''
+    name: probeKey
   - expression: 'has(oldObject.status.capacity) ? oldObject.status.capacity : {}'
     name: oldCap
 ---

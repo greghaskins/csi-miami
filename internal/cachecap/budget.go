@@ -75,9 +75,6 @@ type CapacityMetrics interface {
 	// IncCachePatchFailure counts a failed patch or clear of the node's
 	// capacity; reason is PatchDenied or PatchError.
 	IncCachePatchFailure(reason string)
-	// SetCacheFenceOK is 1 when the last probe found the policy in force and
-	// 0 when it found the plugin unfenced or could not tell.
-	SetCacheFenceOK(ok bool)
 	// SetCacheFenceState records the verdict of the last probe: "fenced",
 	// "unfenced" or "unknown" (see the Fence* names); exactly one is 1.
 	SetCacheFenceState(state string)

@@ -96,7 +96,10 @@ var fenceProbePath = "/status/capacity/" + strings.ReplaceAll(fenceProbeResource
 // message so that a webhook quoting it does not count. The policy's reason is
 // Forbidden, so it can only ever answer 403. Only that counts as proof of the fence: a
 // message that merely contains the policy's name does not.
-var policyDenial = regexp.MustCompile(`^nodes "[^"]+" is forbidden: ValidatingAdmissionPolicy '` + regexp.QuoteMeta(cachecap.FencePolicy) + `' with binding '[^']+' denied request: \[capacity\]`)
+// policyDenial returns the pattern of that text for a node.
+func policyDenial(node string) *regexp.Regexp {
+	return regexp.MustCompile(`^nodes "` + regexp.QuoteMeta(node) + `" is forbidden: ValidatingAdmissionPolicy '` + regexp.QuoteMeta(cachecap.FencePolicy) + `' with binding '[^']+' denied request: \[capacity\]`)
+}
 
 // RemoveFenceProbe removes the probe's key from the node's status.capacity if
 // the node carries it.
@@ -130,7 +133,7 @@ func (c *Client) ProbeFence(ctx context.Context, node string) (cachecap.FenceSta
 		return cachecap.Unfenced, nil
 	}
 	var st apierrors.APIStatus
-	if apierrors.IsForbidden(err) && errors.As(err, &st) && policyDenial.MatchString(st.Status().Message) {
+	if apierrors.IsForbidden(err) && errors.As(err, &st) && policyDenial(node).MatchString(st.Status().Message) {
 		return cachecap.Fenced, nil
 	}
 	return cachecap.FenceUnknown, err

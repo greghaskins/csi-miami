@@ -291,6 +291,49 @@ func TestNodeCapacityPolicy(t *testing.T) {
 			}
 		})
 	}
+
+	// The probe key: the plugin may remove a leftover one, but never add or
+	// change it (the probe relies on its add being denied).
+	probeKey := "miami.csi.greghaskins.com~1fence-probe"
+	place := func(t *testing.T) {
+		freshNodes(t, admin)
+		if err := patchStatus(admin, "node-a", jsonPatch(op("add", "/status/capacity/"+probeKey, `"1"`))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("probe key: removing a leftover is allowed", func(t *testing.T) {
+		place(t)
+		if err := patchStatus(own(), "node-a", jsonPatch(op("remove", "/status/capacity/"+probeKey, ""))); err != nil {
+			t.Errorf("denied: %v", err)
+		}
+	})
+	t.Run("probe key: removing it with our key is allowed", func(t *testing.T) {
+		place(t)
+		if err := patchStatus(own(), "node-a", jsonPatch(op("remove", "/status/capacity/"+probeKey, ""), capAdd)); err != nil {
+			t.Errorf("denied: %v", err)
+		}
+	})
+	t.Run("probe key: changing it is denied", func(t *testing.T) {
+		place(t)
+		err := patchStatus(own(), "node-a", jsonPatch(op("replace", "/status/capacity/"+probeKey, `"2"`)))
+		if err == nil || !strings.Contains(err.Error(), "[capacity]") {
+			t.Errorf("err = %v, want a [capacity] denial", err)
+		}
+	})
+	t.Run("probe key: adding it is denied", func(t *testing.T) {
+		freshNodes(t, admin)
+		err := patchStatus(own(), "node-a", jsonPatch(op("add", "/status/capacity/"+probeKey, `"1"`)))
+		if err == nil || !strings.Contains(err.Error(), "[capacity]") {
+			t.Errorf("err = %v, want a [capacity] denial", err)
+		}
+	})
+	t.Run("probe key: removing another key with it is still denied", func(t *testing.T) {
+		place(t)
+		err := patchStatus(own(), "node-a", jsonPatch(op("remove", "/status/capacity/"+probeKey, ""), op("remove", "/status/capacity/cpu", "")))
+		if err == nil || !strings.Contains(err.Error(), "[capacity]") {
+			t.Errorf("err = %v, want a [capacity] denial", err)
+		}
+	})
 }
 
 // TestFenceProbeAgainstThePolicy runs the node's own probe (kube.ProbeFence)
@@ -540,16 +583,22 @@ func TestManagedFieldsApplyEntriesHeld(t *testing.T) {
 		for _, step := range [][]byte{
 			jsonPatch(op("add", "/status/capacity/"+capKey, `"1Gi"`)),
 			jsonPatch(op("add", "/status/capacity/"+capKey, `"2Gi"`)),
-			jsonPatch(op("add", "/status/capacity/miami.csi.greghaskins.com~1fence-probe", `"1"`)),
-			jsonPatch(op("remove", "/status/capacity/miami.csi.greghaskins.com~1fence-probe", "")),
 			jsonPatch(op("remove", "/status/capacity/"+capKey, "")),
 		} {
-			err := patchStatus(plugin, "node-a", step)
-			// The fence probe key is denied by the shipped policy; it is the
-			// removal that must be allowed even so.
-			if err != nil && !strings.Contains(string(step), "fence-probe") {
+			if err := patchStatus(plugin, "node-a", step); err != nil {
 				t.Errorf("%s: denied: %v", step, err)
 			}
+		}
+		// The probe key: its add is denied by design; a leftover one, placed by
+		// the admin, must be removable, and the removal must succeed.
+		if err := patchStatus(plugin, "node-a", jsonPatch(op("add", "/status/capacity/miami.csi.greghaskins.com~1fence-probe", `"1"`))); err == nil {
+			t.Error("the probe key add was allowed")
+		}
+		if err := patchStatus(admin, "node-a", jsonPatch(op("add", "/status/capacity/miami.csi.greghaskins.com~1fence-probe", `"1"`))); err != nil {
+			t.Fatal(err)
+		}
+		if err := patchStatus(plugin, "node-a", jsonPatch(op("remove", "/status/capacity/miami.csi.greghaskins.com~1fence-probe", ""))); err != nil {
+			t.Errorf("removing a leftover probe key was denied: %v", err)
 		}
 		if after := applyEntries(t, admin, "node-a"); !reflect.DeepEqual(before, after) {
 			t.Errorf("the Apply entry changed:\n before %v\n after  %v", before, after)
