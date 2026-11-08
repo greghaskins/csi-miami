@@ -154,7 +154,7 @@ func TestVolumeConditionHasEveryConditionAtZeroAndNoOtherLabel(t *testing.T) {
 	}
 	want := []string{"ok", "unresponsive", "transport-unavailable", "transport-conflict", "stage-conflict",
 		"publish-conflict", "item-missing", "item-not-directory", "failed",
-		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused", "probe-failed"}
+		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused", "probe-failed", "cache-budget-exceeded"}
 	if len(got) != len(want) {
 		t.Errorf("series = %v, want exactly %v", got, want)
 	}

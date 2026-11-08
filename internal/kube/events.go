@@ -31,6 +31,9 @@ const (
 	ReasonPublishRefused  = reconcile.ReasonPublishRefused
 	ReasonGenerationLost  = "GenerationLost"
 	ReasonServerRestarted = "ServerRestarted"
+	// ReasonCacheBudgetExceeded is a stage refused because the node's cache
+	// budget cannot hold the volume (decision 66).
+	ReasonCacheBudgetExceeded = reconcile.ReasonCacheBudgetExceeded
 )
 
 // Event reasons that are Warning events; every other reason is Normal.
@@ -43,6 +46,7 @@ var warningReasons = map[string]bool{
 	reconcile.ReasonGenerationOverdue:    true,
 	ReasonPublishRefused:                 true,
 	ReasonGenerationLost:                 true,
+	ReasonCacheBudgetExceeded:            true,
 }
 
 var eventResource = schema.GroupVersionResource{Version: "v1", Resource: "events"}
@@ -309,6 +313,8 @@ func fixedMessage(reason, node string) string {
 		return "the store refused a generation of this volume from node " + node + " because the volume is no longer held by that node; see the node plugin's log"
 	case ReasonGenerationLost:
 		return "unpublished writes of this volume were discarded on node " + node + "; see the node plugin's log"
+	case ReasonCacheBudgetExceeded:
+		return "the volume was not staged on node " + node + " because the node's cache budget is exhausted; it is retried, and the scheduler should place it where the cache has room"
 	case ReasonServerRestarted:
 		return "the volume's block server was restarted on node " + node + "; its device and mounts were kept"
 	case reconcile.ReasonGarbageUnmounted:
