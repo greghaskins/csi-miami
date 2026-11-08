@@ -11,7 +11,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/greghaskins/csi-miami/internal/cache"
-	"github.com/greghaskins/csi-miami/internal/chunk"
 	"github.com/greghaskins/csi-miami/internal/item"
 	kinds "github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -96,13 +95,9 @@ func (it *Item) committedByName(ctx context.Context) (map[string]int64, error) {
 // It reads nothing, so a drain record and a stage are counted by one rule; the
 // store's own records (raiseSize) can only raise a stage's figure further.
 func servedFootprint(v vol) int64 {
-	size := max(v.size, chunk.RoundUp(v.in.GrownSize, v.chunk))
-	if size > v.size && v.params.CacheSize >= v.params.Size {
-		v.bound = size
-	}
 	p := v.params
-	p.Size, p.CacheSize = size, v.bound
-	return kinds.CacheFootprint(p)
+	p.Size, p.CacheSize = v.size, v.bound
+	return kinds.ServedFootprint(p, v.in.GrownSize)
 }
 
 // warnRecordOnce logs a warning the first time key is seen.

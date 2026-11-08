@@ -451,3 +451,23 @@ func TestStageRewritesTheRecordAtTheRaisedSize(t *testing.T) {
 		t.Fatalf("record = %+v, %v, want no GrownSize", in, err)
 	}
 }
+
+// The node and the admission webhook must agree on a grown volume's footprint:
+// both call volume.ServedFootprint, and servedFootprint (what the stage check
+// and the commitment count) reduces to it for a vol built from a context.
+func TestServedFootprintIsTheSharedRule(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cache int64
+	}{{"whole-volume cache", 64 * mi}, {"partial cache", 8 * mi}} {
+		p := kinds.VolumeParams{ChunkSize: 4 * mi, Size: 64 * mi, CacheSize: tc.cache}
+		p.Generations.DirtyWatermark = 4 * mi
+		for _, grown := range []int64{0, 32 * mi, 128 * mi, 130 * mi} {
+			v := vol{params: p, size: p.Size, bound: p.CacheSize, chunk: p.ChunkSize}
+			v.in.GrownSize = grown
+			if got, want := servedFootprint(v), kinds.ServedFootprint(p, grown); got != want {
+				t.Errorf("%s grown to %d MiB: servedFootprint %d, ServedFootprint %d", tc.name, grown/mi, got, want)
+			}
+		}
+	}
+}

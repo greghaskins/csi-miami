@@ -669,6 +669,35 @@ func TestCacheMetrics(t *testing.T) {
 	}
 }
 
+func TestWebhookMetrics(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.Outcome("mutated")
+	off.Unresolved()
+	for _, n := range []string{NameWebhookMutations, NameWebhookUnresolved} {
+		if family(t, off, n) != nil {
+			t.Errorf("%s exposed without WithWebhook", n)
+		}
+	}
+	on := New(WithWebhook())
+	on.Outcome("mutated")
+	on.Outcome("mutated")
+	on.Outcome("error")
+	on.Outcome("some-path-or-address") // dropped: the label is a fixed list
+	on.Unresolved()
+	for outcome, want := range map[string]float64{"mutated": 2, "unchanged": 0, "stripped": 0, "error": 1} {
+		if got := sample(t, on, NameWebhookMutations, map[string]string{"outcome": outcome}).GetCounter().GetValue(); got != want {
+			t.Errorf("outcome %s = %v, want %v", outcome, got, want)
+		}
+	}
+	if n := len(family(t, on, NameWebhookMutations).GetMetric()); n != 4 {
+		t.Errorf("%d outcome series, want 4", n)
+	}
+	if got := family(t, on, NameWebhookUnresolved).GetMetric()[0].GetCounter().GetValue(); got != 1 {
+		t.Errorf("unresolved = %v, want 1", got)
+	}
+}
+
 func TestCachePatchFailures(t *testing.T) {
 	t.Parallel()
 	off := New(WithReconciler())

@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"math"
 	"testing"
 )
 
@@ -96,5 +97,31 @@ func TestAddFootprintSaturates(t *testing.T) {
 	}
 	if got := AddFootprint(3<<20, 5<<20); got != 8<<20 {
 		t.Errorf("AddFootprint(3Mi, 5Mi) = %d, want 8Mi", got)
+	}
+}
+
+func TestServedFootprint(t *testing.T) {
+	whole := VolumeParams{ChunkSize: 4 * mi, Size: 10 * gi, CacheSize: 10 * gi}
+	whole.Generations.DirtyWatermark = 5 * gi
+	lazy := VolumeParams{ChunkSize: 4 * mi, Size: 100 * gi, CacheSize: 8 * gi}
+	lazy.Generations.DirtyWatermark = 4 * gi
+	for _, tc := range []struct {
+		name   string
+		p      VolumeParams
+		served int64
+		want   int64
+	}{
+		{"not grown", whole, 0, CacheFootprint(whole)},
+		{"smaller served size changes nothing", whole, 1 * gi, CacheFootprint(whole)},
+		{"whole-volume cache follows the growth", whole, 20 * gi, CacheFootprint(VolumeParams{Size: 20 * gi, CacheSize: 20 * gi, Generations: whole.Generations})},
+		{"growth rounds up to whole chunks", whole, 20*gi + 1, CacheFootprint(VolumeParams{Size: 20*gi + 4*mi, CacheSize: 20*gi + 4*mi, Generations: whole.Generations})},
+		{"a served size near the int64 limit saturates", whole, math.MaxInt64 - 1, CacheFootprint(VolumeParams{Size: math.MaxInt64 / (4 * mi) * 4 * mi, CacheSize: math.MaxInt64 / (4 * mi) * 4 * mi, Generations: whole.Generations})},
+		{"partial cache keeps its bound", lazy, 200 * gi, CacheFootprint(lazy)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ServedFootprint(tc.p, tc.served); got != tc.want {
+				t.Fatalf("ServedFootprint = %d MiB, want %d MiB", got/mi, tc.want/mi)
+			}
+		})
 	}
 }
