@@ -102,6 +102,8 @@ const (
 	// It means "the blockd unit restarted": a restart that happened while the
 	// plugin was down, and a re-point by the same process, raise nothing.
 	ReasonServerRestarted = kube.ReasonServerRestarted
+	// ReasonCacheBudgetExceeded is a stage refused by the cache-budget check.
+	ReasonCacheBudgetExceeded = kube.ReasonCacheBudgetExceeded
 )
 
 // ErrGenerationSkipped is returned by Generation when a publish was already in
@@ -182,6 +184,12 @@ type Config struct {
 	// frozen, and PublishTimeout the final generation of an unstage. Zero
 	// means the Default constants.
 	Timeout, StartTimeout, PollEvery, FreezeBound, PublishTimeout time.Duration
+
+	// CacheBudget is the node's cache budget now: the bytes its cache directory
+	// may commit to volumes, and whether accounting is on. An error means the
+	// budget could not be computed (a statfs failure). Nil, or enabled false,
+	// turns the stage check off (see checkBudget).
+	CacheBudget func(ctx context.Context) (budget int64, enabled bool, err error)
 
 	// Event reports a reason for a volume, as reconcile.Events does; nil
 	// discards. Logger receives log lines, never a key; nil discards.

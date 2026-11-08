@@ -41,6 +41,9 @@ func (it *Item) Converge(ctx context.Context, in intent.Intent, obs item.Observe
 	if err := it.checkPrereq(v, obs.Prereq); err != nil {
 		return err
 	}
+	if err := it.checkBudget(ctx, v); err != nil {
+		return err
+	}
 	st := it.state(in.VolumeID)
 	st.fz.Lock()
 	st.tearingDown, st.gone = false, false // a restage after an unstage that failed or finished

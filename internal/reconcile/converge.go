@@ -527,6 +527,9 @@ const (
 	ConditionBadKey              = "bad-key"
 	ConditionGenerationOverdue   = "generation-overdue"
 	ConditionPublishRefused      = "publish-refused"
+	// ConditionCacheBudgetExceeded is a volume new to the node that does not
+	// fit its cache budget (decision 66).
+	ConditionCacheBudgetExceeded = "cache-budget-exceeded"
 	// ConditionProbeFailed is a volume whose device failed its active probe
 	// twice in a row; the stack looks converged but does not answer reads.
 	ConditionProbeFailed = "probe-failed"
@@ -540,6 +543,7 @@ var Conditions = []string{
 	ConditionFailed,
 	ConditionPrerequisiteMissing, ConditionHolderContended, ConditionServerDown, ConditionKeyRequired,
 	ConditionBadKey, ConditionGenerationOverdue, ConditionPublishRefused, ConditionProbeFailed,
+	ConditionCacheBudgetExceeded,
 }
 
 // conditionOf classifies an error by the sentinel it wraps. A transport that
@@ -578,6 +582,8 @@ func conditionOf(err error) string {
 		return ConditionGenerationOverdue
 	case errors.Is(err, ErrPublishRefused):
 		return ConditionPublishRefused
+	case errors.Is(err, ErrCacheBudgetExceeded):
+		return ConditionCacheBudgetExceeded
 	default:
 		return ConditionFailed
 	}

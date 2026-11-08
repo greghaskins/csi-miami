@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/greghaskins/csi-miami/internal/cachecap"
 	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/item/directory"
@@ -62,11 +63,14 @@ func realDeps(cfg nodeConfig) nodeDeps {
 // the real thing), StartTimeout, PollEvery, FreezeBound and PublishTimeout (the
 // item's defaults are the spec's bounds), and Event, Judge, Takeover and
 // VolumeExists when there is no cluster or no event recorder.
-func volumeConfig(cfg nodeConfig, root string, d nodeDeps, m mount.Mounter, events eventRunner, cluster clusterAPI, log *slog.Logger) volitem.Config {
+func volumeConfig(cfg nodeConfig, root string, d nodeDeps, m mount.Mounter, events eventRunner, cluster clusterAPI, src *cachecap.Source, log *slog.Logger) volitem.Config {
 	c := volitem.Config{
 		Root: root, BinDir: cfg.binDir, CacheDir: cfg.cacheDir, Sysfs: volitem.DefaultSysfs,
 		Tools: d.Tools, Systemd: d.Systemd, NBD: d.NBD, Holder: d.Holder, Mounter: m, Dial: d.Dial,
 		Node: cfg.nodeID, BinaryHash: version, Timeout: cfg.deadline, Logger: log,
+	}
+	if src != nil {
+		c.CacheBudget = src.Current
 	}
 	if events != nil {
 		c.Event = events.Event
@@ -84,15 +88,16 @@ func volumeConfig(cfg nodeConfig, root string, d nodeDeps, m mount.Mounter, even
 }
 
 // wireItems sets the reconciler's items (the directory kind and the volume
-// kind) and the options the volume kind's timers read.
-func wireItems(opts *reconcile.Options, cfg nodeConfig, root string, d nodeDeps, m mount.Mounter, events eventRunner, cluster clusterAPI, log *slog.Logger) error {
+// kind) and the options the volume kind's timers read. It returns the volume
+// item, whose Committed the advertisement loop reports.
+func wireItems(opts *reconcile.Options, cfg nodeConfig, root string, d nodeDeps, m mount.Mounter, events eventRunner, cluster clusterAPI, src *cachecap.Source, log *slog.Logger) (*volitem.Item, error) {
 	dir, err := directory.New(directory.Config{Root: root, Mounter: m, Timeout: opts.StatTimeout})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	vol, err := volitem.New(volumeConfig(cfg, root, d, m, events, cluster, log))
+	vol, err := volitem.New(volumeConfig(cfg, root, d, m, events, cluster, src, log))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	opts.Items = []item.Item{dir, vol}
 	opts.Probe = &reconcile.ProbeOptions{}
@@ -100,7 +105,7 @@ func wireItems(opts *reconcile.Options, cfg nodeConfig, root string, d nodeDeps,
 	if cluster != nil {
 		opts.PVAnnotation = cluster.PVAnnotation
 	}
-	return nil
+	return vol, nil
 }
 
 // lazySystemd is a systemd.Manager that connects on the first call that finds

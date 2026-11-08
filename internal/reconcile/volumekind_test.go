@@ -84,6 +84,23 @@ func TestBatchKeysIsPerVolumeAndSkipsOtherRequests(t *testing.T) {
 	}
 }
 
+func TestConditionOfCacheBudgetExceeded(t *testing.T) {
+	t.Parallel()
+	err := fmt.Errorf("volume x: %w", ErrCacheBudgetExceeded)
+	if ConditionCacheBudgetExceeded != "cache-budget-exceeded" {
+		t.Errorf("condition = %q", ConditionCacheBudgetExceeded)
+	}
+	if got := conditionOf(err); got != ConditionCacheBudgetExceeded {
+		t.Errorf("conditionOf = %q", got)
+	}
+	if got := Classify(err); got != ClassUnavailable {
+		t.Errorf("class = %v", got)
+	}
+	if !slices.Contains(Conditions, ConditionCacheBudgetExceeded) {
+		t.Error("not listed in Conditions")
+	}
+}
+
 func TestVolumeConditionsAreRegisteredAndClassified(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -98,6 +115,7 @@ func TestVolumeConditionsAreRegisteredAndClassified(t *testing.T) {
 		{ErrBadKey, ConditionBadKey, ClassFailedPrecondition},
 		{ErrGenerationOverdue, ConditionGenerationOverdue, ClassInternal},
 		{ErrPublishRefused, ConditionPublishRefused, ClassFailedPrecondition},
+		{ErrCacheBudgetExceeded, ConditionCacheBudgetExceeded, ClassUnavailable},
 	} {
 		wrapped := fmt.Errorf("volume x: %w", tc.err)
 		if got := conditionOf(wrapped); got != tc.condition {
