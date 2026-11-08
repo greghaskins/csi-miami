@@ -35,6 +35,7 @@ func TestRunControllerFlags(t *testing.T) {
 			wantStdout: []string{
 				"Usage of miami controller:", "-endpoint", "unix:///csi/csi.sock",
 				"-transports-root", "/var/lib/miami", "-kubeconfig", "-deadline", "10s", "-metrics-addr", ":9811",
+				"-webhook-addr", ":9814", "-webhook-tls-secret", "-webhook-config", "miami-cache", "-webhook-service", "miami-webhook", "-webhook-sync-interval", "30s",
 			},
 		},
 		{name: "unknown flag", args: []string{"-nope"}, wantCode: 2, wantStderr: []string{"flag provided but not defined: -nope"}},
@@ -68,6 +69,7 @@ func TestRunControllerFlags(t *testing.T) {
 // Outside a cluster and with no kubeconfig the controller says so and exits 1,
 // without having made a socket.
 func TestRunControllerWithoutAClusterFails(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "miami-system")
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	sock := filepath.Join(t.TempDir(), "csi.sock")
@@ -90,7 +92,9 @@ func TestServeControllerWithServesUntilTheContextEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	go func() { done <- serveControllerWith(ctx, cfg, &kubefake.Reader{}, &fake.Mounter{}, log) }()
+	go func() {
+		done <- serveControllerWith(ctx, cfg, &kubefake.Reader{}, &fake.Mounter{}, webhookBackend{}, log)
+	}()
 
 	conn, err := grpc.NewClient("unix:"+sock, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -140,7 +144,7 @@ func TestServeControllerWithErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			err := serveControllerWith(context.Background(), tt.cfg, &kubefake.Reader{}, &fake.Mounter{}, log)
+			err := serveControllerWith(context.Background(), tt.cfg, &kubefake.Reader{}, &fake.Mounter{}, webhookBackend{}, log)
 			if err == nil {
 				t.Error("no error")
 			}
