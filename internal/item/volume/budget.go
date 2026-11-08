@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/greghaskins/csi-miami/internal/cache"
+	"github.com/greghaskins/csi-miami/internal/chunk"
 	"github.com/greghaskins/csi-miami/internal/item"
 	kinds "github.com/greghaskins/csi-miami/internal/volume"
 )
@@ -45,35 +46,63 @@ import (
 // excluded by name: a discarded cache keeps its record, and a fresh volume has
 // none yet. A record Orphans would skip is skipped here, and warned about once.
 func (it *Item) Committed(ctx context.Context) (int64, int, error) {
-	ents, err := os.ReadDir(it.cfg.CacheDir)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil
-	}
+	by, err := it.committedByName(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("volume item: listing the cache directory: %w", err)
+		return 0, 0, err
 	}
 	var sum int64
-	var n int
+	for _, f := range by {
+		sum = kinds.AddFootprint(sum, f)
+	}
+	return sum, len(by), nil
+}
+
+// committedByName is the footprint of each volume with a usable drain record,
+// by volume name; Committed is its sum.
+func (it *Item) committedByName(ctx context.Context) (map[string]int64, error) {
+	ents, err := os.ReadDir(it.cfg.CacheDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("volume item: listing the cache directory: %w", err)
+	}
+	out := map[string]int64{}
 	for _, e := range ents {
 		if err := ctx.Err(); err != nil {
-			return 0, 0, err
+			return nil, err
 		}
 		name, ok := strings.CutSuffix(e.Name(), drainSuffix)
 		if !ok || e.IsDir() {
 			continue
 		}
 		in, err := readDrainRecord(filepath.Join(it.cfg.CacheDir, e.Name()), name)
+		var rv vol
 		if err == nil {
-			_, err = it.volOf(in)
+			rv, err = it.volOf(in)
 		}
 		if err != nil {
 			it.warnRecordOnce("record\x00"+e.Name(), "a drain record is not usable, so its volume is not counted in the node's committed cache", "file", e.Name(), "error", err)
 			continue
 		}
-		sum = kinds.AddFootprint(sum, kinds.CacheFootprint(*in.Volume))
-		n++
+		out[name] = servedFootprint(rv)
 	}
-	return sum, n, nil
+	return out, nil
+}
+
+// servedFootprint is the cache footprint of v at the size the item serves it:
+// the largest of the class size and the intent's grown size, rounded to whole
+// chunks, with the whole-volume cache bound raised with it (as raiseSize does).
+// It reads nothing, so a drain record and a stage are counted by one rule; the
+// store's own records (raiseSize) can only raise a stage's figure further.
+func servedFootprint(v vol) int64 {
+	size := max(v.size, chunk.RoundUp(v.in.GrownSize, v.chunk))
+	if size > v.size && v.params.CacheSize >= v.params.Size {
+		v.bound = size
+	}
+	p := v.params
+	p.Size, p.CacheSize = size, v.bound
+	return kinds.CacheFootprint(p)
 }
 
 // warnRecordOnce logs a warning the first time key is seen.
@@ -117,15 +146,24 @@ func (it *Item) checkBudget(ctx context.Context, v vol) error {
 	if v, err = it.raiseSize(ctx, v, it.state(v.in.VolumeID), cur); err != nil {
 		return err
 	}
-	p := v.params
-	p.Size, p.CacheSize = v.size, v.bound
-	need := kinds.CacheFootprint(p)
+	need := servedFootprint(v)
 
-	committed, volumes, err := it.Committed(ctx)
+	// The volume's own record, left by a stage that failed after writing it or
+	// by a release that failed, is not a second volume: it is replaced by need.
+	by, err := it.committedByName(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		it.log.Warn("the node's committed cache could not be read, so the cache-budget check is skipped", "volume", v.name, "error", err)
 		return nil
 	}
+	delete(by, v.name)
+	var committed int64
+	for _, f := range by {
+		committed = kinds.AddFootprint(committed, f)
+	}
+	volumes := len(by)
 	if kinds.AddFootprint(committed, need) <= budget {
 		return nil
 	}

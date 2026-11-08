@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/greghaskins/csi-miami/internal/cache"
 	"github.com/greghaskins/csi-miami/internal/item"
 	"github.com/greghaskins/csi-miami/internal/sizerec"
 	"github.com/greghaskins/csi-miami/internal/systemd"
@@ -117,15 +118,18 @@ func TestRebootWithSurvivingCacheNeverRefused(t *testing.T) {
 	e.makeCache(1, "")
 	e.budgetOf(1)
 	e.mustConverge()
-	if !e.cacheExists() {
-		t.Error("the surviving cache is gone")
+	if strings.Contains(e.logs.String(), "removing the node-local cache") {
+		t.Errorf("the surviving cache was not reused:\n%s", e.logs.String())
+	}
+	if _, err := cache.ReadIndex(e.v.cacheDir); err != nil {
+		t.Errorf("the surviving cache's index: %v", err)
 	}
 }
 
 func TestDrainNeverRefused(t *testing.T) {
 	e := orphanEnv(t)
 	e.budgetOf(1)
-	if err := e.it.Drain(bg, e.drainIntent(t)); errors.Is(err, item.ErrCacheBudgetExceeded) {
+	if err := e.it.Drain(bg, e.drainIntent(t)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -134,7 +138,7 @@ func TestTeardownNeverRefused(t *testing.T) {
 	e := newEnv(t)
 	e.seedRunning()
 	e.budgetOf(1)
-	if err := e.it.Teardown(bg, e.in, item.Observed{Mounts: e.mnt.table()}); errors.Is(err, item.ErrCacheBudgetExceeded) {
+	if err := e.it.Teardown(bg, e.in, item.Observed{Mounts: e.mnt.table()}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -211,10 +215,9 @@ func TestCommittedListingErrorFailsOpen(t *testing.T) {
 	}
 }
 
-func TestCommittedKeepsRecordOfDiscardedCache(t *testing.T) {
+func TestCommittedCountsRecordWithNoCacheDirectory(t *testing.T) {
 	e := newEnv(t)
 	e.otherRecord(t, 1, nil)
-	// A discarded cache keeps its record: the cache directory is gone.
 	n, count, err := e.it.Committed(bg)
 	if err != nil || n != testFootprint || count != 1 {
 		t.Fatalf("Committed = %d, %d, %v", n, count, err)
@@ -312,3 +315,101 @@ func TestBudgetErrorFailsOpenWithLog(t *testing.T) {
 }
 
 func systemdGone() systemd.State { return systemd.State{} }
+
+// stateFails is a systemd whose State fails, as a bus that is down does after
+// the stage has already written the drain record.
+type stateFails struct{ systemd.Manager }
+
+func (stateFails) State(context.Context, string) (systemd.State, error) {
+	return systemd.State{}, errors.New("bus down")
+}
+
+// A first stage that fails after the drain record is written leaves the record
+// with no device and no cache index; the retry is still a fresh stage and its
+// own record is not a second volume.
+func TestOwnRecordFromAFailedFirstStageIsNotCountedTwice(t *testing.T) {
+	e := newEnv(t)
+	e.budgetOf(testFootprint) // exactly this volume
+	real := e.it.cfg.Systemd
+	e.it.cfg.Systemd = stateFails{real}
+	if err := e.converge(); err == nil || errors.Is(err, item.ErrCacheBudgetExceeded) {
+		t.Fatalf("first Converge = %v, want the bus error", err)
+	}
+	if !e.drainRecordExists() {
+		t.Fatal("the failed stage left no drain record, so the test proves nothing")
+	}
+	e.it.cfg.Systemd = real
+	e.mustConverge()
+}
+
+// The volume's own record does not hide the others': with another volume
+// committed, the failed-then-retried volume is still refused when it does not fit.
+func TestOwnRecordIsExcludedButOthersStillCount(t *testing.T) {
+	e := newEnv(t)
+	e.otherRecord(t, 1, nil)
+	if err := e.it.saveDrainRecord(e.v); err != nil {
+		t.Fatal(err)
+	}
+	e.budgetOf(2*testFootprint - mi)
+	if err := e.converge(); !errors.Is(err, item.ErrCacheBudgetExceeded) {
+		t.Fatalf("Converge = %v, want a refusal", err)
+	}
+	e.budgetOf(2 * testFootprint)
+	e.mustConverge()
+}
+
+// An unstage whose release fails keeps the record (for the retry) and removes
+// the cache; a restage of that volume on this node is then fresh, and must not
+// count the kept record as well as its own need.
+func TestRestageAfterAFailedReleaseIsNotCountedTwice(t *testing.T) {
+	skipIfRoot(t)
+	e := dirtyEnv(t)
+	e.mustConverge()
+	e.it.cfg.Systemd = chmodAfterStop{e.sd, e.v.holdDir}
+	t.Cleanup(func() { _ = os.Chmod(e.v.holdDir, 0o750) }) //nolint:gosec // a directory in the test's temporary tree
+	err := e.it.Teardown(bg, e.in, item.Observed{})
+	_ = os.Chmod(e.v.holdDir, 0o750) //nolint:gosec // as above
+	if !errors.Is(err, item.ErrReleasePending) {
+		t.Fatalf("Teardown = %v, want a pending release", err)
+	}
+	if e.cacheExists() || !e.drainRecordExists() {
+		t.Fatalf("cache %t, record %t: the setup is not a discarded cache with a kept record", e.cacheExists(), e.drainRecordExists())
+	}
+	e.it.cfg.Systemd = e.sd
+	e.nbd.devs = nil
+	e.ctl.down = true
+	e.budgetOf(testFootprint)
+	if err := e.converge(); errors.Is(err, item.ErrCacheBudgetExceeded) {
+		t.Fatalf("Converge = %v: the volume's own kept record was counted", err)
+	}
+}
+
+// A record's footprint is that of the size the volume is served at: the
+// intent's grown size raises it.
+func TestCommittedCountsGrownVolumeAtItsGrownSize(t *testing.T) {
+	e := newEnv(t)
+	name := e.otherRecord(t, 1, nil)
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grown := strings.Replace(string(b), "{\n", fmt.Sprintf("{\n  \"grownSize\": %d,\n", 3*testSize), 1)
+	if err := os.WriteFile(name, []byte(grown), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, count, err := e.it.Committed(bg)
+	if err != nil || count != 1 || n != 52*mi {
+		t.Fatalf("Committed = %d, %d, %v, want 52Mi\n%s\n%s", n, count, err, e.logs.String(), grown)
+	}
+}
+
+func TestCancelledCheckReturnsTheContextError(t *testing.T) {
+	e := newEnv(t)
+	e.budgetOf(testFootprint)
+	ctx, cancel := context.WithCancel(bg)
+	e.otherRecord(t, 1, nil)
+	cancel()
+	if err := e.it.checkBudget(ctx, e.v); !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkBudget = %v, want context.Canceled", err)
+	}
+}
