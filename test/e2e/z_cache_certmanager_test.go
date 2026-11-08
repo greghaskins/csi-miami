@@ -24,7 +24,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// certManagerManifest is the release manifest of a pinned cert-manager.
+// certManagerManifest is the release manifest of a pinned cert-manager. It is
+// applied from a URL without a checksum: acceptable only for a throwaway kind
+// cluster in CI, and not to be copied into deploy/.
 const certManagerManifest = "https://github.com/cert-manager/cert-manager/releases/download/v1.19.1/cert-manager.yaml"
 
 // managedSecret is the Secret the cert-manager component's Certificate fills.

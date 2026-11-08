@@ -344,7 +344,7 @@ func (n *testNS) waitPodEvent(t *testing.T, pod, reason, contains string) string
 	return msg
 }
 
-// podPhaseIs reports the pod's phase and whether its main container is
+// podState reports the pod's phase and whether its main container is
 // waiting in ContainerCreating.
 func (n *testNS) podState(ctx context.Context, name string) (phase corev1.PodPhase, creating, ready bool, err error) {
 	p, err := n.e.Client.CoreV1().Pods(n.Name).Get(ctx, name, metav1.GetOptions{})
@@ -359,7 +359,7 @@ func (n *testNS) podState(ctx context.Context, name string) (phase corev1.PodPha
 	return p.Status.Phase, creating, podReady(p), nil
 }
 
-// holdFor fails if the pod becomes Ready within d, and returns early with the
+// holdNotReady fails if the pod becomes Ready within d, and returns early with the
 // pod's state otherwise: the pod is expected to stay as it is.
 func (n *testNS) holdNotReady(t *testing.T, name string, d time.Duration) {
 	t.Helper()

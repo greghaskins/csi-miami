@@ -103,6 +103,21 @@ func TestCachePolicyNegative(t *testing.T) {
 		}
 	})
 
+	t.Run("refused-status-field-through-nodes-status", func(t *testing.T) {
+		ctx, cancel := e.withDeadline()
+		defer cancel()
+		patch := `{"status":{"phase":"Pending"}}`
+		_, err := asOwn.CoreV1().Nodes().Patch(ctx, own, types.MergePatchType, []byte(patch), metav1.PatchOptions{FieldManager: "miami-node"}, "status")
+		wantDenied(t, err, "status")
+		n, gerr := e.Client.CoreV1().Nodes().Get(ctx, own, metav1.GetOptions{})
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if n.Status.Phase == "Pending" {
+			t.Error("status.phase changed although the patch was refused")
+		}
+	})
+
 	t.Run("refused-token-bound-to-the-other-workers-pod", func(t *testing.T) {
 		err := patchCapacity(asOther, own, "add", cacheKeyPointer, "1Gi")
 		wantDenied(t, err, "node-name")
