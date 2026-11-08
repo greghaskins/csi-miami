@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/api/resource"
 
+	"github.com/greghaskins/csi-miami/internal/cachecap"
 	"github.com/greghaskins/csi-miami/internal/csi"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/kube"
@@ -50,6 +52,15 @@ type nodeConfig struct {
 	systemdSocket string
 	sharedDirs    stringList
 
+	// The node's cache budget: the flags as given, and what they parse to
+	// (cacheConfig; the zero value, accounting off, in tests that build a
+	// nodeConfig directly).
+	cacheAccounting bool
+	cacheShare      float64
+	cacheReserve    string
+	cacheBudget     string
+	cache           cachecap.Config
+
 	// The defaults of the generation timers, for a volume whose class sets none.
 	genInterval, genMaxAge, genTimeout time.Duration
 }
@@ -74,6 +85,38 @@ func (c nodeConfig) withDefaults() nodeConfig {
 	}
 	return c
 }
+
+// cacheConfig parses the cache budget flags. An empty -cache-budget means the
+// formula; "0" is an explicit zero budget.
+func (c nodeConfig) cacheConfig() (cachecap.Config, error) {
+	if !(c.cacheShare > 0 && c.cacheShare <= 1) {
+		return cachecap.Config{}, errors.New("-cache-budget-share must be above 0 and at most 1")
+	}
+	out := cachecap.Config{Accounting: c.cacheAccounting, Share: c.cacheShare}
+	q, err := resource.ParseQuantity(c.cacheReserve)
+	if err != nil || q.Sign() < 0 {
+		return cachecap.Config{}, errors.New("-cache-budget-reserve must be a quantity of zero or more, such as 15Gi")
+	}
+	out.Reserve = q.Value()
+	if c.cacheBudget != "" {
+		q, err := resource.ParseQuantity(c.cacheBudget)
+		if err != nil || q.Sign() < 0 {
+			return cachecap.Config{}, errors.New("-cache-budget must be a quantity of zero or more, such as 100Gi")
+		}
+		out.Absolute, out.HaveAbsolute = q.Value(), true
+	}
+	return out, nil
+}
+
+// noopNodeCapacity is the NodeCapacity of a node that does not yet patch its
+// status: it reports the key absent and changes nothing.
+type noopNodeCapacity struct{}
+
+func (noopNodeCapacity) CacheCapacity(context.Context, string) (int64, bool, error) {
+	return 0, false, nil
+}
+func (noopNodeCapacity) SetCacheCapacity(context.Context, string, int64) error { return nil }
+func (noopNodeCapacity) RemoveCacheCapacity(context.Context, string) error     { return nil }
 
 // eventRunner is the event recorder of the node: the reconciler's Events and
 // the goroutine that talks to the API server.
@@ -100,6 +143,10 @@ func nodeFlags(fs *flag.FlagSet, cfg *nodeConfig) {
 	fs.StringVar(&cfg.binDir, "bin-dir", "", "directory the per-hash copies of the miami binary are kept in (default <kubelet-dir>/plugins/"+csi.DriverName+"/bin)")
 	fs.StringVar(&cfg.systemdSocket, "systemd-socket", "/run/systemd/private", "systemd's private socket, used to run each volume's block server as a unit")
 	fs.Var(&cfg.sharedDirs, "shared-dir", "a directory the node container sees at the same absolute path as the host, besides -kubelet-dir; -cache-dir and -bin-dir must lie under one (repeatable)")
+	fs.BoolVar(&cfg.cacheAccounting, "cache-accounting", true, "advertise this node's cache budget to the scheduler and refuse a new volume that does not fit; false removes the advertisement and skips the check")
+	fs.Float64Var(&cfg.cacheShare, "cache-budget-share", 0.5, "the share of the cache filesystem offered as budget, above 0 and at most 1")
+	fs.StringVar(&cfg.cacheReserve, "cache-budget-reserve", "15Gi", "space kept back from the share, a quantity such as 15Gi")
+	fs.StringVar(&cfg.cacheBudget, "cache-budget", "", "an absolute budget, a quantity such as 100Gi (0 is a budget of zero); empty uses -cache-budget-share and -cache-budget-reserve")
 	fs.DurationVar(&cfg.genInterval, "generation-interval", volkinds.DefaultGenerationEvery, "how often a volume with unpublished writes publishes a generation, unless its class sets generations.interval")
 	fs.DurationVar(&cfg.genMaxAge, "generation-max-age", volkinds.DefaultGenerationMaxAge, "how old the newest generation of a volume with unpublished writes may get before the volume is reported overdue, unless its class sets generations.maxAge")
 	fs.DurationVar(&cfg.genTimeout, "generation-timeout", reconcile.DefaultGenerationTimeout, "deadline of one generation, freeze to upload")
@@ -127,6 +174,12 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "miami node: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
+	cache, cacheErr := cfg.cacheConfig()
+	if cacheErr != nil {
+		_, _ = fmt.Fprintf(stderr, "miami node: %v\n", cacheErr)
+		return 2
+	}
+	cfg.cache = cache
 	for _, p := range []struct {
 		name string
 		bad  bool
@@ -193,7 +246,7 @@ func serveNode(ctx context.Context, cfg nodeConfig, log *slog.Logger) error {
 //
 // On ctx ending it stops in the order that loses nothing: the CSI server stops
 // accepting and finishes the calls in flight, which are waiting on the
-// reconciler; then the reconciler is cancelled; then the event recorder and
+// reconciler; then the reconciler and the cache advertisement loop are cancelled; then the event recorder and
 // the metrics server, which the last calls were still reporting to.
 func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events eventRunner, cluster clusterAPI, log *slog.Logger, ready func(metricsAddr string)) error {
 	tRoot, err := resolveRoot(cfg.transportsRoot)
@@ -210,7 +263,11 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	}
 	defer func() { _ = store.Close() }()
 
-	reg := metrics.New(metrics.WithReconciler())
+	mopts := []metrics.Option{metrics.WithReconciler()}
+	if cfg.cache.Accounting {
+		mopts = append(mopts, metrics.WithCacheCapacity())
+	}
+	reg := metrics.New(mopts...)
 	opts := reconcile.Options{
 		TransportsRoot: tRoot,
 		StageRoot:      sRoot,
@@ -289,6 +346,13 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 			fail(fmt.Errorf("reconciler: %w", err))
 		}
 	})
+	// The advertisement loop has a goroutine of its own, so a slow API server
+	// cannot stall the reconciler. Until the node patches its status for real,
+	// it talks to a NodeCapacity that does nothing, and until volumes report
+	// their commitment, the committed figure is zero.
+	cacheRunner := cachecap.NewRunner(cachecap.NewSource(cfg.cache, cfg.cacheDir, cachecap.RealFSStat),
+		noopNodeCapacity{}, cfg.nodeID, func(context.Context) (int64, int, error) { return 0, 0, nil }, reg, log, cfg.interval)
+	stopCache := start(cacheRunner.Run)
 	stopEvents := func() {}
 	if events != nil {
 		stopEvents = start(events.Run)
@@ -313,6 +377,7 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	serveErr := srv.Serve(srvCtx)
 
 	stopRec()
+	stopCache()
 	stopEvents()
 	stopMetrics()
 	if serveErr != nil {

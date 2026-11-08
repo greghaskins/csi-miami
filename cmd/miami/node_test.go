@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/greghaskins/csi-miami/internal/cachecap"
 	"github.com/greghaskins/csi-miami/internal/mount/fake"
 )
 
@@ -244,5 +246,42 @@ func TestRunDispatchesNode(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"node", "-h"}, &stdout, &stderr); code != 0 || !strings.HasPrefix(stdout.String(), "Usage of miami node:") {
 		t.Errorf("exit code = %d, stdout = %q", code, stdout.String())
+	}
+}
+
+func TestNodeFlagsCacheBudget(t *testing.T) {
+	t.Parallel()
+	parse := func(args ...string) (cachecap.Config, error) {
+		var cfg nodeConfig
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		nodeFlags(fs, &cfg)
+		if err := fs.Parse(args); err != nil {
+			return cachecap.Config{}, err
+		}
+		return cfg.cacheConfig()
+	}
+	const gi = int64(1) << 30
+	got, err := parse()
+	if err != nil || got != (cachecap.Config{Accounting: true, Share: 0.5, Reserve: 15 * gi}) {
+		t.Errorf("defaults = %+v, %v", got, err)
+	}
+	if got, err = parse("-cache-budget=100Gi"); err != nil || !got.HaveAbsolute || got.Absolute != 100*gi {
+		t.Errorf("-cache-budget=100Gi = %+v, %v", got, err)
+	}
+	if got, err = parse("-cache-budget=0"); err != nil || !got.HaveAbsolute || got.Absolute != 0 {
+		t.Errorf("-cache-budget=0 = %+v, %v", got, err)
+	}
+	if got, err = parse("-cache-accounting=false"); err != nil || got.Accounting {
+		t.Errorf("-cache-accounting=false = %+v, %v", got, err)
+	}
+	for _, bad := range [][]string{
+		{"-cache-budget-share=0"}, {"-cache-budget-share=1.5"}, {"-cache-budget-reserve=-1Gi"},
+		{"-cache-budget=-1"}, {"-cache-budget=lots"}, {"-cache-budget-reserve=lots"},
+	} {
+		var stderr bytes.Buffer
+		if code := runNode(append([]string{"-node-id=n"}, bad...), io.Discard, &stderr); code != 2 {
+			t.Errorf("%v: exit %d, want 2 (%s)", bad, code, stderr.String())
+		}
 	}
 }

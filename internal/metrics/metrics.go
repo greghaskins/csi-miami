@@ -61,6 +61,11 @@ const (
 	NameCacheBytes                = "miami_cache_bytes"
 	NameChunkFetchDuration        = "miami_chunk_fetch_duration_seconds"
 	NameChunkFetchErrors          = "miami_chunk_fetch_errors_total"
+
+	NameCacheBudget    = "miami_cache_budget_bytes"
+	NameCacheCommitted = "miami_cache_committed_bytes"
+	NameCacheFSSize    = "miami_cache_fs_size_bytes"
+	NameCacheFSFree    = "miami_cache_fs_free_bytes"
 )
 
 // NodeFamilies are the families a node plugin serves: its reconciler's and the
@@ -117,6 +122,8 @@ type Registry struct {
 	publishes     *prometheus.CounterVec
 	cacheBytes    *prometheus.GaugeVec
 	fetches       *fetchCollector
+
+	cacheBudget, cacheCommitted, cacheFSSize, cacheFSFree prometheus.Gauge
 }
 
 var (
@@ -128,7 +135,7 @@ var (
 // Option configures New.
 type Option func(*options)
 
-type options struct{ reconciler bool }
+type options struct{ reconciler, cacheCapacity bool }
 
 // WithReconciler registers the reconciler's family (the intents, transports,
 // reconcile duration and error, timeout, garbage and load-failure metrics).
@@ -137,6 +144,11 @@ type options struct{ reconciler bool }
 // zero. The Registry still implements reconcile.Metrics, and its methods work
 // either way.
 func WithReconciler() Option { return func(o *options) { o.reconciler = true } }
+
+// WithCacheCapacity registers the node's cache budget gauges (budget,
+// committed, and the cache filesystem's size and free space). Only a node with
+// cache accounting on carries them; SetCacheCapacity works either way.
+func WithCacheCapacity() Option { return func(o *options) { o.cacheCapacity = true } }
 
 // New returns a Registry with the CSI request metrics, the Go collector and
 // the process collector registered on its own prometheus.Registry (the global
@@ -207,6 +219,13 @@ func New(opts ...Option) *Registry {
 		Name: NameCacheBytes, Help: "Bytes in the volume's node-local cache: clean (copies of chunks the store holds) or dirty (unpublished writes).",
 	}, []string{"volume", "state"})
 	r.fetches = newFetchCollector()
+	gauge := func(name, help string) prometheus.Gauge {
+		return prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
+	}
+	r.cacheBudget = gauge(NameCacheBudget, "Bytes of node-local cache this node offers the scheduler.")
+	r.cacheCommitted = gauge(NameCacheCommitted, "Bytes of cache footprint committed to the volumes staged on this node.")
+	r.cacheFSSize = gauge(NameCacheFSSize, "Size in bytes of the filesystem the volume caches live on.")
+	r.cacheFSFree = gauge(NameCacheFSFree, "Bytes available on the filesystem the volume caches live on.")
 
 	// The steps the reconciler reports are a fixed list (reconcile.Metrics), so
 	// their counters exist at zero from the start: a series that appears only
@@ -238,7 +257,18 @@ func New(opts ...Option) *Registry {
 			r.volumesServed, r.genAge, r.genDirty, r.publishDur, r.publishes, r.cacheBytes, r.fetches,
 		)
 	}
+	if o.cacheCapacity {
+		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree)
+	}
 	return r
+}
+
+// SetCacheCapacity sets the cache budget gauges (see cachecap.CapacityMetrics).
+func (r *Registry) SetCacheCapacity(budget, committed, fsSize, fsFree int64) {
+	r.cacheBudget.Set(float64(budget))
+	r.cacheCommitted.Set(float64(committed))
+	r.cacheFSSize.Set(float64(fsSize))
+	r.cacheFSFree.Set(float64(fsFree))
 }
 
 // Gatherer returns the registry's metrics, for tests and for other handlers.

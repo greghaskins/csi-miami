@@ -637,3 +637,32 @@ func TestPublishAndServedMetrics(t *testing.T) {
 		t.Errorf("%d state series, want 3", n)
 	}
 }
+
+func TestCacheMetrics(t *testing.T) {
+	t.Parallel()
+	names := []string{"miami_cache_budget_bytes", "miami_cache_committed_bytes", "miami_cache_fs_size_bytes", "miami_cache_fs_free_bytes"}
+	off := New(WithReconciler())
+	off.SetCacheCapacity(1, 2, 3, 4)
+	for _, n := range names {
+		if family(t, off, n) != nil {
+			t.Errorf("%s exposed without WithCacheCapacity", n)
+		}
+	}
+	on := New(WithCacheCapacity())
+	on.SetCacheCapacity(95<<30, 30<<30, 220<<30, 100<<30)
+	want := []float64{95 << 30, 30 << 30, 220 << 30, 100 << 30}
+	for i, n := range names {
+		f := family(t, on, n)
+		if f == nil || len(f.GetMetric()) != 1 {
+			t.Fatalf("%s: family = %v", n, f)
+		}
+		if got := f.GetMetric()[0].GetGauge().GetValue(); got != want[i] {
+			t.Errorf("%s = %v, want %v", n, got, want[i])
+		}
+	}
+	rec := httptest.NewRecorder()
+	on.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if want := "miami_cache_budget_bytes "; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("/metrics lacks %q", want)
+	}
+}
