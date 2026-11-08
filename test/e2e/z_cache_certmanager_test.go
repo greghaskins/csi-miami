@@ -61,6 +61,7 @@ func TestCacheCertManagerComponent(t *testing.T) {
 		if !t.Failed() {
 			return
 		}
+		e.describeBundles(t)
 		for _, args := range [][]string{
 			{"-n", "cert-manager", "logs", "deploy/cert-manager-cainjector", "--tail=60"},
 			{"-n", "cert-manager", "logs", "deploy/cert-manager", "--tail=40"},
@@ -364,4 +365,45 @@ func (e *env) revertCertManager(t *testing.T) {
 		return fmt.Sprintf("ca.crt %d bytes", len(ca)), len(ca) > 0, nil
 	})
 	e.waitBundle(t, ca, "the controller's own CA again")
+}
+
+// describeBundles logs the certificates in the webhook configuration's
+// caBundle and in the Secrets that could be its source.
+func (e *env) describeBundles(t *testing.T) {
+	t.Helper()
+	ctx, cancel := e.withDeadline()
+	defer cancel()
+	describe := func(what string, b []byte) {
+		var parts []string
+		for rest := b; ; {
+			var blk *pem.Block
+			blk, rest = pem.Decode(rest)
+			if blk == nil {
+				break
+			}
+			c, err := x509.ParseCertificate(blk.Bytes)
+			if err != nil {
+				parts = append(parts, "unparsable: "+err.Error())
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("[subject %s issuer %s serial %s]", c.Subject, c.Issuer, c.SerialNumber))
+		}
+		t.Logf("%s: %d bytes, %d certificates %s", what, len(b), len(parts), strings.Join(parts, " "))
+	}
+	if bundles, err := e.webhookBundles(ctx); err == nil {
+		for i, b := range bundles {
+			describe(fmt.Sprintf("caBundle of webhook %d", i), b)
+		}
+	}
+	for _, name := range []string{managedSecret, "miami-webhook-ca", "miami-webhook-tls"} {
+		if s, err := e.Client.CoreV1().Secrets(e.DriverNS).Get(ctx, name, metav1.GetOptions{}); err == nil {
+			describe("Secret "+name+" ca.crt", s.Data["ca.crt"])
+		} else {
+			t.Logf("Secret %s: %v", name, err)
+		}
+	}
+	if p, err := e.controllerPod(ctx); err == nil {
+		out, _ := e.logs(ctx, e.DriverNS, p.Name)
+		t.Logf("controller %s log:\n%s", p.Name, tail(out, 4000))
+	}
 }
