@@ -30,14 +30,18 @@ type Runner struct {
 	// probeKeyLeft: an allowed probe's key could not be removed yet.
 	probeKeyLeft  bool
 	cleanupWarned bool
+	// probeRemoveFailing: the Error for an allowed probe's key that could not
+	// be removed has been logged; repeats go to Debug until a removal works.
+	probeRemoveFailing bool
 	// warnedUnknown: the failed passes of the current unknown verdict have
 	// been logged at Warn once already.
 	warnedUnknown bool
 }
 
-// DefaultProbeInterval is how often the fence probe runs. Each probe is a
-// request the API server denies on purpose, so the expected denial rate of the
-// policy is one per node per interval.
+// DefaultProbeInterval is how often the fence probe runs while the node is
+// fenced. Each probe is a request the API server denies on purpose, so the
+// expected denial rate of the policy is one per node per interval. A node that
+// is unfenced or unknown probes on every pass instead.
 const DefaultProbeInterval = 10 * time.Minute
 
 // defaultDeadline bounds one pass when NewRunner is given no positive
@@ -83,16 +87,19 @@ var ErrUnfenced = errors.New("cachecap: the admission policy " + FencePolicy + "
 var ErrFenceUnknown = errors.New("cachecap: not advertising: the admission policy " + FencePolicy + " has not been confirmed in force")
 
 // probeIfDue runs the fence probe when none has run, or the last verdict is
-// older than the probe interval (an unknown verdict is retried at the normal
-// pass interval), and records the verdict. It returns the probe's own error.
+// older than its wait, and records the verdict. Only a Fenced verdict waits the
+// probe interval; Unfenced and Unknown are retried at the normal pass interval,
+// so a node that probed before the policy was enforced (as at install) recovers
+// within a pass. It returns the probe's own error.
 func (r *Runner) probeIfDue(ctx context.Context) error {
-	wait := r.probeEvery
-	if r.verdict == FenceUnknown {
-		wait = r.interval
+	wait := r.interval
+	if r.verdict == Fenced {
+		wait = r.probeEvery
 	}
 	if !r.probedAt.IsZero() && r.now().Sub(r.probedAt) < wait {
 		return nil
 	}
+	prev := r.verdict
 	state, perr := r.nc.ProbeFence(ctx, r.node)
 	r.probedAt, r.verdict = r.now(), state
 	switch state {
@@ -104,16 +111,28 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 		if s, ok := r.nc.(interface{ Subject() string }); ok {
 			subject = s.Subject()
 		}
-		r.log.Error("the admission policy "+FencePolicy+" does not fence this node plugin; it will advertise no cache capacity until a probe is denied. "+
+		// The probe repeats every pass while unfenced: say so loudly on the
+		// way in, and quietly after.
+		lvl := slog.LevelDebug
+		if prev != Unfenced {
+			lvl = slog.LevelError
+		}
+		r.log.Log(ctx, lvl, "the admission policy "+FencePolicy+" does not fence this node plugin; it will advertise no cache capacity until a probe is denied. "+
 			"Patch the policy's matchCondition and binding for the renamed or moved ServiceAccount",
 			"policy", FencePolicy, "subject", subject, "node", r.node)
 		if perr != nil {
 			// The probe was allowed but its key could not be removed. Say so,
 			// count it, and retry on every pass until it is gone.
-			r.log.Error("the fence probe key could not be removed from the node; will retry on the next pass", "node", r.node, "error", perr)
+			lvl := slog.LevelDebug
+			if !r.probeRemoveFailing {
+				lvl = slog.LevelError
+			}
+			r.probeRemoveFailing = true
+			r.log.Log(ctx, lvl, "the fence probe key could not be removed from the node; will retry on the next pass", "node", r.node, "error", perr)
 			r.probeKeyLeft = true
 			return r.counted(perr)
 		}
+		r.probeRemoveFailing = false
 		return nil
 	default:
 		// Unknown shows as its own state and is counted under its own reason, not as a denial.
@@ -136,7 +155,7 @@ func (r *Runner) retryProbeCleanup(ctx context.Context) error {
 	}
 	err := r.nc.RemoveFenceProbe(ctx, r.node)
 	if err == nil {
-		r.probeKeyLeft, r.cleanupWarned = false, false
+		r.probeKeyLeft, r.cleanupWarned, r.probeRemoveFailing = false, false, false
 		return nil
 	}
 	if !r.cleanupWarned {
@@ -177,8 +196,9 @@ func (r *Runner) Pass(ctx context.Context) error {
 	// The plugin advertises only under the admission policy that narrows its
 	// grant; an overlay that renames the ServiceAccount can leave the policy
 	// matching nobody, which no static check sees. So the runner asks the API
-	// server, at start and then every probe interval, and fails closed. Each
-	// probe is a denied request by design, so it is not made on every pass.
+	// server, at start and then every probe interval while fenced (every pass
+	// while unfenced or unknown), and fails closed. Each probe is a denied
+	// request by design, so a fenced node does not make it on every pass.
 	// An allowed probe's key is removed on every pass, whatever the verdict.
 	cerr = errors.Join(cerr, r.retryProbeCleanup(ctx))
 	if perr := r.probeIfDue(ctx); perr != nil {

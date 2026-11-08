@@ -53,7 +53,8 @@
 # static match follows every rename: such an overlay MUST patch the
 # matchCondition to the new name (TestNodePolicyDetectsRenamingOverlays pins
 # that the base's does not follow). The backstop is the node plugin itself: at
-# start, and every -cache-fence-probe-interval (10 minutes), it tries a
+# start, every -cache-fence-probe-interval (10 minutes) while fenced, and every
+# pass while unfenced or unknown, it tries a
 # patch this policy must deny; if the patch is allowed it logs an error naming
 # this policy and its subject, removes what it wrote, sets
 # miami_cache_fence_state to unfenced, and advertises nothing until a probe is denied.
@@ -65,7 +66,11 @@
 # Each probe is a denial by design, so while fenced this policy's expected
 # denial rate is one per node per probe interval; while the node cannot tell
 # (unknown: a renamed policy, an API server failing, a cluster before 1.32) it
-# repeats at the pass interval, up to one per node per 30 seconds. The node
+# repeats at the pass interval, up to one per node per 30 seconds. While
+# unfenced the probe is allowed, so it is one add plus one remove per pass and
+# no denial. At install the policy and the DaemonSet are created together, so
+# the first probe can beat enforcement and read unfenced for a pass or two; the
+# node then recovers by itself. The node
 # reports the verdict as miami_cache_fence_state{state=fenced|unfenced|unknown}.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy

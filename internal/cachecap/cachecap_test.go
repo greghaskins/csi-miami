@@ -498,22 +498,22 @@ func TestFenceUnfencedFailsClosed(t *testing.T) {
 	if !slices.Equal(m.states, []string{"unfenced"}) {
 		t.Errorf("fence states = %v, want [unfenced]", m.states)
 	}
-	// Between probes the verdict stands: no set, no new probe, and a key that
+	// An unfenced verdict is re-probed on every pass: no set, and a key that
 	// came back is removed again.
 	c.t = c.t.Add(time.Minute)
 	nc.have = true
-	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) || nc.probes != 1 || len(nc.setBytes) != 0 || len(nc.calls) != 2 {
+	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) || nc.probes != 2 || len(nc.setBytes) != 0 || len(nc.calls) != 2 {
 		t.Errorf("second pass: err %v, probes %d, calls %v", err, nc.probes, nc.calls)
 	}
 	// A later probe that is denied lifts it.
 	nc.unfenced = false
-	c.t = c.t.Add(10 * time.Minute)
+	c.t = c.t.Add(time.Minute)
 	nc.have = false
-	if err := r.Pass(ctx); err != nil || nc.probes != 2 || len(nc.setBytes) != 1 {
+	if err := r.Pass(ctx); err != nil || nc.probes != 3 || len(nc.setBytes) != 1 {
 		t.Errorf("after a denied probe: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
 	}
-	if !slices.Equal(m.states, []string{"unfenced", "fenced"}) {
-		t.Errorf("fence states = %v; want [unfenced fenced]", m.states)
+	if !slices.Equal(m.states, []string{"unfenced", "unfenced", "fenced"}) {
+		t.Errorf("fence states = %v; want [unfenced unfenced fenced]", m.states)
 	}
 }
 
@@ -576,8 +576,11 @@ func TestFenceProbeCleanupRetriedEveryPass(t *testing.T) {
 	if !slices.Equal(m.failures, []string{"error"}) {
 		t.Errorf("failures = %v, want one error", m.failures)
 	}
+	// The probe re-runs each pass while unfenced; its own key removal now
+	// works, the earlier leftover does not.
+	nc.probeCleanErr = nil
 	c.t = c.t.Add(time.Minute)
-	if err := r.Pass(ctx); !errors.Is(err, boom) || nc.removeProbes != 1 || nc.probes != 1 {
+	if err := r.Pass(ctx); !errors.Is(err, boom) || nc.removeProbes != 1 || nc.probes != 2 {
 		t.Errorf("second pass: err %v, cleanups %d, probes %d", err, nc.removeProbes, nc.probes)
 	}
 	nc.removeProbeErr = nil
@@ -698,5 +701,186 @@ func TestFenceProbeCleanupRetriedWhateverTheVerdict(t *testing.T) {
 	_ = r.Pass(ctx)
 	if nc.removeProbes != 4 {
 		t.Errorf("cleanup attempts = %d, want it to stop after succeeding (4)", nc.removeProbes)
+	}
+}
+
+// TestFenceUnfencedReprobesNextPass: an unfenced verdict is not held for the
+// probe interval; the next pass probes again.
+func TestFenceUnfencedReprobesNextPass(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{unfenced: true}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	_ = r.Pass(ctx)
+	c.t = c.t.Add(time.Minute)
+	_ = r.Pass(ctx)
+	if nc.probes != 2 {
+		t.Errorf("probes = %d, want 2: unfenced must re-probe on the next pass", nc.probes)
+	}
+}
+
+// TestFenceUnfencedThenFencedAdvertises: once the policy is enforced the next
+// pass is denied and the node advertises, long before the probe interval.
+func TestFenceUnfencedThenFencedAdvertises(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{unfenced: true}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) {
+		t.Fatalf("first pass err = %v, want ErrUnfenced", err)
+	}
+	nc.unfenced = false
+	c.t = c.t.Add(time.Minute)
+	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 1 {
+		t.Errorf("next pass: err %v, sets %v, want an advertisement", err, nc.setBytes)
+	}
+}
+
+// TestFenceFencedWaitsProbeInterval: a fenced verdict is held for the whole
+// probe interval.
+func TestFenceFencedWaitsProbeInterval(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	_ = r.Pass(ctx)
+	c.t = c.t.Add(9*time.Minute + 59*time.Second)
+	_ = r.Pass(ctx)
+	if nc.probes != 1 {
+		t.Fatalf("probes = %d before the interval, want 1", nc.probes)
+	}
+	c.t = c.t.Add(time.Second)
+	_ = r.Pass(ctx)
+	if nc.probes != 2 {
+		t.Errorf("probes = %d at the interval, want 2", nc.probes)
+	}
+}
+
+// TestFenceUnfencedErrorLoggedOnTransition: the Error about the policy is
+// logged once across repeated unfenced passes, again after a fenced pass in
+// between, and repeats go to Debug.
+func TestFenceUnfencedErrorLoggedOnTransition(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{unfenced: true}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		_ = r.Pass(ctx)
+		c.t = c.t.Add(time.Minute)
+	}
+	if n := strings.Count(logs.String(), "level=ERROR"); n != 1 {
+		t.Errorf("%d Error lines across 4 unfenced passes, want 1:\n%s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), "level=DEBUG") {
+		t.Errorf("repeats not logged at Debug:\n%s", logs.String())
+	}
+	nc.unfenced = false
+	_ = r.Pass(ctx)
+	nc.unfenced = true
+	c.t = c.t.Add(11 * time.Minute)
+	_ = r.Pass(ctx)
+	if n := strings.Count(logs.String(), "level=ERROR"); n != 2 {
+		t.Errorf("%d Error lines after fenced then unfenced again, want 2", n)
+	}
+}
+
+// TestFenceUnfencedThenFencedLeavesNoProbeKey: the allowed probe's key is
+// removed at once, and the denied probe on the next pass advertises.
+func TestFenceUnfencedThenFencedLeavesNoProbeKey(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{unfenced: true}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	_ = r.Pass(ctx)
+	if r.probeKeyLeft {
+		t.Error("probe key left after an allowed probe whose removal succeeded")
+	}
+	nc.unfenced = false
+	c.t = c.t.Add(time.Minute)
+	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 1 || r.probeKeyLeft || nc.removeProbes != 0 {
+		t.Errorf("err %v, sets %v, keyLeft %v, cleanups %d", err, nc.setBytes, r.probeKeyLeft, nc.removeProbes)
+	}
+}
+
+// TestFenceFencedThenUnfenced: a node that was advertising stops, its key is
+// removed, the probe key is gone, and the Error is logged exactly once.
+func TestFenceFencedThenUnfenced(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := context.Background()
+	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 1 {
+		t.Fatalf("first pass: err %v, sets %v", err, nc.setBytes)
+	}
+	nc.have, nc.bytes, nc.unfenced = true, nc.setBytes[0], true
+	for i := 0; i < 3; i++ {
+		c.t = c.t.Add(11 * time.Minute)
+		if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) {
+			t.Fatalf("pass %d: err %v, want ErrUnfenced", i, err)
+		}
+	}
+	if len(nc.setBytes) != 1 || nc.calls[len(nc.calls)-1] != "remove" || r.probeKeyLeft {
+		t.Errorf("sets %v, calls %v, keyLeft %v", nc.setBytes, nc.calls, r.probeKeyLeft)
+	}
+	if n := strings.Count(logs.String(), "level=ERROR"); n != 1 {
+		t.Errorf("%d Error lines, want 1:\n%s", n, logs.String())
+	}
+}
+
+// TestFenceProbeKeyRemovalErrorLoggedOnce: a probe key that keeps failing to
+// be removed logs the Error once, then Debug, and is counted on every pass.
+func TestFenceProbeKeyRemovalErrorLoggedOnce(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("cannot remove")
+	nc := &fakeNC{unfenced: true, probeCleanErr: boom, removeProbeErr: boom}
+	m, c := &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := context.Background()
+	passes := 4
+	for i := 0; i < passes; i++ {
+		_ = r.Pass(ctx)
+		c.t = c.t.Add(time.Minute)
+	}
+	if n := strings.Count(logs.String(), "key could not be removed from the node"); n != passes {
+		t.Errorf("%d lines about the probe key, want %d", n, passes)
+	}
+	if n := strings.Count(logs.String(), "level=ERROR msg=\"the fence probe key"); n != 1 {
+		t.Errorf("%d Error lines about the probe key, want 1:\n%s", n, logs.String())
+	}
+	if n := strings.Count(strings.Join(m.failures, ","), "error"); n < passes {
+		t.Errorf("failures = %v, want one counted per pass at least", m.failures)
+	}
+	// Once it works, a new failure is an Error again.
+	nc.probeCleanErr, nc.removeProbeErr = nil, nil
+	_ = r.Pass(ctx)
+	nc.probeCleanErr = boom
+	c.t = c.t.Add(time.Minute)
+	_ = r.Pass(ctx)
+	if n := strings.Count(logs.String(), "level=ERROR msg=\"the fence probe key"); n != 2 {
+		t.Errorf("%d Error lines after recovery and a new failure, want 2", n)
+	}
+}
+
+// TestFenceUnknownThenUnfencedLogsError: the Error is logged on the way from
+// Unknown into Unfenced.
+func TestFenceUnknownThenUnfencedLogsError(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{probeErr: errors.New("timeout")}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := context.Background()
+	_ = r.Pass(ctx)
+	nc.probeErr, nc.unfenced = nil, true
+	c.t = c.t.Add(time.Minute)
+	_ = r.Pass(ctx)
+	if n := strings.Count(logs.String(), "level=ERROR msg=\"the admission policy"); n != 1 {
+		t.Errorf("%d Error lines on Unknown to Unfenced, want 1:\n%s", n, logs.String())
 	}
 }
