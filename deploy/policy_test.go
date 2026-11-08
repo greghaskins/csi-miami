@@ -1931,7 +1931,7 @@ func TestCertManagerComponent(t *testing.T) {
 	}
 	r.get(t, "Issuer", "miami-webhook-ca", &caIssuerFull)
 	r.get(t, "Issuer", "miami-webhook-selfsigned", &rootIssuerFull)
-	if !reflect.DeepEqual(caIssuerFull.Spec, map[string]any{"ca": map[string]any{"secretName": "miami-webhook-ca"}}) {
+	if !reflect.DeepEqual(caIssuerFull.Spec, map[string]any{"ca": map[string]any{"secretName": "miami-webhook-ca"}}) { //nolint:gosec // a Secret's name
 		t.Errorf("CA issuer spec = %v", caIssuerFull.Spec)
 	}
 	if !reflect.DeepEqual(rootIssuerFull.Spec, map[string]any{"selfSigned": map[string]any{}}) {
