@@ -830,3 +830,57 @@ func TestFenceFencedThenUnfenced(t *testing.T) {
 		t.Errorf("%d Error lines, want 1:\n%s", n, logs.String())
 	}
 }
+
+// TestFenceProbeKeyRemovalErrorLoggedOnce: a probe key that keeps failing to
+// be removed logs the Error once, then Debug, and is counted on every pass.
+func TestFenceProbeKeyRemovalErrorLoggedOnce(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("cannot remove")
+	nc := &fakeNC{unfenced: true, probeCleanErr: boom, removeProbeErr: boom}
+	m, c := &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := context.Background()
+	passes := 4
+	for i := 0; i < passes; i++ {
+		_ = r.Pass(ctx)
+		c.t = c.t.Add(time.Minute)
+	}
+	if n := strings.Count(logs.String(), "key could not be removed from the node"); n != passes {
+		t.Errorf("%d lines about the probe key, want %d", n, passes)
+	}
+	if n := strings.Count(logs.String(), "level=ERROR msg=\"the fence probe key"); n != 1 {
+		t.Errorf("%d Error lines about the probe key, want 1:\n%s", n, logs.String())
+	}
+	if n := strings.Count(strings.Join(m.failures, ","), "error"); n < passes {
+		t.Errorf("failures = %v, want one counted per pass at least", m.failures)
+	}
+	// Once it works, a new failure is an Error again.
+	nc.probeCleanErr, nc.removeProbeErr = nil, nil
+	_ = r.Pass(ctx)
+	nc.probeCleanErr = boom
+	c.t = c.t.Add(time.Minute)
+	_ = r.Pass(ctx)
+	if n := strings.Count(logs.String(), "level=ERROR msg=\"the fence probe key"); n != 2 {
+		t.Errorf("%d Error lines after recovery and a new failure, want 2", n)
+	}
+}
+
+// TestFenceUnknownThenUnfencedLogsError: the Error is logged on the way from
+// Unknown into Unfenced.
+func TestFenceUnknownThenUnfencedLogsError(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{probeErr: errors.New("timeout")}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := context.Background()
+	_ = r.Pass(ctx)
+	nc.probeErr, nc.unfenced = nil, true
+	c.t = c.t.Add(time.Minute)
+	_ = r.Pass(ctx)
+	if n := strings.Count(logs.String(), "level=ERROR msg=\"the admission policy"); n != 1 {
+		t.Errorf("%d Error lines on Unknown to Unfenced, want 1:\n%s", n, logs.String())
+	}
+}

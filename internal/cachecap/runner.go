@@ -30,6 +30,9 @@ type Runner struct {
 	// probeKeyLeft: an allowed probe's key could not be removed yet.
 	probeKeyLeft  bool
 	cleanupWarned bool
+	// probeRemoveFailing: the Error for an allowed probe's key that could not
+	// be removed has been logged; repeats go to Debug until a removal works.
+	probeRemoveFailing bool
 	// warnedUnknown: the failed passes of the current unknown verdict have
 	// been logged at Warn once already.
 	warnedUnknown bool
@@ -120,10 +123,16 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 		if perr != nil {
 			// The probe was allowed but its key could not be removed. Say so,
 			// count it, and retry on every pass until it is gone.
-			r.log.Error("the fence probe key could not be removed from the node; will retry on the next pass", "node", r.node, "error", perr)
+			lvl := slog.LevelDebug
+			if !r.probeRemoveFailing {
+				lvl = slog.LevelError
+			}
+			r.probeRemoveFailing = true
+			r.log.Log(ctx, lvl, "the fence probe key could not be removed from the node; will retry on the next pass", "node", r.node, "error", perr)
 			r.probeKeyLeft = true
 			return r.counted(perr)
 		}
+		r.probeRemoveFailing = false
 		return nil
 	default:
 		// Unknown shows as its own state and is counted under its own reason, not as a denial.
@@ -146,7 +155,7 @@ func (r *Runner) retryProbeCleanup(ctx context.Context) error {
 	}
 	err := r.nc.RemoveFenceProbe(ctx, r.node)
 	if err == nil {
-		r.probeKeyLeft, r.cleanupWarned = false, false
+		r.probeKeyLeft, r.cleanupWarned, r.probeRemoveFailing = false, false, false
 		return nil
 	}
 	if !r.cleanupWarned {
