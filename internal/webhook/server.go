@@ -19,11 +19,14 @@ const (
 	// MutatePath is the only path served; the webhook configuration names it.
 	MutatePath = "/mutate"
 
-	// maxBodyBytes bounds a request body. A pod is far below this (the API
-	// server limits an object to about 1.5 MiB, and the review carries one
-	// pod); the bound keeps a stray client from making the controller buffer
-	// more.
-	maxBodyBytes = 1 << 20
+	// maxBodyBytes bounds a request body. It MUST stay above the API server's
+	// own request limit (--max-request-bytes, 3 MiB by default), with room for
+	// the JSON review of an object submitted as protobuf. A smaller bound makes
+	// the webhook answer 413 to a large pod; the API server counts that as a
+	// webhook failure and, under failurePolicy Ignore, admits the pod as sent,
+	// so padding a pod past the bound would keep a hand-set cache request and
+	// bypass the strip-on-error rule. The bound only caps what is buffered.
+	maxBodyBytes = 8 << 20
 
 	admissionAPIVersion = "admission.k8s.io/v1"
 	admissionKind       = "AdmissionReview"

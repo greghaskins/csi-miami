@@ -139,7 +139,7 @@ func TestServerRejectsNonPostAndOversizedBody(t *testing.T) {
 		}
 	}
 
-	// Above 1 MiB with a declared length: refused up front.
+	// Above the bound with a declared length: refused up front.
 	big := bytes.Repeat([]byte("a"), maxBodyBytes+1)
 	resp, err := ts.http.Post(ts.url+"/mutate", "application/json", bytes.NewReader(big))
 	if err != nil {
@@ -163,7 +163,7 @@ func TestServerRejectsNonPostAndOversizedBody(t *testing.T) {
 			t.Errorf("chunked oversized: status = %d, want 413", resp.StatusCode)
 		}
 	}
-	if got := served.Load(); got > 8<<20 {
+	if got := served.Load(); got > 16<<20 {
 		t.Errorf("the server read %d bytes of a 64 MiB body", got)
 	}
 	if n := ts.mut.calls.Load(); n != 0 {
@@ -180,6 +180,32 @@ func (c countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n.Add(int64(n))
 	return n, err
+}
+
+// A pod the API server accepts (up to its 3 MiB limit) is processed, not
+// rejected: a 413 would be a webhook failure, and the pod would be admitted
+// as sent.
+func TestServerProcessesLargeReview(t *testing.T) {
+	t.Parallel()
+	ts := startServer(t)
+	pad := strings.Repeat("x", 3<<20)
+	body, _ := json.Marshal(map[string]any{
+		"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview",
+		"request": map[string]any{"uid": "big", "operation": "CREATE", "kind": map[string]any{"version": "v1", "kind": "Pod"},
+			"object": map[string]any{"metadata": map[string]any{"annotations": map[string]any{"pad": pad}}}},
+	})
+	resp, err := ts.http.Post(ts.url+"/mutate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var out admissionv1.AdmissionReview
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != 200 || out.Response == nil || out.Response.UID != "big" {
+		t.Errorf("status %d, review %+v, err %v", resp.StatusCode, out, err)
+	}
+	if ts.mut.calls.Load() != 1 {
+		t.Errorf("mutator ran %d times", ts.mut.calls.Load())
+	}
 }
 
 func TestServerServesOnlyMutatePath(t *testing.T) {
