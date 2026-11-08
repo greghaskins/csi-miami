@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1342,7 +1343,7 @@ func TestExampleStorageClasses(t *testing.T) {
 // TestE2EOverlay: the overlay renders, adds the two example StorageClasses,
 // and otherwise differs from the base only in the driver image and its pull
 // policy, and the node plugin's mount of the host's /export for the example
-// local class.
+// local class, and the node plugin's two cache arguments (e2eNodeArgs).
 func TestE2EOverlay(t *testing.T) {
 	t.Parallel()
 	b, o := base(t), overlay(t)
@@ -1368,6 +1369,9 @@ func TestE2EOverlay(t *testing.T) {
 						delete(cm, "image")
 						delete(cm, "imagePullPolicy")
 						cm["volumeMounts"] = without(cm["volumeMounts"], localExport)
+						if ob.kind == "DaemonSet" {
+							cm["args"] = withoutArgs(cm["args"], e2eNodeArgs...)
+						}
 					}
 				}
 				if ob.kind == "DaemonSet" {
@@ -1382,6 +1386,12 @@ func TestE2EOverlay(t *testing.T) {
 	}
 	if !reflect.DeepEqual(norm(b), norm(o)) {
 		t.Error("the overlay differs from the base beyond the driver image, its pull policy and the StorageClasses")
+	}
+	nodeArgs := container(t, node(t, o).Spec.Template.Spec, "miami").Args
+	for _, want := range e2eNodeArgs {
+		if !slices.Contains(nodeArgs, want) {
+			t.Errorf("the overlay's node args %v lack %s", nodeArgs, want)
+		}
 	}
 	for role, spec := range allContainers(t, o) {
 		c := container(t, spec, "miami")
@@ -1416,6 +1426,22 @@ func dropPluginOff(spec map[string]any) {
 		}
 		term["matchExpressions"] = keep
 	}
+}
+
+// e2eNodeArgs are the two arguments the e2e overlay adds to the node plugin.
+var e2eNodeArgs = []string{"--cache-budget=4Gi", "--reconcile-interval=5s"}
+
+// withoutArgs returns a container's args minus the named ones.
+func withoutArgs(list any, drop ...string) []any {
+	var out []any
+	items, _ := list.([]any)
+	for _, it := range items {
+		if s, ok := it.(string); ok && slices.Contains(drop, s) {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 // localExport is the name of the volume the e2e overlay adds to the node
