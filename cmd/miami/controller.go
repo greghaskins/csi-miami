@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -108,7 +109,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	cfg.namespace = os.Getenv("POD_NAMESPACE")
+	cfg.namespace = podNamespace()
 	if msg := cfg.validateWebhook(); msg != "" {
 		_, _ = fmt.Fprintf(stderr, "miami controller: %s\n", msg)
 		return 2
@@ -125,6 +126,22 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// namespaceFile is where a pod finds its own namespace without configuration.
+var namespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// podNamespace is POD_NAMESPACE, else the namespace the service account
+// token was issued in, else "".
+func podNamespace() string {
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	b, err := os.ReadFile(namespaceFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 // validateWebhook returns what is wrong with the webhook's flags, or "". A
 // disabled webhook needs nothing.
 func (c controllerConfig) validateWebhook() string {
@@ -138,7 +155,7 @@ func (c controllerConfig) validateWebhook() string {
 		return "-webhook-sync-interval must be positive"
 	}
 	if c.namespace == "" {
-		return "POD_NAMESPACE is required for the webhook (set it from the downward API, or use -webhook-addr= to turn the webhook off)"
+		return "the webhook needs the pod's namespace: set POD_NAMESPACE (downward API), or use -webhook-addr= to turn the webhook off"
 	}
 	if c.webhookService == "" || (c.webhookTLSSecret == "" && c.webhookConfig == "") {
 		return "-webhook-service and -webhook-config must not be empty"

@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -136,9 +137,25 @@ func TestControllerFlagsWebhook(t *testing.T) {
 	})
 	t.Run("no namespace exits 2", func(t *testing.T) {
 		t.Setenv("POD_NAMESPACE", "")
+		namespaceFile = filepath.Join(t.TempDir(), "absent")
 		var errb bytes.Buffer
 		if code := runController(nil, io.Discard, &errb); code != 2 || !strings.Contains(errb.String(), "POD_NAMESPACE") {
 			t.Errorf("exit %d, stderr %q", code, errb.String())
+		}
+	})
+	t.Run("namespace falls back to the service account's", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "")
+		f := filepath.Join(t.TempDir(), "ns")
+		if err := os.WriteFile(f, []byte("from-file\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		namespaceFile = f
+		if got := podNamespace(); got != "from-file" {
+			t.Errorf("podNamespace = %q", got)
+		}
+		t.Setenv("POD_NAMESPACE", "from-env")
+		if got := podNamespace(); got != "from-env" {
+			t.Errorf("podNamespace = %q", got)
 		}
 	})
 	t.Run("zero sync interval exits 2", func(t *testing.T) {
