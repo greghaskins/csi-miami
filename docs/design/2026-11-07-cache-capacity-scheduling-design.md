@@ -284,8 +284,8 @@ for a PVC whose access mode is many-node.
 
 ### 4.8 The node's own check, metrics and alerts
 
-**The stage check.** In `Converge`, at layer 4 and only there, immediately
-before `ensureServer`, and only when the volume is new to this node: no nbd
+**The stage check.** In `Converge`, at the top, before the holder layer (amended
+2026-11-08, so a refusal acquires and writes nothing), and only when the volume is new to this node: no nbd
 device carries its name and its cache directory has no index (the state in
 which `decideCache` would build a fresh cache). An adopted mount, a server
 restart, a reboot with a surviving cache, a drain and a teardown never reach
