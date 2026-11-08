@@ -377,3 +377,20 @@ func (n *testNS) holdNotReady(t *testing.T, name string, d time.Duration) {
 		time.Sleep(pollEvery)
 	}
 }
+
+// discardStrandedCache removes, when the test ends, the cache and the drain
+// record that the old holder's node keeps for a volume another node took over:
+// on kind the shared kernel stops that node from ever unstaging it, so the
+// record would stay in the node's committed cache (by design: a cache awaiting
+// a drain is committed) and starve the tests that run after.
+func (e *env) discardStrandedCache(t *testing.T, node string, vol volumeInfo) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := e.withDeadline()
+		defer cancel()
+		dir := cachePath(vol.PV)
+		if out, err := nodeExec(ctx, node, "rm", "-rf", dir, dir+".drain.json"); err != nil {
+			t.Errorf("removing the stranded cache of %s on %s: %v: %s", vol.PV, node, err, out)
+		}
+	})
+}
