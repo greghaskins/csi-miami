@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // certManagerManifest is the release manifest of a pinned cert-manager. It is
@@ -95,6 +96,11 @@ func TestCacheCertManagerComponent(t *testing.T) {
 		managedCA = s.Data["ca.crt"]
 		return fmt.Sprintf("keys %d", len(s.Data)), len(managedCA) > 0 && len(s.Data["tls.crt"]) > 0, nil
 	})
+	// The configuration came from the self-signed install and still carries its
+	// CA beside the injected one (cert-manager adds to a bundle that is there).
+	// A fresh install of the component starts from an empty bundle, so empty it
+	// and let cainjector inject: it must come out as the managed CA alone.
+	e.setBundleEmpty(t)
 	e.waitBundle(t, managedCA, "the managed Secret's ca.crt, injected by cert-manager")
 
 	probe := 0
@@ -406,5 +412,24 @@ func (e *env) describeBundles(t *testing.T) {
 	if p, err := e.controllerPod(ctx); err == nil {
 		b, _ := e.Client.CoreV1().Pods(e.DriverNS).GetLogs(p.Name, &corev1.PodLogOptions{Container: "miami"}).DoRaw(ctx)
 		t.Logf("controller %s log:\n%s", p.Name, tail(string(b), 4000))
+	}
+}
+
+// setBundleEmpty empties the caBundle of every webhook of the configuration.
+func (e *env) setBundleEmpty(t *testing.T) {
+	t.Helper()
+	ctx, cancel := e.withDeadline()
+	defer cancel()
+	m, err := e.Client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "miami-cache", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ops []string
+	for i := range m.Webhooks {
+		ops = append(ops, fmt.Sprintf(`{"op":"add","path":"/webhooks/%d/clientConfig/caBundle","value":""}`, i))
+	}
+	patch := "[" + strings.Join(ops, ",") + "]"
+	if _, err := e.Client.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, "miami-cache", types.JSONPatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		t.Fatalf("emptying the caBundle: %v", err)
 	}
 }
