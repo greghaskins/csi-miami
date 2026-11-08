@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -39,6 +41,8 @@ type fakeClaims struct {
 	def     *kube.StorageClass
 	err     error
 	panics  bool
+	hang    chan struct{} // when set, GetPVC blocks until it is closed, ignoring its context
+	pvcGets int
 }
 
 func newClaims() *fakeClaims {
@@ -53,6 +57,10 @@ func (f *fakeClaims) fail() error {
 }
 
 func (f *fakeClaims) GetPVC(_ context.Context, ns, name string) (*kube.PVC, error) {
+	f.pvcGets++
+	if f.hang != nil {
+		<-f.hang
+	}
 	if err := f.fail(); err != nil {
 		return nil, err
 	}
@@ -474,7 +482,7 @@ func TestLookupErrorIsAllowedUnchanged(t *testing.T) {
 			set(h.claims)
 			resp, _ := h.run(rawOf(t, testPod(claimVol("v", "data"))))
 			if len(resp.Patch) != 0 {
-				t.Fatalf("patch %s", resp.Patch)
+				t.Fatalf("patch %s: a pod with nothing to strip needs no patch", resp.Patch)
 			}
 			if resp.Result != nil && resp.Result.Message != "" {
 				t.Fatalf("the response says %q: an error string must not reach the API server's client", resp.Result.Message)
@@ -833,4 +841,181 @@ func TestNamespaceComesFromTheRequest(t *testing.T) {
 	pod.Namespace = "other"
 	_, got := h.run(rawOf(t, pod))
 	wantCache(t, got, 15376*mi)
+}
+
+// errored asserts the error outcome, an allowed response and, whatever the pod
+// carried by hand, no cache resource left on any container.
+func errored(t *testing.T, h *harness, resp *admissionv1.AdmissionResponse, pod *corev1.Pod) {
+	t.Helper()
+	if len(resp.Patch) == 0 {
+		t.Fatal("no strip patch on the error path")
+	}
+	wantNoCache(t, pod)
+	assertPatchTouchesOnlyOurKey(t, resp.Patch)
+	h.outcome("error")
+}
+
+func strayPod(vols ...corev1.Volume) *corev1.Pod {
+	pod := testPod(vols...)
+	withStray(pod, 0, "900Gi", "900Gi", false)
+	withStray(pod, 1, "1Gi", "1Gi", false)
+	withStray(pod, 0, "1Gi", "1Gi", true)
+	return pod
+}
+
+func TestLookupErrorStripsHandSetRequest(t *testing.T) {
+	h := newHarness(t)
+	h.claims.err = errors.New("the API server could not be reached")
+	resp, pod := h.run(rawOf(t, strayPod(claimVol("v", "data"))))
+	errored(t, h, resp, pod)
+}
+
+func TestPanicStripsHandSetRequestAndAllows(t *testing.T) {
+	h := newHarness(t)
+	h.claims.panics = true
+	resp, pod := h.run(rawOf(t, strayPod(claimVol("v", "data"))))
+	errored(t, h, resp, pod)
+}
+
+func TestUndecodablePodStaysUnchanged(t *testing.T) {
+	h := newHarness(t)
+	resp := h.m.Mutate(context.Background(), review([]byte(`{"spec":{"containers":"x"}}`)))
+	if !resp.Allowed || len(resp.Patch) != 0 {
+		t.Fatalf("%+v", resp)
+	}
+}
+
+func TestTooManyClaimsIsErrorAndStripped(t *testing.T) {
+	h := newHarness(t)
+	h.claims.classes["c"] = miamiClass("c")
+	var vols []corev1.Volume
+	for i := 0; i < 3*maxClaimLookups; i++ {
+		name := fmt.Sprintf("claim-%d", i)
+		h.claims.pending("ns", name, "c", gi)
+		vols = append(vols, claimVol(fmt.Sprintf("v%d", i), name))
+	}
+	resp, pod := h.run(rawOf(t, strayPod(vols...)))
+	errored(t, h, resp, pod)
+	if h.claims.pvcGets > maxClaimLookups {
+		t.Fatalf("%d claim lookups, cap %d", h.claims.pvcGets, maxClaimLookups)
+	}
+	if h.met.unresolved != 1 {
+		t.Fatalf("unresolved = %d, want 1", h.met.unresolved)
+	}
+}
+
+func TestEphemeralVolumesCountTowardTheCap(t *testing.T) {
+	h := newHarness(t)
+	h.claims.def = miamiClass("d")
+	var vols []corev1.Volume
+	for i := 0; i < maxClaimLookups+1; i++ {
+		vols = append(vols, ephemeralVol(fmt.Sprintf("e%d", i), nil, "1Gi"))
+	}
+	resp, pod := h.run(rawOf(t, strayPod(vols...)))
+	errored(t, h, resp, pod)
+}
+
+func TestSlowClaimsHitTheDeadline(t *testing.T) {
+	h := newHarness(t)
+	h.claims.hang = make(chan struct{})
+	t.Cleanup(func() { close(h.claims.hang) })
+	h.m.Deadline = 50 * time.Millisecond
+	start := time.Now()
+	resp, pod := h.run(rawOf(t, strayPod(claimVol("v", "data"))))
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("took %v", d)
+	}
+	errored(t, h, resp, pod)
+}
+
+func TestDefaultDeadlineIsBelowTheWebhookTimeout(t *testing.T) {
+	if mutateDeadline >= 10*time.Second {
+		t.Fatalf("mutateDeadline %v must be below the webhook's timeoutSeconds 10", mutateDeadline)
+	}
+}
+
+func TestUnresolvedIsLoggedOncePerPod(t *testing.T) {
+	h := newHarness(t)
+	var buf bytes.Buffer
+	h.m.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	var vols []corev1.Volume
+	for i := 0; i < 5; i++ {
+		vols = append(vols, claimVol(fmt.Sprintf("v%d", i), fmt.Sprintf("gone-%d", i)))
+	}
+	h.run(rawOf(t, testPod(vols...)))
+	if h.met.unresolved != 5 {
+		t.Fatalf("unresolved = %d, want 5", h.met.unresolved)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "\n"); n != 1 {
+		t.Fatalf("%d log lines, want 1:\n%s", n, out)
+	}
+	if !strings.Contains(out, "gone-0") {
+		t.Fatalf("the log does not name the claim: %s", out)
+	}
+}
+
+func TestEphemeralRequestBeyondInt64IsNotWrapped(t *testing.T) {
+	h := newHarness(t)
+	h.claims.def = miamiClass("d")
+	resp, _ := h.run(rawOf(t, testPod(ephemeralVol("e", nil, "100Ei"))))
+	if len(resp.Patch) != 0 || h.met.unresolved != 1 {
+		t.Fatalf("patch %s, unresolved %d", resp.Patch, h.met.unresolved)
+	}
+}
+
+func TestEmptyRequestNamespaceIsUnchanged(t *testing.T) {
+	h := newHarness(t)
+	h.claims.bind(t, "ns", "data", "pvc-1", params(), 10*gi, 10*gi)
+	h.ns = ""
+	pod := testPod(claimVol("v", "data"))
+	resp, _ := h.run(rawOf(t, pod)) // the pod's own metadata names ns
+	if len(resp.Patch) != 0 {
+		t.Fatalf("patch %s", resp.Patch)
+	}
+	h.outcome("unchanged")
+}
+
+func TestNewMutatorValidates(t *testing.T) {
+	if _, err := NewMutator(nil, &fakeMetrics{}, nil); err == nil {
+		t.Error("nil Claims accepted")
+	}
+	if _, err := NewMutator(newClaims(), nil, nil); err == nil {
+		t.Error("nil Metrics accepted")
+	}
+	if m, err := NewMutator(newClaims(), &fakeMetrics{}, nil); err != nil || m == nil {
+		t.Errorf("%v", err)
+	}
+}
+
+func TestNilMetricsDoesNotEscapeMutate(t *testing.T) {
+	c := newClaims()
+	c.panics = true
+	m := &Mutator{Claims: c}
+	resp := m.Mutate(context.Background(), review(rawOf(t, testPod(claimVol("v", "data")))))
+	if resp == nil || !resp.Allowed {
+		t.Fatalf("%+v", resp)
+	}
+}
+
+func TestPreBoundPendingClaimUsesItsPV(t *testing.T) {
+	h := newHarness(t)
+	h.claims.bind(t, "ns", "data", "pvc-1", params(), 10*gi, 10*gi)
+	h.claims.pvcs["ns/data"].Phase = "Pending"
+	h.claims.pvcs["ns/data"].StorageClassName, h.claims.pvcs["ns/data"].StorageClassSet = "fast", true
+	h.claims.classes["fast"] = miamiClass("fast", "cacheSize", "1Gi") // would give a different number
+	_, pod := h.run(rawOf(t, testPod(claimVol("v", "data"))))
+	wantCache(t, pod, 15376*mi)
+}
+
+func TestPreBoundPendingClaimFallsBackToClassOnNotFound(t *testing.T) {
+	h := newHarness(t)
+	h.claims.classes["fast"] = miamiClass("fast")
+	h.claims.pending("ns", "data", "fast", 10*gi)
+	h.claims.pvcs["ns/data"].VolumeName = "not-yet"
+	_, pod := h.run(rawOf(t, testPod(claimVol("v", "data"))))
+	wantCache(t, pod, footprintOf(t, params(), 10*gi))
+	if h.met.unresolved != 0 {
+		t.Fatalf("unresolved = %d", h.met.unresolved)
+	}
 }

@@ -19,6 +19,13 @@
 //     number set by hand cannot under-request.
 //   - The patch touches the resource's key and nothing else.
 //
+// The cost of the second rule is on the error path: the strip runs whenever
+// the webhook fails, so on a re-invocation (another mutator changed the pod)
+// a transient error in the second call removes the number the first call set.
+// That pod is then scheduled with no reservation. It is rare, heals with the
+// next pod, and is backstopped by the node's stage check; change either side
+// only with the other in view.
+//
 // The footprint itself is computed by package volume, the one place the
 // formula is spelled, with the rule the node uses for an expanded volume
 // (volume.ServedFootprint), so the two cannot disagree.

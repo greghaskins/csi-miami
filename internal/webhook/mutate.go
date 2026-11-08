@@ -3,14 +3,17 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/greghaskins/csi-miami/internal/kube"
 	"github.com/greghaskins/csi-miami/internal/volume"
@@ -33,12 +36,42 @@ const (
 	outcomeError     = "error"     // our own failure; the pod was allowed unchanged
 )
 
+const (
+	// mutateDeadline bounds one Mutate call, whatever its Claims do. The
+	// webhook configuration gives the API server timeoutSeconds: 10 and then
+	// admits the pod as sent (failurePolicy Ignore); finishing at 7s leaves
+	// time to answer, so the strip patch below still reaches the API server.
+	mutateDeadline = 7 * time.Second
+
+	// maxClaimLookups caps the distinct claims (and claim templates) one pod
+	// makes the webhook look up, so a pod with thousands of volumes cannot
+	// turn one CREATE into thousands of API reads.
+	maxClaimLookups = 64
+)
+
+// errTooManyClaims is the pod having more claims than maxClaimLookups.
+var errTooManyClaims = errors.New("the pod has more claims than the webhook will look up")
+
 // Mutator turns a pod CREATE into the JSON patch that requests the pod's
 // cache footprint. It holds no state and is safe for concurrent use.
 type Mutator struct {
 	Claims  Claims
 	Metrics Metrics
 	Log     *slog.Logger
+	// Deadline bounds one Mutate call; zero means mutateDeadline.
+	Deadline time.Duration
+}
+
+// NewMutator returns a Mutator, or an error when it would have nothing to
+// look claims up with or nowhere to count. A nil log means slog.Default.
+func NewMutator(claims Claims, metrics Metrics, log *slog.Logger) (*Mutator, error) {
+	if claims == nil {
+		return nil, errors.New("webhook: Claims is required")
+	}
+	if metrics == nil {
+		return nil, errors.New("webhook: Metrics is required")
+	}
+	return &Mutator{Claims: claims, Metrics: metrics, Log: log}, nil
 }
 
 func (m *Mutator) log() *slog.Logger {
@@ -48,63 +81,60 @@ func (m *Mutator) log() *slog.Logger {
 	return slog.Default()
 }
 
+func (m *Mutator) outcome(o string) {
+	if m.Metrics != nil {
+		m.Metrics.Outcome(o)
+	}
+}
+
+func (m *Mutator) unresolvedCount() {
+	if m.Metrics != nil {
+		m.Metrics.Unresolved()
+	}
+}
+
 // Mutate answers an admission request for a pod. It always allows the pod: the
-// webhook only accounts, and a failure of its own (a lookup, a pod it cannot
-// read, a bug) is counted and leaves the pod as it came.
+// webhook only accounts, and a failure of its own (a lookup, a deadline, a
+// pod with too many claims, a bug) is counted as error. On such a failure the
+// pod still has the cache resource removed from every container, so a value
+// written by hand cannot survive by making the webhook fail; only a pod that
+// cannot be decoded at all is allowed as it came.
 func (m *Mutator) Mutate(ctx context.Context, req *admissionv1.AdmissionRequest) (resp *admissionv1.AdmissionResponse) {
 	if req == nil {
 		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 	resp = &admissionv1.AdmissionResponse{UID: req.UID, Allowed: true}
+	var raw map[string]any
 	defer func() {
 		if r := recover(); r != nil {
-			m.log().Error("the cache webhook panicked, so the pod is admitted unchanged", "panic", fmt.Sprint(r))
-			m.Metrics.Outcome(outcomeError)
-			resp = &admissionv1.AdmissionResponse{UID: req.UID, Allowed: true}
+			m.log().Error("the cache webhook panicked, so the pod is admitted with the resource stripped", "panic", fmt.Sprint(r))
+			m.outcome(outcomeError)
+			resp = stripResponse(req.UID, raw)
 		}
 	}()
 
 	if req.Operation != admissionv1.Create || req.SubResource != "" || req.Kind.Kind != "Pod" || req.Kind.Group != "" {
-		m.Metrics.Outcome(outcomeUnchanged)
+		m.outcome(outcomeUnchanged)
 		return resp
 	}
-	outcome, patch, err := m.patchFor(ctx, req)
-	if err != nil {
-		// The error text is for the log only: the response carries none.
-		m.log().Warn("the cache webhook could not account for a pod, so it is admitted unchanged", "namespace", req.Namespace, "error", err)
-		m.Metrics.Outcome(outcomeError)
-		return resp
-	}
-	m.Metrics.Outcome(outcome)
-	if len(patch) > 0 {
-		pt := admissionv1.PatchTypeJSONPatch
-		resp.Patch, resp.PatchType = patch, &pt
-	}
-	return resp
-}
-
-// patchFor decodes the pod, works out its footprint and builds the patch. An
-// empty patch means nothing to change.
-func (m *Mutator) patchFor(ctx context.Context, req *admissionv1.AdmissionRequest) (string, []byte, error) {
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
-		return "", nil, fmt.Errorf("decoding the pod: %w", err)
+		return m.failed(resp, nil, req, fmt.Errorf("decoding the pod: %w", err))
 	}
-	var raw map[string]any
 	if err := json.Unmarshal(req.Object.Raw, &raw); err != nil {
-		return "", nil, fmt.Errorf("decoding the pod: %w", err)
+		return m.failed(resp, nil, req, fmt.Errorf("decoding the pod: %w", err))
 	}
-	if len(pod.Spec.Containers) == 0 {
-		return outcomeUnchanged, nil, nil
+	// The claims live in the request's namespace. The API server sets it for
+	// every namespaced CREATE; the pod's own metadata is user-controlled and is
+	// never consulted.
+	if req.Namespace == "" || len(pod.Spec.Containers) == 0 {
+		m.outcome(outcomeUnchanged)
+		return resp
 	}
-	ns := req.Namespace
-	if ns == "" {
-		ns = pod.Namespace
-	}
-	r := &resolver{m: m, ns: ns, classes: map[string]*kube.StorageClass{}, known: map[string]bool{}}
-	sum, err := r.footprint(ctx, &pod)
+
+	sum, err := m.footprint(ctx, req.Namespace, &pod)
 	if err != nil {
-		return "", nil, err
+		return m.failed(resp, raw, req, err)
 	}
 	want := ""
 	if sum > 0 {
@@ -112,16 +142,78 @@ func (m *Mutator) patchFor(ctx context.Context, req *admissionv1.AdmissionReques
 	}
 	ops := patchOps(raw, want)
 	if len(ops) == 0 {
-		return outcomeUnchanged, nil, nil
+		m.outcome(outcomeUnchanged)
+		return resp
 	}
 	patch, err := json.Marshal(ops)
 	if err != nil {
-		return "", nil, err
+		return m.failed(resp, raw, req, err)
 	}
 	if want == "" {
-		return outcomeStripped, patch, nil
+		m.outcome(outcomeStripped)
+	} else {
+		m.outcome(outcomeMutated)
 	}
-	return outcomeMutated, patch, nil
+	pt := admissionv1.PatchTypeJSONPatch
+	resp.Patch, resp.PatchType = patch, &pt
+	return resp
+}
+
+// failed counts an error and answers with the strip patch (none when raw is
+// nil, the pod being unreadable). The error text goes to the log only.
+func (m *Mutator) failed(resp *admissionv1.AdmissionResponse, raw map[string]any, req *admissionv1.AdmissionRequest, err error) *admissionv1.AdmissionResponse {
+	m.log().Warn("the cache webhook could not account for a pod, so it is admitted with the resource stripped", "namespace", req.Namespace, "error", err)
+	m.outcome(outcomeError)
+	return stripResponse(resp.UID, raw)
+}
+
+// stripResponse allows the pod and removes the cache resource from every
+// container that carries it.
+func stripResponse(uid types.UID, raw map[string]any) *admissionv1.AdmissionResponse {
+	resp := &admissionv1.AdmissionResponse{UID: uid, Allowed: true}
+	if raw == nil {
+		return resp
+	}
+	if ops := patchOps(raw, ""); len(ops) > 0 {
+		if patch, err := json.Marshal(ops); err == nil {
+			pt := admissionv1.PatchTypeJSONPatch
+			resp.Patch, resp.PatchType = patch, &pt
+		}
+	}
+	return resp
+}
+
+// footprint resolves the pod's volumes under the call's deadline. The
+// resolver runs in its own goroutine so that a Claims that ignores its context
+// still cannot hold the call past the deadline; its answer is then dropped.
+func (m *Mutator) footprint(ctx context.Context, ns string, pod *corev1.Pod) (int64, error) {
+	d := m.Deadline
+	if d <= 0 {
+		d = mutateDeadline
+	}
+	ctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	type result struct {
+		sum int64
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- result{err: fmt.Errorf("panic while resolving volumes: %v", r)}
+			}
+		}()
+		r := &resolver{m: m, ns: ns, classes: map[string]*kube.StorageClass{}, known: map[string]bool{}}
+		sum, err := r.footprint(ctx, pod)
+		ch <- result{sum, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.sum, res.err
+	case <-ctx.Done():
+		return 0, fmt.Errorf("resolving volumes: %w", ctx.Err())
+	}
 }
 
 // op is one JSON patch operation.

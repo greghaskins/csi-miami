@@ -32,12 +32,20 @@ type resolver struct {
 	ns      string
 	classes map[string]*kube.StorageClass // by name; "" is the default class
 	known   map[string]bool
+
+	lookups int      // distinct claims looked up so far
+	missing []string // claims that could not be accounted for, for one log line
+	more    int      // how many beyond the names kept
 }
+
+// maxLoggedClaims bounds the claim names one log line carries.
+const maxLoggedClaims = 5
 
 // footprint is the summed footprint of the pod's volumes. A volume that is not
 // ours, or that cannot be accounted for, adds nothing; only a lookup error
 // whose answer is unknown is returned.
 func (r *resolver) footprint(ctx context.Context, pod *corev1.Pod) (int64, error) {
+	defer r.logUnresolved()
 	var sum int64
 	seen := map[string]bool{}
 	for _, v := range pod.Spec.Volumes {
@@ -50,9 +58,13 @@ func (r *resolver) footprint(ctx context.Context, pod *corev1.Pod) (int64, error
 				continue // one claim, one cache, however many mounts
 			}
 			seen[name] = true
-			n, err = r.fromClaim(ctx, name)
+			if err = r.countLookup(); err == nil {
+				n, err = r.fromClaim(ctx, name)
+			}
 		case v.Ephemeral != nil && v.Ephemeral.VolumeClaimTemplate != nil:
-			n, err = r.fromTemplate(ctx, pod, v)
+			if err = r.countLookup(); err == nil {
+				n, err = r.fromTemplate(ctx, pod, v)
+			}
 		}
 		if err != nil {
 			return 0, err
@@ -62,18 +74,42 @@ func (r *resolver) footprint(ctx context.Context, pod *corev1.Pod) (int64, error
 	return sum, nil
 }
 
+// countLookup admits one more distinct claim, or fails the pod when it has
+// more than maxClaimLookups, counting it unresolved once.
+func (r *resolver) countLookup() error {
+	r.lookups++
+	if r.lookups > maxClaimLookups {
+		if r.lookups == maxClaimLookups+1 {
+			r.m.unresolvedCount()
+		}
+		return errTooManyClaims
+	}
+	return nil
+}
+
 // unresolved records a volume the webhook could not account for, and gives it
-// no footprint.
-func (r *resolver) unresolved(what string) (int64, error) {
-	r.m.Metrics.Unresolved()
-	r.m.log().Info("a volume could not be accounted for, so the pod is admitted without it", "namespace", r.ns, "reason", what)
+// no footprint. The log line is written once per pod, by logUnresolved.
+func (r *resolver) unresolved(claim string) (int64, error) {
+	r.m.unresolvedCount()
+	if len(r.missing) < maxLoggedClaims {
+		r.missing = append(r.missing, claim)
+	} else {
+		r.more++
+	}
 	return 0, nil
+}
+
+func (r *resolver) logUnresolved() {
+	if len(r.missing) > 0 {
+		r.m.log().Info("some volumes could not be accounted for, so the pod is admitted without them",
+			"namespace", r.ns, "claims", r.missing, "more", r.more)
+	}
 }
 
 func (r *resolver) fromClaim(ctx context.Context, name string) (int64, error) {
 	pvc, err := r.m.Claims.GetPVC(ctx, r.ns, name)
 	if errors.Is(err, kube.ErrNotFound) {
-		return r.unresolved("the claim does not exist")
+		return r.unresolved(name + " (the claim does not exist)")
 	}
 	if err != nil {
 		return 0, err
@@ -82,7 +118,15 @@ func (r *resolver) fromClaim(ctx context.Context, name string) (int64, error) {
 		return 0, nil
 	}
 	if pvc.VolumeName != "" && pvc.Phase == "Bound" {
-		return r.fromPV(ctx, pvc.VolumeName)
+		n, _, err := r.fromPV(ctx, name, pvc.VolumeName, true)
+		return n, err
+	}
+	if pvc.VolumeName != "" {
+		// Pre-bound (volumeName set, the binder not yet done): the PV decides
+		// when it exists, the class when it does not.
+		if n, found, err := r.fromPV(ctx, name, pvc.VolumeName, false); err != nil || found {
+			return n, err
+		}
 	}
 	return r.fromClass(ctx, pvc.StorageClassName, pvc.StorageClassSet, pvc.RequestBytes, r.ns, name)
 }
@@ -110,31 +154,40 @@ func (r *resolver) fromTemplate(ctx context.Context, pod *corev1.Pod, v corev1.V
 	if base != "" {
 		claim = base + "-" + v.Name
 	}
-	return r.fromClass(ctx, class, spec.StorageClassName != nil, spec.Resources.Requests.Storage().Value(), r.ns, claim)
+	request, err := kube.QuantityBytes(*spec.Resources.Requests.Storage())
+	if err != nil {
+		return r.unresolved(claim + " (the template's request is not usable)")
+	}
+	return r.fromClass(ctx, class, spec.StorageClassName != nil, request, r.ns, claim)
 }
 
 // fromPV is the footprint of a bound volume: the PV's own context and its
-// served capacity.
-func (r *resolver) fromPV(ctx context.Context, name string) (int64, error) {
+// served capacity. found is false when the PV does not exist; the caller says
+// whether that counts as unresolved.
+func (r *resolver) fromPV(ctx context.Context, claim, name string, countMissing bool) (n int64, found bool, err error) {
 	pv, err := r.m.Claims.GetPV(ctx, name)
 	if errors.Is(err, kube.ErrNotFound) {
-		return r.unresolved("the bound volume does not exist")
+		if countMissing {
+			_, _ = r.unresolved(claim + " (the bound volume does not exist)")
+		}
+		return 0, false, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if pv.Driver != csi.DriverName {
-		return 0, nil
+		return 0, true, nil
 	}
 	c, err := volume.DecodeContext(pv.VolumeAttributes)
 	if err != nil {
-		return r.unresolved("the volume's context is not usable")
+		n, _ = r.unresolved(claim + " (the volume's context is not usable)")
+		return n, true, nil
 	}
 	if c.Kind != volume.KindVolume {
-		return 0, nil
+		return 0, true, nil
 	}
 	// The same rule the node's stage check uses for a volume that was grown.
-	return volume.ServedFootprint(*c.Volume, pv.CapacityBytes), nil
+	return volume.ServedFootprint(*c.Volume, pv.CapacityBytes), true, nil
 }
 
 // fromClass is the footprint of a claim with no volume yet: the class's
@@ -146,7 +199,7 @@ func (r *resolver) fromClass(ctx context.Context, name string, set bool, request
 	}
 	class, err := r.class(ctx, name)
 	if errors.Is(err, kube.ErrNotFound) {
-		return r.unresolved("the class does not exist")
+		return r.unresolved(claimName + " (the class does not exist)")
 	}
 	if err != nil {
 		return 0, err
@@ -165,13 +218,13 @@ func (r *resolver) fromClass(ctx context.Context, name string, set bool, request
 	p["csi.storage.k8s.io/pvc/namespace"] = claimNS
 	c, err := volume.NewContext(p)
 	if err != nil {
-		return r.unresolved("the class's parameters are not usable")
+		return r.unresolved(claimName + " (the class's parameters are not usable)")
 	}
 	if c.Kind != volume.KindVolume {
 		return 0, nil
 	}
 	if c, err = c.WithSize(request); err != nil {
-		return r.unresolved("the claim's request is not usable")
+		return r.unresolved(claimName + " (the claim's request is not usable)")
 	}
 	return volume.CacheFootprint(*c.Volume), nil
 }

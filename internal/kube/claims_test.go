@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -237,4 +238,20 @@ func TestClaimsPVCapacity(t *testing.T) {
 
 func toUnstructured(o map[string]any) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: o}
+}
+
+func TestQuantityBytes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"10Gi", 10 << 30, false}, {"1500m", 2, false}, {"100Ei", math.MaxInt64, false}, {"-1", 0, true},
+	} {
+		got, err := QuantityBytes(resource.MustParse(tc.in))
+		if (err != nil) != tc.wantErr || (err == nil && got != tc.want) {
+			t.Errorf("QuantityBytes(%s) = %d, %v", tc.in, got, err)
+		}
+	}
 }

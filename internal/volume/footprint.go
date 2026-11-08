@@ -78,18 +78,31 @@ func AddFootprint(a, b int64) int64 {
 // context is immutable and says the size the volume was created with, so a
 // grown volume is served at more; and a class that caches the whole volume
 // (CacheSize >= Size) keeps doing so when it grows, so its cache bound rises
-// with the size. A class with a partial cache keeps its bound. It is the one
-// place that rule is spelled: the node's stage and commitment accounting and
-// the webhook both call it, so they cannot disagree about an expanded volume.
+// with the size. A class with a partial cache keeps its bound. The
+// rule's condition is CachesWholeVolume, which the node's size raising uses
+// too, so the node and the webhook cannot disagree about an expanded volume.
 // served <= 0 means no larger size is known.
 func ServedFootprint(v VolumeParams, served int64) int64 {
+	return CacheFootprint(ServedParams(v, served))
+}
+
+// ServedParams is v at the size it is served (see ServedFootprint): Size
+// raised to served rounded up to whole chunks, never lowered, and CacheSize
+// raised with it when the class caches the whole volume. The node's size
+// raising and ServedFootprint both call it.
+func ServedParams(v VolumeParams, served int64) VolumeParams {
 	if v.ChunkSize > 0 && served > math.MaxInt64-v.ChunkSize {
 		served = math.MaxInt64 / v.ChunkSize * v.ChunkSize // RoundUp would overflow
 	}
 	size := max(v.Size, chunk.RoundUp(served, v.ChunkSize))
-	if size > v.Size && v.CacheSize >= v.Size {
+	if size > v.Size && CachesWholeVolume(v.Size, v.CacheSize) {
 		v.CacheSize = size
 	}
 	v.Size = size
-	return CacheFootprint(v)
+	return v
 }
+
+// CachesWholeVolume reports whether a class's cache bound covers its whole
+// volume, in which case the bound rises with the size when the volume grows.
+// The node's size raising, its footprint accounting and the webhook all ask it.
+func CachesWholeVolume(size, cacheSize int64) bool { return cacheSize >= size }

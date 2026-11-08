@@ -190,8 +190,16 @@ func nestedQuantity(obj map[string]any, fields ...string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%v is not a quantity: %w", fields, err)
 	}
+	return QuantityBytes(q)
+}
+
+// QuantityBytes is q as whole bytes, rounded up. A quantity beyond int64 is
+// MaxInt64, which no caller can satisfy, rather than an overflowed small
+// number; a negative one is an error. The claim reads and the webhook's
+// ephemeral templates share it.
+func QuantityBytes(q resource.Quantity) (int64, error) {
 	if q.Sign() < 0 {
-		return 0, fmt.Errorf("%v is negative", fields)
+		return 0, errors.New("a quantity is negative")
 	}
 	if q.Cmp(*resource.NewQuantity(math.MaxInt64, resource.BinarySI)) >= 0 {
 		return math.MaxInt64, nil
