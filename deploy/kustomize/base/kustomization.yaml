@@ -76,6 +76,8 @@ resources:
   - clusterrolebinding-node.yaml
   - role-node.yaml
   - rolebinding-node.yaml
+  - service-webhook.yaml
+  - mutatingwebhookconfiguration-cache.yaml
   - deployment-controller.yaml
   - daemonset-node.yaml
 configMapGenerator:

@@ -14,6 +14,11 @@
 # VolumeAttributesClass: the deployment turns off the two features that read
 # them (--handle-volume-inuse-error, the VolumeAttributesClass gate), so the
 # sidecar needs neither.
+# The cache webhook (controller process): it reads PVCs, PVs and StorageClasses
+# with rules above, so it adds no read. The one new rule lets it keep the CA in
+# its own MutatingWebhookConfiguration, by name: get and patch, no list, watch,
+# create or delete. Secrets are never granted here (a ClusterRole would reach
+# every namespace); see role-controller.yaml.
 # All three sidecars' leader election needs Leases only in the driver's own
 # namespace; that grant is the Role in role-controller.yaml, not a cluster-wide
 # one.
@@ -49,3 +54,7 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [list, watch, create, update, patch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [mutatingwebhookconfigurations]
+    resourceNames: [miami-cache]
+    verbs: [get, patch]
