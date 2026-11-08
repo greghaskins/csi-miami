@@ -56,6 +56,24 @@ func TestCacheCertManagerComponent(t *testing.T) {
 		e.revertCertManager(t)
 	}
 	t.Cleanup(restore)
+	// On a failure, say what cert-manager saw, before the cleanup removes it.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for _, args := range [][]string{
+			{"-n", "cert-manager", "logs", "deploy/cert-manager-cainjector", "--tail=60"},
+			{"-n", "cert-manager", "logs", "deploy/cert-manager", "--tail=40"},
+			{"-n", e.DriverNS, "get", "certificate,issuer", "-o", "wide"},
+			{"-n", e.DriverNS, "describe", "certificate", "miami-webhook"},
+			{"get", "mutatingwebhookconfiguration", "miami-cache", "-o", "jsonpath={.metadata.annotations}"},
+		} {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			out, err := run(ctx, "kubectl", args...)
+			cancel()
+			t.Logf("kubectl %s (%v):\n%s", strings.Join(args, " "), err, tail(out, 6000))
+		}
+	})
 
 	// Install cert-manager and wait for its deployments.
 	e.kubectl(t, 5*time.Minute, "apply", "-f", certManagerManifest)
