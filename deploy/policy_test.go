@@ -1189,6 +1189,12 @@ func TestNodeRBACExact(t *testing.T) {
 	if n := r.names("MutatingAdmissionPolicy"); len(n) != 0 {
 		t.Errorf("the base ships MutatingAdmissionPolicy %v; remediation was dropped", n)
 	}
+	if n := r.names("MutatingWebhookConfiguration"); !reflect.DeepEqual(n, []string{"miami-cache"}) {
+		t.Errorf("the base ships MutatingWebhookConfiguration %v, want only miami-cache", n)
+	}
+	if n := r.names("ValidatingWebhookConfiguration"); len(n) != 0 {
+		t.Errorf("the base ships ValidatingWebhookConfiguration %v", n)
+	}
 	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
 		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
 			t.Errorf("the base ships %s %v, want only miami-node-capacity", kind, n)
@@ -1886,6 +1892,13 @@ func TestCertManagerComponent(t *testing.T) {
 	if want := map[string]string{"cert-manager.io/inject-ca-from": "miami-system/miami-webhook"}; !reflect.DeepEqual(cfg.Annotations, want) {
 		t.Errorf("annotations = %v, want %v", cfg.Annotations, want)
 	}
+	// Everything else of the Deployment is the base's: only the one arg differs.
+	wantDep := controller(t, base(t))
+	wantDep.Spec.Template.Spec.Containers[0].Args = append(wantDep.Spec.Template.Spec.Containers[0].Args, "--webhook-tls-secret=miami-webhook-tls-managed")
+	if got := controller(t, r); !reflect.DeepEqual(got, wantDep) {
+		t.Errorf("the component changed the Deployment beyond one arg:\n got %+v\nwant %+v", got.Spec, wantDep.Spec)
+	}
+
 	var cert struct {
 		APIVersion string         `json:"apiVersion"`
 		Kind       string         `json:"kind"`
@@ -1903,8 +1916,50 @@ func TestCertManagerComponent(t *testing.T) {
 	if cert.Spec.SecretName != "miami-webhook-tls-managed" {
 		t.Errorf("secretName = %q", cert.Spec.SecretName)
 	}
-	if cert.Spec.IssuerRef.Kind != "Issuer" || len(r.names("Issuer")) != 1 || r.names("Issuer")[0] != cert.Spec.IssuerRef.Name {
-		t.Errorf("issuerRef = %+v, want the component's own Issuer %v", cert.Spec.IssuerRef, r.names("Issuer"))
+	// The chain: selfSigned Issuer -> CA Certificate -> CA Issuer -> serving.
+	if cert.Spec.IssuerRef.Kind != "Issuer" || cert.Spec.IssuerRef.Name != "miami-webhook-ca" {
+		t.Errorf("serving issuerRef = %+v, want the CA Issuer miami-webhook-ca", cert.Spec.IssuerRef)
+	}
+	if n := r.names("Issuer"); !reflect.DeepEqual(n, []string{"miami-webhook-ca", "miami-webhook-selfsigned"}) {
+		t.Errorf("Issuers = %v", n)
+	}
+	var caIssuerFull, rootIssuerFull struct {
+		APIVersion string         `json:"apiVersion"`
+		Kind       string         `json:"kind"`
+		Metadata   map[string]any `json:"metadata"`
+		Spec       map[string]any `json:"spec"`
+	}
+	r.get(t, "Issuer", "miami-webhook-ca", &caIssuerFull)
+	r.get(t, "Issuer", "miami-webhook-selfsigned", &rootIssuerFull)
+	if !reflect.DeepEqual(caIssuerFull.Spec, map[string]any{"ca": map[string]any{"secretName": "miami-webhook-ca"}}) {
+		t.Errorf("CA issuer spec = %v", caIssuerFull.Spec)
+	}
+	if !reflect.DeepEqual(rootIssuerFull.Spec, map[string]any{"selfSigned": map[string]any{}}) {
+		t.Errorf("root issuer spec = %v", rootIssuerFull.Spec)
+	}
+	var caCert struct {
+		APIVersion string         `json:"apiVersion"`
+		Kind       string         `json:"kind"`
+		Metadata   map[string]any `json:"metadata"`
+		Spec       struct {
+			IsCA       bool           `json:"isCA"`
+			SecretName string         `json:"secretName"`
+			Duration   string         `json:"duration"`
+			CommonName string         `json:"commonName"`
+			PrivateKey map[string]any `json:"privateKey"`
+			IssuerRef  struct {
+				Kind string `json:"kind"`
+				Name string `json:"name"`
+			} `json:"issuerRef"`
+		} `json:"spec"`
+	}
+	r.get(t, "Certificate", "miami-webhook-ca", &caCert)
+	if !caCert.Spec.IsCA || caCert.Spec.SecretName != "miami-webhook-ca" || caCert.Spec.IssuerRef.Name != "miami-webhook-selfsigned" ||
+		caCert.Spec.IssuerRef.Kind != "Issuer" || caCert.Spec.Duration != "87600h" {
+		t.Errorf("CA certificate = %+v", caCert.Spec)
+	}
+	if n := r.names("Certificate"); !reflect.DeepEqual(n, []string{"miami-webhook", "miami-webhook-ca"}) {
+		t.Errorf("Certificates = %v", n)
 	}
 	wantNames := []string{"miami-webhook.miami-system.svc", "miami-webhook.miami-system.svc.cluster.local"}
 	if !reflect.DeepEqual(cert.Spec.DNSNames, wantNames) {
@@ -1914,5 +1969,113 @@ func TestCertManagerComponent(t *testing.T) {
 	// The base alone carries no cert-manager object.
 	if n := base(t).names("Certificate"); len(n) != 0 {
 		t.Errorf("the base ships Certificates %v", n)
+	}
+}
+
+// renderComponentOver renders the component over a base that an intermediate
+// kustomization has first patched with the given JSON patch on the target.
+func renderComponentOver(t *testing.T, kind, name, patch string) error {
+	t.Helper()
+	abs, err := filepath.Abs("kustomize")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	mid, top := filepath.Join(root, "mid"), filepath.Join(root, "top")
+	for _, d := range []string{mid, top} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rel := func(from, p string) string {
+		out, err := filepath.Rel(from, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	midK := "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - " + rel(mid, filepath.Join(abs, "base")) +
+		"\npatches:\n  - target: {kind: " + kind + ", name: " + name + "}\n    patch: |-\n" + patch
+	topK := "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../mid\ncomponents:\n  - " +
+		rel(top, filepath.Join(abs, "components", "cert-manager")) + "\n"
+	if err := os.WriteFile(filepath.Join(mid, "kustomization.yaml"), []byte(midK), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(top, "kustomization.yaml"), []byte(topK), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	k := krusty.MakeKustomizer(krusty.MakeDefaultOptions())
+	kustomizeMu.Lock()
+	defer kustomizeMu.Unlock()
+	_, err = k.Run(filesys.MakeFsOnDisk(), top)
+	return err
+}
+
+// TestCertManagerComponentRefusesMovedRules: the component removes rules by
+// index, so a base that moved or added a rule must fail to build, never remove
+// the wrong rule (a Secret create left in managed mode, say).
+func TestCertManagerComponentRefusesMovedRules(t *testing.T) {
+	t.Parallel()
+	ins := "      - op: add\n        path: /rules/0\n        value: {apiGroups: [''], resources: [configmaps], verbs: [get]}\n"
+	app := "      - op: add\n        path: /rules/-\n        value: {apiGroups: [''], resources: [configmaps], verbs: [get]}\n"
+	tests := []struct {
+		name, kind, patch string
+		wantErr           bool
+	}{
+		{"control: an unrelated overlay patch builds", "Deployment", "      - op: add\n        path: /metadata/labels\n        value: {x: y}\n", false},
+		{"ClusterRole rule inserted first", "ClusterRole", ins, true},
+		{"ClusterRole rule appended (removes nothing else)", "ClusterRole", app, false},
+		{"Role rule inserted first", "Role", ins, true},
+		{"Role rule appended (removes nothing else)", "Role", app, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			name := "miami-controller"
+			err := renderComponentOver(t, tc.kind, name, tc.patch)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestControllerRBACExact: the controller's ClusterRole and Role are exactly
+// these rules, in this order. Any widening, by verb, resource, name or rule,
+// fails. The webhook's reads (PVCs, PVs, StorageClasses) are covered by rules
+// that were already there; its only additions are the named configuration
+// rule, the two named Secret verbs and the one namespace-wide Secret create.
+func TestControllerRBACExact(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	pr := func(group, res string, names []string, verbs ...string) rbacv1.PolicyRule {
+		return rbacv1.PolicyRule{APIGroups: []string{group}, Resources: []string{res}, ResourceNames: names, Verbs: verbs}
+	}
+	wantCluster := []rbacv1.PolicyRule{
+		pr("", "persistentvolumes", nil, "get", "list", "watch", "create", "patch", "delete"),
+		pr("", "persistentvolumeclaims", nil, "get", "list", "watch", "update"),
+		pr("", "persistentvolumeclaims/status", nil, "patch"),
+		pr("storage.k8s.io", "storageclasses", nil, "get", "list", "watch"),
+		pr("storage.k8s.io", "volumeattachments", nil, "get", "list", "watch", "patch"),
+		pr("storage.k8s.io", "volumeattachments/status", nil, "patch"),
+		pr("", "nodes", nil, "get", "list", "watch"),
+		pr("storage.k8s.io", "csinodes", nil, "get", "list", "watch"),
+		pr("", "events", nil, "list", "watch", "create", "update", "patch"),
+		pr("admissionregistration.k8s.io", "mutatingwebhookconfigurations", []string{"miami-cache"}, "get", "patch"),
+	}
+	wantRole := []rbacv1.PolicyRule{
+		pr("coordination.k8s.io", "leases", nil, "get", "create", "update", "delete"),
+		pr("", "secrets", []string{"miami-webhook-tls"}, "get", "update"),
+		pr("", "secrets", nil, "create"),
+	}
+	var cr rbacv1.ClusterRole
+	r.get(t, "ClusterRole", "miami-controller", &cr)
+	if !reflect.DeepEqual(cr.Rules, wantCluster) {
+		t.Errorf("controller ClusterRole = %+v\nwant %+v", cr.Rules, wantCluster)
+	}
+	var role rbacv1.Role
+	r.get(t, "Role", "miami-controller", &role)
+	if !reflect.DeepEqual(role.Rules, wantRole) {
+		t.Errorf("controller Role = %+v\nwant %+v", role.Rules, wantRole)
 	}
 }

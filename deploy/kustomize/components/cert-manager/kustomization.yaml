@@ -12,8 +12,18 @@
 #   right are removed; a get on that one Secret stays;
 # - cert-manager's cainjector writes the CA into the configuration (annotation).
 #
-# The Issuer in certificate.yaml is self-signed; point the Certificate's
-# issuerRef at your own issuer to change that.
+# certificate.yaml is cert-manager's usual bootstrap chain: a self-signed
+# Issuer signs a long-lived CA Certificate, a CA Issuer built on it signs the
+# serving Certificate, and the CA stays the same when the serving certificate
+# renews. To use your own issuer, point the serving Certificate's issuerRef at
+# it and drop the rest of the chain from certificate.yaml.
+#
+# caBundle is written by cert-manager's cainjector in this mode; a GitOps tool
+# must ignore differences on it just as in the self-signed mode (README).
+#
+# The RBAC patches address rules by index, so each is guarded by `test` ops:
+# a base (or an overlay below this component) that moved the rule makes the
+# build fail instead of removing another rule.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 resources:
@@ -33,11 +43,32 @@ patches:
   # The configuration rule is the last one of the ClusterRole.
   - target: {kind: ClusterRole, name: miami-controller}
     patch: |-
+      - op: test
+        path: /rules/9/resources
+        value: [mutatingwebhookconfigurations]
+      - op: test
+        path: /rules/9/resourceNames
+        value: [miami-cache]
       - op: remove
         path: /rules/9
   # Rules 1 and 2 of the Role are the Secret rules of the base.
   - target: {kind: Role, name: miami-controller}
     patch: |-
+      - op: test
+        path: /rules/1/resources
+        value: [secrets]
+      - op: test
+        path: /rules/1/resourceNames
+        value: [miami-webhook-tls]
+      - op: test
+        path: /rules/1/verbs
+        value: [get, update]
+      - op: test
+        path: /rules/2/resources
+        value: [secrets]
+      - op: test
+        path: /rules/2/verbs
+        value: [create]
       - op: replace
         path: /rules/1
         value:

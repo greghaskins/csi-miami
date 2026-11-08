@@ -226,8 +226,12 @@ that field's drift (Argo CD: an `ignoreDifferences` entry for
 wipe that lasts is visible, since with `Ignore` a missing bundle means every
 pod skips accounting silently. `-webhook-tls-secret` points at a Secret someone
 else manages (a cert-manager `Certificate` in an overlay, with the CA injector
-annotation on the webhook configuration instead of the controller's patch, and
-no drift to ignore); the owner's cluster has cert-manager and would use it.
+annotation on the webhook configuration instead of the controller's patch);
+the owner's cluster has cert-manager and would use it. The `caBundle` ignore
+rule is needed in both modes: the cainjector writes the live field just as the
+controller does, Argo CD's default diff does not ignore it, so self-heal would
+flap it between empty and filled; and in managed mode `miami_webhook_config_ok`
+is absent by design, so the flap would be invisible.
 
 **Failure policy.** `Ignore`, with the stage check as the net. With `Fail`,
 the controller being down (an upgrade, a crash loop, a node drain) stops every
