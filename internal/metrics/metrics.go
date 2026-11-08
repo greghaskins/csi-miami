@@ -70,6 +70,11 @@ const (
 	NameWebhookMutations  = "miami_webhook_mutations_total"
 	NameWebhookUnresolved = "miami_webhook_unresolved_total"
 
+	// NameWebhookConfigOK is 1 while the MutatingWebhookConfiguration carries
+	// the controller's CA in every webhook's caBundle, 0 otherwise. Without it
+	// (failurePolicy Ignore) a wiped bundle skips accounting silently.
+	NameWebhookConfigOK = "miami_webhook_config_ok"
+
 	// NameCachePatchFailures counts failed patches of the node's advertised
 	// capacity, by reason: denied (a 403 or 422: RBAC or the admission policy
 	// refused) or error (anything else).
@@ -145,6 +150,7 @@ type Registry struct {
 
 	webhookMutations  *prometheus.CounterVec
 	webhookUnresolved prometheus.Counter
+	webhookConfigOK   prometheus.Gauge
 
 	cachePatchFailures *prometheus.CounterVec
 	cacheFenceState    *prometheus.GaugeVec
@@ -159,7 +165,7 @@ var (
 // Option configures New.
 type Option func(*options)
 
-type options struct{ reconciler, cacheCapacity, webhook bool }
+type options struct{ reconciler, cacheCapacity, webhook, webhookConfig bool }
 
 // WithReconciler registers the reconciler's family (the intents, transports,
 // reconcile duration and error, timeout, garbage and load-failure metrics).
@@ -178,6 +184,12 @@ func WithCacheCapacity() Option { return func(o *options) { o.cacheCapacity = tr
 // outcome and the volumes it could not resolve. Only the controller runs the
 // webhook; Outcome and Unresolved work either way.
 func WithWebhook() Option { return func(o *options) { o.webhook = true } }
+
+// WithWebhookConfig registers miami_webhook_config_ok. Only a controller that
+// asserts the configuration's caBundle itself carries it; with a Secret and a
+// bundle managed by someone else the controller cannot say, and a gauge stuck
+// at 0 would be a false alarm.
+func WithWebhookConfig() Option { return func(o *options) { o.webhookConfig = true } }
 
 // New returns a Registry with the CSI request metrics, the Go collector and
 // the process collector registered on its own prometheus.Registry (the global
@@ -272,6 +284,7 @@ func New(opts ...Option) *Registry {
 	r.webhookUnresolved = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: NameWebhookUnresolved, Help: "Pod volumes the admission webhook could not account for (a claim that does not exist yet, or one it could not make sense of).",
 	})
+	r.webhookConfigOK = gauge(NameWebhookConfigOK, "Whether the webhook configuration carries this controller's CA in the caBundle of every webhook: 1 it does, 0 it does not (or could not be read). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	for _, o := range WebhookOutcomes {
 		r.webhookMutations.WithLabelValues(o)
 	}
@@ -312,7 +325,19 @@ func New(opts ...Option) *Registry {
 	if o.webhook {
 		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved)
 	}
+	if o.webhookConfig {
+		r.reg.MustRegister(r.webhookConfigOK)
+	}
 	return r
+}
+
+// SetWebhookConfigOK sets miami_webhook_config_ok.
+func (r *Registry) SetWebhookConfigOK(ok bool) {
+	v := 0.0
+	if ok {
+		v = 1
+	}
+	r.webhookConfigOK.Set(v)
 }
 
 // Outcome counts one pod the webhook handled (see webhook.Metrics). A value

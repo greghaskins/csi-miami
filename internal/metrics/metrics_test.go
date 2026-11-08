@@ -760,3 +760,24 @@ func TestCacheFenceState(t *testing.T) {
 		t.Error("exposed without WithCacheCapacity")
 	}
 }
+
+func TestWebhookConfigOKGauge(t *testing.T) {
+	t.Parallel()
+	off := New(WithWebhook())
+	off.SetWebhookConfigOK(true)
+	if family(t, off, NameWebhookConfigOK) != nil {
+		t.Errorf("%s exposed without WithWebhookConfig", NameWebhookConfigOK)
+	}
+	on := New(WithWebhook(), WithWebhookConfig())
+	if got := family(t, on, NameWebhookConfigOK).GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Errorf("initial = %v, want 0", got)
+	}
+	on.SetWebhookConfigOK(true)
+	if got := family(t, on, NameWebhookConfigOK).GetMetric()[0].GetGauge().GetValue(); got != 1 {
+		t.Errorf("after true = %v, want 1", got)
+	}
+	on.SetWebhookConfigOK(false)
+	if got := family(t, on, NameWebhookConfigOK).GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Errorf("after false = %v, want 0", got)
+	}
+}
