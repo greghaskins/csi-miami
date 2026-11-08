@@ -42,6 +42,7 @@ type PV struct {
 	VolumeAttributes map[string]string // spec.csi.volumeAttributes
 	ReclaimPolicy    string            // spec.persistentVolumeReclaimPolicy: Delete, Retain or Recycle
 	Annotations      map[string]string // metadata.annotations
+	CapacityBytes    int64             // spec.capacity.storage in bytes; 0 when the PV states none
 }
 
 // AnnotationForceDetach is the PV annotation of the emergency detach
@@ -65,6 +66,7 @@ var pvResource = schema.GroupVersionResource{Version: "v1", Resource: "persisten
 type Client struct {
 	pvs      dynamic.NamespaceableResourceInterface
 	nodes    dynamic.NamespaceableResourceInterface
+	dyn      dynamic.Interface // for the claim reads (claims.go)
 	deadline time.Duration
 }
 
@@ -121,7 +123,7 @@ func NewClient(cfg *rest.Config, deadline time.Duration) (*Client, error) {
 	if deadline <= 0 {
 		deadline = DefaultDeadline
 	}
-	return &Client{pvs: dyn.Resource(pvResource), nodes: dyn.Resource(nodeResource), deadline: deadline}, nil
+	return &Client{pvs: dyn.Resource(pvResource), nodes: dyn.Resource(nodeResource), dyn: dyn, deadline: deadline}, nil
 }
 
 // GetPV implements PVReader with one GET under the client's deadline.
@@ -236,6 +238,9 @@ func decodePV(obj *unstructured.Unstructured) (*PV, error) {
 		return nil, fmt.Errorf("kube: PV %q: %w", pv.Name, err)
 	}
 	if pv.VolumeAttributes, _, err = unstructured.NestedStringMap(obj.Object, "spec", "csi", "volumeAttributes"); err != nil {
+		return nil, fmt.Errorf("kube: PV %q: %w", pv.Name, err)
+	}
+	if pv.CapacityBytes, err = nestedQuantity(obj.Object, "spec", "capacity", "storage"); err != nil {
 		return nil, fmt.Errorf("kube: PV %q: %w", pv.Name, err)
 	}
 	return pv, nil

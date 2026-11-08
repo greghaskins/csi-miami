@@ -66,7 +66,14 @@ const (
 	NameCacheCommitted = "miami_cache_committed_bytes"
 	NameCacheFSSize    = "miami_cache_fs_size_bytes"
 	NameCacheFSFree    = "miami_cache_fs_free_bytes"
+
+	NameWebhookMutations  = "miami_webhook_mutations_total"
+	NameWebhookUnresolved = "miami_webhook_unresolved_total"
 )
+
+// WebhookOutcomes are the values of the outcome label of
+// miami_webhook_mutations_total: a fixed list, so the label cannot grow.
+var WebhookOutcomes = []string{"mutated", "unchanged", "stripped", "error"}
 
 // NodeFamilies are the families a node plugin serves: its reconciler's and the
 // two CSI request metrics.
@@ -124,6 +131,9 @@ type Registry struct {
 	fetches       *fetchCollector
 
 	cacheBudget, cacheCommitted, cacheFSSize, cacheFSFree prometheus.Gauge
+
+	webhookMutations  *prometheus.CounterVec
+	webhookUnresolved prometheus.Counter
 }
 
 var (
@@ -135,7 +145,7 @@ var (
 // Option configures New.
 type Option func(*options)
 
-type options struct{ reconciler, cacheCapacity bool }
+type options struct{ reconciler, cacheCapacity, webhook bool }
 
 // WithReconciler registers the reconciler's family (the intents, transports,
 // reconcile duration and error, timeout, garbage and load-failure metrics).
@@ -149,6 +159,11 @@ func WithReconciler() Option { return func(o *options) { o.reconciler = true } }
 // committed, and the cache filesystem's size and free space). Only a node with
 // cache accounting on carries them; SetCacheCapacity works either way.
 func WithCacheCapacity() Option { return func(o *options) { o.cacheCapacity = true } }
+
+// WithWebhook registers the admission webhook's counters: the mutations by
+// outcome and the volumes it could not resolve. Only the controller runs the
+// webhook; Outcome and Unresolved work either way.
+func WithWebhook() Option { return func(o *options) { o.webhook = true } }
 
 // New returns a Registry with the CSI request metrics, the Go collector and
 // the process collector registered on its own prometheus.Registry (the global
@@ -227,6 +242,16 @@ func New(opts ...Option) *Registry {
 	r.cacheFSSize = gauge(NameCacheFSSize, "Size in bytes of the filesystem the volume caches live on.")
 	r.cacheFSFree = gauge(NameCacheFSFree, "Bytes available on the filesystem the volume caches live on.")
 
+	r.webhookMutations = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: NameWebhookMutations, Help: "Pods the admission webhook handled, by outcome: mutated (a cache request set), stripped (a stray request removed), unchanged or error (allowed unchanged because of a lookup failure).",
+	}, []string{"outcome"})
+	r.webhookUnresolved = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: NameWebhookUnresolved, Help: "Pod volumes the admission webhook could not account for (a claim that does not exist yet, or one it could not make sense of).",
+	})
+	for _, o := range WebhookOutcomes {
+		r.webhookMutations.WithLabelValues(o)
+	}
+
 	// The steps the reconciler reports are a fixed list (reconcile.Metrics), so
 	// their counters exist at zero from the start: a series that appears only
 	// at the first failure cannot be rated or alerted on before it.
@@ -260,8 +285,22 @@ func New(opts ...Option) *Registry {
 	if o.cacheCapacity {
 		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree)
 	}
+	if o.webhook {
+		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved)
+	}
 	return r
 }
+
+// Outcome counts one pod the webhook handled (see webhook.Metrics). A value
+// outside WebhookOutcomes is dropped, so the label is a fixed list.
+func (r *Registry) Outcome(outcome string) {
+	if slices.Contains(WebhookOutcomes, outcome) {
+		r.webhookMutations.WithLabelValues(outcome).Inc()
+	}
+}
+
+// Unresolved counts one pod volume the webhook could not account for.
+func (r *Registry) Unresolved() { r.webhookUnresolved.Inc() }
 
 // SetCacheCapacity sets the cache budget gauges (see cachecap.CapacityMetrics).
 func (r *Registry) SetCacheCapacity(budget, committed, fsSize, fsFree int64) {

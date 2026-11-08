@@ -131,7 +131,7 @@ func TestGetPV(t *testing.T) {
 	want := &PV{
 		Name: "pvc-1", Driver: "d.example.com", VolumeHandle: "directory:pvc-1", ReclaimPolicy: "Delete",
 		VolumeAttributes: map[string]string{"miami/kind": "directory", "x": "y"},
-		Annotations:      map[string]string{"a": "b"},
+		Annotations:      map[string]string{"a": "b"}, CapacityBytes: 1 << 30,
 	}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Errorf("GetPV(pvc-1) = %+v, %v; want %+v", got, err, want)
