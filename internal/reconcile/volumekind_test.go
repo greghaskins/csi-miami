@@ -101,6 +101,28 @@ func TestConditionOfCacheBudgetExceeded(t *testing.T) {
 	}
 }
 
+// A refused stage is one event, with its own reason and not MountFailed, however
+// many passes retry it.
+func TestCacheBudgetRefusalRaisesOneEventOfItsOwnReason(t *testing.T) {
+	t.Parallel()
+	ci := &countItem{failConv: fmt.Errorf("volume item x: %w", ErrCacheBudgetExceeded)}
+	e := newEnv(t, func(o *Options) { o.Items = []item.Item{ci} })
+	e.start()
+	in := e.vol("a", pvc1)
+	if err := e.r.Stage(bg, in); !errors.Is(err, ErrCacheBudgetExceeded) {
+		t.Fatalf("Stage = %v", err)
+	}
+	e.pass()
+	e.pass()
+	evs := e.events.all()
+	if len(evs) != 1 || evs[0].Reason != ReasonCacheBudgetExceeded {
+		t.Fatalf("events = %+v, want one %s", evs, ReasonCacheBudgetExceeded)
+	}
+	if len(e.events.reasons(ReasonMountFailed)) != 0 {
+		t.Error("a MountFailed event was raised for a budget refusal")
+	}
+}
+
 func TestVolumeConditionsAreRegisteredAndClassified(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -136,6 +158,7 @@ type countItem struct {
 	converge int
 	teardown int
 	failTear error
+	failConv error
 	src      string // the publish source, when a test publishes
 }
 
@@ -153,7 +176,7 @@ func (c *countItem) Converge(context.Context, intent.Intent, item.Observed) erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.converge++
-	return nil
+	return c.failConv
 }
 func (c *countItem) Teardown(context.Context, intent.Intent, item.Observed) error {
 	c.mu.Lock()

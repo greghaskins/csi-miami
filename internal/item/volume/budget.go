@@ -167,7 +167,6 @@ func (it *Item) checkBudget(ctx context.Context, v vol) error {
 	if kinds.AddFootprint(committed, need) <= budget {
 		return nil
 	}
-	it.event(v.in.VolumeID, ReasonCacheBudgetExceeded)
 	return fmt.Errorf("volume item %s: %w: the node's cache budget is %s, %s is committed to %d volumes, and this volume needs %s",
 		v.in.VolumeID, item.ErrCacheBudgetExceeded, bytesString(budget), bytesString(committed), volumes, bytesString(need))
 }

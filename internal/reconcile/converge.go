@@ -648,6 +648,8 @@ func (res *volumeResult) problem() (string, error) {
 			reason = ReasonTransportUnavailable
 		case errors.Is(res.stage, ErrKeyRequired):
 			reason = ReasonKeyRequired
+		case errors.Is(res.stage, ErrCacheBudgetExceeded):
+			reason = ReasonCacheBudgetExceeded
 		}
 	}
 	targets := make([]string, 0, len(res.publish))

@@ -102,8 +102,6 @@ const (
 	// It means "the blockd unit restarted": a restart that happened while the
 	// plugin was down, and a re-point by the same process, raise nothing.
 	ReasonServerRestarted = kube.ReasonServerRestarted
-	// ReasonCacheBudgetExceeded is a stage refused by the cache-budget check.
-	ReasonCacheBudgetExceeded = kube.ReasonCacheBudgetExceeded
 )
 
 // ErrGenerationSkipped is returned by Generation when a publish was already in

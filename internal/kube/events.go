@@ -33,7 +33,7 @@ const (
 	ReasonServerRestarted = "ServerRestarted"
 	// ReasonCacheBudgetExceeded is a stage refused because the node's cache
 	// budget cannot hold the volume (decision 66).
-	ReasonCacheBudgetExceeded = "CacheBudgetExceeded"
+	ReasonCacheBudgetExceeded = reconcile.ReasonCacheBudgetExceeded
 )
 
 // Event reasons that are Warning events; every other reason is Normal.

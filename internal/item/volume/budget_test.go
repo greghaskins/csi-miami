@@ -92,8 +92,9 @@ func TestFreshStageOverBudgetRefused(t *testing.T) {
 		}
 	}
 	e.noWork(t)
-	if len(e.events) != 1 || e.events[0] != ReasonCacheBudgetExceeded {
-		t.Errorf("events = %v", e.events)
+	// The reconciler raises the event, once per episode (reconcile's tests).
+	if len(e.events) != 0 {
+		t.Errorf("the item raised events itself: %v", e.events)
 	}
 }
 
@@ -411,5 +412,42 @@ func TestCancelledCheckReturnsTheContextError(t *testing.T) {
 	cancel()
 	if err := e.it.checkBudget(ctx, e.v); !errors.Is(err, context.Canceled) {
 		t.Fatalf("checkBudget = %v, want context.Canceled", err)
+	}
+}
+
+// The operator guide's remedy of removing a cache directory by hand leaves its
+// record; the volume's restage replaces that record, and does not add to it.
+func TestRestageWithKeptRecordIsNotCountedTwice(t *testing.T) {
+	e := newEnv(t)
+	if err := e.it.saveDrainRecord(e.v); err != nil {
+		t.Fatal(err)
+	}
+	e.budgetOf(testFootprint) // exactly one footprint
+	if n, count, err := e.it.Committed(bg); err != nil || n != testFootprint || count != 1 {
+		t.Fatalf("Committed = %d, %d, %v: the metric keeps the full sum", n, count, err)
+	}
+	e.mustConverge()
+}
+
+// A stage after a store-side expansion writes the size it serves into the
+// record, so the commitment of a node that restarts is that of the grown volume.
+func TestStageRewritesTheRecordAtTheRaisedSize(t *testing.T) {
+	e := newEnv(t)
+	if _, err := sizerec.Grow(e.v.holdDir, e.v.name, 3*testSize); err != nil {
+		t.Fatal(err)
+	}
+	e.mustConverge()
+	in, err := readDrainRecord(e.it.drainRecordPath(e.v), e.v.name)
+	if err != nil || in.GrownSize != 3*testSize {
+		t.Fatalf("record = %+v, %v, want GrownSize %d", in, err, 3*testSize)
+	}
+	if n, _, err := e.it.Committed(bg); err != nil || n != 52*mi {
+		t.Fatalf("Committed = %d, %v, want 52Mi", n, err)
+	}
+	// A volume that was never grown carries no grown size.
+	e = newEnv(t)
+	e.mustConverge()
+	if in, err := readDrainRecord(e.it.drainRecordPath(e.v), e.v.name); err != nil || in.GrownSize != 0 {
+		t.Fatalf("record = %+v, %v, want no GrownSize", in, err)
 	}
 }
