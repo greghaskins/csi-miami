@@ -954,6 +954,20 @@ is retired.
     `miami.csi.greghaskins.com/held-generations`, until an operator removes the
     annotation. Clone from a generation (M4) is the primary way to go back in
     time and shares the pin mechanism.
+66. **Node cache capacity is a scheduled resource**
+    (`2026-11-07-cache-capacity-scheduling-design.md`). The node plugin
+    advertises `miami.csi.greghaskins.com/cache` on its own node as its budget
+    (a share of the cache file system minus a reserve, or an absolute flag),
+    narrowed by an admission policy to its own node and that one key; a
+    mutating webhook in the controller adds a request equal to the limit, the
+    sum of the footprints `min(size, cacheSize) + dirtyWatermark + 16 MiB` of
+    the volumes a pod mounts, on the pod's first container; and the node
+    refuses a stage that would exceed its budget (`cache-budget-exceeded`,
+    retryable) as defence in depth, with the budget, the commitment and the
+    cache file system's free space as metrics. CSI storage capacity tracking
+    is rejected: it is consulted at provisioning only and pins topology. The
+    webhook fails open; RWX volumes wait for M3; pods sharing one RWO claim on
+    a node are counted conservatively.
 
 ## 7. Milestones
 
