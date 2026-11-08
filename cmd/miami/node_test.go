@@ -262,6 +262,15 @@ func TestNodeFlagsCacheBudget(t *testing.T) {
 		return cfg.cacheConfig()
 	}
 	const gi = int64(1) << 30
+	var dflt nodeConfig
+	dfs := flag.NewFlagSet("t", flag.ContinueOnError)
+	nodeFlags(dfs, &dflt)
+	if dflt.fenceProbe != 10*time.Minute {
+		t.Errorf("-cache-fence-probe-interval default = %v, want 10m", dflt.fenceProbe)
+	}
+	if code := runNode([]string{"-node-id=n", "-cache-fence-probe-interval=0"}, io.Discard, io.Discard); code != 2 {
+		t.Errorf("-cache-fence-probe-interval=0: exit %d, want 2", code)
+	}
 	got, err := parse()
 	if err != nil || got != (cachecap.Config{Accounting: true, Share: 0.5, Reserve: 15 * gi}) {
 		t.Errorf("defaults = %+v, %v", got, err)

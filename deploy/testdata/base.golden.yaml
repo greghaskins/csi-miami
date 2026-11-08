@@ -129,6 +129,105 @@ rules:
   - nodes
   verbs:
   - get
+- apiGroups:
+  - ""
+  resources:
+  - nodes/status
+  verbs:
+  - patch
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: miami-node-capacity
+spec:
+  failurePolicy: Fail
+  matchConditions:
+  - expression: request.userInfo.username.startsWith('system:serviceaccount:') &&
+      request.userInfo.username.endsWith(':miami-node')
+    name: node-plugin-only
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - UPDATE
+      resources:
+      - nodes/status
+  validations:
+  - expression: has(request.userInfo.extra) && 'authentication.kubernetes.io/node-name'
+      in request.userInfo.extra && size(request.userInfo.extra['authentication.kubernetes.io/node-name'])
+      == 1 && request.userInfo.extra['authentication.kubernetes.io/node-name'][0]
+      == object.metadata.name
+    message: '[node-name] the node plugin may update only the node its token is bound
+      to'
+    reason: Forbidden
+  - expression: variables.newCap.all(k, k == variables.key || (k in variables.oldCap
+      && variables.oldCap[k] == variables.newCap[k])) && variables.oldCap.all(k, k
+      == variables.key || k == variables.probeKey || k in variables.newCap)
+    message: '[capacity] the node plugin may change only the miami.csi.greghaskins.com/cache
+      key of status.capacity'
+    reason: Forbidden
+  - expression: '(has(object.status.allocatable) ? has(oldObject.status.allocatable)
+      && object.status.allocatable == oldObject.status.allocatable : !has(oldObject.status.allocatable))
+      && (has(object.status.phase) ? has(oldObject.status.phase) && object.status.phase
+      == oldObject.status.phase : !has(oldObject.status.phase)) && (has(object.status.conditions)
+      ? has(oldObject.status.conditions) && object.status.conditions == oldObject.status.conditions
+      : !has(oldObject.status.conditions)) && (has(object.status.addresses) ? has(oldObject.status.addresses)
+      && object.status.addresses == oldObject.status.addresses : !has(oldObject.status.addresses))
+      && (has(object.status.daemonEndpoints) ? has(oldObject.status.daemonEndpoints)
+      && object.status.daemonEndpoints == oldObject.status.daemonEndpoints : !has(oldObject.status.daemonEndpoints))
+      && (has(object.status.nodeInfo) ? has(oldObject.status.nodeInfo) && object.status.nodeInfo
+      == oldObject.status.nodeInfo : !has(oldObject.status.nodeInfo)) && (has(object.status.images)
+      ? has(oldObject.status.images) && object.status.images == oldObject.status.images
+      : !has(oldObject.status.images)) && (has(object.status.volumesInUse) ? has(oldObject.status.volumesInUse)
+      && object.status.volumesInUse == oldObject.status.volumesInUse : !has(oldObject.status.volumesInUse))
+      && (has(object.status.volumesAttached) ? has(oldObject.status.volumesAttached)
+      && object.status.volumesAttached == oldObject.status.volumesAttached : !has(oldObject.status.volumesAttached))
+      && (has(object.status.config) ? has(oldObject.status.config) && object.status.config
+      == oldObject.status.config : !has(oldObject.status.config)) && (has(object.status.runtimeHandlers)
+      ? has(oldObject.status.runtimeHandlers) && object.status.runtimeHandlers ==
+      oldObject.status.runtimeHandlers : !has(oldObject.status.runtimeHandlers)) &&
+      (has(object.status.features) ? has(oldObject.status.features) && object.status.features
+      == oldObject.status.features : !has(oldObject.status.features)) && (has(object.status.declaredFeatures)
+      ? has(oldObject.status.declaredFeatures) && object.status.declaredFeatures ==
+      oldObject.status.declaredFeatures : !has(oldObject.status.declaredFeatures))'
+    message: '[status] the node plugin may not change any field of status but capacity'
+    reason: Forbidden
+  - expression: '(has(object.metadata.labels) ? has(oldObject.metadata.labels) &&
+      object.metadata.labels == oldObject.metadata.labels : !has(oldObject.metadata.labels))
+      && (has(object.metadata.annotations) ? has(oldObject.metadata.annotations) &&
+      object.metadata.annotations == oldObject.metadata.annotations : !has(oldObject.metadata.annotations))
+      && (has(object.metadata.finalizers) ? has(oldObject.metadata.finalizers) &&
+      object.metadata.finalizers == oldObject.metadata.finalizers : !has(oldObject.metadata.finalizers))
+      && (has(object.metadata.ownerReferences) ? has(oldObject.metadata.ownerReferences)
+      && object.metadata.ownerReferences == oldObject.metadata.ownerReferences : !has(oldObject.metadata.ownerReferences))
+      && (has(object.metadata.managedFields) ? object.metadata.managedFields.filter(e,
+      e.operation == ''Apply'') : []) == (has(oldObject.metadata.managedFields) ?
+      oldObject.metadata.managedFields.filter(e, e.operation == ''Apply'') : [])'
+    message: '[metadata] the node plugin may not change labels, annotations, finalizers,
+      ownerReferences or the Apply entries of managedFields'
+    reason: Forbidden
+  variables:
+  - expression: '''miami.csi.greghaskins.com/cache'''
+    name: key
+  - expression: 'has(object.status.capacity) ? object.status.capacity : {}'
+    name: newCap
+  - expression: '''miami.csi.greghaskins.com/fence-probe'''
+    name: probeKey
+  - expression: 'has(oldObject.status.capacity) ? oldObject.status.capacity : {}'
+    name: oldCap
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: miami-node-capacity
+spec:
+  policyName: miami-node-capacity
+  validationActions:
+  - Deny
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

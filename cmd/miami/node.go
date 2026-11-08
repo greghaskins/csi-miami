@@ -48,6 +48,7 @@ type nodeConfig struct {
 
 	// For the volume kind.
 	cacheDir      string
+	fenceProbe    time.Duration
 	binDir        string
 	systemdSocket string
 	sharedDirs    stringList
@@ -108,16 +109,6 @@ func (c nodeConfig) cacheConfig() (cachecap.Config, error) {
 	return out, nil
 }
 
-// noopNodeCapacity is the NodeCapacity of a node that does not yet patch its
-// status: it reports the key absent and changes nothing.
-type noopNodeCapacity struct{}
-
-func (noopNodeCapacity) CacheCapacity(context.Context, string) (int64, bool, error) {
-	return 0, false, nil
-}
-func (noopNodeCapacity) SetCacheCapacity(context.Context, string, int64) error { return nil }
-func (noopNodeCapacity) RemoveCacheCapacity(context.Context, string) error     { return nil }
-
 // eventRunner is the event recorder of the node: the reconciler's Events and
 // the goroutine that talks to the API server.
 type eventRunner interface {
@@ -146,6 +137,7 @@ func nodeFlags(fs *flag.FlagSet, cfg *nodeConfig) {
 	fs.BoolVar(&cfg.cacheAccounting, "cache-accounting", true, "advertise this node's cache budget to the scheduler and refuse a new volume that does not fit; false removes the advertisement and skips the check")
 	fs.Float64Var(&cfg.cacheShare, "cache-budget-share", 0.5, "the share of the cache filesystem offered as budget, above 0 and at most 1")
 	fs.StringVar(&cfg.cacheReserve, "cache-budget-reserve", "15Gi", "space kept back from the share, a quantity such as 15Gi")
+	fs.DurationVar(&cfg.fenceProbe, "cache-fence-probe-interval", cachecap.DefaultProbeInterval, "how often the node checks that the admission policy fencing its capacity patch is in force, with a request that policy denies on purpose (one expected denial per node per interval)")
 	fs.StringVar(&cfg.cacheBudget, "cache-budget", "", "an absolute budget, a quantity such as 100Gi (0 is a budget of zero); empty uses -cache-budget-share and -cache-budget-reserve")
 	fs.DurationVar(&cfg.genInterval, "generation-interval", volkinds.DefaultGenerationEvery, "how often a volume with unpublished writes publishes a generation, unless its class sets generations.interval")
 	fs.DurationVar(&cfg.genMaxAge, "generation-max-age", volkinds.DefaultGenerationMaxAge, "how old the newest generation of a volume with unpublished writes may get before the volume is reported overdue, unless its class sets generations.maxAge")
@@ -195,6 +187,7 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		{"-shared-dir must be an absolute path", slices.ContainsFunc(cfg.sharedDirs, func(d string) bool { return !filepath.IsAbs(d) })},
 		{"-generation-interval must be at least " + volkinds.MinGenerationInterval.String(), cfg.genInterval < volkinds.MinGenerationInterval},
 		{"-generation-max-age must not be under -generation-interval", cfg.genMaxAge < cfg.genInterval},
+		{"-cache-fence-probe-interval must be positive", cfg.fenceProbe <= 0},
 		{"-generation-timeout must be positive", cfg.genTimeout <= 0},
 	} {
 		if p.bad {
@@ -351,11 +344,14 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		}
 	})
 	// The advertisement loop has a goroutine of its own, so a slow API server
-	// cannot stall the reconciler. Until the node patches its status for real,
-	// it talks to a NodeCapacity that does nothing. The committed figure is the
-	// volume item's own sum, the one its stage check uses.
-	cacheRunner := cachecap.NewRunner(cacheSrc, noopNodeCapacity{}, cfg.nodeID, volItem.Committed, reg, log, cfg.interval)
-	stopCache := start(cacheRunner.Run)
+	// cannot stall the reconciler. Without a cluster (-no-events) there is no
+	// node to patch and it does not run. The committed figure is the volume
+	// item's own sum, the one its stage check uses.
+	stopCache := func() {}
+	if cluster != nil {
+		cacheRunner := cachecap.NewRunner(cacheSrc, cluster, cfg.nodeID, volItem.Committed, reg, log, cfg.interval, cfg.deadline, cfg.fenceProbe)
+		stopCache = start(cacheRunner.Run)
+	}
 	stopEvents := func() {}
 	if events != nil {
 		stopEvents = start(events.Run)

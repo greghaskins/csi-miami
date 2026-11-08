@@ -642,14 +642,16 @@ func TestCacheMetrics(t *testing.T) {
 	t.Parallel()
 	names := []string{"miami_cache_budget_bytes", "miami_cache_committed_bytes", "miami_cache_fs_size_bytes", "miami_cache_fs_free_bytes"}
 	off := New(WithReconciler())
-	off.SetCacheCapacity(1, 2, 3, 4)
+	off.SetCacheCapacity(1, 3, 4)
+	off.SetCacheCommitted(2)
 	for _, n := range names {
 		if family(t, off, n) != nil {
 			t.Errorf("%s exposed without WithCacheCapacity", n)
 		}
 	}
 	on := New(WithCacheCapacity())
-	on.SetCacheCapacity(95<<30, 30<<30, 220<<30, 100<<30)
+	on.SetCacheCapacity(95<<30, 220<<30, 100<<30)
+	on.SetCacheCommitted(30 << 30)
 	want := []float64{95 << 30, 30 << 30, 220 << 30, 100 << 30}
 	for i, n := range names {
 		f := family(t, on, n)
@@ -664,5 +666,68 @@ func TestCacheMetrics(t *testing.T) {
 	on.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if want := "miami_cache_budget_bytes "; !strings.Contains(rec.Body.String(), want) {
 		t.Errorf("/metrics lacks %q", want)
+	}
+}
+
+func TestCachePatchFailures(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.IncCachePatchFailure("denied")
+	if family(t, off, NameCachePatchFailures) != nil {
+		t.Errorf("%s exposed without WithCacheCapacity", NameCachePatchFailures)
+	}
+	on := New(WithCacheCapacity())
+	// Both reasons exist at zero before any failure, so an alert can see them.
+	f := family(t, on, NameCachePatchFailures)
+	if f == nil || len(f.GetMetric()) != 3 {
+		t.Fatalf("family = %v, want three series", f)
+	}
+	on.IncCachePatchFailure("denied")
+	on.IncCachePatchFailure("denied")
+	on.IncCachePatchFailure("error")
+	on.IncCachePatchFailure("anything else")
+	got := map[string]float64{}
+	for _, m := range family(t, on, NameCachePatchFailures).GetMetric() {
+		got[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+	}
+	if len(got) != 3 || got["denied"] != 2 || got["error"] != 2 || got["unknown"] != 0 {
+		t.Errorf("series = %v, want denied 2, error 2, unknown 0", got)
+	}
+	on.IncCachePatchFailure("unknown")
+	for _, m := range family(t, on, NameCachePatchFailures).GetMetric() {
+		if m.GetLabel()[0].GetValue() == "unknown" && m.GetCounter().GetValue() != 1 {
+			t.Errorf("unknown = %v, want 1", m.GetCounter().GetValue())
+		}
+	}
+}
+
+func TestCacheFenceState(t *testing.T) {
+	t.Parallel()
+	on := New(WithCacheCapacity())
+	read := func() map[string]float64 {
+		out := map[string]float64{}
+		for _, m := range family(t, on, NameCacheFenceState).GetMetric() {
+			out[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
+		}
+		return out
+	}
+	for _, tc := range []struct{ set, want string }{{"", "unknown"}, {"fenced", "fenced"}, {"unfenced", "unfenced"}, {"nonsense", "unknown"}, {"fenced", "fenced"}} {
+		if tc.set != "" {
+			on.SetCacheFenceState(tc.set)
+		}
+		got := read()
+		if len(got) != 3 {
+			t.Fatalf("series = %v, want three", got)
+		}
+		for state, v := range got {
+			if (v == 1) != (state == tc.want) || (v != 0 && v != 1) {
+				t.Errorf("after %q: %v, want only %s at 1", tc.set, got, tc.want)
+			}
+		}
+	}
+	off := New(WithReconciler())
+	off.SetCacheFenceState("fenced")
+	if family(t, off, NameCacheFenceState) != nil {
+		t.Error("exposed without WithCacheCapacity")
 	}
 }

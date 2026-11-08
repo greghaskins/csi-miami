@@ -49,6 +49,11 @@
 # Known roots: k0s /var/lib/k0s/kubelet, k3s /var/lib/rancher/k3s/agent/kubelet,
 # microk8s /var/snap/microk8s/common/var/lib/kubelet.
 #
+# Minimum Kubernetes version: 1.32. The node plugin may patch nodes/status, and
+# the ValidatingAdmissionPolicy that fences that patch to its own node and one
+# capacity key needs VAP v1 (1.30) and the node-name token extra (1.32). On a
+# cluster older than 1.30 the ClusterRole grant would land without its fence.
+#
 # The driver image below is the placeholder ghcr.io/greghaskins/csi-miami:unset,
 # a tag CI never publishes, so applying this base without an overlay fails to
 # pull and never runs a mutable image in the privileged node DaemonSet. Every
@@ -63,6 +68,8 @@ resources:
   - serviceaccount-node.yaml
   - clusterrole-controller.yaml
   - clusterrole-node.yaml
+  - validatingadmissionpolicy-node-capacity.yaml
+  - validatingadmissionpolicybinding-node-capacity.yaml
   - clusterrolebinding-controller.yaml
   - role-controller.yaml
   - rolebinding-controller.yaml

@@ -24,12 +24,14 @@ import (
 
 // clusterAPI is what the node reads from the API server: the judge's two reads,
 // the PV annotation of the generation timers and the drain's proof of a deleted
-// volume. *kube.Client implements it. It is nil only when the node runs without
+// volume, and the node's own cache capacity patch. *kube.Client implements it. It is nil only when the node runs without
 // a cluster (-no-events, for tests); the volume kind then cannot take a volume
 // over, cannot be asked for a generation and keeps every surviving cache.
 type clusterAPI interface {
 	reconcile.Cluster
 	PVExists(ctx context.Context, name string) (bool, error)
+	// The node's own advertisement of its cache capacity (decision 66).
+	cachecap.NodeCapacity
 }
 
 // nodeDeps are the clients the volume kind runs on. The node builds the real

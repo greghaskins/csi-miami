@@ -51,6 +51,12 @@ func (s *Source) Current(ctx context.Context) (budget int64, enabled bool, err e
 	}
 	size, free, err := s.stat(s.cacheDir)
 	if err != nil {
+		if s.cfg.HaveAbsolute {
+			// An absolute budget does not depend on the file system's size,
+			// so a statfs that fails must not stop it being advertised or
+			// checked. The figures of Stats stay at their last known value.
+			return Budget(0, s.cfg), true, nil
+		}
 		return 0, true, err
 	}
 	s.mu.Lock()

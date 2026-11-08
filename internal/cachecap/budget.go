@@ -43,9 +43,46 @@ type NodeCapacity interface {
 	CacheCapacity(ctx context.Context, node string) (bytes int64, present bool, err error)
 	SetCacheCapacity(ctx context.Context, node string, bytes int64) error
 	RemoveCacheCapacity(ctx context.Context, node string) error
+	// ProbeFence asks whether the admission policy that fences the node's
+	// status patch is in force, by trying a patch it must deny (decision 66,
+	// 4.9). Fenced: the policy denied it. Unfenced: the patch was allowed
+	// (and is removed again). Unknown comes with the error that left it so.
+	ProbeFence(ctx context.Context, node string) (FenceState, error)
+	// RemoveFenceProbe removes the probe's key if the node carries it.
+	RemoveFenceProbe(ctx context.Context, node string) error
 }
 
-// CapacityMetrics receives the figures of every pass.
+// FenceState is the answer of NodeCapacity.ProbeFence.
+type FenceState int
+
+const (
+	// FenceUnknown means the probe could not tell (a timeout, a server error, a
+	// denial that does not name the policy).
+	FenceUnknown FenceState = iota
+	// Fenced means the policy denied the probe, naming itself.
+	Fenced
+	// Unfenced means the probe patch was allowed, so nothing narrows the node
+	// plugin's grant.
+	Unfenced
+)
+
+// CapacityMetrics receives the figures of every pass. The committed figure
+// has a setter of its own so that a pass that cannot read it leaves the last
+// value standing, which a zero would misreport as a node with room.
 type CapacityMetrics interface {
-	SetCacheCapacity(budget, committed, fsSize, fsFree int64)
+	SetCacheCapacity(budget, fsSize, fsFree int64)
+	SetCacheCommitted(committed int64)
+	// IncCachePatchFailure counts a failed patch or clear of the node's
+	// capacity; reason is PatchDenied or PatchError.
+	IncCachePatchFailure(reason string)
+	// SetCacheFenceState records the verdict of the last probe: "fenced",
+	// "unfenced" or "unknown" (see the Fence* names); exactly one is 1.
+	SetCacheFenceState(state string)
 }
+
+// The reasons of CapacityMetrics.IncCachePatchFailure.
+const (
+	PatchDenied  = "denied"  // the API server answered 403 or 422
+	PatchError   = "error"   // any other failure
+	PatchUnknown = "unknown" // a fence probe that could not tell
+)
