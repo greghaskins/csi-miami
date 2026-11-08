@@ -241,6 +241,10 @@ func TestNodeCapacityPolicy(t *testing.T) {
 	}
 
 	rows := []row{
+		// managedFields is bookkeeping the API server rewrites on every patch,
+		// so the policy cannot hold it still (an equality rule denied the
+		// plugin's own patches); wiping it is accepted, and carries no authority.
+		{"clearing managedFields is accepted", own, "node-a", jsonPatch(op("add", "/metadata/managedFields", "[]")), ""},
 		{"add our key on its own node", own, "node-a", jsonPatch(capAdd), ""},
 		{"change our key", own, "node-a", jsonPatch(op("add", "/status/capacity/"+capKey, `"0"`)), ""},
 		{"remove our key on its own node", own, "node-a", jsonPatch(op("remove", "/status/capacity/"+capKey, "")), ""},

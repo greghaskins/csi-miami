@@ -86,6 +86,8 @@ Underneath both is one chunk format on the NAS, one backup (the NAS's own file-l
 
 `kubectl apply -k deploy/kustomize/base` creates the `miami-system` namespace, the CSIDriver, the RBAC (ServiceAccounts, ClusterRoles and bindings), a node DaemonSet, and a controller Deployment. The examples are applied separately.
 
+**Kubernetes version.** The minimum is 1.32. The node agent may patch `nodes/status`, and a ValidatingAdmissionPolicy fences that to its own node and one capacity key; it needs ValidatingAdmissionPolicy v1 (1.30) and the node-name claim of bound tokens (1.32). On a cluster older than 1.30 the RBAC grant would apply without its fence, so do not install the base there.
+
 **Namespace.** Everything runs in `miami-system`, labeled with Pod Security Admission `enforce: privileged` for the node agent's privileged security context and the controller's `SYS_ADMIN` capability (the controller mounts NFSv3 transports with `mount(2)`, which containerd's default AppArmor profile denies even with the capability).
 
 **Images.** The base uses the placeholder `ghcr.io/greghaskins/csi-miami:unset`, a tag that cannot be pulled; every overlay sets the real image with `images:`, preferably by digest. The sidecars (csi-provisioner, csi-attacher, csi-resizer, csi-node-driver-registrar, livenessprobe) are pinned by digest and are public at `registry.k8s.io/sig-storage/`. The driver image is public at ghcr.io/greghaskins/csi-miami.

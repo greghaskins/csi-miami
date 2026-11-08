@@ -143,7 +143,10 @@ metadata:
 spec:
   failurePolicy: Fail
   matchConditions:
-  - expression: request.userInfo.username == 'system:serviceaccount:miami-system:miami-node'
+  - expression: |-
+      request.userInfo.username.startsWith('system:serviceaccount:') &&
+
+        request.userInfo.username.endsWith(':miami-node')
     name: node-plugin-only
   matchConstraints:
     resourceRules:

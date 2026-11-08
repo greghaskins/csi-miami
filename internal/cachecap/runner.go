@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // Runner keeps the node's advertised cache capacity equal to its budget. It
@@ -61,7 +63,7 @@ func (r *Runner) Pass(ctx context.Context) error {
 		if err != nil || !present {
 			return err
 		}
-		return r.nc.RemoveCacheCapacity(ctx, r.node)
+		return r.counted(r.nc.RemoveCacheCapacity(ctx, r.node))
 	}
 	// A committed figure that cannot be read leaves its gauge as it was (a
 	// zero would say the node has room) and the pass goes on: the
@@ -80,7 +82,19 @@ func (r *Runner) Pass(ctx context.Context) error {
 	if present && have == budget {
 		return cerr
 	}
-	return errors.Join(cerr, r.nc.SetCacheCapacity(ctx, r.node, budget))
+	return errors.Join(cerr, r.counted(r.nc.SetCacheCapacity(ctx, r.node, budget)))
+}
+
+// counted counts a failed patch or clear by reason and returns it.
+func (r *Runner) counted(err error) error {
+	switch {
+	case err == nil:
+	case apierrors.IsForbidden(err) || apierrors.IsInvalid(err):
+		r.metrics.IncCachePatchFailure(PatchDenied)
+	default:
+		r.metrics.IncCachePatchFailure(PatchError)
+	}
+	return err
 }
 
 // Run passes at once and then every interval until ctx ends. A failed pass is

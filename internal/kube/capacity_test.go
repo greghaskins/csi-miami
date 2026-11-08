@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -96,6 +98,9 @@ func TestCacheCapacityPatchErrorsCarryNoURL(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), "http") || strings.Contains(err.Error(), "127.0.0.1") {
 			t.Errorf("%s: error leaks the address: %v", name, err)
+		}
+		if !apierrors.IsForbidden(err) {
+			t.Errorf("%s: the denial is not visible to errors.As: %v", name, err)
 		}
 		if !strings.Contains(err.Error(), "node-a") || !strings.Contains(err.Error(), "Forbidden") {
 			t.Errorf("%s: error = %v", name, err)

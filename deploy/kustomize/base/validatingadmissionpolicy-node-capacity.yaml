@@ -10,8 +10,11 @@
 #   [capacity]   status.capacity differs from the old one in no key but the
 #                cache resource (a key may be added, changed or removed);
 #   [status]     every other field of status is unchanged;
-#   [metadata]   so are labels, annotations, finalizers and ownerReferences
+#   [metadata]   so are labels, annotations, finalizers, ownerReferences
 #                (the status endpoint resets spec, not metadata).
+#                managedFields is deliberately not held still: the API server
+#                rewrites it on every patch, so an equality rule would deny
+#                the plugin's own; it is bookkeeping and carries no authority.
 #
 # [status] lists the fields of NodeStatus one by one, because CEL cannot
 # compare "all of status but one key". TestNodeStatusFieldsCovered fails when
@@ -37,7 +40,9 @@ spec:
         resources: [nodes/status]
   matchConditions:
     - name: node-plugin-only
-      expression: request.userInfo.username == 'system:serviceaccount:miami-system:miami-node'
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:') &&
+          request.userInfo.username.endsWith(':miami-node')
   variables:
     - name: key
       expression: "'miami.csi.greghaskins.com/cache'"

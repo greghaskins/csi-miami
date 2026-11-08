@@ -20,6 +20,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"sigs.k8s.io/kustomize/api/krusty"
+	"sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 	"sigs.k8s.io/yaml"
 
@@ -1466,8 +1467,11 @@ func TestNodePolicyScope(t *testing.T) {
 	if len(pol.Spec.MatchConditions) != 1 {
 		t.Fatalf("matchConditions = %v", pol.Spec.MatchConditions)
 	}
-	if want := "request.userInfo.username == '" + user + "'"; pol.Spec.MatchConditions[0].Expression != want {
-		t.Errorf("matchCondition = %q, want %q", pol.Spec.MatchConditions[0].Expression, want)
+	if got := squash(pol.Spec.MatchConditions[0].Expression); got != nodePluginMatch {
+		t.Errorf("matchCondition = %q, want %q", got, nodePluginMatch)
+	}
+	if !matchesPlugin(user) {
+		t.Errorf("the condition does not match the binding's subject %s", user)
 	}
 
 	// The tags the envtest matrix asserts on are the policy's messages.
@@ -1511,5 +1515,70 @@ func TestNodeStatusFieldsCovered(t *testing.T) {
 		if !strings.Contains(rule, "object.status."+name+")") {
 			t.Errorf("the [status] rule does not hold status.%s still", name)
 		}
+	}
+}
+
+// nodePluginMatch is the matchCondition, and matchesPlugin its meaning in Go.
+const nodePluginMatch = "request.userInfo.username.startsWith('system:serviceaccount:') && request.userInfo.username.endsWith(':miami-node')"
+
+func squash(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+func matchesPlugin(user string) bool {
+	return strings.HasPrefix(user, "system:serviceaccount:") && strings.HasSuffix(user, ":miami-node")
+}
+
+// TestNodePolicyFollowsNamespaceOverlay: a kustomize `namespace:` rewrites the
+// ClusterRoleBinding's subject but not CEL. A condition that named the
+// namespace would then miss the plugin, which would hold nodes/status patch on
+// every node with no fence at all.
+func TestNodePolicyFollowsNamespaceOverlay(t *testing.T) {
+	t.Parallel()
+	// A scratch directory beside the base: kustomize wants relative roots.
+	dir, err := os.MkdirTemp(".", "nsprobe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	kust := "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: storage\nresources:\n  - ../kustomize/base\n"
+	if err := os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kust), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := krusty.MakeDefaultOptions()
+	opts.LoadRestrictions = types.LoadRestrictionsNone
+	kustomizeMu.Lock()
+	m, err := krusty.MakeKustomizer(opts).Run(filesys.MakeFsOnDisk(), dir)
+	kustomizeMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r rendered
+	for _, res := range m.Resources() {
+		js, err := res.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.objects = append(r.objects, object{kind: res.GetKind(), name: res.GetName(), json: js})
+	}
+	var crb rbacv1.ClusterRoleBinding
+	r.get(t, "ClusterRoleBinding", "miami-node", &crb)
+	if len(crb.Subjects) != 1 || crb.Subjects[0].Namespace != "storage" {
+		t.Fatalf("the overlay did not move the subject: %v", crb.Subjects)
+	}
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	if got := squash(pol.Spec.MatchConditions[0].Expression); got != nodePluginMatch {
+		t.Fatalf("matchCondition = %q", got)
+	}
+	subject := "system:serviceaccount:" + crb.Subjects[0].Namespace + ":" + crb.Subjects[0].Name
+	if !matchesPlugin(subject) {
+		t.Errorf("the condition misses the moved subject %s: the grant would be unfenced", subject)
+	}
+	for _, other := range []string{"kubernetes-admin", "system:masters", "system:node:node-a", "system:serviceaccount:storage:miami-controller"} {
+		if matchesPlugin(other) {
+			t.Errorf("the condition matches %s", other)
+		}
+	}
+	if strings.Contains(pol.Spec.MatchConditions[0].Expression, "miami-system") {
+		t.Error("the condition names the base's namespace")
 	}
 }

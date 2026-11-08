@@ -5,8 +5,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -86,13 +90,13 @@ func fakeStat(f *fsFigures) FSStat {
 }
 
 type fakeNC struct {
-	have        bool
-	bytes       int64
-	getErr, set error
-	calls       []string
-	nodes       []string
-	setBytes    []int64
-	setCh       chan struct{}
+	have                bool
+	bytes               int64
+	getErr, set, remove error
+	calls               []string
+	nodes               []string
+	setBytes            []int64
+	setCh               chan struct{}
 }
 
 func (n *fakeNC) CacheCapacity(_ context.Context, node string) (int64, bool, error) {
@@ -116,11 +120,12 @@ func (n *fakeNC) SetCacheCapacity(_ context.Context, node string, b int64) error
 func (n *fakeNC) RemoveCacheCapacity(_ context.Context, node string) error {
 	n.nodes = append(n.nodes, node)
 	n.calls = append(n.calls, "remove")
-	return nil
+	return n.remove
 }
 
 type fakeMetrics struct {
 	n, nComm                 int
+	failures                 []string
 	budget, comm, size, free int64
 }
 
@@ -128,6 +133,8 @@ func (m *fakeMetrics) SetCacheCapacity(b, s, f int64) {
 	m.n++
 	m.budget, m.size, m.free = b, s, f
 }
+
+func (m *fakeMetrics) IncCachePatchFailure(reason string) { m.failures = append(m.failures, reason) }
 
 func (m *fakeMetrics) SetCacheCommitted(c int64) {
 	m.nComm++
@@ -363,4 +370,43 @@ func TestRunRetriesAfterFailedPass(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func statusErr(code int32, reason metav1.StatusReason) error {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: code, Reason: reason}}
+}
+
+// TestPatchFailuresCounted: a budget the node cannot advertise is a metric,
+// by reason, for a set and for a clear; successes and read failures are not.
+func TestPatchFailuresCounted(t *testing.T) {
+	t.Parallel()
+	on := Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}
+	off := Config{Share: 0.5}
+	for _, tt := range []struct {
+		name string
+		cfg  Config
+		nc   *fakeNC
+		want []string
+	}{
+		{"set denied by RBAC or the policy (403)", on, &fakeNC{set: statusErr(403, metav1.StatusReasonForbidden)}, []string{"denied"}},
+		{"set invalid (422)", on, &fakeNC{set: statusErr(422, metav1.StatusReasonInvalid)}, []string{"denied"}},
+		{"set fails otherwise", on, &fakeNC{set: errors.New("down")}, []string{"error"}},
+		{"set server error", on, &fakeNC{set: statusErr(500, metav1.StatusReasonInternalError)}, []string{"error"}},
+		{"set succeeds", on, &fakeNC{}, nil},
+		{"read fails, no patch", on, &fakeNC{getErr: errors.New("down")}, nil},
+		{"clear denied", off, &fakeNC{have: true, remove: statusErr(403, metav1.StatusReasonForbidden)}, []string{"denied"}},
+		{"clear fails", off, &fakeNC{have: true, remove: errors.New("down")}, []string{"error"}},
+		{"clear succeeds", off, &fakeNC{have: true}, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := &fakeMetrics{}
+			f := &fsFigures{size: 220 * gib}
+			r := NewRunner(NewSource(tt.cfg, "/c", fakeStat(f)), tt.nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+			_ = r.Pass(context.Background())
+			if !slices.Equal(m.failures, tt.want) {
+				t.Errorf("failures = %v, want %v", m.failures, tt.want)
+			}
+		})
+	}
 }

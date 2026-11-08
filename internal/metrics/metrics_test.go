@@ -668,3 +668,29 @@ func TestCacheMetrics(t *testing.T) {
 		t.Errorf("/metrics lacks %q", want)
 	}
 }
+
+func TestCachePatchFailures(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.IncCachePatchFailure("denied")
+	if family(t, off, NameCachePatchFailures) != nil {
+		t.Errorf("%s exposed without WithCacheCapacity", NameCachePatchFailures)
+	}
+	on := New(WithCacheCapacity())
+	// Both reasons exist at zero before any failure, so an alert can see them.
+	f := family(t, on, NameCachePatchFailures)
+	if f == nil || len(f.GetMetric()) != 2 {
+		t.Fatalf("family = %v, want two series", f)
+	}
+	on.IncCachePatchFailure("denied")
+	on.IncCachePatchFailure("denied")
+	on.IncCachePatchFailure("error")
+	on.IncCachePatchFailure("anything else")
+	got := map[string]float64{}
+	for _, m := range family(t, on, NameCachePatchFailures).GetMetric() {
+		got[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+	}
+	if len(got) != 2 || got["denied"] != 2 || got["error"] != 2 {
+		t.Errorf("series = %v, want denied 2, error 2", got)
+	}
+}

@@ -51,4 +51,13 @@ type NodeCapacity interface {
 type CapacityMetrics interface {
 	SetCacheCapacity(budget, fsSize, fsFree int64)
 	SetCacheCommitted(committed int64)
+	// IncCachePatchFailure counts a failed patch or clear of the node's
+	// capacity; reason is PatchDenied or PatchError.
+	IncCachePatchFailure(reason string)
 }
+
+// The reasons of CapacityMetrics.IncCachePatchFailure.
+const (
+	PatchDenied = "denied" // the API server answered 403 or 422
+	PatchError  = "error"  // any other failure
+)

@@ -66,6 +66,11 @@ const (
 	NameCacheCommitted = "miami_cache_committed_bytes"
 	NameCacheFSSize    = "miami_cache_fs_size_bytes"
 	NameCacheFSFree    = "miami_cache_fs_free_bytes"
+
+	// NameCachePatchFailures counts failed patches of the node's advertised
+	// capacity, by reason: denied (a 403 or 422: RBAC or the admission policy
+	// refused) or error (anything else).
+	NameCachePatchFailures = "miami_cache_capacity_patch_failures_total"
 )
 
 // NodeFamilies are the families a node plugin serves: its reconciler's and the
@@ -124,6 +129,7 @@ type Registry struct {
 	fetches       *fetchCollector
 
 	cacheBudget, cacheCommitted, cacheFSSize, cacheFSFree prometheus.Gauge
+	cachePatchFailures                                    *prometheus.CounterVec
 }
 
 var (
@@ -226,6 +232,12 @@ func New(opts ...Option) *Registry {
 	r.cacheCommitted = gauge(NameCacheCommitted, "Bytes of cache footprint committed to the volumes staged on this node.")
 	r.cacheFSSize = gauge(NameCacheFSSize, "Size in bytes of the filesystem the volume caches live on.")
 	r.cacheFSFree = gauge(NameCacheFSFree, "Bytes available on the filesystem the volume caches live on.")
+	r.cachePatchFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: NameCachePatchFailures, Help: "Failed patches or clears of this node's advertised cache capacity, by reason: denied (the API server answered 403 or 422, so RBAC or the admission policy refused) or error. A budget the node computes but cannot advertise leaves pods pending.",
+	}, []string{"reason"})
+	for _, reason := range []string{"denied", "error"} {
+		r.cachePatchFailures.WithLabelValues(reason)
+	}
 
 	// The steps the reconciler reports are a fixed list (reconcile.Metrics), so
 	// their counters exist at zero from the start: a series that appears only
@@ -258,7 +270,7 @@ func New(opts ...Option) *Registry {
 		)
 	}
 	if o.cacheCapacity {
-		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree)
+		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree, r.cachePatchFailures)
 	}
 	return r
 }
@@ -268,6 +280,15 @@ func (r *Registry) SetCacheCapacity(budget, fsSize, fsFree int64) {
 	r.cacheBudget.Set(float64(budget))
 	r.cacheFSSize.Set(float64(fsSize))
 	r.cacheFSFree.Set(float64(fsFree))
+}
+
+// IncCachePatchFailure counts one failed capacity patch (see
+// cachecap.CapacityMetrics); any reason but "denied" counts as "error".
+func (r *Registry) IncCachePatchFailure(reason string) {
+	if reason != "denied" {
+		reason = "error"
+	}
+	r.cachePatchFailures.WithLabelValues(reason).Inc()
 }
 
 // SetCacheCommitted sets the committed gauge (see cachecap.CapacityMetrics).
