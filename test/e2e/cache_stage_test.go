@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/greghaskins/csi-miami/internal/metrics"
 )
 
@@ -84,9 +86,22 @@ func TestCacheStageCheckNeverRefusesExisting(t *testing.T) {
 	}
 	e.waitCommitted(t, node, 2*quantityBytes(cacheFootprint), "with two volumes staged")
 
-	e.pluginOff(t, node)
-	e.waitPluginGone(t, node)
-	e.pluginOn(t, node)
+	// The plugin pod is deleted and the DaemonSet starts another, as the
+	// plugin-restart test does.
+	ctx, cancel := e.withDeadline()
+	old, err := e.nodePluginPod(ctx, node)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	oldContainer := containerStatusID(old, "miami")
+	err = e.Client.CoreV1().Pods(e.DriverNS).Delete(ctx, old.Name, metav1.DeleteOptions{})
+	cancel()
+	if err != nil {
+		t.Fatalf("deleting the node plugin pod %s: %v", old.Name, err)
+	}
+	back := e.waitPluginBack(t, node, old.UID, oldContainer)
+	t.Logf("the node plugin on %s was replaced: %s is Ready", node, back.Name)
 	// The new plugin adopts what is staged and says so by serving its figure.
 	e.waitCommitted(t, node, 2*quantityBytes(cacheFootprint), "after the plugin restarted")
 
