@@ -1533,32 +1533,7 @@ func matchesPlugin(user string) bool {
 // every node with no fence at all.
 func TestNodePolicyFollowsNamespaceOverlay(t *testing.T) {
 	t.Parallel()
-	// A scratch directory beside the base: kustomize wants relative roots.
-	dir, err := os.MkdirTemp(".", "nsprobe")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	kust := "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: storage\nresources:\n  - ../kustomize/base\n"
-	if err := os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kust), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	opts := krusty.MakeDefaultOptions()
-	opts.LoadRestrictions = types.LoadRestrictionsNone
-	kustomizeMu.Lock()
-	m, err := krusty.MakeKustomizer(opts).Run(filesys.MakeFsOnDisk(), dir)
-	kustomizeMu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var r rendered
-	for _, res := range m.Resources() {
-		js, err := res.MarshalJSON()
-		if err != nil {
-			t.Fatal(err)
-		}
-		r.objects = append(r.objects, object{kind: res.GetKind(), name: res.GetName(), json: js})
-	}
+	r := renderOverlay(t, "namespace: storage\n")
 	var crb rbacv1.ClusterRoleBinding
 	r.get(t, "ClusterRoleBinding", "miami-node", &crb)
 	if len(crb.Subjects) != 1 || crb.Subjects[0].Namespace != "storage" {
@@ -1581,4 +1556,65 @@ func TestNodePolicyFollowsNamespaceOverlay(t *testing.T) {
 	if strings.Contains(pol.Spec.MatchConditions[0].Expression, "miami-system") {
 		t.Error("the condition names the base's namespace")
 	}
+}
+
+// TestNodePolicyDetectsRenamingOverlays: namePrefix and nameSuffix rename the
+// ServiceAccount, and no static string match follows every rename. The test
+// pins that the mismatch is real, so that nobody takes the namespace test as a
+// promise about renames: such an overlay must patch the matchCondition, and the
+// node's runtime fence probe (cachecap.Runner) is the backstop that stops it
+// advertising when it does not.
+func TestNodePolicyDetectsRenamingOverlays(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, kust, wantSA string }{
+		{"namePrefix", "namePrefix: prod-\n", "prod-miami-node"},
+		{"nameSuffix", "nameSuffix: -prod\n", "miami-node-prod"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := renderOverlay(t, tc.kust)
+			var crb rbacv1.ClusterRoleBinding
+			r.get(t, "ClusterRoleBinding", tc.wantSA, &crb)
+			if len(crb.Subjects) != 1 || crb.Subjects[0].Name != tc.wantSA {
+				t.Fatalf("the subject was not renamed: %v", crb.Subjects)
+			}
+			subject := "system:serviceaccount:" + crb.Subjects[0].Namespace + ":" + crb.Subjects[0].Name
+			if matchesPlugin(subject) {
+				t.Errorf("the condition unexpectedly matches the renamed subject %s; if the policy now follows renames, say so here and in the policy comment", subject)
+			}
+		})
+	}
+}
+
+// renderOverlay renders the base under an overlay whose kustomization carries
+// extra after its resources.
+func renderOverlay(t *testing.T, extra string) rendered {
+	t.Helper()
+	// A scratch directory beside the base: kustomize wants relative roots.
+	dir, err := os.MkdirTemp(".", "nsprobe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	kust := "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n" + extra + "resources:\n  - ../kustomize/base\n"
+	if err := os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kust), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := krusty.MakeDefaultOptions()
+	opts.LoadRestrictions = types.LoadRestrictionsNone
+	kustomizeMu.Lock()
+	m, err := krusty.MakeKustomizer(opts).Run(filesys.MakeFsOnDisk(), dir)
+	kustomizeMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r rendered
+	for _, res := range m.Resources() {
+		js, err := res.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.objects = append(r.objects, object{kind: res.GetKind(), name: res.GetName(), json: js})
+	}
+	return r
 }

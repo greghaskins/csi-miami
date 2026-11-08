@@ -2,9 +2,11 @@ package kube
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -12,7 +14,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 
+	"github.com/greghaskins/csi-miami/internal/cachecap"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -76,6 +80,33 @@ func (c *Client) RemoveCacheCapacity(ctx context.Context, node string) error {
 	return c.patchCapacity(ctx, node, patchOp{Op: "remove", Path: capacityPath})
 }
 
+// fenceProbeResource is the capacity key ProbeFence tries to add. It is not
+// ours to write, so the policy must deny it.
+const fenceProbeResource = "miami.csi.greghaskins.com/fence-probe"
+
+var fenceProbePath = "/status/capacity/" + strings.ReplaceAll(fenceProbeResource, "/", "~1")
+
+// ProbeFence tries to add a capacity key the admission policy must refuse, on
+// the node's own node. A denial that names the policy (FencePolicy) means the
+// policy is in force; a patch that goes through means it is not, and the key is
+// removed at once. Anything else (a timeout, a server error, a denial by RBAC
+// or by something other than the policy) leaves the answer unknown.
+func (c *Client) ProbeFence(ctx context.Context, node string) (cachecap.FenceState, error) {
+	err := c.patchCapacity(ctx, node, patchOp{Op: "add", Path: fenceProbePath, Value: "1"})
+	if err == nil {
+		if rerr := c.patchCapacity(ctx, node, patchOp{Op: "remove", Path: fenceProbePath}); rerr != nil {
+			return cachecap.Unfenced, fmt.Errorf("kube: the fence probe key was left on node %q: %w", node, rerr)
+		}
+		return cachecap.Unfenced, nil
+	}
+	var st apierrors.APIStatus
+	if (apierrors.IsForbidden(err) || apierrors.IsInvalid(err)) && errors.As(err, &st) &&
+		strings.Contains(st.Status().Message, cachecap.FencePolicy) {
+		return cachecap.Fenced, nil
+	}
+	return cachecap.FenceUnknown, err
+}
+
 func (c *Client) patchCapacity(ctx context.Context, node string, op patchOp) error {
 	if node == "" {
 		return errors.New("kube: a node name is required")
@@ -103,3 +134,40 @@ func (e *nodePatchError) Error() string {
 	return fmt.Sprintf("kube: patching the capacity of node %q: %s", e.node, e.reason)
 }
 func (e *nodePatchError) Unwrap() error { return e.err }
+
+// Subject is the identity the client's token names (for a service account,
+// system:serviceaccount:<namespace>:<name>), read from the token's own claims
+// without asking the API server, or "unknown". It is for log lines.
+func (c *Client) Subject() string {
+	if c.subject == "" {
+		return "unknown"
+	}
+	return c.subject
+}
+
+// tokenSubject returns the sub claim of the bearer token in cfg, or "".
+func tokenSubject(cfg *rest.Config) string {
+	tok := cfg.BearerToken
+	if tok == "" && cfg.BearerTokenFile != "" {
+		b, err := os.ReadFile(cfg.BearerTokenFile)
+		if err != nil {
+			return ""
+		}
+		tok = strings.TrimSpace(string(b))
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return ""
+	}
+	return claims.Sub
+}

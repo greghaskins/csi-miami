@@ -71,6 +71,10 @@ const (
 	// capacity, by reason: denied (a 403 or 422: RBAC or the admission policy
 	// refused) or error (anything else).
 	NameCachePatchFailures = "miami_cache_capacity_patch_failures_total"
+
+	// NameCacheFenceOK is 1 while the admission policy that narrows the node
+	// plugin's nodes/status grant is in force, 0 when a probe found it not.
+	NameCacheFenceOK = "miami_cache_fence_ok"
 )
 
 // NodeFamilies are the families a node plugin serves: its reconciler's and the
@@ -130,6 +134,7 @@ type Registry struct {
 
 	cacheBudget, cacheCommitted, cacheFSSize, cacheFSFree prometheus.Gauge
 	cachePatchFailures                                    *prometheus.CounterVec
+	cacheFenceOK                                          prometheus.Gauge
 }
 
 var (
@@ -235,6 +240,7 @@ func New(opts ...Option) *Registry {
 	r.cachePatchFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: NameCachePatchFailures, Help: "Failed patches or clears of this node's advertised cache capacity, by reason: denied (the API server answered 403 or 422, so RBAC or the admission policy refused) or error. A budget the node computes but cannot advertise leaves pods pending.",
 	}, []string{"reason"})
+	r.cacheFenceOK = gauge(NameCacheFenceOK, "1 when the admission policy that narrows this node plugin's nodes/status patch is in force, 0 when a probe found it not (the node then advertises nothing).")
 	for _, reason := range []string{"denied", "error"} {
 		r.cachePatchFailures.WithLabelValues(reason)
 	}
@@ -270,7 +276,7 @@ func New(opts ...Option) *Registry {
 		)
 	}
 	if o.cacheCapacity {
-		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree, r.cachePatchFailures)
+		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree, r.cachePatchFailures, r.cacheFenceOK)
 	}
 	return r
 }
@@ -289,6 +295,15 @@ func (r *Registry) IncCachePatchFailure(reason string) {
 		reason = "error"
 	}
 	r.cachePatchFailures.WithLabelValues(reason).Inc()
+}
+
+// SetCacheFenceOK sets the fence gauge (see cachecap.CapacityMetrics).
+func (r *Registry) SetCacheFenceOK(ok bool) {
+	v := 0.0
+	if ok {
+		v = 1
+	}
+	r.cacheFenceOK.Set(v)
 }
 
 // SetCacheCommitted sets the committed gauge (see cachecap.CapacityMetrics).

@@ -694,3 +694,23 @@ func TestCachePatchFailures(t *testing.T) {
 		t.Errorf("series = %v, want denied 2, error 2", got)
 	}
 }
+
+func TestCacheFenceOK(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.SetCacheFenceOK(true)
+	if family(t, off, NameCacheFenceOK) != nil {
+		t.Errorf("%s exposed without WithCacheCapacity", NameCacheFenceOK)
+	}
+	on := New(WithCacheCapacity())
+	for _, tc := range []struct {
+		ok   bool
+		want float64
+	}{{true, 1}, {false, 0}} {
+		on.SetCacheFenceOK(tc.ok)
+		f := family(t, on, NameCacheFenceOK)
+		if f == nil || f.GetMetric()[0].GetGauge().GetValue() != tc.want {
+			t.Errorf("SetCacheFenceOK(%v): %v, want %v", tc.ok, f, tc.want)
+		}
+	}
+}

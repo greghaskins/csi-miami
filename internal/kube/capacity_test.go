@@ -2,16 +2,20 @@ package kube
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/rest"
 
+	"github.com/greghaskins/csi-miami/internal/cachecap"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
 
@@ -175,5 +179,90 @@ func TestCacheCapacityDeadline(t *testing.T) {
 	}
 	if err := c.SetCacheCapacity(context.Background(), "n", 1<<20); err == nil || errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want a timeout", err)
+	}
+}
+
+func statusBody(code int, reason, msg string) map[string]any {
+	return map[string]any{"kind": "Status", "apiVersion": "v1", "status": "Failure", "code": code, "reason": reason, "message": msg}
+}
+
+// probeServer answers the n-th request with replies[n] and records the bodies.
+func probeServer(t *testing.T, replies []func(w http.ResponseWriter)) (*Client, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var bodies []string
+	cfg := apiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		i := len(bodies)
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if i >= len(replies) {
+			writeJSON(w, 500, statusBody(500, "InternalError", "unexpected request"))
+			return
+		}
+		replies[i](w)
+	})
+	c, err := NewClient(cfg, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), bodies...) }
+}
+
+func TestProbeFence(t *testing.T) {
+	t.Parallel()
+	ok := func(w http.ResponseWriter) { writeJSON(w, 200, node("n", nil, "True")) }
+	fail := func(code int, reason, msg string) func(http.ResponseWriter) {
+		return func(w http.ResponseWriter) { writeJSON(w, code, statusBody(code, reason, msg)) }
+	}
+	const denial = `ValidatingAdmissionPolicy 'miami-node-capacity' with binding 'miami-node-capacity' denied request: [capacity] no`
+	probeAdd := `[{"op":"add","path":"/status/capacity/miami.csi.greghaskins.com~1fence-probe","value":"1"}]`
+	probeRemove := `[{"op":"remove","path":"/status/capacity/miami.csi.greghaskins.com~1fence-probe"}]`
+	tests := []struct {
+		name    string
+		replies []func(http.ResponseWriter)
+		want    cachecap.FenceState
+		wantErr bool
+		bodies  []string
+	}{
+		{"denied by the policy (403)", []func(http.ResponseWriter){fail(403, "Forbidden", denial)}, cachecap.Fenced, false, []string{probeAdd}},
+		{"denied by the policy (422)", []func(http.ResponseWriter){fail(422, "Invalid", denial)}, cachecap.Fenced, false, []string{probeAdd}},
+		{"denied by RBAC, not the policy", []func(http.ResponseWriter){fail(403, "Forbidden", `User "x" cannot patch resource "nodes/status"`)}, cachecap.FenceUnknown, true, []string{probeAdd}},
+		{"server error", []func(http.ResponseWriter){fail(500, "InternalError", "boom")}, cachecap.FenceUnknown, true, []string{probeAdd}},
+		{"allowed, then removed", []func(http.ResponseWriter){ok, ok}, cachecap.Unfenced, false, []string{probeAdd, probeRemove}},
+		{"allowed, removal fails", []func(http.ResponseWriter){ok, fail(500, "InternalError", "boom")}, cachecap.Unfenced, true, []string{probeAdd, probeRemove}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, bodies := probeServer(t, tc.replies)
+			got, err := c.ProbeFence(context.Background(), "n")
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Errorf("got (%v, %v), want (%v, error %v)", got, err, tc.want, tc.wantErr)
+			}
+			if b := bodies(); !slices.Equal(b, tc.bodies) {
+				t.Errorf("requests = %v, want %v", b, tc.bodies)
+			}
+			if err != nil && strings.Contains(err.Error(), "127.0.0.1") {
+				t.Errorf("error leaks the address: %v", err)
+			}
+		})
+	}
+}
+
+func TestClientSubject(t *testing.T) {
+	t.Parallel()
+	jwt := "e30." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"system:serviceaccount:storage:prod-miami-node"}`)) + ".sig"
+	c, err := NewClient(&rest.Config{Host: "http://127.0.0.1:1", BearerToken: jwt}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Subject(); got != "system:serviceaccount:storage:prod-miami-node" {
+		t.Errorf("Subject = %q", got)
+	}
+	c, _ = NewClient(&rest.Config{Host: "http://127.0.0.1:1"}, time.Second)
+	if got := c.Subject(); got != "unknown" {
+		t.Errorf("Subject without a token = %q", got)
 	}
 }

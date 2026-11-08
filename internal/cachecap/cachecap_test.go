@@ -93,6 +93,9 @@ type fakeNC struct {
 	have                bool
 	bytes               int64
 	getErr, set, remove error
+	unfenced            bool
+	probeErr            error
+	probes              int
 	calls               []string
 	nodes               []string
 	setBytes            []int64
@@ -117,6 +120,17 @@ func (n *fakeNC) SetCacheCapacity(_ context.Context, node string, b int64) error
 	return n.set
 }
 
+func (n *fakeNC) ProbeFence(context.Context, string) (FenceState, error) {
+	n.probes++
+	switch {
+	case n.probeErr != nil:
+		return FenceUnknown, n.probeErr
+	case n.unfenced:
+		return Unfenced, nil
+	}
+	return Fenced, nil
+}
+
 func (n *fakeNC) RemoveCacheCapacity(_ context.Context, node string) error {
 	n.nodes = append(n.nodes, node)
 	n.calls = append(n.calls, "remove")
@@ -126,6 +140,7 @@ func (n *fakeNC) RemoveCacheCapacity(_ context.Context, node string) error {
 type fakeMetrics struct {
 	n, nComm                 int
 	failures                 []string
+	fence                    []bool
 	budget, comm, size, free int64
 }
 
@@ -133,6 +148,8 @@ func (m *fakeMetrics) SetCacheCapacity(b, s, f int64) {
 	m.n++
 	m.budget, m.size, m.free = b, s, f
 }
+
+func (m *fakeMetrics) SetCacheFenceOK(ok bool) { m.fence = append(m.fence, ok) }
 
 func (m *fakeMetrics) IncCachePatchFailure(reason string) { m.failures = append(m.failures, reason) }
 
@@ -170,7 +187,7 @@ func TestRunnerPass(t *testing.T) {
 			f := &fsFigures{size: tt.fs, free: 7 * gib}
 			m := &fakeMetrics{}
 			committed := func(context.Context) (int64, int, error) { return 3 * gib, 2, nil }
-			r := NewRunner(NewSource(tt.cfg, "/c", fakeStat(f)), tt.nc, node, committed, m, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Minute, time.Second)
+			r := NewRunner(NewSource(tt.cfg, "/c", fakeStat(f)), tt.nc, node, committed, m, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Minute, time.Second, 0)
 			err := r.Pass(context.Background())
 			if (err != nil) != tt.wantErr {
 				t.Errorf("err = %v, wantErr %v", err, tt.wantErr)
@@ -207,7 +224,7 @@ func TestRunnerRunPassesImmediatelyAndStops(t *testing.T) {
 	nc := &fakeNC{setCh: make(chan struct{}, 1)}
 	f := &fsFigures{size: 220 * gib}
 	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n",
-		func(context.Context) (int64, int, error) { return 0, 0, nil }, &fakeMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour, time.Second)
+		func(context.Context) (int64, int, error) { return 0, 0, nil }, &fakeMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour, time.Second, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.Run(ctx); close(done) }()
@@ -232,7 +249,7 @@ func TestPassFSStatError(t *testing.T) {
 	t.Run("formula", func(t *testing.T) {
 		t.Parallel()
 		nc, m := &fakeNC{}, &fakeMetrics{}
-		r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", failing), nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+		r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", failing), nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second, 0)
 		if err := r.Pass(context.Background()); !errors.Is(err, boom) {
 			t.Errorf("err = %v, want the statfs error", err)
 		}
@@ -247,7 +264,7 @@ func TestPassFSStatError(t *testing.T) {
 		t.Parallel()
 		nc, m := &fakeNC{}, &fakeMetrics{}
 		cfg := Config{Accounting: true, Absolute: 100 * gib, HaveAbsolute: true}
-		r := NewRunner(NewSource(cfg, "/c", failing), nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+		r := NewRunner(NewSource(cfg, "/c", failing), nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second, 0)
 		if err := r.Pass(context.Background()); err != nil {
 			t.Fatalf("err = %v", err)
 		}
@@ -270,7 +287,7 @@ func TestPassFSStatError(t *testing.T) {
 		}
 		m := &fakeMetrics{}
 		cfg := Config{Accounting: true, Absolute: 10 * gib, HaveAbsolute: true}
-		r := NewRunner(NewSource(cfg, "/c", stat), &fakeNC{}, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+		r := NewRunner(NewSource(cfg, "/c", stat), &fakeNC{}, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second, 0)
 		if err := r.Pass(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -299,7 +316,7 @@ func TestPassCommittedError(t *testing.T) {
 		}
 		return 0, 0, boom
 	}
-	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}, "/c", fakeStat(f)), nc, "n", committed, m, quietLog(), time.Minute, time.Second)
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}, "/c", fakeStat(f)), nc, "n", committed, m, quietLog(), time.Minute, time.Second, 0)
 	if err := r.Pass(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +337,7 @@ func TestPassRunsUnderDeadline(t *testing.T) {
 	t.Parallel()
 	f := &fsFigures{size: 220 * gib}
 	nc := &blockingNC{}
-	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n", zeroCommitted, &fakeMetrics{}, quietLog(), time.Minute, 50*time.Millisecond)
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n", zeroCommitted, &fakeMetrics{}, quietLog(), time.Minute, 50*time.Millisecond, 0)
 	done := make(chan error, 1)
 	go func() { done <- r.Pass(context.Background()) }()
 	select {
@@ -342,7 +359,7 @@ func (*blockingNC) CacheCapacity(ctx context.Context, _ string) (int64, bool, er
 
 func TestNewRunnerDefaults(t *testing.T) {
 	t.Parallel()
-	r := NewRunner(NewSource(Config{}, "/c", nil), &fakeNC{}, "n", zeroCommitted, &fakeMetrics{}, quietLog(), 0, -1)
+	r := NewRunner(NewSource(Config{}, "/c", nil), &fakeNC{}, "n", zeroCommitted, &fakeMetrics{}, quietLog(), 0, -1, 0)
 	if r.interval != defaultInterval || r.deadline != defaultDeadline {
 		t.Errorf("interval %v, deadline %v", r.interval, r.deadline)
 	}
@@ -357,7 +374,7 @@ func TestRunRetriesAfterFailedPass(t *testing.T) {
 	t.Parallel()
 	f := &fsFigures{size: 220 * gib}
 	nc := &fakeNC{set: errors.New("denied"), setCh: make(chan struct{}, 8)}
-	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n", zeroCommitted, &fakeMetrics{}, quietLog(), 5*time.Millisecond, time.Second)
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n", zeroCommitted, &fakeMetrics{}, quietLog(), 5*time.Millisecond, time.Second, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.Run(ctx); close(done) }()
@@ -402,11 +419,127 @@ func TestPatchFailuresCounted(t *testing.T) {
 			t.Parallel()
 			m := &fakeMetrics{}
 			f := &fsFigures{size: 220 * gib}
-			r := NewRunner(NewSource(tt.cfg, "/c", fakeStat(f)), tt.nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+			r := NewRunner(NewSource(tt.cfg, "/c", fakeStat(f)), tt.nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second, 0)
 			_ = r.Pass(context.Background())
 			if !slices.Equal(m.failures, tt.want) {
 				t.Errorf("failures = %v, want %v", m.failures, tt.want)
 			}
 		})
+	}
+}
+
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time { return c.t }
+
+func fenceRunner(nc *fakeNC, m *fakeMetrics, c *clock) *Runner {
+	f := &fsFigures{size: 220 * gib}
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}, "/c", fakeStat(f)), nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second, 10*time.Minute)
+	r.now = c.now
+	return r
+}
+
+// TestFenceProbeCadence: the probe runs at start and then once per probe
+// interval; passes in between advertise on the last verdict.
+func TestFenceProbeCadence(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	if err := r.Pass(ctx); err != nil || nc.probes != 1 || len(nc.setBytes) != 1 {
+		t.Fatalf("first pass: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
+	}
+	for i := 0; i < 9; i++ {
+		c.t = c.t.Add(time.Minute)
+		nc.have, nc.bytes = false, 0 // the key keeps vanishing, so every pass advertises
+		if err := r.Pass(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if nc.probes != 1 || len(nc.setBytes) != 10 {
+		t.Errorf("within the interval: probes %d, sets %d, want 1 and 10", nc.probes, len(nc.setBytes))
+	}
+	c.t = c.t.Add(time.Minute)
+	if err := r.Pass(ctx); err != nil || nc.probes != 2 {
+		t.Errorf("at the interval: err %v, probes %d, want 2", err, nc.probes)
+	}
+	if len(m.fence) != 2 || !m.fence[0] || !m.fence[1] {
+		t.Errorf("fence gauge writes = %v", m.fence)
+	}
+	if len(m.failures) != 0 {
+		t.Errorf("a denied probe counted as a failure: %v", m.failures)
+	}
+}
+
+// TestFenceUnfencedFailsClosed: an allowed probe stops the advertisement and
+// removes our key, until a later probe is denied.
+func TestFenceUnfencedFailsClosed(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{unfenced: true, have: true, bytes: 95 * gib}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) {
+		t.Fatalf("err = %v, want ErrUnfenced", err)
+	}
+	if len(nc.setBytes) != 0 || !slices.Equal(nc.calls, []string{"remove"}) {
+		t.Errorf("calls = %v, sets = %v; want a removal and no set", nc.calls, nc.setBytes)
+	}
+	if !slices.Equal(m.fence, []bool{false}) {
+		t.Errorf("fence gauge writes = %v, want [false]", m.fence)
+	}
+	// Between probes the verdict stands: no set, no new probe, and a key that
+	// came back is removed again.
+	c.t = c.t.Add(time.Minute)
+	nc.have = true
+	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) || nc.probes != 1 || len(nc.setBytes) != 0 || len(nc.calls) != 2 {
+		t.Errorf("second pass: err %v, probes %d, calls %v", err, nc.probes, nc.calls)
+	}
+	// A later probe that is denied lifts it.
+	nc.unfenced = false
+	c.t = c.t.Add(10 * time.Minute)
+	nc.have = false
+	if err := r.Pass(ctx); err != nil || nc.probes != 2 || len(nc.setBytes) != 1 {
+		t.Errorf("after a denied probe: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
+	}
+	if !slices.Equal(m.fence, []bool{false, true}) {
+		t.Errorf("fence gauge writes = %v, want [false true]", m.fence)
+	}
+}
+
+// TestFenceUnknownSkipsAndRetriesSoon: a probe that cannot tell leaves the
+// gauge alone, advertises nothing, counts a failure, and is retried at the
+// pass interval and not the probe interval.
+func TestFenceUnknownSkipsAndRetriesSoon(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{probeErr: errors.New("timeout")}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	if err := r.Pass(ctx); err == nil {
+		t.Fatal("no error from an unknown probe")
+	}
+	if len(nc.setBytes) != 0 || len(m.fence) != 0 || !slices.Equal(m.failures, []string{"error"}) {
+		t.Errorf("sets %v, fence writes %v, failures %v", nc.setBytes, m.fence, m.failures)
+	}
+	// Under the pass interval nothing is probed, and nothing is advertised.
+	c.t = c.t.Add(30 * time.Second)
+	if err := r.Pass(ctx); !errors.Is(err, ErrFenceUnknown) || nc.probes != 1 || len(nc.setBytes) != 0 {
+		t.Errorf("early pass: err %v, probes %d", err, nc.probes)
+	}
+	// At the pass interval it probes again, and a clean answer advertises.
+	nc.probeErr = nil
+	c.t = c.t.Add(time.Minute)
+	if err := r.Pass(ctx); err != nil || nc.probes != 2 || len(nc.setBytes) != 1 {
+		t.Errorf("retry: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
+	}
+	if !slices.Equal(m.fence, []bool{true}) {
+		t.Errorf("fence gauge writes = %v", m.fence)
+	}
+}
+
+func TestFenceProbeIntervalDefault(t *testing.T) {
+	t.Parallel()
+	r := NewRunner(NewSource(Config{}, "/c", nil), &fakeNC{}, "n", zeroCommitted, &fakeMetrics{}, quietLog(), 0, 0, 0)
+	if r.probeEvery != 10*time.Minute || DefaultProbeInterval != 10*time.Minute {
+		t.Errorf("probe interval = %v, default %v, want 10m", r.probeEvery, DefaultProbeInterval)
 	}
 }

@@ -19,13 +19,32 @@
 # [status] lists the fields of NodeStatus one by one, because CEL cannot
 # compare "all of status but one key". TestNodeStatusFieldsCovered fails when
 # the API gains a field this list lacks. A field a cluster's API does not have
-# makes the expression fail to compile, and failurePolicy Fail then refuses the
-# plugin's patch (the node advertises nothing; the stage check still runs on
-# the flags' budget): the policy needs the node-name token extra (GA in 1.32)
-# and declaredFeatures (1.35).
+# only makes has() false (type-checking warns in the policy's status and never
+# blocks evaluation), so the list is safe on older clusters.
 #
-# The ServiceAccount name below is the base's namespace; an overlay that moves
-# the driver to another namespace patches the matchCondition with it.
+# Kubernetes versions: the policy needs ValidatingAdmissionPolicy v1 (1.30) and
+# the node-name token extra (GA in 1.32). Before 1.32 the [node-name] rule
+# denies every patch, which fails closed (the node advertises nothing; the
+# stage check still runs on the flags' budget). Before 1.30 the policy cannot
+# be created at all while the ClusterRole grant still applies, so the minimum
+# for this base is 1.32.
+#
+# The matchCondition names the ServiceAccount without its namespace, so an
+# overlay that moves the driver to another namespace (a kustomize `namespace:`
+# rewrites the ClusterRoleBinding subject but not CEL) is still fenced. It
+# fences more, never less: any ServiceAccount called miami-node is held to the
+# rules, and the rules only narrow what a patch may do.
+#
+# A `namePrefix:` or `nameSuffix:` overlay renames the ServiceAccount, and no
+# static match follows every rename: such an overlay MUST patch the
+# matchCondition to the new name (TestNodePolicyDetectsRenamingOverlays pins
+# that the base's does not follow). The backstop is the node plugin itself: at
+# start, and every -cache-fence-probe-interval (10 minutes), it tries a
+# patch this policy must deny; if the patch is allowed it logs an error naming
+# this policy and its subject, removes what it wrote, sets
+# miami_cache_fence_ok to 0, and advertises nothing until a probe is denied.
+# Each probe is a denial by design, so this policy's expected denial rate is
+# one per node per probe interval.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:

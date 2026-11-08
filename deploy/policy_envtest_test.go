@@ -17,6 +17,9 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+
+	"github.com/greghaskins/csi-miami/internal/cachecap"
+	"github.com/greghaskins/csi-miami/internal/kube"
 )
 
 // These tests run the shipped admission policy against a real API server and
@@ -221,6 +224,7 @@ func TestNodeCapacityPolicy(t *testing.T) {
 		body      []byte
 	}{
 		{"another capacity key", "[capacity]", jsonPatch(op("add", "/status/capacity/example.com~1other", `"1"`))},
+		{"the fence probe key", "[capacity]", jsonPatch(op("add", "/status/capacity/miami.csi.greghaskins.com~1fence-probe", `"1"`))},
 		{"cpu capacity", "[capacity]", jsonPatch(op("replace", "/status/capacity/cpu", `"8"`))},
 		{"removing cpu capacity", "[capacity]", jsonPatch(op("remove", "/status/capacity/cpu", ""))},
 		{"our key with another", "[capacity]", jsonPatch(capAdd, op("add", "/status/capacity/example.com~1other", `"1"`))},
@@ -278,5 +282,75 @@ func TestNodeCapacityPolicy(t *testing.T) {
 				t.Errorf("denied, but not by the policy: %v", err)
 			}
 		})
+	}
+}
+
+// TestFenceProbeAgainstThePolicy runs the node's own probe (kube.ProbeFence)
+// as the plugin: denied by the shipped policy while the binding exists, and
+// allowed, with its key removed again, once the binding is gone.
+func TestFenceProbeAgainstThePolicy(t *testing.T) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Fatal("KUBEBUILDER_ASSETS is not set; run these tests with `make envtest`")
+	}
+	env := &envtest.Environment{}
+	cfg, err := env.Start()
+	if err != nil {
+		t.Fatalf("starting the API server: %v", err)
+	}
+	t.Cleanup(func() { _ = env.Stop() })
+	admin := dyn(t, cfg)
+	r := base(t)
+	createRendered(t, admin, r, "ClusterRole", "miami-node", clusterRole)
+	createRendered(t, admin, r, "ClusterRoleBinding", "miami-node", clusterBind)
+	createRendered(t, admin, r, "ValidatingAdmissionPolicy", "miami-node-capacity", vapGVR)
+	createRendered(t, admin, r, "ValidatingAdmissionPolicyBinding", "miami-node-capacity", bindingGVR)
+	freshNodes(t, admin)
+
+	pc := rest.CopyConfig(cfg)
+	pc.Impersonate = rest.ImpersonationConfig{
+		UserName: nodeSAUser,
+		Groups:   []string{"system:serviceaccounts", "system:authenticated"},
+		Extra:    map[string][]string{nodeNameKey: {"node-a"}},
+	}
+	plugin, err := kube.NewClient(pc, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := func() (cachecap.FenceState, error) { return plugin.ProbeFence(context.Background(), "node-a") }
+
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		st, err := probe()
+		if st == cachecap.Fenced {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the policy never fenced the probe: %v, %v", st, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if err := admin.Resource(bindingGVR).Delete(context.Background(), "miami-node-capacity", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		st, err := probe()
+		if st == cachecap.Unfenced {
+			if err != nil {
+				t.Fatalf("unfenced, but the probe key was not cleaned: %v", err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("an unbound policy still looks like a fence: %v, %v", st, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	n, err := admin.Resource(nodesGVR).Get(context.Background(), "node-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedString(n.Object, "status", "capacity", "miami.csi.greghaskins.com/fence-probe"); found {
+		t.Error("the probe key was left on the node")
 	}
 }

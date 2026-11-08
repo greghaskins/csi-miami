@@ -48,6 +48,7 @@ type nodeConfig struct {
 
 	// For the volume kind.
 	cacheDir      string
+	fenceProbe    time.Duration
 	binDir        string
 	systemdSocket string
 	sharedDirs    stringList
@@ -136,6 +137,7 @@ func nodeFlags(fs *flag.FlagSet, cfg *nodeConfig) {
 	fs.BoolVar(&cfg.cacheAccounting, "cache-accounting", true, "advertise this node's cache budget to the scheduler and refuse a new volume that does not fit; false removes the advertisement and skips the check")
 	fs.Float64Var(&cfg.cacheShare, "cache-budget-share", 0.5, "the share of the cache filesystem offered as budget, above 0 and at most 1")
 	fs.StringVar(&cfg.cacheReserve, "cache-budget-reserve", "15Gi", "space kept back from the share, a quantity such as 15Gi")
+	fs.DurationVar(&cfg.fenceProbe, "cache-fence-probe-interval", cachecap.DefaultProbeInterval, "how often the node checks that the admission policy fencing its capacity patch is in force, with a request that policy denies on purpose (one expected denial per node per interval)")
 	fs.StringVar(&cfg.cacheBudget, "cache-budget", "", "an absolute budget, a quantity such as 100Gi (0 is a budget of zero); empty uses -cache-budget-share and -cache-budget-reserve")
 	fs.DurationVar(&cfg.genInterval, "generation-interval", volkinds.DefaultGenerationEvery, "how often a volume with unpublished writes publishes a generation, unless its class sets generations.interval")
 	fs.DurationVar(&cfg.genMaxAge, "generation-max-age", volkinds.DefaultGenerationMaxAge, "how old the newest generation of a volume with unpublished writes may get before the volume is reported overdue, unless its class sets generations.maxAge")
@@ -185,6 +187,7 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		{"-shared-dir must be an absolute path", slices.ContainsFunc(cfg.sharedDirs, func(d string) bool { return !filepath.IsAbs(d) })},
 		{"-generation-interval must be at least " + volkinds.MinGenerationInterval.String(), cfg.genInterval < volkinds.MinGenerationInterval},
 		{"-generation-max-age must not be under -generation-interval", cfg.genMaxAge < cfg.genInterval},
+		{"-cache-fence-probe-interval must be positive", cfg.fenceProbe <= 0},
 		{"-generation-timeout must be positive", cfg.genTimeout <= 0},
 	} {
 		if p.bad {
@@ -343,7 +346,7 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	stopCache := func() {}
 	if cluster != nil {
 		cacheRunner := cachecap.NewRunner(cachecap.NewSource(cfg.cache, cfg.cacheDir, cachecap.RealFSStat),
-			cluster, cfg.nodeID, func(context.Context) (int64, int, error) { return 0, 0, nil }, reg, log, cfg.interval, cfg.deadline)
+			cluster, cfg.nodeID, func(context.Context) (int64, int, error) { return 0, 0, nil }, reg, log, cfg.interval, cfg.deadline, cfg.fenceProbe)
 		stopCache = start(cacheRunner.Run)
 	}
 	stopEvents := func() {}
