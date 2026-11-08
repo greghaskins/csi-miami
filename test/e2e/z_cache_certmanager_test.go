@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -403,7 +404,7 @@ func (e *env) describeBundles(t *testing.T) {
 		}
 	}
 	if p, err := e.controllerPod(ctx); err == nil {
-		out, _ := e.logs(ctx, e.DriverNS, p.Name)
-		t.Logf("controller %s log:\n%s", p.Name, tail(out, 4000))
+		b, _ := e.Client.CoreV1().Pods(e.DriverNS).GetLogs(p.Name, &corev1.PodLogOptions{Container: "miami"}).DoRaw(ctx)
+		t.Logf("controller %s log:\n%s", p.Name, tail(string(b), 4000))
 	}
 }
