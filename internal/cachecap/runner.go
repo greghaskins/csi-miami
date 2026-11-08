@@ -27,6 +27,11 @@ type Runner struct {
 	probedAt   time.Time
 	verdict    FenceState
 	now        func() time.Time
+	// probeKeyLeft: an allowed probe's key could not be removed yet.
+	probeKeyLeft bool
+	// warnedUnknown: the failed passes of the current unknown verdict have
+	// been logged at Warn once already.
+	warnedUnknown bool
 }
 
 // DefaultProbeInterval is how often the fence probe runs. Each probe is a
@@ -101,6 +106,13 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 		r.log.Error("the admission policy "+FencePolicy+" does not fence this node plugin; it will advertise no cache capacity until a probe is denied. "+
 			"Patch the policy's matchCondition and binding for the renamed or moved ServiceAccount",
 			"policy", FencePolicy, "subject", subject, "node", r.node)
+		if perr != nil {
+			// The probe was allowed but its key could not be removed. Say so,
+			// count it, and retry on every pass until it is gone.
+			r.log.Error("the fence probe key could not be removed from the node; will retry on the next pass", "node", r.node, "error", perr)
+			r.probeKeyLeft = true
+			return r.counted(perr)
+		}
 		return nil
 	default:
 		return r.counted(perr)
@@ -151,7 +163,13 @@ func (r *Runner) Pass(ctx context.Context) error {
 		if err == nil && present {
 			err = r.counted(r.nc.RemoveCacheCapacity(ctx, r.node))
 		}
-		return errors.Join(cerr, ErrUnfenced, err)
+		var perr error
+		if r.probeKeyLeft {
+			if perr = r.counted(r.nc.RemoveFenceProbe(ctx, r.node)); perr == nil {
+				r.probeKeyLeft = false
+			}
+		}
+		return errors.Join(cerr, ErrUnfenced, err, perr)
 	default:
 		// No verdict yet, or the last probe could not tell: no advertising.
 		return errors.Join(cerr, ErrFenceUnknown)
@@ -186,7 +204,19 @@ func (r *Runner) Run(ctx context.Context) {
 	defer t.Stop()
 	for {
 		if err := r.Pass(ctx); err != nil && ctx.Err() == nil {
-			r.log.Warn("cache capacity advertisement failed; will retry", "error", err)
+			// While the fence verdict is unknown (a slow start, a flapping API
+			// server) every pass fails the same way: say it once, then quietly.
+			if r.verdict == FenceUnknown && r.warnedUnknown {
+				r.log.Debug("cache capacity advertisement failed; will retry", "error", err)
+			} else {
+				r.log.Warn("cache capacity advertisement failed; will retry", "error", err)
+				r.warnedUnknown = r.verdict == FenceUnknown
+			}
+		} else if r.verdict != FenceUnknown {
+			r.warnedUnknown = false
+		}
+		if r.verdict != FenceUnknown {
+			r.warnedUnknown = false
 		}
 		select {
 		case <-ctx.Done():

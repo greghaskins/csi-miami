@@ -35,6 +35,7 @@ func (stubCluster) PVExists(context.Context, string) (bool, error)              
 func (stubCluster) CacheCapacity(context.Context, string) (int64, bool, error)   { return 0, false, nil }
 func (stubCluster) SetCacheCapacity(context.Context, string, int64) error        { return nil }
 func (stubCluster) RemoveCacheCapacity(context.Context, string) error            { return nil }
+func (stubCluster) RemoveFenceProbe(context.Context, string) error               { return nil }
 func (stubCluster) ProbeFence(context.Context, string) (cachecap.FenceState, error) {
 	return cachecap.Fenced, nil
 }

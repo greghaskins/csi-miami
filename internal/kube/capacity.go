@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,6 +20,10 @@ import (
 	"github.com/greghaskins/csi-miami/internal/cachecap"
 	"github.com/greghaskins/csi-miami/internal/volume"
 )
+
+// FieldManager is the field manager of every patch the node plugin makes, set
+// explicitly instead of derived from the user agent.
+const FieldManager = "miami-node"
 
 // capacityPath is the JSON-pointer path of the node's cache resource in the
 // node's status; the "/" of the resource name is escaped as "~1" (RFC 6901).
@@ -86,6 +91,29 @@ const fenceProbeResource = "miami.csi.greghaskins.com/fence-probe"
 
 var fenceProbePath = "/status/capacity/" + strings.ReplaceAll(fenceProbeResource, "/", "~1")
 
+// policyDenial is the API server's form of a ValidatingAdmissionPolicy denial
+// by this policy's [capacity] rule. Only that counts as proof of the fence: a
+// message that merely contains the policy's name does not.
+var policyDenial = regexp.MustCompile(`ValidatingAdmissionPolicy '` + regexp.QuoteMeta(cachecap.FencePolicy) + `' with binding '[^']+' denied request: \[capacity\]`)
+
+// RemoveFenceProbe removes the probe's key from the node's status.capacity if
+// the node carries it.
+func (c *Client) RemoveFenceProbe(ctx context.Context, node string) error {
+	if node == "" {
+		return errors.New("kube: a node name is required")
+	}
+	gctx, cancel := context.WithTimeout(ctx, c.deadline)
+	obj, err := c.nodes.Get(gctx, node, metav1.GetOptions{})
+	cancel()
+	if err != nil {
+		return &nodeReadError{node: node, reason: reasonOf(err), err: err}
+	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "status", "capacity", fenceProbeResource); !found {
+		return nil
+	}
+	return c.patchCapacity(ctx, node, patchOp{Op: "remove", Path: fenceProbePath})
+}
+
 // ProbeFence tries to add a capacity key the admission policy must refuse, on
 // the node's own node. A denial that names the policy (FencePolicy) means the
 // policy is in force; a patch that goes through means it is not, and the key is
@@ -100,8 +128,7 @@ func (c *Client) ProbeFence(ctx context.Context, node string) (cachecap.FenceSta
 		return cachecap.Unfenced, nil
 	}
 	var st apierrors.APIStatus
-	if (apierrors.IsForbidden(err) || apierrors.IsInvalid(err)) && errors.As(err, &st) &&
-		strings.Contains(st.Status().Message, cachecap.FencePolicy) {
+	if (apierrors.IsForbidden(err) || apierrors.IsInvalid(err)) && errors.As(err, &st) && policyDenial.MatchString(st.Status().Message) {
 		return cachecap.Fenced, nil
 	}
 	return cachecap.FenceUnknown, err
@@ -117,7 +144,7 @@ func (c *Client) patchCapacity(ctx context.Context, node string, op patchOp) err
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.deadline)
 	defer cancel()
-	if _, err := c.nodes.Patch(ctx, node, types.JSONPatchType, body, metav1.PatchOptions{}, "status"); err != nil {
+	if _, err := c.nodes.Patch(ctx, node, types.JSONPatchType, body, metav1.PatchOptions{FieldManager: FieldManager}, "status"); err != nil {
 		return &nodePatchError{node: node, reason: reasonOf(err), err: err}
 	}
 	return nil

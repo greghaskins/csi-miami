@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -216,7 +217,7 @@ func TestProbeFence(t *testing.T) {
 	fail := func(code int, reason, msg string) func(http.ResponseWriter) {
 		return func(w http.ResponseWriter) { writeJSON(w, code, statusBody(code, reason, msg)) }
 	}
-	const denial = `ValidatingAdmissionPolicy 'miami-node-capacity' with binding 'miami-node-capacity' denied request: [capacity] no`
+	const denial = `nodes "n" is forbidden: ValidatingAdmissionPolicy 'miami-node-capacity' with binding 'miami-node-capacity' denied request: [capacity] the node plugin may change only the cache key`
 	probeAdd := `[{"op":"add","path":"/status/capacity/miami.csi.greghaskins.com~1fence-probe","value":"1"}]`
 	probeRemove := `[{"op":"remove","path":"/status/capacity/miami.csi.greghaskins.com~1fence-probe"}]`
 	tests := []struct {
@@ -228,6 +229,10 @@ func TestProbeFence(t *testing.T) {
 	}{
 		{"denied by the policy (403)", []func(http.ResponseWriter){fail(403, "Forbidden", denial)}, cachecap.Fenced, false, []string{probeAdd}},
 		{"denied by the policy (422)", []func(http.ResponseWriter){fail(422, "Invalid", denial)}, cachecap.Fenced, false, []string{probeAdd}},
+		{"another rule of the policy (not [capacity])", []func(http.ResponseWriter){fail(403, "Forbidden", `ValidatingAdmissionPolicy 'miami-node-capacity' with binding 'miami-node-capacity' denied request: [node-name] no`)}, cachecap.FenceUnknown, true, []string{probeAdd}},
+		{"a message that merely contains the name", []func(http.ResponseWriter){fail(403, "Forbidden", `webhook "miami-node-capacity.example.com" denied the request: [capacity]`)}, cachecap.FenceUnknown, true, []string{probeAdd}},
+		{"a renamed policy", []func(http.ResponseWriter){fail(403, "Forbidden", `ValidatingAdmissionPolicy 'prod-miami-node-capacity' with binding 'prod-miami-node-capacity' denied request: [capacity] no`)}, cachecap.FenceUnknown, true, []string{probeAdd}},
+		{"a 500 carrying the policy's text", []func(http.ResponseWriter){fail(500, "InternalError", denial)}, cachecap.FenceUnknown, true, []string{probeAdd}},
 		{"denied by RBAC, not the policy", []func(http.ResponseWriter){fail(403, "Forbidden", `User "x" cannot patch resource "nodes/status"`)}, cachecap.FenceUnknown, true, []string{probeAdd}},
 		{"server error", []func(http.ResponseWriter){fail(500, "InternalError", "boom")}, cachecap.FenceUnknown, true, []string{probeAdd}},
 		{"allowed, then removed", []func(http.ResponseWriter){ok, ok}, cachecap.Unfenced, false, []string{probeAdd, probeRemove}},
@@ -264,5 +269,83 @@ func TestClientSubject(t *testing.T) {
 	c, _ = NewClient(&rest.Config{Host: "http://127.0.0.1:1"}, time.Second)
 	if got := c.Subject(); got != "unknown" {
 		t.Errorf("Subject without a token = %q", got)
+	}
+}
+
+// TestPluginPatchesTouchOnlyItsTwoKeys pins the invariant that keeps the
+// policy's hold on other managers' managedFields entries safe: the plugin's
+// patches (set, remove, probe and its cleanup) touch exactly two leaf keys
+// under status.capacity, with add and remove only, and name the field manager.
+func TestPluginPatchesTouchOnlyItsTwoKeys(t *testing.T) {
+	t.Parallel()
+	type req struct{ body, manager string }
+	var mu sync.Mutex
+	var reqs []req
+	cfg := apiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if r.Method == http.MethodPatch {
+			mu.Lock()
+			reqs = append(reqs, req{string(b), r.URL.Query().Get("fieldManager")})
+			mu.Unlock()
+		}
+		n := node("n", nil, "True")
+		n["status"].(map[string]any)["capacity"] = map[string]any{"miami.csi.greghaskins.com/fence-probe": "1"}
+		writeJSON(w, 200, n)
+	})
+	c, err := NewClient(cfg, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := c.SetCacheCapacity(ctx, "n", 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RemoveCacheCapacity(ctx, "n"); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := c.ProbeFence(ctx, "n"); st != cachecap.Unfenced || err != nil {
+		t.Fatalf("probe = %v, %v", st, err)
+	}
+	if err := c.RemoveFenceProbe(ctx, "n"); err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{
+		"/status/capacity/miami.csi.greghaskins.com~1cache":       true,
+		"/status/capacity/miami.csi.greghaskins.com~1fence-probe": true,
+	}
+	seen := map[string]bool{}
+	if len(reqs) != 5 {
+		t.Fatalf("%d patches, want 5 (set, remove, probe add and remove, cleanup)", len(reqs))
+	}
+	for _, rq := range reqs {
+		var ops []patchOp
+		if err := json.Unmarshal([]byte(rq.body), &ops); err != nil {
+			t.Fatal(err)
+		}
+		if len(ops) != 1 || (ops[0].Op != "add" && ops[0].Op != "remove") || !allowed[ops[0].Path] {
+			t.Errorf("a patch strays from the two keys: %s", rq.body)
+		}
+		seen[ops[0].Path] = true
+		if rq.manager != "miami-node" {
+			t.Errorf("field manager = %q, want miami-node (%s)", rq.manager, rq.body)
+		}
+	}
+	if len(seen) != 2 {
+		t.Errorf("paths touched = %v, want both keys", seen)
+	}
+}
+
+func TestRemoveFenceProbeOnlyWhenPresent(t *testing.T) {
+	t.Parallel()
+	var patches int
+	cfg := apiServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patches++
+		}
+		writeJSON(w, 200, node("n", nil, "True"))
+	})
+	c, _ := NewClient(cfg, 5*time.Second)
+	if err := c.RemoveFenceProbe(context.Background(), "n"); err != nil || patches != 0 {
+		t.Errorf("err %v, patches %d; want none for a node without the key", err, patches)
 	}
 }

@@ -1,11 +1,14 @@
 package cachecap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,6 +97,9 @@ type fakeNC struct {
 	bytes               int64
 	getErr, set, remove error
 	unfenced            bool
+	probeCleanErr       error
+	removeProbeErr      error
+	removeProbes        int
 	probeErr            error
 	probes              int
 	calls               []string
@@ -126,9 +132,14 @@ func (n *fakeNC) ProbeFence(context.Context, string) (FenceState, error) {
 	case n.probeErr != nil:
 		return FenceUnknown, n.probeErr
 	case n.unfenced:
-		return Unfenced, nil
+		return Unfenced, n.probeCleanErr
 	}
 	return Fenced, nil
+}
+
+func (n *fakeNC) RemoveFenceProbe(context.Context, string) error {
+	n.removeProbes++
+	return n.removeProbeErr
 }
 
 func (n *fakeNC) RemoveCacheCapacity(_ context.Context, node string) error {
@@ -542,4 +553,87 @@ func TestFenceProbeIntervalDefault(t *testing.T) {
 	if r.probeEvery != 10*time.Minute || DefaultProbeInterval != 10*time.Minute {
 		t.Errorf("probe interval = %v, default %v, want 10m", r.probeEvery, DefaultProbeInterval)
 	}
+}
+
+// TestFenceProbeCleanupRetriedEveryPass: an allowed probe whose key cannot be
+// removed is logged, counted, and retried on the next pass, not after the
+// probe interval.
+func TestFenceProbeCleanupRetriedEveryPass(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("cannot remove")
+	nc := &fakeNC{unfenced: true, probeCleanErr: boom, removeProbeErr: boom}
+	m, c := &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx := context.Background()
+	if err := r.Pass(ctx); !errors.Is(err, boom) {
+		t.Fatalf("first pass err = %v", err)
+	}
+	if !strings.Contains(logs.String(), "fence probe key could not be removed") {
+		t.Errorf("no log of the failed cleanup: %s", logs.String())
+	}
+	if !slices.Equal(m.failures, []string{"error"}) {
+		t.Errorf("failures = %v, want one error", m.failures)
+	}
+	c.t = c.t.Add(time.Minute)
+	if err := r.Pass(ctx); !errors.Is(err, boom) || nc.removeProbes != 1 || nc.probes != 1 {
+		t.Errorf("second pass: err %v, cleanups %d, probes %d", err, nc.removeProbes, nc.probes)
+	}
+	nc.removeProbeErr = nil
+	c.t = c.t.Add(time.Minute)
+	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) || errors.Is(err, boom) || nc.removeProbes != 2 {
+		t.Errorf("third pass: err %v, cleanups %d", err, nc.removeProbes)
+	}
+	c.t = c.t.Add(time.Minute)
+	_ = r.Pass(ctx)
+	if nc.removeProbes != 2 {
+		t.Errorf("cleanup kept being retried after it succeeded: %d", nc.removeProbes)
+	}
+}
+
+// TestRunLogsUnknownVerdictOnce: while the verdict is unknown a failing pass
+// is a Warn the first time and a Debug after; a changed verdict resets it.
+func TestRunLogsUnknownVerdictOnce(t *testing.T) {
+	t.Parallel()
+	nc := &fakeNC{probeErr: errors.New("timeout"), setCh: make(chan struct{}, 64)}
+	var mu sync.Mutex
+	var logs bytes.Buffer
+	h := slog.NewTextHandler(&lockedWriter{&mu, &logs}, &slog.HandlerOptions{Level: slog.LevelDebug})
+	f := &fsFigures{size: 220 * gib}
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n", zeroCommitted, &fakeMetrics{}, slog.New(h), 5*time.Millisecond, time.Second, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := strings.Count(logs.String(), "level=DEBUG")
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("too few passes")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if w := strings.Count(logs.String(), "level=WARN"); w != 1 {
+		t.Errorf("%d Warn lines, want 1:\n%s", w, logs.String())
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
