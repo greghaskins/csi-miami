@@ -264,12 +264,14 @@ func New(opts ...Option) *Registry {
 }
 
 // SetCacheCapacity sets the cache budget gauges (see cachecap.CapacityMetrics).
-func (r *Registry) SetCacheCapacity(budget, committed, fsSize, fsFree int64) {
+func (r *Registry) SetCacheCapacity(budget, fsSize, fsFree int64) {
 	r.cacheBudget.Set(float64(budget))
-	r.cacheCommitted.Set(float64(committed))
 	r.cacheFSSize.Set(float64(fsSize))
 	r.cacheFSFree.Set(float64(fsFree))
 }
+
+// SetCacheCommitted sets the committed gauge (see cachecap.CapacityMetrics).
+func (r *Registry) SetCacheCommitted(committed int64) { r.cacheCommitted.Set(float64(committed)) }
 
 // Gatherer returns the registry's metrics, for tests and for other handlers.
 func (r *Registry) Gatherer() prometheus.Gatherer { return r.reg }

@@ -120,13 +120,18 @@ func (n *fakeNC) RemoveCacheCapacity(_ context.Context, node string) error {
 }
 
 type fakeMetrics struct {
-	n                        int
+	n, nComm                 int
 	budget, comm, size, free int64
 }
 
-func (m *fakeMetrics) SetCacheCapacity(b, c, s, f int64) {
+func (m *fakeMetrics) SetCacheCapacity(b, s, f int64) {
 	m.n++
-	m.budget, m.comm, m.size, m.free = b, c, s, f
+	m.budget, m.size, m.free = b, s, f
+}
+
+func (m *fakeMetrics) SetCacheCommitted(c int64) {
+	m.nComm++
+	m.comm = c
 }
 
 func TestRunnerPass(t *testing.T) {
@@ -158,7 +163,7 @@ func TestRunnerPass(t *testing.T) {
 			f := &fsFigures{size: tt.fs, free: 7 * gib}
 			m := &fakeMetrics{}
 			committed := func(context.Context) (int64, int, error) { return 3 * gib, 2, nil }
-			r := NewRunner(NewSource(tt.cfg, "/c", fakeStat(f)), tt.nc, node, committed, m, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Minute)
+			r := NewRunner(NewSource(tt.cfg, "/c", fakeStat(f)), tt.nc, node, committed, m, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Minute, time.Second)
 			err := r.Pass(context.Background())
 			if (err != nil) != tt.wantErr {
 				t.Errorf("err = %v, wantErr %v", err, tt.wantErr)
@@ -180,7 +185,7 @@ func TestRunnerPass(t *testing.T) {
 				}
 			}
 			if tt.wantMet {
-				if m.n != 1 || m.budget != Budget(tt.fs, tt.cfg) || m.comm != 3*gib || m.size != tt.fs || m.free != 7*gib {
+				if m.n != 1 || m.nComm != 1 || m.budget != Budget(tt.fs, tt.cfg) || m.comm != 3*gib || m.size != tt.fs || m.free != 7*gib {
 					t.Errorf("metrics = %+v", *m)
 				}
 			} else if m.n != 0 {
@@ -195,7 +200,7 @@ func TestRunnerRunPassesImmediatelyAndStops(t *testing.T) {
 	nc := &fakeNC{setCh: make(chan struct{}, 1)}
 	f := &fsFigures{size: 220 * gib}
 	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n",
-		func(context.Context) (int64, int, error) { return 0, 0, nil }, &fakeMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour)
+		func(context.Context) (int64, int, error) { return 0, 0, nil }, &fakeMetrics{}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Hour, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.Run(ctx); close(done) }()
@@ -203,6 +208,158 @@ func TestRunnerRunPassesImmediatelyAndStops(t *testing.T) {
 	case <-nc.setCh:
 	case <-time.After(5 * time.Second):
 		t.Fatal("no immediate pass")
+	}
+	cancel()
+	<-done
+}
+
+func quietLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func zeroCommitted(context.Context) (int64, int, error) { return 0, 0, nil }
+
+// TestPassFSStatError: only the formula needs the file system's size.
+func TestPassFSStatError(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("statfs failed")
+	failing := func(string) (int64, int64, error) { return 0, 0, boom }
+	t.Run("formula", func(t *testing.T) {
+		t.Parallel()
+		nc, m := &fakeNC{}, &fakeMetrics{}
+		r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", failing), nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+		if err := r.Pass(context.Background()); !errors.Is(err, boom) {
+			t.Errorf("err = %v, want the statfs error", err)
+		}
+		if len(nc.calls) != 0 || len(nc.nodes) != 0 {
+			t.Errorf("the node was touched: %v", nc.nodes)
+		}
+		if m.n != 0 || m.nComm != 0 {
+			t.Errorf("gauges set on a failed pass: %+v", *m)
+		}
+	})
+	t.Run("absolute", func(t *testing.T) {
+		t.Parallel()
+		nc, m := &fakeNC{}, &fakeMetrics{}
+		cfg := Config{Accounting: true, Absolute: 100 * gib, HaveAbsolute: true}
+		r := NewRunner(NewSource(cfg, "/c", failing), nc, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+		if err := r.Pass(context.Background()); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if len(nc.setBytes) != 1 || nc.setBytes[0] != 100*gib {
+			t.Errorf("set = %v, want [100Gi]", nc.setBytes)
+		}
+		if m.budget != 100*gib || m.size != 0 || m.free != 0 {
+			t.Errorf("gauges = %+v, want the budget and zero figures", *m)
+		}
+	})
+	t.Run("absolute keeps the last known figures", func(t *testing.T) {
+		t.Parallel()
+		f := &fsFigures{size: 200 * gib, free: 50 * gib}
+		fail := false
+		stat := func(d string) (int64, int64, error) {
+			if fail {
+				return 0, 0, boom
+			}
+			return fakeStat(f)(d)
+		}
+		m := &fakeMetrics{}
+		cfg := Config{Accounting: true, Absolute: 10 * gib, HaveAbsolute: true}
+		r := NewRunner(NewSource(cfg, "/c", stat), &fakeNC{}, "n", zeroCommitted, m, quietLog(), time.Minute, time.Second)
+		if err := r.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		fail = true
+		if err := r.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if m.size != 200*gib || m.free != 50*gib {
+			t.Errorf("gauges = %+v, want the last known figures", *m)
+		}
+	})
+}
+
+// TestPassCommittedError: an unreadable commitment never reads as zero.
+func TestPassCommittedError(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("cannot read drain records")
+	f := &fsFigures{size: 220 * gib, free: 7 * gib}
+	m := &fakeMetrics{}
+	nc := &fakeNC{}
+	n := 0
+	committed := func(context.Context) (int64, int, error) {
+		n++
+		if n == 1 {
+			return 3 * gib, 2, nil
+		}
+		return 0, 0, boom
+	}
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}, "/c", fakeStat(f)), nc, "n", committed, m, quietLog(), time.Minute, time.Second)
+	if err := r.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	err := r.Pass(context.Background())
+	if !errors.Is(err, boom) {
+		t.Errorf("err = %v, want the committed error", err)
+	}
+	if m.nComm != 1 || m.comm != 3*gib {
+		t.Errorf("committed gauge written %d times, last %d; want once, 3Gi", m.nComm, m.comm)
+	}
+	if m.n != 2 {
+		t.Errorf("budget gauges written %d times, want 2", m.n)
+	}
+}
+
+// TestPassRunsUnderDeadline: a node API that never answers cannot hold a pass.
+func TestPassRunsUnderDeadline(t *testing.T) {
+	t.Parallel()
+	f := &fsFigures{size: 220 * gib}
+	nc := &blockingNC{}
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n", zeroCommitted, &fakeMetrics{}, quietLog(), time.Minute, 50*time.Millisecond)
+	done := make(chan error, 1)
+	go func() { done <- r.Pass(context.Background()) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want a deadline error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pass outlived its deadline")
+	}
+}
+
+type blockingNC struct{ fakeNC }
+
+func (*blockingNC) CacheCapacity(ctx context.Context, _ string) (int64, bool, error) {
+	<-ctx.Done()
+	return 0, false, ctx.Err()
+}
+
+func TestNewRunnerDefaults(t *testing.T) {
+	t.Parallel()
+	r := NewRunner(NewSource(Config{}, "/c", nil), &fakeNC{}, "n", zeroCommitted, &fakeMetrics{}, quietLog(), 0, -1)
+	if r.interval != defaultInterval || r.deadline != defaultDeadline {
+		t.Errorf("interval %v, deadline %v", r.interval, r.deadline)
+	}
+	// A zero interval would panic time.NewTicker.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.Run(ctx)
+}
+
+// TestRunRetriesAfterFailedPass: a failed pass is tried again at the next tick.
+func TestRunRetriesAfterFailedPass(t *testing.T) {
+	t.Parallel()
+	f := &fsFigures{size: 220 * gib}
+	nc := &fakeNC{set: errors.New("denied"), setCh: make(chan struct{}, 8)}
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5}, "/c", fakeStat(f)), nc, "n", zeroCommitted, &fakeMetrics{}, quietLog(), 5*time.Millisecond, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-nc.setCh:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d passes ran; Run gave up after a failure", i)
+		}
 	}
 	cancel()
 	<-done

@@ -45,7 +45,10 @@ type NodeCapacity interface {
 	RemoveCacheCapacity(ctx context.Context, node string) error
 }
 
-// CapacityMetrics receives the figures of every pass.
+// CapacityMetrics receives the figures of every pass. The committed figure
+// has a setter of its own so that a pass that cannot read it leaves the last
+// value standing, which a zero would misreport as a node with room.
 type CapacityMetrics interface {
-	SetCacheCapacity(budget, committed, fsSize, fsFree int64)
+	SetCacheCapacity(budget, fsSize, fsFree int64)
+	SetCacheCommitted(committed int64)
 }

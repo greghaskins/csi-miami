@@ -642,14 +642,16 @@ func TestCacheMetrics(t *testing.T) {
 	t.Parallel()
 	names := []string{"miami_cache_budget_bytes", "miami_cache_committed_bytes", "miami_cache_fs_size_bytes", "miami_cache_fs_free_bytes"}
 	off := New(WithReconciler())
-	off.SetCacheCapacity(1, 2, 3, 4)
+	off.SetCacheCapacity(1, 3, 4)
+	off.SetCacheCommitted(2)
 	for _, n := range names {
 		if family(t, off, n) != nil {
 			t.Errorf("%s exposed without WithCacheCapacity", n)
 		}
 	}
 	on := New(WithCacheCapacity())
-	on.SetCacheCapacity(95<<30, 30<<30, 220<<30, 100<<30)
+	on.SetCacheCapacity(95<<30, 220<<30, 100<<30)
+	on.SetCacheCommitted(30 << 30)
 	want := []float64{95 << 30, 30 << 30, 220 << 30, 100 << 30}
 	for i, n := range names {
 		f := family(t, on, n)

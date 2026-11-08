@@ -108,16 +108,6 @@ func (c nodeConfig) cacheConfig() (cachecap.Config, error) {
 	return out, nil
 }
 
-// noopNodeCapacity is the NodeCapacity of a node that does not yet patch its
-// status: it reports the key absent and changes nothing.
-type noopNodeCapacity struct{}
-
-func (noopNodeCapacity) CacheCapacity(context.Context, string) (int64, bool, error) {
-	return 0, false, nil
-}
-func (noopNodeCapacity) SetCacheCapacity(context.Context, string, int64) error { return nil }
-func (noopNodeCapacity) RemoveCacheCapacity(context.Context, string) error     { return nil }
-
 // eventRunner is the event recorder of the node: the reconciler's Events and
 // the goroutine that talks to the API server.
 type eventRunner interface {
@@ -347,12 +337,15 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 		}
 	})
 	// The advertisement loop has a goroutine of its own, so a slow API server
-	// cannot stall the reconciler. Until the node patches its status for real,
-	// it talks to a NodeCapacity that does nothing, and until volumes report
-	// their commitment, the committed figure is zero.
-	cacheRunner := cachecap.NewRunner(cachecap.NewSource(cfg.cache, cfg.cacheDir, cachecap.RealFSStat),
-		noopNodeCapacity{}, cfg.nodeID, func(context.Context) (int64, int, error) { return 0, 0, nil }, reg, log, cfg.interval)
-	stopCache := start(cacheRunner.Run)
+	// cannot stall the reconciler. Without a cluster (-no-events) there is no
+	// node to patch and it does not run. Until volumes report their
+	// commitment, the committed figure is zero.
+	stopCache := func() {}
+	if cluster != nil {
+		cacheRunner := cachecap.NewRunner(cachecap.NewSource(cfg.cache, cfg.cacheDir, cachecap.RealFSStat),
+			cluster, cfg.nodeID, func(context.Context) (int64, int, error) { return 0, 0, nil }, reg, log, cfg.interval, cfg.deadline)
+		stopCache = start(cacheRunner.Run)
+	}
 	stopEvents := func() {}
 	if events != nil {
 		stopEvents = start(events.Run)

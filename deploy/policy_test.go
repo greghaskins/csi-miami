@@ -11,8 +11,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -44,9 +46,16 @@ type rendered struct {
 	yaml    []byte
 }
 
+// kustomizeMu serialises renders: kustomize initialises its OpenAPI schema
+// lazily into package state, and two parallel tests rendering at once race on
+// it (the race detector reports it).
+var kustomizeMu sync.Mutex
+
 func render(t *testing.T, dir string) rendered {
 	t.Helper()
 	k := krusty.MakeKustomizer(krusty.MakeDefaultOptions())
+	kustomizeMu.Lock()
+	defer kustomizeMu.Unlock()
 	m, err := k.Run(filesys.MakeFsOnDisk(), dir)
 	if err != nil {
 		t.Fatalf("render %s: %v", dir, err)
@@ -211,6 +220,9 @@ func TestRBACRuleSets(t *testing.T) {
 			{"", "persistentvolumes", []string{"get"}},
 			// The taint of a holder's node (decision 52): read, never written.
 			{"", "nodes", []string{"get"}},
+			// The node's own cache capacity (decision 66), narrowed by the
+			// admission policy miami-node-capacity.
+			{"", "nodes/status", []string{"patch"}},
 		}},
 	}
 	r := base(t)
@@ -1109,6 +1121,7 @@ func TestNodeRBACExact(t *testing.T) {
 	want := map[string]bool{
 		"/persistentvolumes:get": true,
 		"/nodes:get":             true,
+		"/nodes/status:patch":    true,
 		"/events:get":            true,
 		"/events:create":         true,
 		"/events:patch":          true,
@@ -1121,9 +1134,14 @@ func TestNodeRBACExact(t *testing.T) {
 			t.Errorf("node grants %s", k)
 		}
 	}
-	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding", "MutatingAdmissionPolicy"} {
-		if n := r.names(kind); len(n) != 0 {
-			t.Errorf("the base ships %s %v; remediation was dropped", kind, n)
+	// The one policy the base ships fences the node's status patch; the
+	// remediation policies were dropped.
+	if n := r.names("MutatingAdmissionPolicy"); len(n) != 0 {
+		t.Errorf("the base ships MutatingAdmissionPolicy %v; remediation was dropped", n)
+	}
+	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
+			t.Errorf("the base ships %s %v, want only miami-node-capacity", kind, n)
 		}
 	}
 
@@ -1390,5 +1408,108 @@ func TestBaseGolden(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("the rendered base differs from %s; review the change and regenerate it with `go test ./deploy -update`", path)
+	}
+}
+
+// TestPolicyAndBindingShip: a policy with no binding enforces nothing, and a
+// policy that fails open would let a compromised node plugin write what the
+// policy exists to stop. Taking either file out of the kustomization fails
+// here, because the render then lacks the object.
+func TestPolicyAndBindingShip(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	var bind admissionv1.ValidatingAdmissionPolicyBinding
+	r.get(t, "ValidatingAdmissionPolicyBinding", "miami-node-capacity", &bind)
+
+	if bind.Spec.PolicyName != pol.Name {
+		t.Errorf("the binding names policy %q, want %q", bind.Spec.PolicyName, pol.Name)
+	}
+	if !reflect.DeepEqual(bind.Spec.ValidationActions, []admissionv1.ValidationAction{admissionv1.Deny}) {
+		t.Errorf("validationActions = %v, want [Deny]", bind.Spec.ValidationActions)
+	}
+	if bind.Spec.MatchResources != nil || bind.Spec.ParamRef != nil {
+		t.Errorf("the binding narrows the policy: %+v", bind.Spec)
+	}
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionv1.Fail {
+		t.Errorf("failurePolicy = %v, want Fail", pol.Spec.FailurePolicy)
+	}
+}
+
+// TestNodePolicyScope pins what the policy matches: UPDATE of nodes/status
+// only, and only for the node plugin's ServiceAccount (the one the node
+// ClusterRoleBinding names). Anything wider would put the kubelet and the
+// admins under rules written for the plugin, and anything narrower would let
+// the plugin's grant through unchecked.
+func TestNodePolicyScope(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	if pol.Spec.MatchConstraints == nil || len(pol.Spec.MatchConstraints.ResourceRules) != 1 {
+		t.Fatalf("matchConstraints = %+v", pol.Spec.MatchConstraints)
+	}
+	rr := pol.Spec.MatchConstraints.ResourceRules[0]
+	if !reflect.DeepEqual(rr.Resources, []string{"nodes/status"}) ||
+		!reflect.DeepEqual(rr.Operations, []admissionv1.OperationType{admissionv1.Update}) ||
+		!reflect.DeepEqual(rr.APIGroups, []string{""}) {
+		t.Errorf("the policy matches %+v", rr)
+	}
+
+	var crb rbacv1.ClusterRoleBinding
+	r.get(t, "ClusterRoleBinding", "miami-node", &crb)
+	if len(crb.Subjects) != 1 {
+		t.Fatalf("subjects = %v", crb.Subjects)
+	}
+	user := "system:serviceaccount:" + crb.Subjects[0].Namespace + ":" + crb.Subjects[0].Name
+	if len(pol.Spec.MatchConditions) != 1 {
+		t.Fatalf("matchConditions = %v", pol.Spec.MatchConditions)
+	}
+	if want := "request.userInfo.username == '" + user + "'"; pol.Spec.MatchConditions[0].Expression != want {
+		t.Errorf("matchCondition = %q, want %q", pol.Spec.MatchConditions[0].Expression, want)
+	}
+
+	// The tags the envtest matrix asserts on are the policy's messages.
+	var msgs []string
+	for _, v := range pol.Spec.Validations {
+		msgs = append(msgs, v.Message)
+	}
+	for _, tag := range []string{"[node-name]", "[capacity]", "[status]", "[metadata]"} {
+		n := 0
+		for _, m := range msgs {
+			if strings.Contains(m, tag) {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%d validations carry %s, want 1", n, tag)
+		}
+	}
+}
+
+// TestNodeStatusFieldsCovered: the [status] and [metadata] rules name the
+// fields they hold still, so a field the API gains would be writable by the
+// plugin until it is added there. Every field of NodeStatus but capacity must
+// appear in the status rule.
+func TestNodeStatusFieldsCovered(t *testing.T) {
+	t.Parallel()
+	var pol admissionv1.ValidatingAdmissionPolicy
+	base(t).get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	var rule string
+	for _, v := range pol.Spec.Validations {
+		if strings.Contains(v.Message, "[status]") {
+			rule = v.Expression
+		}
+	}
+	rt := reflect.TypeOf(corev1.NodeStatus{})
+	for i := 0; i < rt.NumField(); i++ {
+		name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+		if name == "capacity" {
+			continue
+		}
+		if !strings.Contains(rule, "object.status."+name+")") {
+			t.Errorf("the [status] rule does not hold status.%s still", name)
+		}
 	}
 }

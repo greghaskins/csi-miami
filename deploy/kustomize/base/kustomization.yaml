@@ -63,6 +63,8 @@ resources:
   - serviceaccount-node.yaml
   - clusterrole-controller.yaml
   - clusterrole-node.yaml
+  - validatingadmissionpolicy-node-capacity.yaml
+  - validatingadmissionpolicybinding-node-capacity.yaml
   - clusterrolebinding-controller.yaml
   - role-controller.yaml
   - rolebinding-controller.yaml
