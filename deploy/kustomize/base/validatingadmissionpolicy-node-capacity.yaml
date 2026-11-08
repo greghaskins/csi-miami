@@ -61,8 +61,11 @@
 # [capacity]"), so an overlay must keep the policy and its binding named
 # miami-node-capacity (patch the ServiceAccount name, not the policy's); a
 # renamed policy reads as unknown and the node advertises nothing.
-# Each probe is a denial by design, so this policy's expected denial rate is
-# one per node per probe interval.
+# Each probe is a denial by design, so while fenced this policy's expected
+# denial rate is one per node per probe interval; while the node cannot tell
+# (unknown: a renamed policy, an API server failing, a cluster before 1.32) it
+# repeats at the pass interval, up to one per node per 30 seconds. The node
+# reports the verdict as miami_cache_fence_state{state=fenced|unfenced|unknown}.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:

@@ -679,8 +679,8 @@ func TestCachePatchFailures(t *testing.T) {
 	on := New(WithCacheCapacity())
 	// Both reasons exist at zero before any failure, so an alert can see them.
 	f := family(t, on, NameCachePatchFailures)
-	if f == nil || len(f.GetMetric()) != 2 {
-		t.Fatalf("family = %v, want two series", f)
+	if f == nil || len(f.GetMetric()) != 3 {
+		t.Fatalf("family = %v, want three series", f)
 	}
 	on.IncCachePatchFailure("denied")
 	on.IncCachePatchFailure("denied")
@@ -690,8 +690,14 @@ func TestCachePatchFailures(t *testing.T) {
 	for _, m := range family(t, on, NameCachePatchFailures).GetMetric() {
 		got[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
 	}
-	if len(got) != 2 || got["denied"] != 2 || got["error"] != 2 {
-		t.Errorf("series = %v, want denied 2, error 2", got)
+	if len(got) != 3 || got["denied"] != 2 || got["error"] != 2 || got["unknown"] != 0 {
+		t.Errorf("series = %v, want denied 2, error 2, unknown 0", got)
+	}
+	on.IncCachePatchFailure("unknown")
+	for _, m := range family(t, on, NameCachePatchFailures).GetMetric() {
+		if m.GetLabel()[0].GetValue() == "unknown" && m.GetCounter().GetValue() != 1 {
+			t.Errorf("unknown = %v, want 1", m.GetCounter().GetValue())
+		}
 	}
 }
 
@@ -712,5 +718,36 @@ func TestCacheFenceOK(t *testing.T) {
 		if f == nil || f.GetMetric()[0].GetGauge().GetValue() != tc.want {
 			t.Errorf("SetCacheFenceOK(%v): %v, want %v", tc.ok, f, tc.want)
 		}
+	}
+}
+
+func TestCacheFenceState(t *testing.T) {
+	t.Parallel()
+	on := New(WithCacheCapacity())
+	read := func() map[string]float64 {
+		out := map[string]float64{}
+		for _, m := range family(t, on, NameCacheFenceState).GetMetric() {
+			out[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
+		}
+		return out
+	}
+	for _, tc := range []struct{ set, want string }{{"", "unknown"}, {"fenced", "fenced"}, {"unfenced", "unfenced"}, {"nonsense", "unknown"}, {"fenced", "fenced"}} {
+		if tc.set != "" {
+			on.SetCacheFenceState(tc.set)
+		}
+		got := read()
+		if len(got) != 3 {
+			t.Fatalf("series = %v, want three", got)
+		}
+		for state, v := range got {
+			if (v == 1) != (state == tc.want) || (v != 0 && v != 1) {
+				t.Errorf("after %q: %v, want only %s at 1", tc.set, got, tc.want)
+			}
+		}
+	}
+	off := New(WithReconciler())
+	off.SetCacheFenceState("fenced")
+	if family(t, off, NameCacheFenceState) != nil {
+		t.Error("exposed without WithCacheCapacity")
 	}
 }

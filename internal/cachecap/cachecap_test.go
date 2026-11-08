@@ -152,6 +152,7 @@ type fakeMetrics struct {
 	n, nComm                 int
 	failures                 []string
 	fence                    []bool
+	states                   []string
 	budget, comm, size, free int64
 }
 
@@ -161,6 +162,8 @@ func (m *fakeMetrics) SetCacheCapacity(b, s, f int64) {
 }
 
 func (m *fakeMetrics) SetCacheFenceOK(ok bool) { m.fence = append(m.fence, ok) }
+
+func (m *fakeMetrics) SetCacheFenceState(s string) { m.states = append(m.states, s) }
 
 func (m *fakeMetrics) IncCachePatchFailure(reason string) { m.failures = append(m.failures, reason) }
 
@@ -474,8 +477,8 @@ func TestFenceProbeCadence(t *testing.T) {
 	if err := r.Pass(ctx); err != nil || nc.probes != 2 {
 		t.Errorf("at the interval: err %v, probes %d, want 2", err, nc.probes)
 	}
-	if len(m.fence) != 2 || !m.fence[0] || !m.fence[1] {
-		t.Errorf("fence gauge writes = %v", m.fence)
+	if len(m.fence) != 2 || !m.fence[0] || !m.fence[1] || !slices.Equal(m.states, []string{"fenced", "fenced"}) {
+		t.Errorf("fence gauge writes = %v, states = %v", m.fence, m.states)
 	}
 	if len(m.failures) != 0 {
 		t.Errorf("a denied probe counted as a failure: %v", m.failures)
@@ -512,8 +515,8 @@ func TestFenceUnfencedFailsClosed(t *testing.T) {
 	if err := r.Pass(ctx); err != nil || nc.probes != 2 || len(nc.setBytes) != 1 {
 		t.Errorf("after a denied probe: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
 	}
-	if !slices.Equal(m.fence, []bool{false, true}) {
-		t.Errorf("fence gauge writes = %v, want [false true]", m.fence)
+	if !slices.Equal(m.fence, []bool{false, true}) || !slices.Equal(m.states, []string{"unfenced", "fenced"}) {
+		t.Errorf("fence gauge writes = %v, states = %v; want [false true] and [unfenced fenced]", m.fence, m.states)
 	}
 }
 
@@ -528,8 +531,8 @@ func TestFenceUnknownSkipsAndRetriesSoon(t *testing.T) {
 	if err := r.Pass(ctx); err == nil {
 		t.Fatal("no error from an unknown probe")
 	}
-	if len(nc.setBytes) != 0 || len(m.fence) != 0 || !slices.Equal(m.failures, []string{"error"}) {
-		t.Errorf("sets %v, fence writes %v, failures %v", nc.setBytes, m.fence, m.failures)
+	if len(nc.setBytes) != 0 || !slices.Equal(m.fence, []bool{false}) || !slices.Equal(m.states, []string{"unknown"}) || !slices.Equal(m.failures, []string{"unknown"}) {
+		t.Errorf("sets %v, fence writes %v, states %v, failures %v", nc.setBytes, m.fence, m.states, m.failures)
 	}
 	// Under the pass interval nothing is probed, and nothing is advertised.
 	c.t = c.t.Add(30 * time.Second)
@@ -542,8 +545,8 @@ func TestFenceUnknownSkipsAndRetriesSoon(t *testing.T) {
 	if err := r.Pass(ctx); err != nil || nc.probes != 2 || len(nc.setBytes) != 1 {
 		t.Errorf("retry: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
 	}
-	if !slices.Equal(m.fence, []bool{true}) {
-		t.Errorf("fence gauge writes = %v", m.fence)
+	if !slices.Equal(m.fence, []bool{false, true}) || !slices.Equal(m.states, []string{"unknown", "fenced"}) {
+		t.Errorf("fence gauge writes = %v, states = %v", m.fence, m.states)
 	}
 }
 
@@ -636,4 +639,70 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
+}
+
+// TestFenceStateTransitions walks fenced -> unknown -> unfenced -> fenced and
+// checks the state, the gauge and the failure counts at each step: an unknown
+// probe is its own state and its own reason, never a denial.
+func TestFenceStateTransitions(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	ctx := context.Background()
+	step := func(mutate func()) {
+		c.t = c.t.Add(11 * time.Minute) // past the probe interval
+		mutate()
+		_ = r.Pass(ctx)
+	}
+	_ = r.Pass(ctx)
+	step(func() { nc.probeErr = statusErr(403, metav1.StatusReasonForbidden) })
+	step(func() { nc.probeErr, nc.unfenced = nil, true })
+	step(func() { nc.unfenced = false })
+	want := []string{"fenced", "unknown", "unfenced", "fenced"}
+	if !slices.Equal(m.states, want) {
+		t.Errorf("states = %v, want %v", m.states, want)
+	}
+	if !slices.Equal(m.fence, []bool{true, false, false, true}) {
+		t.Errorf("fence_ok = %v", m.fence)
+	}
+	if !slices.Equal(m.failures, []string{"unknown"}) {
+		t.Errorf("failures = %v, want one unknown and no denied", m.failures)
+	}
+}
+
+// TestFenceProbeCleanupRetriedWhateverTheVerdict: a probe key that could not be
+// removed is retried after the verdict has flipped to Fenced, is counted and
+// warned about once when it keeps failing, and stops when it succeeds.
+func TestFenceProbeCleanupRetriedWhateverTheVerdict(t *testing.T) {
+	t.Parallel()
+	denied := statusErr(403, metav1.StatusReasonForbidden)
+	nc := &fakeNC{unfenced: true, probeCleanErr: errors.New("net"), removeProbeErr: denied}
+	m, c := &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	var logs bytes.Buffer
+	r := fenceRunner(nc, m, c)
+	r.log = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx := context.Background()
+	_ = r.Pass(ctx) // allowed probe, key left
+	// The binding is fixed: the next probe is denied, so the verdict is Fenced.
+	nc.unfenced, nc.probeCleanErr = false, nil
+	c.t = c.t.Add(11 * time.Minute)
+	for i := 0; i < 3; i++ {
+		_ = r.Pass(ctx)
+		c.t = c.t.Add(time.Minute)
+	}
+	if r.verdict != Fenced || nc.removeProbes != 3 {
+		t.Errorf("verdict %v, cleanup attempts %d; want Fenced and 3", r.verdict, nc.removeProbes)
+	}
+	if n := strings.Count(logs.String(), "still on the node"); n != 1 {
+		t.Errorf("%d warnings about the stranded key, want 1", n)
+	}
+	if n := slices.Index(m.failures, "denied"); n < 0 {
+		t.Errorf("failures = %v, want denied removals counted", m.failures)
+	}
+	nc.removeProbeErr = nil
+	_ = r.Pass(ctx)
+	_ = r.Pass(ctx)
+	if nc.removeProbes != 4 {
+		t.Errorf("cleanup attempts = %d, want it to stop after succeeding (4)", nc.removeProbes)
+	}
 }

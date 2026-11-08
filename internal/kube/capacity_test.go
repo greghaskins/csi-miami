@@ -228,7 +228,8 @@ func TestProbeFence(t *testing.T) {
 		bodies  []string
 	}{
 		{"denied by the policy (403)", []func(http.ResponseWriter){fail(403, "Forbidden", denial)}, cachecap.Fenced, false, []string{probeAdd}},
-		{"denied by the policy (422)", []func(http.ResponseWriter){fail(422, "Invalid", denial)}, cachecap.Fenced, false, []string{probeAdd}},
+		{"a 422 is not this policy's answer", []func(http.ResponseWriter){fail(422, "Invalid", denial)}, cachecap.FenceUnknown, true, []string{probeAdd}},
+		{"a webhook quoting the policy's text", []func(http.ResponseWriter){fail(403, "Forbidden", `admission webhook "w.example.com" denied the request: `+denial)}, cachecap.FenceUnknown, true, []string{probeAdd}},
 		{"another rule of the policy (not [capacity])", []func(http.ResponseWriter){fail(403, "Forbidden", `ValidatingAdmissionPolicy 'miami-node-capacity' with binding 'miami-node-capacity' denied request: [node-name] no`)}, cachecap.FenceUnknown, true, []string{probeAdd}},
 		{"a message that merely contains the name", []func(http.ResponseWriter){fail(403, "Forbidden", `webhook "miami-node-capacity.example.com" denied the request: [capacity]`)}, cachecap.FenceUnknown, true, []string{probeAdd}},
 		{"a renamed policy", []func(http.ResponseWriter){fail(403, "Forbidden", `ValidatingAdmissionPolicy 'prod-miami-node-capacity' with binding 'prod-miami-node-capacity' denied request: [capacity] no`)}, cachecap.FenceUnknown, true, []string{probeAdd}},

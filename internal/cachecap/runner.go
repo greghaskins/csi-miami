@@ -28,7 +28,8 @@ type Runner struct {
 	verdict    FenceState
 	now        func() time.Time
 	// probeKeyLeft: an allowed probe's key could not be removed yet.
-	probeKeyLeft bool
+	probeKeyLeft  bool
+	cleanupWarned bool
 	// warnedUnknown: the failed passes of the current unknown verdict have
 	// been logged at Warn once already.
 	warnedUnknown bool
@@ -97,8 +98,10 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 	switch state {
 	case Fenced:
 		r.metrics.SetCacheFenceOK(true)
+		r.metrics.SetCacheFenceState("fenced")
 	case Unfenced:
 		r.metrics.SetCacheFenceOK(false)
+		r.metrics.SetCacheFenceState("unfenced")
 		subject := "unknown"
 		if s, ok := r.nc.(interface{ Subject() string }); ok {
 			subject = s.Subject()
@@ -115,9 +118,37 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 		}
 		return nil
 	default:
-		return r.counted(perr)
+		// Unknown reads 0 in miami_cache_fence_ok, shows as its own state, and
+		// is counted under its own reason, not as a denial.
+		r.metrics.SetCacheFenceOK(false)
+		r.metrics.SetCacheFenceState("unknown")
+		if perr != nil {
+			r.metrics.IncCachePatchFailure(PatchUnknown)
+		}
+		return perr
 	}
 	return nil
+}
+
+// retryProbeCleanup removes the fence probe's key if an allowed probe left it,
+// on every pass and whatever the verdict has become since. If the policy
+// itself now denies the removal (it denies touching any key but ours), the
+// key is stranded and an operator has to remove it: that is said once.
+func (r *Runner) retryProbeCleanup(ctx context.Context) error {
+	if !r.probeKeyLeft {
+		return nil
+	}
+	err := r.nc.RemoveFenceProbe(ctx, r.node)
+	if err == nil {
+		r.probeKeyLeft, r.cleanupWarned = false, false
+		return nil
+	}
+	if !r.cleanupWarned {
+		r.cleanupWarned = true
+		r.log.Warn("the fence probe key is still on the node and could not be removed; an operator must remove status.capacity[miami.csi.greghaskins.com/fence-probe] if the admission policy now denies it",
+			"node", r.node, "error", err)
+	}
+	return r.counted(err)
 }
 
 // Pass computes the budget, sets the metrics, and patches the node when its
@@ -152,6 +183,8 @@ func (r *Runner) Pass(ctx context.Context) error {
 	// matching nobody, which no static check sees. So the runner asks the API
 	// server, at start and then every probe interval, and fails closed. Each
 	// probe is a denied request by design, so it is not made on every pass.
+	// An allowed probe's key is removed on every pass, whatever the verdict.
+	cerr = errors.Join(cerr, r.retryProbeCleanup(ctx))
 	if perr := r.probeIfDue(ctx); perr != nil {
 		return errors.Join(cerr, perr)
 	}
@@ -163,13 +196,7 @@ func (r *Runner) Pass(ctx context.Context) error {
 		if err == nil && present {
 			err = r.counted(r.nc.RemoveCacheCapacity(ctx, r.node))
 		}
-		var perr error
-		if r.probeKeyLeft {
-			if perr = r.counted(r.nc.RemoveFenceProbe(ctx, r.node)); perr == nil {
-				r.probeKeyLeft = false
-			}
-		}
-		return errors.Join(cerr, ErrUnfenced, err, perr)
+		return errors.Join(cerr, ErrUnfenced, err)
 	default:
 		// No verdict yet, or the last probe could not tell: no advertising.
 		return errors.Join(cerr, ErrFenceUnknown)

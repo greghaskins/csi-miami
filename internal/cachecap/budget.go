@@ -76,12 +76,16 @@ type CapacityMetrics interface {
 	// capacity; reason is PatchDenied or PatchError.
 	IncCachePatchFailure(reason string)
 	// SetCacheFenceOK is 1 when the last probe found the policy in force and
-	// 0 when it found the plugin unfenced; an unknown probe leaves it as it was.
+	// 0 when it found the plugin unfenced or could not tell.
 	SetCacheFenceOK(ok bool)
+	// SetCacheFenceState records the verdict of the last probe: "fenced",
+	// "unfenced" or "unknown" (see the Fence* names); exactly one is 1.
+	SetCacheFenceState(state string)
 }
 
 // The reasons of CapacityMetrics.IncCachePatchFailure.
 const (
-	PatchDenied = "denied" // the API server answered 403 or 422
-	PatchError  = "error"  // any other failure
+	PatchDenied  = "denied"  // the API server answered 403 or 422
+	PatchError   = "error"   // any other failure
+	PatchUnknown = "unknown" // a fence probe that could not tell
 )
