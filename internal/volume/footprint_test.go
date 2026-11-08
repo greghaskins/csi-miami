@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"math"
 	"testing"
 )
 
@@ -114,6 +115,7 @@ func TestServedFootprint(t *testing.T) {
 		{"smaller served size changes nothing", whole, 1 * gi, CacheFootprint(whole)},
 		{"whole-volume cache follows the growth", whole, 20 * gi, CacheFootprint(VolumeParams{Size: 20 * gi, CacheSize: 20 * gi, Generations: whole.Generations})},
 		{"growth rounds up to whole chunks", whole, 20*gi + 1, CacheFootprint(VolumeParams{Size: 20*gi + 4*mi, CacheSize: 20*gi + 4*mi, Generations: whole.Generations})},
+		{"a served size near the int64 limit saturates", whole, math.MaxInt64 - 1, CacheFootprint(VolumeParams{Size: math.MaxInt64 / (4 * mi) * 4 * mi, CacheSize: math.MaxInt64 / (4 * mi) * 4 * mi, Generations: whole.Generations})},
 		{"partial cache keeps its bound", lazy, 200 * gi, CacheFootprint(lazy)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

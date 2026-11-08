@@ -1,6 +1,7 @@
 package volume
 
 import (
+	"math"
 	"math/bits"
 
 	"github.com/greghaskins/csi-miami/internal/chunk"
@@ -82,6 +83,9 @@ func AddFootprint(a, b int64) int64 {
 // the webhook both call it, so they cannot disagree about an expanded volume.
 // served <= 0 means no larger size is known.
 func ServedFootprint(v VolumeParams, served int64) int64 {
+	if v.ChunkSize > 0 && served > math.MaxInt64-v.ChunkSize {
+		served = math.MaxInt64 / v.ChunkSize * v.ChunkSize // RoundUp would overflow
+	}
 	size := max(v.Size, chunk.RoundUp(served, v.ChunkSize))
 	if size > v.Size && v.CacheSize >= v.Size {
 		v.CacheSize = size
