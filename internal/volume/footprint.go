@@ -1,6 +1,10 @@
 package volume
 
-import "math/bits"
+import (
+	"math/bits"
+
+	"github.com/greghaskins/csi-miami/internal/chunk"
+)
 
 // CacheResource is the extended resource a pod requests and a node
 // advertises for node-local cache space, in bytes and always a whole number
@@ -66,4 +70,22 @@ func AddFootprint(a, b int64) int64 {
 		return MaxFootprint
 	}
 	return a + b
+}
+
+// ServedFootprint is the footprint of a volume at the size it is served: the
+// larger of v.Size and served rounded up to whole chunks. A PV's volume
+// context is immutable and says the size the volume was created with, so a
+// grown volume is served at more; and a class that caches the whole volume
+// (CacheSize >= Size) keeps doing so when it grows, so its cache bound rises
+// with the size. A class with a partial cache keeps its bound. It is the one
+// place that rule is spelled: the node's stage and commitment accounting and
+// the webhook both call it, so they cannot disagree about an expanded volume.
+// served <= 0 means no larger size is known.
+func ServedFootprint(v VolumeParams, served int64) int64 {
+	size := max(v.Size, chunk.RoundUp(served, v.ChunkSize))
+	if size > v.Size && v.CacheSize >= v.Size {
+		v.CacheSize = size
+	}
+	v.Size = size
+	return CacheFootprint(v)
 }
