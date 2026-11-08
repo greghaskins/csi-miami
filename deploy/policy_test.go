@@ -11,13 +11,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"sigs.k8s.io/kustomize/api/krusty"
+	"sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 	"sigs.k8s.io/yaml"
 
@@ -44,9 +47,16 @@ type rendered struct {
 	yaml    []byte
 }
 
+// kustomizeMu serialises renders: kustomize initialises its OpenAPI schema
+// lazily into package state, and two parallel tests rendering at once race on
+// it (the race detector reports it).
+var kustomizeMu sync.Mutex
+
 func render(t *testing.T, dir string) rendered {
 	t.Helper()
 	k := krusty.MakeKustomizer(krusty.MakeDefaultOptions())
+	kustomizeMu.Lock()
+	defer kustomizeMu.Unlock()
 	m, err := k.Run(filesys.MakeFsOnDisk(), dir)
 	if err != nil {
 		t.Fatalf("render %s: %v", dir, err)
@@ -211,6 +221,9 @@ func TestRBACRuleSets(t *testing.T) {
 			{"", "persistentvolumes", []string{"get"}},
 			// The taint of a holder's node (decision 52): read, never written.
 			{"", "nodes", []string{"get"}},
+			// The node's own cache capacity (decision 66), narrowed by the
+			// admission policy miami-node-capacity.
+			{"", "nodes/status", []string{"patch"}},
 		}},
 	}
 	r := base(t)
@@ -1109,6 +1122,7 @@ func TestNodeRBACExact(t *testing.T) {
 	want := map[string]bool{
 		"/persistentvolumes:get": true,
 		"/nodes:get":             true,
+		"/nodes/status:patch":    true,
 		"/events:get":            true,
 		"/events:create":         true,
 		"/events:patch":          true,
@@ -1121,9 +1135,14 @@ func TestNodeRBACExact(t *testing.T) {
 			t.Errorf("node grants %s", k)
 		}
 	}
-	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding", "MutatingAdmissionPolicy"} {
-		if n := r.names(kind); len(n) != 0 {
-			t.Errorf("the base ships %s %v; remediation was dropped", kind, n)
+	// The one policy the base ships fences the node's status patch; the
+	// remediation policies were dropped.
+	if n := r.names("MutatingAdmissionPolicy"); len(n) != 0 {
+		t.Errorf("the base ships MutatingAdmissionPolicy %v; remediation was dropped", n)
+	}
+	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
+			t.Errorf("the base ships %s %v, want only miami-node-capacity", kind, n)
 		}
 	}
 
@@ -1391,4 +1410,211 @@ func TestBaseGolden(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Errorf("the rendered base differs from %s; review the change and regenerate it with `go test ./deploy -update`", path)
 	}
+}
+
+// TestPolicyAndBindingShip: a policy with no binding enforces nothing, and a
+// policy that fails open would let a compromised node plugin write what the
+// policy exists to stop. Taking either file out of the kustomization fails
+// here, because the render then lacks the object.
+func TestPolicyAndBindingShip(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	var bind admissionv1.ValidatingAdmissionPolicyBinding
+	r.get(t, "ValidatingAdmissionPolicyBinding", "miami-node-capacity", &bind)
+
+	if bind.Spec.PolicyName != pol.Name {
+		t.Errorf("the binding names policy %q, want %q", bind.Spec.PolicyName, pol.Name)
+	}
+	if !reflect.DeepEqual(bind.Spec.ValidationActions, []admissionv1.ValidationAction{admissionv1.Deny}) {
+		t.Errorf("validationActions = %v, want [Deny]", bind.Spec.ValidationActions)
+	}
+	if bind.Spec.MatchResources != nil || bind.Spec.ParamRef != nil {
+		t.Errorf("the binding narrows the policy: %+v", bind.Spec)
+	}
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionv1.Fail {
+		t.Errorf("failurePolicy = %v, want Fail", pol.Spec.FailurePolicy)
+	}
+}
+
+// TestNodePolicyScope pins what the policy matches: UPDATE of nodes/status
+// only, and only for the node plugin's ServiceAccount (the one the node
+// ClusterRoleBinding names). Anything wider would put the kubelet and the
+// admins under rules written for the plugin, and anything narrower would let
+// the plugin's grant through unchecked.
+func TestNodePolicyScope(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	if pol.Spec.MatchConstraints == nil || len(pol.Spec.MatchConstraints.ResourceRules) != 1 {
+		t.Fatalf("matchConstraints = %+v", pol.Spec.MatchConstraints)
+	}
+	rr := pol.Spec.MatchConstraints.ResourceRules[0]
+	if !reflect.DeepEqual(rr.Resources, []string{"nodes/status"}) ||
+		!reflect.DeepEqual(rr.Operations, []admissionv1.OperationType{admissionv1.Update}) ||
+		!reflect.DeepEqual(rr.APIGroups, []string{""}) {
+		t.Errorf("the policy matches %+v", rr)
+	}
+
+	var crb rbacv1.ClusterRoleBinding
+	r.get(t, "ClusterRoleBinding", "miami-node", &crb)
+	if len(crb.Subjects) != 1 {
+		t.Fatalf("subjects = %v", crb.Subjects)
+	}
+	user := "system:serviceaccount:" + crb.Subjects[0].Namespace + ":" + crb.Subjects[0].Name
+	if len(pol.Spec.MatchConditions) != 1 {
+		t.Fatalf("matchConditions = %v", pol.Spec.MatchConditions)
+	}
+	if got := squash(pol.Spec.MatchConditions[0].Expression); got != nodePluginMatch {
+		t.Errorf("matchCondition = %q, want %q", got, nodePluginMatch)
+	}
+	if !matchesPlugin(user) {
+		t.Errorf("the condition does not match the binding's subject %s", user)
+	}
+
+	// The tags the envtest matrix asserts on are the policy's messages.
+	var msgs []string
+	for _, v := range pol.Spec.Validations {
+		msgs = append(msgs, v.Message)
+	}
+	for _, tag := range []string{"[node-name]", "[capacity]", "[status]", "[metadata]"} {
+		n := 0
+		for _, m := range msgs {
+			if strings.Contains(m, tag) {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%d validations carry %s, want 1", n, tag)
+		}
+	}
+}
+
+// TestNodeStatusFieldsCovered: the [status] and [metadata] rules name the
+// fields they hold still, so a field the API gains would be writable by the
+// plugin until it is added there. Every field of NodeStatus but capacity must
+// appear in the status rule.
+func TestNodeStatusFieldsCovered(t *testing.T) {
+	t.Parallel()
+	var pol admissionv1.ValidatingAdmissionPolicy
+	base(t).get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	var rule string
+	for _, v := range pol.Spec.Validations {
+		if strings.Contains(v.Message, "[status]") {
+			rule = v.Expression
+		}
+	}
+	rt := reflect.TypeOf(corev1.NodeStatus{})
+	for i := 0; i < rt.NumField(); i++ {
+		name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+		if name == "capacity" {
+			continue
+		}
+		if !strings.Contains(rule, "object.status."+name+")") {
+			t.Errorf("the [status] rule does not hold status.%s still", name)
+		}
+	}
+}
+
+// nodePluginMatch is the matchCondition, and matchesPlugin its meaning in Go.
+const nodePluginMatch = "request.userInfo.username.startsWith('system:serviceaccount:') && request.userInfo.username.endsWith(':miami-node')"
+
+func squash(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+func matchesPlugin(user string) bool {
+	return strings.HasPrefix(user, "system:serviceaccount:") && strings.HasSuffix(user, ":miami-node")
+}
+
+// TestNodePolicyFollowsNamespaceOverlay: a kustomize `namespace:` rewrites the
+// ClusterRoleBinding's subject but not CEL. A condition that named the
+// namespace would then miss the plugin, which would hold nodes/status patch on
+// every node with no fence at all.
+func TestNodePolicyFollowsNamespaceOverlay(t *testing.T) {
+	t.Parallel()
+	r := renderOverlay(t, "namespace: storage\n")
+	var crb rbacv1.ClusterRoleBinding
+	r.get(t, "ClusterRoleBinding", "miami-node", &crb)
+	if len(crb.Subjects) != 1 || crb.Subjects[0].Namespace != "storage" {
+		t.Fatalf("the overlay did not move the subject: %v", crb.Subjects)
+	}
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-node-capacity", &pol)
+	if got := squash(pol.Spec.MatchConditions[0].Expression); got != nodePluginMatch {
+		t.Fatalf("matchCondition = %q", got)
+	}
+	subject := "system:serviceaccount:" + crb.Subjects[0].Namespace + ":" + crb.Subjects[0].Name
+	if !matchesPlugin(subject) {
+		t.Errorf("the condition misses the moved subject %s: the grant would be unfenced", subject)
+	}
+	for _, other := range []string{"kubernetes-admin", "system:masters", "system:node:node-a", "system:serviceaccount:storage:miami-controller"} {
+		if matchesPlugin(other) {
+			t.Errorf("the condition matches %s", other)
+		}
+	}
+	if strings.Contains(pol.Spec.MatchConditions[0].Expression, "miami-system") {
+		t.Error("the condition names the base's namespace")
+	}
+}
+
+// TestNodePolicyDetectsRenamingOverlays: namePrefix and nameSuffix rename the
+// ServiceAccount, and no static string match follows every rename. The test
+// pins that the mismatch is real, so that nobody takes the namespace test as a
+// promise about renames: such an overlay must patch the matchCondition, and the
+// node's runtime fence probe (cachecap.Runner) is the backstop that stops it
+// advertising when it does not.
+func TestNodePolicyDetectsRenamingOverlays(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, kust, wantSA string }{
+		{"namePrefix", "namePrefix: prod-\n", "prod-miami-node"},
+		{"nameSuffix", "nameSuffix: -prod\n", "miami-node-prod"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := renderOverlay(t, tc.kust)
+			var crb rbacv1.ClusterRoleBinding
+			r.get(t, "ClusterRoleBinding", tc.wantSA, &crb)
+			if len(crb.Subjects) != 1 || crb.Subjects[0].Name != tc.wantSA {
+				t.Fatalf("the subject was not renamed: %v", crb.Subjects)
+			}
+			subject := "system:serviceaccount:" + crb.Subjects[0].Namespace + ":" + crb.Subjects[0].Name
+			if matchesPlugin(subject) {
+				t.Errorf("the condition unexpectedly matches the renamed subject %s; if the policy now follows renames, say so here and in the policy comment", subject)
+			}
+		})
+	}
+}
+
+// renderOverlay renders the base under an overlay whose kustomization carries
+// extra after its resources.
+func renderOverlay(t *testing.T, extra string) rendered {
+	t.Helper()
+	// A scratch directory beside the base: kustomize wants relative roots.
+	dir, err := os.MkdirTemp(".", "nsprobe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	kust := "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n" + extra + "resources:\n  - ../kustomize/base\n"
+	if err := os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kust), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := krusty.MakeDefaultOptions()
+	opts.LoadRestrictions = types.LoadRestrictionsNone
+	kustomizeMu.Lock()
+	m, err := krusty.MakeKustomizer(opts).Run(filesys.MakeFsOnDisk(), dir)
+	kustomizeMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r rendered
+	for _, res := range m.Resources() {
+		js, err := res.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.objects = append(r.objects, object{kind: res.GetKind(), name: res.GetName(), json: js})
+	}
+	return r
 }

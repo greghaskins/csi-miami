@@ -7,8 +7,15 @@
 #     force-detach annotation (decision 52).
 #   - Nodes: the judge reads a holder node's taints, to see the
 #     node.kubernetes.io/out-of-service taint.
-# Both are `get` only; the node never writes an annotation or a taint, which
-# are the operator's. The events it writes are namespaced (the `default`
+#   - nodes/status: `patch`, and nothing else new. The node advertises one
+#     number on its own node, status.capacity[miami.csi.greghaskins.com/cache]
+#     (design decision 66). RBAC cannot say "this node, this key", so the
+#     ValidatingAdmissionPolicy miami-node-capacity does: it denies the plugin
+#     any patch of another node, of any other capacity key, of any other part
+#     of status, and of labels, annotations, finalizers and ownerReferences.
+#     `nodes` itself stays `get` only.
+# PVs and nodes are read with `get` only; the node never writes an annotation
+# or a taint, which are the operator's. The events it writes are namespaced (the `default`
 # namespace) and have their own Role, role-node.yaml. The registrar and the
 # liveness probe call no API.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -22,3 +29,6 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get]
+  - apiGroups: [""]
+    resources: [nodes/status]
+    verbs: [patch]

@@ -68,6 +68,7 @@ type Client struct {
 	nodes    dynamic.NamespaceableResourceInterface
 	dyn      dynamic.Interface // for the claim reads (claims.go)
 	deadline time.Duration
+	subject  string
 }
 
 var _ PVReader = (*Client)(nil)
@@ -123,7 +124,7 @@ func NewClient(cfg *rest.Config, deadline time.Duration) (*Client, error) {
 	if deadline <= 0 {
 		deadline = DefaultDeadline
 	}
-	return &Client{pvs: dyn.Resource(pvResource), nodes: dyn.Resource(nodeResource), dyn: dyn, deadline: deadline}, nil
+	return &Client{pvs: dyn.Resource(pvResource), nodes: dyn.Resource(nodeResource), dyn: dyn, deadline: deadline, subject: tokenSubject(c)}, nil
 }
 
 // GetPV implements PVReader with one GET under the client's deadline.

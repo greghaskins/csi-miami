@@ -91,7 +91,7 @@ ENVTEST_K8S_VERSION := 1.37.0
 
 envtest:
 	KUBEBUILDER_ASSETS="$$(setup-envtest use $(ENVTEST_K8S_VERSION) --print path)" \
-		go test -tags envtest -count=1 ./internal/csi ./internal/webhook
+		go test -tags envtest -count=1 ./internal/csi ./deploy ./internal/webhook
 
 # The csi-sanity suite (pinned in mise.toml) against the identity, controller
 # and node services served together, on a local transport, with real bind
