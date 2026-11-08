@@ -43,6 +43,10 @@ const (
 	// unpublished writes are kept. It is raised when the refusal begins, not
 	// on every tick.
 	ReasonPublishRefused = "PublishRefused"
+	// ReasonCacheBudgetExceeded is a stage refused because the node's cache
+	// budget cannot hold the volume (decision 66). It is raised when the
+	// refusal begins, not on every retry.
+	ReasonCacheBudgetExceeded = "CacheBudgetExceeded"
 	// ReasonVolumeUnhealthy is a volume whose device failed its active probe
 	// twice in a row (probe.go). It is raised when the volume turns
 	// unhealthy, not on every pass.

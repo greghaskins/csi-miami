@@ -281,7 +281,11 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	probe(ctx)
 	deps := realDeps(cfg)
 	defer func() { _ = deps.Systemd.(io.Closer).Close() }()
-	if err := wireItems(&opts, cfg, tRoot, deps, m, events, cluster, log); err != nil {
+	// One Source for the stage check and the advertisement loop, so they never
+	// disagree about the budget.
+	cacheSrc := cachecap.NewSource(cfg.cache, cfg.cacheDir, cachecap.RealFSStat)
+	volItem, err := wireItems(&opts, cfg, tRoot, deps, m, events, cluster, cacheSrc, log)
+	if err != nil {
 		return err
 	}
 	rec, err := reconcile.New(store, m, opts)
@@ -341,12 +345,11 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	})
 	// The advertisement loop has a goroutine of its own, so a slow API server
 	// cannot stall the reconciler. Without a cluster (-no-events) there is no
-	// node to patch and it does not run. Until volumes report their
-	// commitment, the committed figure is zero.
+	// node to patch and it does not run. The committed figure is the volume
+	// item's own sum, the one its stage check uses.
 	stopCache := func() {}
 	if cluster != nil {
-		cacheRunner := cachecap.NewRunner(cachecap.NewSource(cfg.cache, cfg.cacheDir, cachecap.RealFSStat),
-			cluster, cfg.nodeID, func(context.Context) (int64, int, error) { return 0, 0, nil }, reg, log, cfg.interval, cfg.deadline, cfg.fenceProbe)
+		cacheRunner := cachecap.NewRunner(cacheSrc, cluster, cfg.nodeID, volItem.Committed, reg, log, cfg.interval, cfg.deadline, cfg.fenceProbe)
 		stopCache = start(cacheRunner.Run)
 	}
 	stopEvents := func() {}

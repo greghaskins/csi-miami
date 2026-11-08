@@ -366,6 +366,7 @@ func TestEventTextFixedPerReason(t *testing.T) {
 		{reconcile.ReasonGenerationOverdue, "Warning", "the volume's newest generation is older than its maximum age and node node-a holds unpublished writes"},
 		{ReasonPublishRefused, "Warning", "the store refused a generation of this volume from node node-a because the volume is no longer held by that node; see the node plugin's log"},
 		{ReasonGenerationLost, "Warning", "unpublished writes of this volume were discarded on node node-a; see the node plugin's log"},
+		{ReasonCacheBudgetExceeded, "Warning", "the volume was not staged on node node-a because the node's cache budget is exhausted; it is retried, and the scheduler should place it where the cache has room"},
 		{ReasonServerRestarted, "Normal", "the volume's block server was restarted on node node-a; its device and mounts were kept"},
 		{reconcile.ReasonEmergencyDetach, "Warning", "an emergency detach was carried out by node node-a"},
 	}

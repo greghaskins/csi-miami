@@ -263,8 +263,8 @@ The node serves `/metrics` on `:9810` (`-metrics-addr`), the controller on
 
 The conditions of a volume: `ok`, `prerequisite-missing`, `holder-contended`,
 `server-down`, `key-required`, `bad-key`, `generation-overdue`,
-`publish-refused`, `probe-failed`, plus the transport and stage conditions the
-directory kind has.
+`publish-refused`, `probe-failed`, `cache-budget-exceeded`, plus the transport
+and stage conditions the directory kind has.
 
 **Alerting.** While a volume's block server is down, its per-volume
 `miami_generation_age_seconds`, `miami_generation_dirty_bytes`,

@@ -183,6 +183,12 @@ type Config struct {
 	// means the Default constants.
 	Timeout, StartTimeout, PollEvery, FreezeBound, PublishTimeout time.Duration
 
+	// CacheBudget is the node's cache budget now: the bytes its cache directory
+	// may commit to volumes, and whether accounting is on. An error means the
+	// budget could not be computed (a statfs failure). Nil, or enabled false,
+	// turns the stage check off (see checkBudget).
+	CacheBudget func(ctx context.Context) (budget int64, enabled bool, err error)
+
 	// Event reports a reason for a volume, as reconcile.Events does; nil
 	// discards. Logger receives log lines, never a key; nil discards.
 	Event  func(volumeID, reason string)

@@ -68,13 +68,18 @@ func parsedConfig(t *testing.T, args ...string) nodeConfig {
 	return cfg.withDefaults()
 }
 
+// testSource is a cache Source over a statfs that answers a fixed 100 GiB.
+func testSource(cfg nodeConfig) *cachecap.Source {
+	return cachecap.NewSource(cfg.cache, cfg.cacheDir, func(string) (int64, int64, error) { return 100 << 30, 50 << 30, nil })
+}
+
 // Every field of the volume item's Config is set by the production wiring,
 // except the ones that are left zero on purpose.
 func TestVolumeConfigSetsEveryField(t *testing.T) {
 	t.Parallel()
 	cfg := parsedConfig(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := volumeConfig(cfg, "/r", testDeps(), &fake.Mounter{}, stubEvents{}, stubCluster{}, log)
+	c := volumeConfig(cfg, "/r", testDeps(), &fake.Mounter{}, stubEvents{}, stubCluster{}, testSource(cfg), log)
 
 	zeroOnPurpose := map[string]bool{
 		"DevDir": true, "Exe": true, "Current": true, "Freeze": true, "Thaw": true,
@@ -103,7 +108,10 @@ func TestVolumeConfigSetsEveryField(t *testing.T) {
 // Without a cluster the seams that need one stay nil rather than panic.
 func TestVolumeConfigWithoutACluster(t *testing.T) {
 	t.Parallel()
-	c := volumeConfig(parsedConfig(t), "/r", testDeps(), &fake.Mounter{}, nil, nil, nil)
+	c := volumeConfig(parsedConfig(t), "/r", testDeps(), &fake.Mounter{}, nil, nil, nil, nil)
+	if c.CacheBudget != nil {
+		t.Error("a budget is set without a source")
+	}
 	if c.Judge != nil || c.Takeover != nil || c.VolumeExists != nil || c.Event != nil {
 		t.Errorf("seams set without a cluster or recorder: %+v", c)
 	}
@@ -116,8 +124,9 @@ func TestWireItems(t *testing.T) {
 	cfg := parsedConfig(t, "-generation-interval=2m", "-generation-max-age=30m", "-generation-timeout=3m")
 	opts := reconcile.Options{StatTimeout: time.Second}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if err := wireItems(&opts, cfg, "/r", testDeps(), &fake.Mounter{}, stubEvents{}, stubCluster{}, log); err != nil {
-		t.Fatal(err)
+	vi, err := wireItems(&opts, cfg, "/r", testDeps(), &fake.Mounter{}, stubEvents{}, stubCluster{}, testSource(cfg), log)
+	if err != nil || vi == nil {
+		t.Fatalf("wireItems = %v, %v", vi, err)
 	}
 	kinds := map[string]bool{}
 	for _, it := range opts.Items {

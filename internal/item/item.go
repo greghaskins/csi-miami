@@ -159,6 +159,13 @@ var (
 	// is Unavailable, like ErrUnstageIncomplete, but says nothing about writes.
 	ErrReleasePending = errors.New("the holder file could not be released yet")
 
+	// ErrCacheBudgetExceeded is returned by the volume item's Converge for a
+	// volume new to the node whose cache footprint, added to what the node
+	// has committed, would exceed the node's cache budget (decision 66). The
+	// check is defence in depth behind the scheduler; nothing was acquired or
+	// written. Retryable: it clears when a volume leaves the node.
+	ErrCacheBudgetExceeded = errors.New("the node's cache budget cannot hold the volume's cache")
+
 	// ErrGenerationOverdue is the condition of a volume whose newest published
 	// generation is older than generations.maxAge. It is reported, not an error
 	// of Converge.
