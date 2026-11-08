@@ -1,0 +1,49 @@
+# Optional: let cert-manager issue the webhook's certificate instead of the
+# controller. Add it to an overlay's `components:`; the base never depends on
+# it, and cert-manager must be installed first.
+#
+#   components:
+#     - ../../components/cert-manager
+#
+# What changes in the base:
+# - the controller reads the Secret miami-webhook-tls-managed (cert-manager's,
+#   with tls.crt, tls.key and ca.crt) and never writes a Secret;
+# - its Secret create and update rights and its MutatingWebhookConfiguration
+#   right are removed; a get on that one Secret stays;
+# - cert-manager's cainjector writes the CA into the configuration (annotation).
+#
+# The Issuer in certificate.yaml is self-signed; point the Certificate's
+# issuerRef at your own issuer to change that.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - certificate.yaml
+patches:
+  - target: {kind: Deployment, name: miami-controller}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --webhook-tls-secret=miami-webhook-tls-managed
+  - target: {kind: MutatingWebhookConfiguration, name: miami-cache}
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          cert-manager.io/inject-ca-from: miami-system/miami-webhook
+  # The configuration rule is the last one of the ClusterRole.
+  - target: {kind: ClusterRole, name: miami-controller}
+    patch: |-
+      - op: remove
+        path: /rules/9
+  # Rules 1 and 2 of the Role are the Secret rules of the base.
+  - target: {kind: Role, name: miami-controller}
+    patch: |-
+      - op: replace
+        path: /rules/1
+        value:
+          apiGroups: [""]
+          resources: [secrets]
+          resourceNames: [miami-webhook-tls-managed]
+          verbs: [get]
+      - op: remove
+        path: /rules/2

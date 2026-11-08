@@ -1,0 +1,45 @@
+# The cache webhook (design decision 66): on pod CREATE it adds the node-local
+# cache request (miami.csi.greghaskins.com/cache) to the pod's first regular
+# container, so the scheduler places the pod where the cache fits.
+#
+# failurePolicy is Ignore: an outage of the controller must never keep a pod
+# from being created. The scheduler then sees no request, and the node plugin's
+# stage check is the backstop. The namespaces kube-system and miami-system are
+# excluded (the controller itself runs in the latter), and so is any namespace
+# labelled miami.csi.greghaskins.com/cache-accounting=disabled.
+#
+# caBundle is empty here. With the default self-signed certificate the
+# controller writes the CA into it (so a GitOps tool must ignore differences on
+# webhooks[].clientConfig.caBundle; see the README); with the cert-manager
+# component the annotation below makes cert-manager write it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: miami-cache
+webhooks:
+  - name: cache.miami.csi.greghaskins.com
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    failurePolicy: Ignore
+    matchPolicy: Equivalent
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 10
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, miami-system]
+        - key: miami.csi.greghaskins.com/cache-accounting
+          operator: NotIn
+          values: [disabled]
+    clientConfig:
+      service:
+        name: miami-webhook
+        namespace: miami-system
+        path: /mutate
+        port: 443

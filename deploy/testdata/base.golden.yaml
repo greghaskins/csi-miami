@@ -111,6 +111,15 @@ rules:
   - create
   - update
   - patch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resourceNames:
+  - miami-cache
+  resources:
+  - mutatingwebhookconfigurations
+  verbs:
+  - get
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -257,6 +266,21 @@ rules:
   - create
   - update
   - delete
+- apiGroups:
+  - ""
+  resourceNames:
+  - miami-webhook-tls
+  resources:
+  - secrets
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -314,6 +338,61 @@ subjects:
   name: miami-node
   namespace: miami-system
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: miami-webhook
+  namespace: miami-system
+spec:
+  ports:
+  - name: https
+    port: 443
+    protocol: TCP
+    targetPort: 9814
+  selector:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/name: miami
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: miami-cache
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: miami-webhook
+      namespace: miami-system
+      path: /mutate
+      port: 443
+  failurePolicy: Ignore
+  matchPolicy: Equivalent
+  name: cache.miami.csi.greghaskins.com
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - miami-system
+    - key: miami.csi.greghaskins.com/cache-accounting
+      operator: NotIn
+      values:
+      - disabled
+  reinvocationPolicy: IfNeeded
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+  sideEffects: None
+  timeoutSeconds: 10
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -349,6 +428,13 @@ spec:
         - --endpoint=unix:///csi/csi.sock
         - --transports-root=/var/lib/miami
         - --metrics-addr=:9811
+        - --webhook-addr=:9814
+        - --webhook-config=miami-cache
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         image: ghcr.io/greghaskins/csi-miami:unset
         livenessProbe:
           failureThreshold: 3
@@ -362,6 +448,8 @@ spec:
         ports:
         - containerPort: 9811
           name: metrics
+        - containerPort: 9814
+          name: webhook
         resources:
           limits:
             cpu: 500m

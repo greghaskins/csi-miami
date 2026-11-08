@@ -90,6 +90,20 @@ Underneath both is one chunk format on the NAS, one backup (the NAS's own file-l
 
 **Cache capacity metrics and the fence probe.** The node exposes `miami_cache_budget_bytes`, `miami_cache_committed_bytes`, `miami_cache_fs_size_bytes`, `miami_cache_fs_free_bytes`, `miami_cache_capacity_patch_failures_total{reason="denied"|"error"|"unknown"}` (a budget the node computed but could not advertise; `unknown` counts fence probes that could not tell), `miami_cache_fence_state{state="fenced"|"unfenced"|"unknown"}` (one series at 1; the verdict of the fence probe). At start and then every `-cache-fence-probe-interval` (default 10 minutes) the node tries a patch that the admission policy `miami-node-capacity` must deny. `fenced` means that policy denied it; `unfenced` means the patch was allowed (the node plugin's grant is not narrowed: it removes what it wrote and advertises nothing); `unknown` means the probe could not tell (a renamed policy, a failing API server, a cluster older than 1.32), and the node advertises nothing. Alert on `unfenced`, and on `unknown` for 30 minutes or more. Each probe is a denial by design: while fenced the expected denial rate is one per node per probe interval, and while `unknown` the probe repeats every pass interval (`-reconcile-interval`, 30 seconds), so up to one per node per pass interval (`apiserver_validating_admission_policy_check_total{policy="miami-node-capacity",state="deny"}`); neither is an incident by itself. An overlay that renames the node ServiceAccount with `namePrefix` or `nameSuffix` must patch the policy's `matchCondition` and keep the policy and its binding named `miami-node-capacity` (the probe recognises only that name); the probe is the backstop that stops the node advertising if it does not.
 
+**Cache webhook.** The base ships a MutatingWebhookConfiguration `miami-cache` (pods, CREATE, `failurePolicy: Ignore`; it skips `kube-system`, `miami-system` and namespaces labelled `miami.csi.greghaskins.com/cache-accounting: disabled`) and the Service `miami-webhook` in front of the controller's port 9814. By default the controller makes a self-signed certificate in the Secret `miami-webhook-tls` and writes its CA into the configuration's `webhooks[].clientConfig.caBundle`. A GitOps tool such as Argo CD must therefore ignore differences on that field, or it will keep reverting the CA; for Argo CD, on the Application:
+
+```yaml
+spec:
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      name: miami-cache
+      jqPathExpressions:
+        - .webhooks[].clientConfig.caBundle
+```
+
+To have cert-manager issue the certificate instead, add the component `deploy/kustomize/components/cert-manager` to an overlay's `components:`; the controller then never writes the Secret or the configuration, and cert-manager's CA injection fills `caBundle` (no ignore rule is needed).
+
 **Namespace.** Everything runs in `miami-system`, labeled with Pod Security Admission `enforce: privileged` for the node agent's privileged security context and the controller's `SYS_ADMIN` capability (the controller mounts NFSv3 transports with `mount(2)`, which containerd's default AppArmor profile denies even with the capability).
 
 **Images.** The base uses the placeholder `ghcr.io/greghaskins/csi-miami:unset`, a tag that cannot be pulled; every overlay sets the real image with `images:`, preferably by digest. The sidecars (csi-provisioner, csi-attacher, csi-resizer, csi-node-driver-registrar, livenessprobe) are pinned by digest and are public at `registry.k8s.io/sig-storage/`. The driver image is public at ghcr.io/greghaskins/csi-miami.

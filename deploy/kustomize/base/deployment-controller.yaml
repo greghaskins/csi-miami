@@ -44,9 +44,19 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --transports-root=/var/lib/miami
             - --metrics-addr=:9811
+            - --webhook-addr=:9814
+            - --webhook-config=miami-cache
+          env:
+            # The namespace of the webhook's Secret.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: metrics
               containerPort: 9811
+            - name: webhook
+              containerPort: 9814
           livenessProbe:
             httpGet:
               path: /healthz

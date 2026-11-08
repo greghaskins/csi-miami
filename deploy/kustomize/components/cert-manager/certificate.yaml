@@ -1,0 +1,21 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: miami-webhook-selfsigned
+  namespace: miami-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: miami-webhook
+  namespace: miami-system
+spec:
+  secretName: miami-webhook-tls-managed
+  dnsNames:
+    - miami-webhook.miami-system.svc
+    - miami-webhook.miami-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: miami-webhook-selfsigned

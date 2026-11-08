@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/kustomize/api/krusty"
 	"sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
@@ -215,6 +216,9 @@ func TestRBACRuleSets(t *testing.T) {
 			{"", "nodes", []string{"get", "list", "watch"}},
 			{"storage.k8s.io", "csinodes", []string{"get", "list", "watch"}},
 			{"", "events", []string{"list", "watch", "create", "update", "patch"}},
+			// The webhook's reads (PVCs, PVs, StorageClasses) are covered above;
+			// this is its one write, narrowed to one name below.
+			{"admissionregistration.k8s.io", "mutatingwebhookconfigurations", []string{"get", "patch"}},
 		}},
 		{"miami-node", []rule{
 			// The events' PV lookup, and the emergency detach's annotation read.
@@ -250,8 +254,20 @@ func TestRBACRuleSets(t *testing.T) {
 				}
 			}
 			for _, ru := range cr.Rules {
-				if len(ru.ResourceNames) > 0 || len(ru.NonResourceURLs) > 0 {
-					t.Errorf("unexpected resourceNames or nonResourceURLs in %+v", ru)
+				if len(ru.NonResourceURLs) > 0 {
+					t.Errorf("unexpected nonResourceURLs in %+v", ru)
+				}
+				// Only the webhook configuration rule is limited by name, and
+				// it must be.
+				named := len(ru.ResourceNames) > 0
+				isMWC := len(ru.Resources) == 1 && ru.Resources[0] == "mutatingwebhookconfigurations"
+				if named != isMWC {
+					t.Errorf("resourceNames on the wrong rules: %+v", ru)
+				}
+				for _, res := range ru.Resources {
+					if res == "secrets" || res == "*" {
+						t.Errorf("%s grants %s cluster-wide", tc.role, res)
+					}
 				}
 			}
 
@@ -281,17 +297,16 @@ func TestControllerLeaseRole(t *testing.T) {
 	if role.Namespace != "miami-system" {
 		t.Errorf("role namespace = %q, want miami-system", role.Namespace)
 	}
-	want := map[string]bool{}
-	for _, v := range []string{"get", "create", "update", "delete"} {
-		want["coordination.k8s.io/leases:"+v] = true
+	// The Role is exact: leases, and the webhook's Secret. Get and update
+	// are limited to miami-webhook-tls; create cannot be limited by name, so
+	// it is the one namespace-wide verb (the review checklist names it).
+	wantRules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "create", "update", "delete"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"miami-webhook-tls"}, Verbs: []string{"get", "update"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"create"}},
 	}
-	if got := ruleSet(role.Rules); !reflect.DeepEqual(got, want) {
-		t.Errorf("role grants %v, want %v", got, want)
-	}
-	for _, ru := range role.Rules {
-		if len(ru.ResourceNames) > 0 || len(ru.NonResourceURLs) > 0 {
-			t.Errorf("unexpected resourceNames or nonResourceURLs in %+v", ru)
-		}
+	if !reflect.DeepEqual(role.Rules, wantRules) {
+		t.Errorf("role rules = %+v, want %+v", role.Rules, wantRules)
 	}
 
 	var rb rbacv1.RoleBinding
@@ -315,8 +330,8 @@ func TestControllerLeaseRole(t *testing.T) {
 		r.get(t, "ClusterRole", o.name, &cr)
 		for _, ru := range cr.Rules {
 			for _, res := range ru.Resources {
-				if res == "leases" {
-					t.Errorf("ClusterRole %s grants leases cluster-wide", o.name)
+				if res == "leases" || res == "secrets" {
+					t.Errorf("ClusterRole %s grants %s cluster-wide", o.name, res)
 				}
 			}
 		}
@@ -844,6 +859,30 @@ func TestControllerDeployment(t *testing.T) {
 	if got := flagValue(t, m.Args, "transports-root"); got != "/var/lib/miami" {
 		t.Errorf("--transports-root = %q", got)
 	}
+	for _, a := range []string{"--webhook-addr=:9814", "--webhook-config=miami-cache"} {
+		if !hasArg(m.Args, a) {
+			t.Errorf("miami lacks %s", a)
+		}
+	}
+	// Self-signed is the base's mode: no --webhook-tls-secret.
+	for _, a := range m.Args {
+		if strings.HasPrefix(a, "--webhook-tls-secret") {
+			t.Errorf("the base sets %s; only the cert-manager component does", a)
+		}
+	}
+	wantEnv := []corev1.EnvVar{{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}}}
+	if !reflect.DeepEqual(m.Env, wantEnv) {
+		t.Errorf("miami env = %+v, want POD_NAMESPACE from the downward API", m.Env)
+	}
+	hasWebhookPort := false
+	for _, cp := range m.Ports {
+		if cp.Name == "webhook" && cp.ContainerPort == 9814 {
+			hasWebhookPort = true
+		}
+	}
+	if !hasWebhookPort {
+		t.Errorf("miami ports = %+v, want webhook 9814", m.Ports)
+	}
 	p := container(t, spec, "csi-provisioner")
 	for _, a := range []string{"--timeout=60s", "--extra-create-metadata", "--feature-gates=Topology=true", "--leader-election", "--csi-address=/csi/csi.sock"} {
 		if !hasArg(p.Args, a) {
@@ -978,12 +1017,22 @@ func TestPortsDistinct(t *testing.T) {
 				declared[int(p.ContainerPort)] = true
 			}
 		}
-		if !declared[metrics] || !declared[health] || len(declared) != 2 {
-			t.Errorf("%s: declared ports %v, want exactly %d and %d", role, declared, metrics, health)
+		want := map[int]bool{metrics: true, health: true}
+		if role == "controller" {
+			// The webhook shares the host network with everything else.
+			wp := port(flagValue(t, m.Args, "webhook-addr"))
+			claim(wp, role+" webhook")
+			want[wp] = true
+		}
+		if !reflect.DeepEqual(declared, want) {
+			t.Errorf("%s: declared ports %v, want %v", role, declared, want)
 		}
 	}
 	if used[9810] != "node metrics" || used[9811] != "controller metrics" {
 		t.Errorf("metrics ports = %v, want node 9810 and controller 9811 (internal/metrics)", used)
+	}
+	if used[9814] != "controller webhook" || used[9812] != "node health" || used[9813] != "controller health" {
+		t.Errorf("ports = %v, want webhook 9814, node health 9812, controller health 9813", used)
 	}
 }
 
@@ -1617,4 +1666,253 @@ func renderOverlay(t *testing.T, extra string) rendered {
 		r.objects = append(r.objects, object{kind: res.GetKind(), name: res.GetName(), json: js})
 	}
 	return r
+}
+
+func TestWebhookConfiguration(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	if n := r.names("MutatingWebhookConfiguration"); !reflect.DeepEqual(n, []string{"miami-cache"}) {
+		t.Fatalf("MutatingWebhookConfigurations = %v, want only miami-cache", n)
+	}
+	var cfg admissionv1.MutatingWebhookConfiguration
+	r.get(t, "MutatingWebhookConfiguration", "miami-cache", &cfg)
+	if len(cfg.Webhooks) != 1 {
+		t.Fatalf("webhooks = %d, want 1", len(cfg.Webhooks))
+	}
+	w := cfg.Webhooks[0]
+	if w.FailurePolicy == nil || *w.FailurePolicy != admissionv1.Ignore {
+		t.Errorf("failurePolicy = %v, want Ignore", w.FailurePolicy)
+	}
+	if w.SideEffects == nil || *w.SideEffects != admissionv1.SideEffectClassNone {
+		t.Errorf("sideEffects = %v, want None", w.SideEffects)
+	}
+	if w.MatchPolicy == nil || *w.MatchPolicy != admissionv1.Equivalent {
+		t.Errorf("matchPolicy = %v, want Equivalent", w.MatchPolicy)
+	}
+	if w.ReinvocationPolicy == nil || *w.ReinvocationPolicy != admissionv1.IfNeededReinvocationPolicy {
+		t.Errorf("reinvocationPolicy = %v, want IfNeeded", w.ReinvocationPolicy)
+	}
+	if w.TimeoutSeconds == nil || *w.TimeoutSeconds != 10 {
+		t.Errorf("timeoutSeconds = %v, want 10", w.TimeoutSeconds)
+	}
+	if !reflect.DeepEqual(w.AdmissionReviewVersions, []string{"v1"}) {
+		t.Errorf("admissionReviewVersions = %v, want [v1]", w.AdmissionReviewVersions)
+	}
+	wantRules := []admissionv1.RuleWithOperations{{
+		Operations: []admissionv1.OperationType{admissionv1.Create},
+		Rule:       admissionv1.Rule{APIGroups: []string{""}, APIVersions: []string{"v1"}, Resources: []string{"pods"}},
+	}}
+	if !reflect.DeepEqual(w.Rules, wantRules) {
+		t.Errorf("rules = %+v, want CREATE on pods only", w.Rules)
+	}
+	if w.NamespaceSelector == nil || len(w.NamespaceSelector.MatchLabels) != 0 {
+		t.Fatalf("namespaceSelector = %+v, want matchExpressions only", w.NamespaceSelector)
+	}
+	wantExpr := []metav1.LabelSelectorRequirement{
+		{Key: "kubernetes.io/metadata.name", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"kube-system", "miami-system"}},
+		{Key: "miami.csi.greghaskins.com/cache-accounting", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"disabled"}},
+	}
+	if !reflect.DeepEqual(w.NamespaceSelector.MatchExpressions, wantExpr) {
+		t.Errorf("namespaceSelector = %+v, want %+v", w.NamespaceSelector.MatchExpressions, wantExpr)
+	}
+	if w.ObjectSelector != nil {
+		t.Errorf("objectSelector = %+v, want none", w.ObjectSelector)
+	}
+	cc := w.ClientConfig
+	if cc.URL != nil || len(cc.CABundle) != 0 {
+		t.Errorf("clientConfig url=%v caBundle=%d bytes; the base has a Service and an empty caBundle", cc.URL, len(cc.CABundle))
+	}
+	if cc.Service == nil || cc.Service.Name != "miami-webhook" || cc.Service.Namespace != "miami-system" ||
+		cc.Service.Path == nil || *cc.Service.Path != "/mutate" || cc.Service.Port == nil || *cc.Service.Port != 443 {
+		t.Errorf("clientConfig.service = %+v, want miami-webhook.miami-system /mutate :443", cc.Service)
+	}
+	if len(cfg.Annotations) != 0 {
+		t.Errorf("annotations = %v; the base has no CA injection", cfg.Annotations)
+	}
+
+	// The Service: 443 to the controller's webhook port, the controller's two
+	// labels, and nothing else.
+	var svc corev1.Service
+	r.get(t, "Service", "miami-webhook", &svc)
+	if svc.Namespace != "miami-system" || len(svc.Spec.Ports) != 1 {
+		t.Fatalf("service = %+v", svc)
+	}
+	sp := svc.Spec.Ports[0]
+	if sp.Port != 443 || sp.TargetPort.IntValue() != 9814 || (sp.Protocol != "" && sp.Protocol != corev1.ProtocolTCP) {
+		t.Errorf("service port = %+v, want 443 to 9814/TCP", sp)
+	}
+	wantSel := map[string]string{"app.kubernetes.io/name": "miami", "app.kubernetes.io/component": "controller"}
+	if !reflect.DeepEqual(svc.Spec.Selector, wantSel) {
+		t.Errorf("service selector = %v, want %v", svc.Spec.Selector, wantSel)
+	}
+	if svc.Spec.Type != "" && svc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Errorf("service type = %v, want ClusterIP", svc.Spec.Type)
+	}
+	// The selector matches the controller's pod labels, and the target port is
+	// the one the miami container serves on.
+	d := controller(t, r)
+	for k, v := range wantSel {
+		if d.Spec.Template.Labels[k] != v {
+			t.Errorf("controller pod label %s = %q, want %q", k, d.Spec.Template.Labels[k], v)
+		}
+	}
+}
+
+// TestWebhookRBACNarrow: the webhook adds no read and nothing with watch or
+// on nodes; its two writes are named objects. The node's rights and T3's
+// policy are as before.
+func TestWebhookRBACNarrow(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var cr rbacv1.ClusterRole
+	r.get(t, "ClusterRole", "miami-controller", &cr)
+	var mwc []rbacv1.PolicyRule
+	for _, ru := range cr.Rules {
+		for _, g := range ru.APIGroups {
+			if g == "admissionregistration.k8s.io" {
+				mwc = append(mwc, ru)
+			}
+		}
+	}
+	want := []rbacv1.PolicyRule{{
+		APIGroups: []string{"admissionregistration.k8s.io"}, Resources: []string{"mutatingwebhookconfigurations"},
+		ResourceNames: []string{"miami-cache"}, Verbs: []string{"get", "patch"},
+	}}
+	if !reflect.DeepEqual(mwc, want) {
+		t.Errorf("admissionregistration rules = %+v, want %+v", mwc, want)
+	}
+	// The pre-existing reads are what covers the webhook; the whole set of
+	// ClusterRole rules is exact in TestRBACRuleSets.
+	var node rbacv1.ClusterRole
+	r.get(t, "ClusterRole", "miami-node", &node)
+	wantNode := []rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"persistentvolumes"}, Verbs: []string{"get"}},
+		{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get"}},
+		{APIGroups: []string{""}, Resources: []string{"nodes/status"}, Verbs: []string{"patch"}},
+	}
+	if !reflect.DeepEqual(node.Rules, wantNode) {
+		t.Errorf("node ClusterRole = %+v, want %+v", node.Rules, wantNode)
+	}
+	for _, o := range r.objects {
+		if o.kind != "Role" && o.kind != "ClusterRole" {
+			continue
+		}
+		var rules []rbacv1.PolicyRule
+		if o.kind == "Role" {
+			var ro rbacv1.Role
+			r.get(t, o.kind, o.name, &ro)
+			rules = ro.Rules
+		} else {
+			var c rbacv1.ClusterRole
+			r.get(t, o.kind, o.name, &c)
+			rules = c.Rules
+		}
+		for _, ru := range rules {
+			for _, res := range ru.Resources {
+				if res == "secrets" || res == "mutatingwebhookconfigurations" {
+					for _, v := range ru.Verbs {
+						if v == "watch" || v == "list" || v == "delete" || v == "*" {
+							t.Errorf("%s %s grants %s on %s", o.kind, o.name, v, res)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestCertManagerComponent: the component swaps the controller's own
+// certificate for cert-manager's. The controller then holds a get on the one
+// managed Secret, no write to any Secret, and no right on the webhook
+// configuration.
+func TestCertManagerComponent(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	abs, err := filepath.Abs("kustomize")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Kustomize takes relative roots only.
+	rel := func(p string) string {
+		t.Helper()
+		out, err := filepath.Rel(dir, filepath.Join(abs, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	kust := "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - " +
+		rel("base") + "\ncomponents:\n  - " + rel("components/cert-manager") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kust), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := render(t, dir)
+
+	var role rbacv1.Role
+	r.get(t, "Role", "miami-controller", &role)
+	wantRules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "create", "update", "delete"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"miami-webhook-tls-managed"}, Verbs: []string{"get"}},
+	}
+	if !reflect.DeepEqual(role.Rules, wantRules) {
+		t.Errorf("role rules = %+v, want %+v", role.Rules, wantRules)
+	}
+
+	var cr rbacv1.ClusterRole
+	r.get(t, "ClusterRole", "miami-controller", &cr)
+	var baseCR rbacv1.ClusterRole
+	base(t).get(t, "ClusterRole", "miami-controller", &baseCR)
+	for _, ru := range cr.Rules {
+		for _, g := range ru.APIGroups {
+			if g == "admissionregistration.k8s.io" {
+				t.Errorf("ClusterRole still has %+v", ru)
+			}
+		}
+	}
+	if !reflect.DeepEqual(cr.Rules, baseCR.Rules[:len(baseCR.Rules)-1]) {
+		t.Errorf("ClusterRole = %+v, want the base's without its last (webhook configuration) rule", cr.Rules)
+	}
+
+	m := container(t, controller(t, r).Spec.Template.Spec, "miami")
+	if got := flagValue(t, m.Args, "webhook-tls-secret"); got != "miami-webhook-tls-managed" {
+		t.Errorf("--webhook-tls-secret = %q, want miami-webhook-tls-managed", got)
+	}
+	if got := flagValue(t, m.Args, "webhook-addr"); got != ":9814" {
+		t.Errorf("--webhook-addr = %q", got)
+	}
+
+	var cfg admissionv1.MutatingWebhookConfiguration
+	r.get(t, "MutatingWebhookConfiguration", "miami-cache", &cfg)
+	if want := map[string]string{"cert-manager.io/inject-ca-from": "miami-system/miami-webhook"}; !reflect.DeepEqual(cfg.Annotations, want) {
+		t.Errorf("annotations = %v, want %v", cfg.Annotations, want)
+	}
+	var cert struct {
+		APIVersion string         `json:"apiVersion"`
+		Kind       string         `json:"kind"`
+		Metadata   map[string]any `json:"metadata"`
+		Spec       struct {
+			SecretName string `json:"secretName"`
+			IssuerRef  struct {
+				Kind string `json:"kind"`
+				Name string `json:"name"`
+			} `json:"issuerRef"`
+			DNSNames []string `json:"dnsNames"`
+		} `json:"spec"`
+	}
+	r.get(t, "Certificate", "miami-webhook", &cert)
+	if cert.Spec.SecretName != "miami-webhook-tls-managed" {
+		t.Errorf("secretName = %q", cert.Spec.SecretName)
+	}
+	if cert.Spec.IssuerRef.Kind != "Issuer" || len(r.names("Issuer")) != 1 || r.names("Issuer")[0] != cert.Spec.IssuerRef.Name {
+		t.Errorf("issuerRef = %+v, want the component's own Issuer %v", cert.Spec.IssuerRef, r.names("Issuer"))
+	}
+	wantNames := []string{"miami-webhook.miami-system.svc", "miami-webhook.miami-system.svc.cluster.local"}
+	if !reflect.DeepEqual(cert.Spec.DNSNames, wantNames) {
+		t.Errorf("dnsNames = %v, want %v", cert.Spec.DNSNames, wantNames)
+	}
+
+	// The base alone carries no cert-manager object.
+	if n := base(t).names("Certificate"); len(n) != 0 {
+		t.Errorf("the base ships Certificates %v", n)
+	}
 }
