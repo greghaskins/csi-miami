@@ -1203,8 +1203,8 @@ func TestNodeRBACExact(t *testing.T) {
 		t.Errorf("the base ships ValidatingWebhookConfiguration %v", n)
 	}
 	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
-		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-controller-webhook-config", "miami-node-capacity"}) {
-			t.Errorf("the base ships %s %v, want only miami-controller-webhook-config and miami-node-capacity", kind, n)
+		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-controller-secrets", "miami-controller-webhook-config", "miami-node-capacity"}) {
+			t.Errorf("the base ships %s %v, want the controller's two and the node's", kind, n)
 		}
 	}
 
@@ -1530,6 +1530,59 @@ func TestControllerWebhookConfigPolicyShips(t *testing.T) {
 	if !strings.Contains(e, "system:serviceaccount:") || !strings.Contains(e, "endsWith(':miami-controller')") || strings.Contains(e, "miami-system") {
 		t.Errorf("matchCondition = %q: want the ServiceAccount name without its namespace", e)
 	}
+}
+
+// TestControllerSecretPolicyShips: the policy that pins the controller's Secret
+// creation comes with its binding, fails closed, matches only CREATE of
+// secrets for the controller's ServiceAccount in any namespace, and pins the
+// one name and type the controller creates. The envtest runs it.
+func TestControllerSecretPolicyShips(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-controller-secrets", &pol)
+	var bind admissionv1.ValidatingAdmissionPolicyBinding
+	r.get(t, "ValidatingAdmissionPolicyBinding", "miami-controller-secrets", &bind)
+	if bind.Spec.PolicyName != pol.Name || !reflect.DeepEqual(bind.Spec.ValidationActions, []admissionv1.ValidationAction{admissionv1.Deny}) ||
+		bind.Spec.MatchResources != nil || bind.Spec.ParamRef != nil {
+		t.Errorf("binding = %+v, want an unscoped Deny binding of %s", bind.Spec, pol.Name)
+	}
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionv1.Fail {
+		t.Errorf("failurePolicy = %v, want Fail", pol.Spec.FailurePolicy)
+	}
+	rules := pol.Spec.MatchConstraints.ResourceRules
+	if len(rules) != 1 || !reflect.DeepEqual(rules[0].Operations, []admissionv1.OperationType{admissionv1.Create}) ||
+		!reflect.DeepEqual(rules[0].Resources, []string{"secrets"}) || !reflect.DeepEqual(rules[0].APIGroups, []string{""}) {
+		t.Errorf("matchConstraints = %+v", pol.Spec.MatchConstraints)
+	}
+	if len(pol.Spec.MatchConditions) != 1 {
+		t.Fatalf("matchConditions = %+v", pol.Spec.MatchConditions)
+	}
+	if e := pol.Spec.MatchConditions[0].Expression; !strings.Contains(e, "endsWith(':miami-controller')") || strings.Contains(e, "miami-system") {
+		t.Errorf("matchCondition = %q: want the ServiceAccount name without its namespace", e)
+	}
+	var exprs []string
+	for _, v := range pol.Spec.Validations {
+		exprs = append(exprs, v.Expression)
+	}
+	if !reflect.DeepEqual(exprs, []string{"object.metadata.name == 'miami-webhook-tls'", "has(object.type) && object.type == 'kubernetes.io/tls'"}) {
+		t.Errorf("validations = %q", exprs)
+	}
+	// The name the policy allows is the one the controller creates.
+	var role rbacv1.Role
+	r.get(t, "Role", "miami-controller", &role)
+	if !hasRuleFor(role.Rules, "secrets", "miami-webhook-tls") {
+		t.Errorf("the Role names no Secret miami-webhook-tls: %+v", role.Rules)
+	}
+}
+
+func hasRuleFor(rules []rbacv1.PolicyRule, resource, name string) bool {
+	for _, ru := range rules {
+		if slices.Contains(ru.Resources, resource) && slices.Contains(ru.ResourceNames, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestPolicyAndBindingShip: a policy with no binding enforces nothing, and a
@@ -2031,8 +2084,9 @@ func TestCertManagerComponent(t *testing.T) {
 		t.Errorf("dnsNames = %v, want %v", cert.Spec.DNSNames, wantNames)
 	}
 
-	// No right on the configuration is left, so the policy that fences that
-	// right goes too, with its binding; the node policy stays.
+	// The controller's rights on the configuration and on creating Secrets are
+	// gone, so the two policies that fence them go too, with their bindings;
+	// the node policy stays.
 	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
 		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
 			t.Errorf("with the component the render has %s %v, want only miami-node-capacity", kind, n)

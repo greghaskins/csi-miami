@@ -309,6 +309,43 @@ spec:
   validationActions:
   - Deny
 ---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: miami-controller-secrets
+spec:
+  failurePolicy: Fail
+  matchConditions:
+  - expression: request.userInfo.username.startsWith('system:serviceaccount:') &&
+      request.userInfo.username.endsWith(':miami-controller')
+    name: controller-only
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      resources:
+      - secrets
+  validations:
+  - expression: object.metadata.name == 'miami-webhook-tls'
+    message: '[name] the controller may create only the Secret miami-webhook-tls'
+    reason: Forbidden
+  - expression: has(object.type) && object.type == 'kubernetes.io/tls'
+    message: '[type] the controller may create only a Secret of type kubernetes.io/tls'
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: miami-controller-secrets
+spec:
+  policyName: miami-controller-secrets
+  validationActions:
+  - Deny
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
