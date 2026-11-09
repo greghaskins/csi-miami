@@ -10,7 +10,10 @@
 #   with tls.crt, tls.key and ca.crt) and never writes a Secret;
 # - its Secret create and update rights and its MutatingWebhookConfiguration
 #   right are removed; a get on that one Secret stays;
-# - cert-manager's cainjector writes the CA into the configuration (annotation).
+# - cert-manager's cainjector writes the CA into the configuration (annotation);
+# - the policy that fences the controller's patch of that configuration, and its
+#   binding, are removed: the controller has no right on the configuration left
+#   for them to fence.
 #
 # certificate.yaml is cert-manager's usual bootstrap chain: a self-signed
 # Issuer signs a long-lived CA Certificate, a CA Issuer built on it signs the
@@ -40,6 +43,20 @@ patches:
         path: /metadata/annotations
         value:
           cert-manager.io/inject-ca-from: miami-system/miami-webhook
+  - target: {kind: ValidatingAdmissionPolicy, name: miami-controller-webhook-config}
+    patch: |-
+      $patch: delete
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      metadata:
+        name: miami-controller-webhook-config
+  - target: {kind: ValidatingAdmissionPolicyBinding, name: miami-controller-webhook-config}
+    patch: |-
+      $patch: delete
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      metadata:
+        name: miami-controller-webhook-config
   # The configuration rule is the last one of the ClusterRole.
   - target: {kind: ClusterRole, name: miami-controller}
     patch: |-

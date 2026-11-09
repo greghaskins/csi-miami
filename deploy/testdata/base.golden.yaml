@@ -238,6 +238,77 @@ spec:
   validationActions:
   - Deny
 ---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: miami-controller-webhook-config
+spec:
+  failurePolicy: Fail
+  matchConditions:
+  - expression: request.userInfo.username.startsWith('system:serviceaccount:') &&
+      request.userInfo.username.endsWith(':miami-controller')
+    name: controller-only
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - admissionregistration.k8s.io
+      apiVersions:
+      - v1
+      operations:
+      - UPDATE
+      resources:
+      - mutatingwebhookconfigurations
+  validations:
+  - expression: 'size(variables.newWebhooks) == size(variables.oldWebhooks) && variables.newWebhooks.map(w,
+      [dyn(has(w.name) ? w.name : ''''), dyn(has(w.failurePolicy) ? w.failurePolicy
+      : ''''), dyn(has(w.matchPolicy) ? w.matchPolicy : ''''), dyn(has(w.sideEffects)
+      ? w.sideEffects : ''''), dyn(has(w.reinvocationPolicy) ? w.reinvocationPolicy
+      : ''''), dyn(has(w.timeoutSeconds) ? w.timeoutSeconds : 0), dyn(has(w.admissionReviewVersions)
+      ? w.admissionReviewVersions : []), dyn(has(w.rules) ? w.rules : []), dyn(has(w.matchConditions)
+      ? w.matchConditions : []), dyn(has(w.namespaceSelector) ? w.namespaceSelector
+      : {}), dyn(has(w.objectSelector) ? w.objectSelector : {}), dyn(has(w.clientConfig.service)
+      ? w.clientConfig.service : {}), dyn(has(w.clientConfig.url) ? w.clientConfig.url
+      : '''')]) == variables.oldWebhooks.map(w, [dyn(has(w.name) ? w.name : ''''),
+      dyn(has(w.failurePolicy) ? w.failurePolicy : ''''), dyn(has(w.matchPolicy) ?
+      w.matchPolicy : ''''), dyn(has(w.sideEffects) ? w.sideEffects : ''''), dyn(has(w.reinvocationPolicy)
+      ? w.reinvocationPolicy : ''''), dyn(has(w.timeoutSeconds) ? w.timeoutSeconds
+      : 0), dyn(has(w.admissionReviewVersions) ? w.admissionReviewVersions : []),
+      dyn(has(w.rules) ? w.rules : []), dyn(has(w.matchConditions) ? w.matchConditions
+      : []), dyn(has(w.namespaceSelector) ? w.namespaceSelector : {}), dyn(has(w.objectSelector)
+      ? w.objectSelector : {}), dyn(has(w.clientConfig.service) ? w.clientConfig.service
+      : {}), dyn(has(w.clientConfig.url) ? w.clientConfig.url : '''')])'
+    message: '[webhooks] the controller may change only webhooks[].clientConfig.caBundle
+      of a webhook configuration'
+    reason: Forbidden
+  - expression: '(has(object.metadata.labels) ? has(oldObject.metadata.labels) &&
+      object.metadata.labels == oldObject.metadata.labels : !has(oldObject.metadata.labels))
+      && (has(object.metadata.annotations) ? has(oldObject.metadata.annotations) &&
+      object.metadata.annotations == oldObject.metadata.annotations : !has(oldObject.metadata.annotations))
+      && (has(object.metadata.finalizers) ? has(oldObject.metadata.finalizers) &&
+      object.metadata.finalizers == oldObject.metadata.finalizers : !has(oldObject.metadata.finalizers))
+      && (has(object.metadata.ownerReferences) ? has(oldObject.metadata.ownerReferences)
+      && object.metadata.ownerReferences == oldObject.metadata.ownerReferences : !has(oldObject.metadata.ownerReferences))
+      && (has(object.metadata.managedFields) ? object.metadata.managedFields.filter(e,
+      e.operation == ''Apply'') : []) == (has(oldObject.metadata.managedFields) ?
+      oldObject.metadata.managedFields.filter(e, e.operation == ''Apply'') : [])'
+    message: '[metadata] the controller may not change labels, annotations, finalizers,
+      ownerReferences or the Apply entries of managedFields'
+    reason: Forbidden
+  variables:
+  - expression: 'has(object.webhooks) ? object.webhooks : []'
+    name: newWebhooks
+  - expression: 'has(oldObject.webhooks) ? oldObject.webhooks : []'
+    name: oldWebhooks
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: miami-controller-webhook-config
+spec:
+  policyName: miami-controller-webhook-config
+  validationActions:
+  - Deny
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:

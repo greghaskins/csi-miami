@@ -1203,8 +1203,8 @@ func TestNodeRBACExact(t *testing.T) {
 		t.Errorf("the base ships ValidatingWebhookConfiguration %v", n)
 	}
 	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
-		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
-			t.Errorf("the base ships %s %v, want only miami-node-capacity", kind, n)
+		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-controller-webhook-config", "miami-node-capacity"}) {
+			t.Errorf("the base ships %s %v, want only miami-controller-webhook-config and miami-node-capacity", kind, n)
 		}
 	}
 
@@ -1496,6 +1496,39 @@ func TestBaseGolden(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("the rendered base differs from %s; review the change and regenerate it with `go test ./deploy -update`", path)
+	}
+}
+
+// TestControllerWebhookConfigPolicyShips: the policy that fences the
+// controller's patch of the webhook configuration comes with its binding, fails
+// closed, and matches only UPDATE of mutatingwebhookconfigurations for the
+// controller's ServiceAccount, whatever its namespace. The envtest runs it.
+func TestControllerWebhookConfigPolicyShips(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-controller-webhook-config", &pol)
+	var bind admissionv1.ValidatingAdmissionPolicyBinding
+	r.get(t, "ValidatingAdmissionPolicyBinding", "miami-controller-webhook-config", &bind)
+	if bind.Spec.PolicyName != pol.Name || !reflect.DeepEqual(bind.Spec.ValidationActions, []admissionv1.ValidationAction{admissionv1.Deny}) ||
+		bind.Spec.MatchResources != nil || bind.Spec.ParamRef != nil {
+		t.Errorf("binding = %+v, want an unscoped Deny binding of %s", bind.Spec, pol.Name)
+	}
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionv1.Fail {
+		t.Errorf("failurePolicy = %v, want Fail", pol.Spec.FailurePolicy)
+	}
+	rules := pol.Spec.MatchConstraints.ResourceRules
+	if len(rules) != 1 || !reflect.DeepEqual(rules[0].Operations, []admissionv1.OperationType{admissionv1.Update}) ||
+		!reflect.DeepEqual(rules[0].Resources, []string{"mutatingwebhookconfigurations"}) ||
+		!reflect.DeepEqual(rules[0].APIGroups, []string{"admissionregistration.k8s.io"}) {
+		t.Errorf("matchConstraints = %+v", pol.Spec.MatchConstraints)
+	}
+	if len(pol.Spec.MatchConditions) != 1 {
+		t.Fatalf("matchConditions = %+v", pol.Spec.MatchConditions)
+	}
+	e := pol.Spec.MatchConditions[0].Expression
+	if !strings.Contains(e, "system:serviceaccount:") || !strings.Contains(e, "endsWith(':miami-controller')") || strings.Contains(e, "miami-system") {
+		t.Errorf("matchCondition = %q: want the ServiceAccount name without its namespace", e)
 	}
 }
 
@@ -1996,6 +2029,14 @@ func TestCertManagerComponent(t *testing.T) {
 	wantNames := []string{"miami-webhook.miami-system.svc", "miami-webhook.miami-system.svc.cluster.local"}
 	if !reflect.DeepEqual(cert.Spec.DNSNames, wantNames) {
 		t.Errorf("dnsNames = %v, want %v", cert.Spec.DNSNames, wantNames)
+	}
+
+	// No right on the configuration is left, so the policy that fences that
+	// right goes too, with its binding; the node policy stays.
+	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
+			t.Errorf("with the component the render has %s %v, want only miami-node-capacity", kind, n)
+		}
 	}
 
 	// The base alone carries no cert-manager object.
