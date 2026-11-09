@@ -78,8 +78,8 @@ Anti-goals:
   defaults to half the cache; both are StorageClass parameters and are also in
   the PV's volume context (`miami/cacheSize`, `miami/generations.dirtyWatermark`,
   `miami/chunkSize`) once provisioned.
-- The owner's workers have one disk each, 220 to 465 GiB, holding the OS,
-  images, logs, emptyDirs and the caches. The kubelet's own `nodefs` eviction
+- The workers have one disk each, of different sizes (a smaller and a larger
+  worker class), holding the OS, images, logs, emptyDirs and the caches. The kubelet's own `nodefs` eviction
   thresholds apply to that disk.
 
 ## 4. Design
@@ -156,13 +156,46 @@ base's policy fails closed (the patch is refused, the node advertises nothing,
 the stage check still runs on the flags' budget); no controller-side fallback
 is built for that case.
 
+> **Amendment 2026-11-09 (never below committed).** The node advertises
+> `max(budget, committed)`, rounded up to a whole MiB, and holds it there while
+> the commitment exceeds the budget (one Warn per episode, and the gauge
+> `miami_cache_advertised_bytes`); a lower budget takes effect as volumes
+> leave. The reason: the kubelet re-admits every pod against the advertised
+> figure when it restarts, and fails with `OutOf<resource>` the ones that no
+> longer fit, so a figure lowered under the running pods' requests costs them
+> their place at the next kubelet restart or node reboot. The stage check keeps
+> using the budget, unchanged. Consequence: while committed exceeds the budget
+> the advertised figure no longer means free room, the scheduler may place a pod
+> that the stage check then refuses (`CacheBudgetExceeded` until space frees),
+> and the overcommit alert shows it. An unreadable commitment falls back to the
+> budget.
+
+> **Amendment 2026-11-09 (the fence is reported, not enforced; owner's
+> decision).** An `unfenced` verdict no longer removes the node's key or stops
+> the advertisement. The node logs the Error on the transition, shows
+> `miami_cache_fence_state`, and keeps advertising and updating its budget as if
+> fenced; an `unknown` verdict keeps the last figure; the first probe still
+> runs before the first advertisement but its result does not gate it, so a fresh
+> install advertises on its first pass. The probe key is still removed at once
+> after an allowed probe, and a probe key found on the node (a run killed
+> between the probe's add and its remove, or an admin's) is removed before each
+> probe, because an add over an existing key is a no-op that the API server does
+> not run admission for and would read as unfenced. The reasons: removing our
+> own key does not constrain a compromised plugin, and it would turn a
+> configuration mistake (a renamed ServiceAccount, a pruned policy) into a
+> scheduling outage for every new pod that mounts a volume of ours. The
+> replacement for the outage is the page: `MiamiCacheFenceNotInForce` is
+> page-severity. The sentence below that the node "advertises nothing" unless it
+> is `fenced` is superseded.
+
 > **Amendment 2026-11-09.** The status endpoint does not reset `metadata`, so
 > the policy pins more than one capacity key: `metadata.labels`, `annotations`,
 > `finalizers` and `ownerReferences` hold still too, and so does every
 > `managedFields` entry whose operation is `Apply` (the rest of `managedFields`
 > is free, since the node's own patches change it). The node also probes the
 > fence and exports the verdict as `miami_cache_fence_state{state}`; unless it
-> is `fenced` the node advertises nothing. The cadence, the expected denial
+> is `fenced` the node advertises nothing (superseded by the amendments above: the
+> node keeps advertising and the verdict is reported). The cadence, the expected denial
 > rates and the alert are in the README ("Cache capacity metrics and the fence
 > probe"), which holds the full text.
 
@@ -259,6 +292,23 @@ is absent by design, so the flap would be invisible.
 > new CA into the existing `caBundle`: empty `webhooks[].clientConfig.caBundle`
 > and delete the Secret `miami-webhook-tls`.
 
+> **Amendment 2026-11-09 (the webhook's own client, its listener, its Secret).**
+> The webhook has an API client and rate limiter of its own, separate from the
+> CSI controller's (a burst of pods that mount claims must not starve volume
+> deletes, nor the other way round), and at most 16 `Mutate` calls resolve
+> claims at once: a call over the bound is answered at once with the strip
+> patch and counted as `error`, never blocked. It listens on the pod's own IP
+> (`--webhook-addr=$(POD_IP):9814`, the downward API) instead of every
+> interface of the host-network pod, since the API server does not authenticate
+> to it and anything on the node's network could otherwise post forged reviews.
+> In self-signed mode the controller labels the Secret it creates
+> (`app.kubernetes.io/managed-by: miami-controller`) and never overwrites a
+> Secret it did not create or one without `ca.key`: that is an Error naming
+> `-webhook-tls-secret` and a count, `miami_webhook_tls_secret_refused_total`.
+> `miami_webhook_serving` is 1 once a serving certificate is loaded, in both
+> modes. The `caBundle` patch is a JSON-patch `add`, and a Secret update keeps
+> the labels, annotations and owner references it read.
+
 **Failure policy.** `Ignore`, with the stage check as the net. With `Fail`,
 the controller being down (an upgrade, a crash loop, a node drain) stops every
 pod creation in every namespace the selector matches, which is the whole
@@ -351,6 +401,8 @@ drain that never ends.
 
 **Metrics** (node, per pass): `miami_cache_budget_bytes`,
 `miami_cache_committed_bytes` (the sum above; amended 2026-11-09: over all drain records, not staged volumes only),
+`miami_cache_advertised_bytes` (added 2026-11-09: `max(budget, committed)`),
+and the webhook's `miami_webhook_serving`,
 `miami_cache_fs_size_bytes` and `miami_cache_fs_free_bytes` (`statfs` of the
 cache directory's file system), and the webhook's `miami_webhook_mutations_total`
 by outcome and `miami_webhook_unresolved_total`.
@@ -360,7 +412,22 @@ owner's overlay): `miami_cache_committed_bytes > miami_cache_budget_bytes` (an
 unaccounted overcommit exists on the node); `miami_cache_fs_free_bytes <
 reserve` (the disk is where the kubelet will act next); the unaccounted
 recording rule above being non-zero for longer than a rollout; and
-`apiserver_admission_webhook_fail_open_count` rising for the webhook.
+`apiserver_admission_webhook_fail_open_count` rising for the webhook. Amended
+2026-11-09: the fence alert (`miami_cache_fence_state{state!="fenced"}`) is
+page-severity, because the node keeps advertising when the fence is lost; the
+overcommit alert has three causes of a sustained excess: unaccounted pods, an
+online expansion (a request is fixed at admission, the node counts the grown
+size) and `nodeName`-pinned pods (they skip the scheduler, so the request is
+never checked against the node). The recording rule under-reports, which is the
+benign direction: kube-state-metrics includes Succeeded and Failed pods, and a
+shared RWO claim is counted once per pod. Drain records written before an
+upgrade count at the class size until the plugin's next start rewrites them.
+Tenant levers: more than 64 claims in a pod goes unaccounted (the stage check is
+the net), and N pods on one RWO claim count N times, so a
+`ResourceQuota` on `requests.miami.csi.greghaskins.com/cache` is the per-tenant
+control. `miami_webhook_unresolved_total` counts a missing claim, a missing
+class, a missing bound volume, unusable class parameters or volume context and
+the 64-claim cap, not only "a claim that does not exist yet".
 
 ### 4.9 The privilege increase, and how it is narrowed
 
@@ -368,11 +435,43 @@ recording rule above being non-zero for longer than a rollout; and
 |---|---|---|
 | node plugin | `nodes/status` patch | ValidatingAdmissionPolicy: own node only (bound-token `node-name`), one capacity key only (amended 2026-11-09: metadata is pinned too, see 4.3) |
 | controller | `persistentvolumeclaims` get (all namespaces), `storageclasses` get | reads only; both already readable by the sidecars |
-| controller | `mutatingwebhookconfigurations` get and patch | `resourceNames` of the one object; only when self-signed TLS is used |
-| controller | `secrets` get, create and update in `miami-system` | `resourceNames: [miami-webhook-tls]`; absent when `-webhook-tls-secret` names a managed Secret |
+| controller | `mutatingwebhookconfigurations` get and patch | `resourceNames` of the one object; only when self-signed TLS is used. Amended 2026-11-09: `resourceNames` limits the object, not the field, so a ValidatingAdmissionPolicy (`miami-controller-webhook-config`) holds the update to `webhooks[].clientConfig.caBundle` |
+| controller | `secrets` get and update in `miami-system` | `resourceNames: [miami-webhook-tls]`; absent when `-webhook-tls-secret` names a managed Secret |
+| controller | `secrets` create in `miami-system` | amended 2026-11-09: **not** name-scoped (RBAC cannot name an object that does not exist yet); a ValidatingAdmissionPolicy (`miami-controller-secrets`) pins the name `miami-webhook-tls` and the type `kubernetes.io/tls`; absent with the cert-manager component |
 
-Nothing new reads Secrets outside the driver's namespace, and nothing new can
-delete or evict anything.
+> **Amendment 2026-11-09 (what the table did not say).** The first version of
+> this section claimed that nothing new reads Secrets outside the driver's
+> namespace and that nothing new can delete or evict anything. Both need
+> qualifying, and two powers need stating:
+>
+> 1. *With self-signed TLS the controller owns the webhook configuration.*
+>    `resourceNames` limits the grant to one object, not one field. A
+>    compromised controller could rewrite `miami-cache`'s `rules` to match
+>    Secrets (or anything else), widen its `namespaceSelector` to `kube-system`
+>    and repoint its `clientConfig`, and the API server would send it every
+>    matching object as it is written, Secret data included, and apply what it
+>    returned. A webhook configuration is exempt from webhooks but not from
+>    ValidatingAdmissionPolicies (the envtest proves a policy is evaluated for
+>    `mutatingwebhookconfigurations`), so the base ships the policy named in the
+>    table, which holds the controller to the `caBundle` and the metadata. The
+>    policy cannot guard itself (policies and bindings are exempt from API-based
+>    policies); RBAC does, since the controller has no right on them. The
+>    cert-manager component removes the controller's right and the policy.
+> 2. *In both modes the webhook mutates every pod created outside the excluded
+>    namespaces.* A compromised controller can set the cache request of pods of
+>    more privileged workloads (a GitOps controller, cert-manager, monitoring).
+>    The webhook only ever touches the resource's key, but nothing outside the
+>    process enforces that, and no policy can narrow what the webhook exists to
+>    do. The controller is host-network with `SYS_ADMIN`, so this is a real
+>    increase in what compromising it buys.
+>
+> Recommendation: use the cert-manager component on any cluster with tenants
+> or with powerful controllers in matched namespaces; it removes power 1.
+> Follow-up, not built: a separate, unprivileged webhook Deployment (not
+> host-network, no `SYS_ADMIN`, a ServiceAccount with only PVC, PV and
+> StorageClass reads), which also gives the webhook its own failure domain.
+> The Secret `create` row above is the same story as power 1: namespace-wide
+> at RBAC, pinned by policy.
 
 ### 4.10 Rollout order
 
@@ -383,7 +482,13 @@ delete or evict anything.
    that must opt out sets `-cache-accounting=false` and labels its namespaces
    out of the webhook. *Amended 2026-11-09:* `-cache-budget 0` is a budget of
    zero (advertises `0`, refuses every fresh volume), as 4.3 says; it is not
-   an off switch.
+   an off switch. The full opt-out is both sides: `-cache-accounting=false` on
+   the nodes **and** the webhook out (the `miami-cache` configuration deleted,
+   or every namespace labelled out). The nodes alone leave every new pod that
+   mounts a volume of ours Pending with `Insufficient
+   miami.csi.greghaskins.com/cache`. Absolute budgets (the owner's overlay) go
+   out in this same release, not after it: a later, lower absolute budget is a
+   lowered budget (4.3), which takes effect only as volumes leave.
 2. In the cluster: the node plugins advertise and begin checking; existing
    pods are unaccounted (4.6); the recording rule shows the gap.
 3. Rolling restarts of the workloads with volumes, in the order the operator
@@ -424,11 +529,13 @@ conservatively.
 2. The node plugin patches its own node's capacity, narrowed by the admission
    policy; the controller does not patch nodes.
 3. The base defaults are `share 0.5` and `reserve 15Gi`. The owner's overlay
-   sets absolute budgets: `-cache-budget 100Gi` on the 220 GiB workers and
-   `200Gi` on the two 466 GiB workers (with the defaults those would be about
-   95 and 218 GiB, and the 220 GiB nodes already carry 20 to 100 GiB of
-   other usage, so the absolute figures leave the kubelet's own eviction line
-   clear).
+   sets absolute budgets, one per worker class (`<budget-small>` on the
+   smaller workers and `<budget-large>` on the larger ones). The formula's
+   figures for those disks would be higher than the absolute ones, and the
+   smaller workers already carry other usage, so the absolute figures leave
+   the kubelet's own eviction line clear. (Amended 2026-11-09: the figures are
+   not recorded here; they live in the overlay. They must reach the cluster in
+   the same release as the base, see 4.10.)
 4. Pods sharing one RWO claim on a node are counted conservatively.
 5. Pods that predate the rollout stay unaccounted until recreated; the stage
    check protects the node and the recording rule shows the gap.

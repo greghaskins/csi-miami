@@ -53,6 +53,8 @@ The change is done when, on the kind e2e cluster over the nfs3 transport and in 
 7. With the controller down, pod creation still succeeds (fail open) and the stage check holds the line.
 8. `docs/operating-volumes.md` carries the alerts, the recording rule and the runbook of design 4.6 and 4.8.
 
+Amended 2026-11-09: the reboot with a surviving cache and the orphan drain at a full budget in criterion 6 are covered by unit tests only (`internal/item/volume`, `budget_test.go`); the kind suite does not reboot a node or stage into a full budget with a drain pending. The second half of `TestCacheStageCheckNeverRefusesExisting` says itself that it does not test what the test's name claims.
+
 ## 2. Repository layout
 
 | Path | Change |
@@ -178,8 +180,8 @@ Branch per task from `origin/main`; T1 first; T3 to T5 consume its functions (T2
 - Produces: `cachecap.Config`, `Budget`, `FSStat`, `Source` (with `Current` and `Stats`), `Runner` with its `NewRunner` constructor, `NodeCapacity`, `CapacityMetrics` (section 3); node flags `-cache-accounting` (bool, true), `-cache-budget-share` (float, 0.5), `-cache-budget-reserve` (quantity string, `15Gi`), `-cache-budget` (quantity string, empty means "use the formula"; `0` is an explicit zero).
 
 - [ ] **Step 1: Write the failing tests.**
-  `TestBudgetFormula`: 220Gi fs, share 0.5, reserve 15Gi gives 95Gi; 466Gi gives 218Gi; a 20Gi fs gives 0 (negative clamps); share 0.5 on a 10Gi+700KiB fs with reserve 0 rounds down to whole MiB (review focus 3).
-  `TestBudgetAbsoluteWins`: `HaveAbsolute` with 100Gi returns 100Gi on a 20Gi fs and on a 466Gi fs; `Absolute: 0, HaveAbsolute: true` returns 0 with `enabled` true from `Source.Current` (zero is an answer).
+  `TestBudgetFormula`: a 200Gi fs, share 0.5, reserve 15Gi gives 85Gi; a 500Gi fs gives 235Gi; a 20Gi fs gives 0 (negative clamps); share 0.5 on a 10Gi+700KiB fs with reserve 0 rounds down to whole MiB (review focus 3).
+  `TestBudgetAbsoluteWins`: `HaveAbsolute` with 100Gi returns 100Gi on a 20Gi fs and on a 500Gi fs; `Absolute: 0, HaveAbsolute: true` returns 0 with `enabled` true from `Source.Current` (zero is an answer).
   `TestSourceAccountingOff`: `Current` returns `enabled == false`.
   `TestSourceStats`: `Stats` returns `(0, 0)` before any `Current`, then the size and free bytes of the latest `FSStat` call, and they change when the fake `FSStat` changes.
   `TestRunnerPass` with a fake `NodeCapacity` and a fake `FSStat`:
