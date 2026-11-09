@@ -414,7 +414,7 @@ for (pods that predate the rollout):
           sum by (node) (
             kube_pod_container_resource_requests{resource="miami_csi_greghaskins_com_cache"}
           )
-          or (0 * miami_cache_committed_bytes)
+          or on(node) (0 * sum by (node) (miami_cache_committed_bytes))
         ),
       0)
 ```
