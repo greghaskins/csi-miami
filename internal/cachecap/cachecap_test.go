@@ -153,7 +153,10 @@ type fakeMetrics struct {
 	failures                 []string
 	states                   []string
 	budget, comm, size, free int64
+	advertised               []int64
 }
+
+func (m *fakeMetrics) SetCacheAdvertised(b int64) { m.advertised = append(m.advertised, b) }
 
 func (m *fakeMetrics) SetCacheCapacity(b, s, f int64) {
 	m.n++
@@ -187,7 +190,7 @@ func TestRunnerPass(t *testing.T) {
 		{"absent key is set", on, &fakeNC{}, 220 * gib, []string{"set"}, 95 * gib, false, true},
 		{"equal key is left alone", on, &fakeNC{have: true, bytes: 95 * gib}, 220 * gib, nil, 0, false, true},
 		{"different key is set once", on, &fakeNC{have: true, bytes: 50 * gib}, 220 * gib, []string{"set"}, 95 * gib, false, true},
-		{"zero is set, not removed", on, &fakeNC{have: true, bytes: 5 * gib}, 20 * gib, []string{"set"}, 0, false, true},
+		{"a zero budget under a commitment holds at the commitment", on, &fakeNC{have: true, bytes: 5 * gib}, 20 * gib, []string{"set"}, 3 * gib, false, true},
 		{"accounting off removes a present key", Config{Share: 0.5}, &fakeNC{have: true, bytes: gib}, 220 * gib, []string{"remove"}, 0, false, false},
 		{"accounting off with no key does nothing", Config{Share: 0.5}, &fakeNC{}, 220 * gib, nil, 0, false, false},
 		{"read error is returned, metrics set", on, &fakeNC{getErr: boom}, 220 * gib, nil, 0, true, true},
@@ -882,5 +885,94 @@ func TestFenceUnknownThenUnfencedLogsError(t *testing.T) {
 	_ = r.Pass(ctx)
 	if n := strings.Count(logs.String(), "level=ERROR msg=\"the admission policy"); n != 1 {
 		t.Errorf("%d Error lines on Unknown to Unfenced, want 1:\n%s", n, logs.String())
+	}
+}
+
+// TestAdvertisedNeverBelowCommitted: a lower budget takes effect only as
+// volumes leave, because the kubelet re-admits running pods against the
+// advertised figure at its next restart.
+func TestAdvertisedNeverBelowCommitted(t *testing.T) {
+	t.Parallel()
+	f := &fsFigures{size: 220 * gib, free: 7 * gib} // budget 95Gi
+	cfg := Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}
+	var comm int64
+	nc, m := &fakeNC{}, &fakeMetrics{}
+	var logs bytes.Buffer
+	r := NewRunner(NewSource(cfg, "/c", fakeStat(f)), nc, "n", func(context.Context) (int64, int, error) { return comm, 1, nil },
+		m, slog.New(slog.NewTextHandler(&logs, nil)), time.Minute, time.Second, 0)
+	pass := func() {
+		t.Helper()
+		if err := r.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lastAdvertised := func() int64 {
+		t.Helper()
+		if len(m.advertised) == 0 {
+			t.Fatal("no advertised figure recorded")
+		}
+		return m.advertised[len(m.advertised)-1]
+	}
+
+	comm = 60 * gib
+	pass()
+	if lastAdvertised() != 95*gib || nc.setBytes[len(nc.setBytes)-1] != 95*gib {
+		t.Fatalf("under budget: advertised %d, set %v; want the budget", lastAdvertised(), nc.setBytes)
+	}
+	nc.have, nc.bytes = true, 95*gib
+
+	// The budget drops below the commitment: hold at the commitment.
+	f.size = 150 * gib // budget 60Gi
+	comm = 80 * gib
+	pass()
+	if lastAdvertised() != 80*gib || nc.setBytes[len(nc.setBytes)-1] != 80*gib {
+		t.Fatalf("over budget: advertised %d, set %v; want the committed 80Gi", lastAdvertised(), nc.setBytes)
+	}
+	if m.budget != 60*gib {
+		t.Errorf("the budget gauge = %d, want the real budget 60Gi", m.budget)
+	}
+	nc.bytes = 80 * gib
+	pass() // still over, nothing to patch
+	pass()
+	if got := strings.Count(logs.String(), "holding the advertised cache capacity at the committed figure"); got != 1 {
+		t.Errorf("warned %d times for one episode, want 1:\n%s", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("not at Warn:\n%s", logs.String())
+	}
+
+	// Volumes leave: the advertised figure follows the commitment down to the budget.
+	comm = 70 * gib
+	pass()
+	if lastAdvertised() != 70*gib || nc.setBytes[len(nc.setBytes)-1] != 70*gib {
+		t.Fatalf("falling: advertised %d, set %v; want 70Gi", lastAdvertised(), nc.setBytes)
+	}
+	nc.bytes = 70 * gib
+	comm = 20 * gib
+	pass()
+	if lastAdvertised() != 60*gib || nc.setBytes[len(nc.setBytes)-1] != 60*gib {
+		t.Fatalf("under budget again: advertised %d, set %v; want the budget 60Gi", lastAdvertised(), nc.setBytes)
+	}
+
+	// A new episode warns again.
+	nc.bytes = 60 * gib
+	comm = 90 * gib
+	pass()
+	if got := strings.Count(logs.String(), "holding the advertised cache capacity at the committed figure"); got != 2 {
+		t.Errorf("warned %d times over two episodes, want 2", got)
+	}
+}
+
+// TestAdvertisedFallsBackToBudgetWhenCommittedUnreadable: an unreadable
+// commitment is not a reason to advertise more or less than the budget.
+func TestAdvertisedFallsBackToBudgetWhenCommittedUnreadable(t *testing.T) {
+	t.Parallel()
+	f := &fsFigures{size: 220 * gib, free: 7 * gib}
+	nc, m := &fakeNC{}, &fakeMetrics{}
+	r := NewRunner(NewSource(Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}, "/c", fakeStat(f)), nc, "n",
+		func(context.Context) (int64, int, error) { return 0, 0, errors.New("unreadable") }, m, quietLog(), time.Minute, time.Second, 0)
+	_ = r.Pass(context.Background())
+	if len(nc.setBytes) != 1 || nc.setBytes[0] != 95*gib {
+		t.Fatalf("set = %v, want the budget", nc.setBytes)
 	}
 }

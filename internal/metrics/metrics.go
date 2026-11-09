@@ -64,8 +64,11 @@ const (
 
 	NameCacheBudget    = "miami_cache_budget_bytes"
 	NameCacheCommitted = "miami_cache_committed_bytes"
-	NameCacheFSSize    = "miami_cache_fs_size_bytes"
-	NameCacheFSFree    = "miami_cache_fs_free_bytes"
+	// NameCacheAdvertised is the figure the node is set to advertise:
+	// max(budget, committed).
+	NameCacheAdvertised = "miami_cache_advertised_bytes"
+	NameCacheFSSize     = "miami_cache_fs_size_bytes"
+	NameCacheFSFree     = "miami_cache_fs_free_bytes"
 
 	NameWebhookMutations  = "miami_webhook_mutations_total"
 	NameWebhookUnresolved = "miami_webhook_unresolved_total"
@@ -146,7 +149,7 @@ type Registry struct {
 	cacheBytes    *prometheus.GaugeVec
 	fetches       *fetchCollector
 
-	cacheBudget, cacheCommitted, cacheFSSize, cacheFSFree prometheus.Gauge
+	cacheBudget, cacheCommitted, cacheAdvertised, cacheFSSize, cacheFSFree prometheus.Gauge
 
 	webhookMutations  *prometheus.CounterVec
 	webhookUnresolved prometheus.Counter
@@ -165,7 +168,7 @@ var (
 // Option configures New.
 type Option func(*options)
 
-type options struct{ reconciler, cacheCapacity, webhook, webhookConfig bool }
+type options struct{ reconciler, cacheCapacity, cachePatchFailures, webhook, webhookConfig bool }
 
 // WithReconciler registers the reconciler's family (the intents, transports,
 // reconcile duration and error, timeout, garbage and load-failure metrics).
@@ -179,6 +182,12 @@ func WithReconciler() Option { return func(o *options) { o.reconciler = true } }
 // committed, and the cache filesystem's size and free space). Only a node with
 // cache accounting on carries them; SetCacheCapacity works either way.
 func WithCacheCapacity() Option { return func(o *options) { o.cacheCapacity = true } }
+
+// WithCachePatchFailures registers miami_cache_capacity_patch_failures_total
+// alone. The capacity runner runs on a node with accounting off too, where it
+// removes a key left behind, and a failure of that must be visible; with
+// WithCacheCapacity the counter is registered anyway.
+func WithCachePatchFailures() Option { return func(o *options) { o.cachePatchFailures = true } }
 
 // WithWebhook registers the admission webhook's counters: the mutations by
 // outcome and the volumes it could not resolve. Only the controller runs the
@@ -265,6 +274,7 @@ func New(opts ...Option) *Registry {
 	}
 	r.cacheBudget = gauge(NameCacheBudget, "Bytes of node-local cache this node offers the scheduler.")
 	r.cacheCommitted = gauge(NameCacheCommitted, "Bytes of cache footprint committed to the volumes staged on this node.")
+	r.cacheAdvertised = gauge(NameCacheAdvertised, "Bytes of node-local cache this node is set to advertise to the scheduler: the budget, or the committed figure when that is higher (a lowered budget takes effect as volumes leave).")
 	r.cacheFSSize = gauge(NameCacheFSSize, "Size in bytes of the filesystem the volume caches live on.")
 	r.cacheFSFree = gauge(NameCacheFSFree, "Bytes available on the filesystem the volume caches live on.")
 	r.cachePatchFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -320,7 +330,10 @@ func New(opts ...Option) *Registry {
 		)
 	}
 	if o.cacheCapacity {
-		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree, r.cachePatchFailures, r.cacheFenceState)
+		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheAdvertised, r.cacheFSSize, r.cacheFSFree, r.cacheFenceState)
+	}
+	if o.cacheCapacity || o.cachePatchFailures {
+		r.reg.MustRegister(r.cachePatchFailures)
 	}
 	if o.webhook {
 		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved)
@@ -381,6 +394,9 @@ func (r *Registry) SetCacheFenceState(state string) {
 		r.cacheFenceState.WithLabelValues(s).Set(v)
 	}
 }
+
+// SetCacheAdvertised sets the advertised gauge (see cachecap.CapacityMetrics).
+func (r *Registry) SetCacheAdvertised(advertised int64) { r.cacheAdvertised.Set(float64(advertised)) }
 
 // SetCacheCommitted sets the committed gauge (see cachecap.CapacityMetrics).
 func (r *Registry) SetCacheCommitted(committed int64) { r.cacheCommitted.Set(float64(committed)) }

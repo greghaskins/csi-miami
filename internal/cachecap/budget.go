@@ -72,6 +72,10 @@ const (
 type CapacityMetrics interface {
 	SetCacheCapacity(budget, fsSize, fsFree int64)
 	SetCacheCommitted(committed int64)
+	// SetCacheAdvertised records the figure the node is set to advertise:
+	// max(budget, committed). It differs from the budget only while a lowered
+	// budget is held up by volumes still on the node.
+	SetCacheAdvertised(bytes int64)
 	// IncCachePatchFailure counts a failed patch or clear of the node's
 	// capacity; reason is PatchDenied or PatchError.
 	IncCachePatchFailure(reason string)

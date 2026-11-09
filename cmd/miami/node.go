@@ -260,6 +260,10 @@ func serveNodeWith(ctx context.Context, cfg nodeConfig, m mount.Mounter, events 
 	if cfg.cache.Accounting {
 		mopts = append(mopts, metrics.WithCacheCapacity())
 	}
+	if cluster != nil {
+		// The runner runs, and removes a key left behind, with accounting off.
+		mopts = append(mopts, metrics.WithCachePatchFailures())
+	}
 	reg := metrics.New(mopts...)
 	opts := reconcile.Options{
 		TransportsRoot: tRoot,

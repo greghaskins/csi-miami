@@ -781,3 +781,34 @@ func TestWebhookConfigOKGauge(t *testing.T) {
 		t.Errorf("after false = %v, want 0", got)
 	}
 }
+
+func TestCacheAdvertisedGauge(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.SetCacheAdvertised(1)
+	if family(t, off, NameCacheAdvertised) != nil {
+		t.Errorf("%s exposed without WithCacheCapacity", NameCacheAdvertised)
+	}
+	on := New(WithCacheCapacity())
+	on.SetCacheAdvertised(80 << 30)
+	f := family(t, on, NameCacheAdvertised)
+	if f == nil || len(f.GetMetric()) != 1 || f.GetMetric()[0].GetGauge().GetValue() != 80<<30 {
+		t.Fatalf("%s family = %v", NameCacheAdvertised, f)
+	}
+}
+
+// With accounting off the runner still removes a key left behind, and a failure
+// of that must be countable.
+func TestPatchFailuresRegisteredWithoutAccounting(t *testing.T) {
+	t.Parallel()
+	if family(t, New(WithReconciler()), NameCachePatchFailures) != nil {
+		t.Fatalf("%s exposed without an option", NameCachePatchFailures)
+	}
+	r := New(WithReconciler(), WithCachePatchFailures())
+	r.IncCachePatchFailure("denied")
+	if got := sample(t, r, NameCachePatchFailures, map[string]string{"reason": "denied"}).GetCounter().GetValue(); got != 1 {
+		t.Errorf("denied = %v, want 1", got)
+	}
+	// With accounting on as well it is registered once, not twice.
+	New(WithCacheCapacity(), WithCachePatchFailures())
+}

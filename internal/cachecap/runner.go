@@ -9,8 +9,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-// Runner keeps the node's advertised cache capacity equal to its budget. It
-// runs in a goroutine of its own, so a slow API server cannot stall volume
+// Runner keeps the node's advertised cache capacity equal to its budget, or to
+// its committed figure when that is higher. It runs in a goroutine of its own, so a slow API server cannot stall volume
 // work.
 type Runner struct {
 	src       *Source
@@ -36,6 +36,9 @@ type Runner struct {
 	// warnedUnknown: the failed passes of the current unknown verdict have
 	// been logged at Warn once already.
 	warnedUnknown bool
+	// holding: the advertised figure is being held at the committed figure
+	// (it exceeds the budget); the Warn for the episode has been logged.
+	holding bool
 }
 
 // DefaultProbeInterval is how often the fence probe runs while the node is
@@ -189,7 +192,8 @@ func (r *Runner) Pass(ctx context.Context) error {
 	committed, _, cerr := r.committed(ctx)
 	size, free := r.src.Stats()
 	r.metrics.SetCacheCapacity(budget, size, free)
-	if cerr == nil {
+	committedKnown := cerr == nil
+	if committedKnown {
 		r.metrics.SetCacheCommitted(committed)
 	}
 
@@ -218,14 +222,39 @@ func (r *Runner) Pass(ctx context.Context) error {
 		return errors.Join(cerr, ErrFenceUnknown)
 	}
 
+	// The node never advertises less than it has committed. The kubelet
+	// re-admits every running pod against the advertised figure when it
+	// restarts, and fails the ones that no longer fit; a lowered budget must
+	// not do that, so it takes effect as volumes leave. The stage check still
+	// uses the budget, so no new volume is let in over it. An unreadable
+	// commitment is no reason to advertise anything but the budget.
+	advertised := budget
+	if committedKnown && committed > budget {
+		advertised = roundUpMiB(committed)
+		if !r.holding {
+			r.holding = true
+			r.log.Warn("holding the advertised cache capacity at the committed figure; lower budgets take effect as volumes leave",
+				"node", r.node, "budget", budget, "committed", committed)
+		}
+	} else if committedKnown {
+		r.holding = false
+	}
+	r.metrics.SetCacheAdvertised(advertised)
+
 	have, present, err := r.nc.CacheCapacity(ctx, r.node)
 	if err != nil {
 		return errors.Join(cerr, err)
 	}
-	if present && have == budget {
+	if present && have == advertised {
 		return cerr
 	}
-	return errors.Join(cerr, r.counted(r.nc.SetCacheCapacity(ctx, r.node, budget)))
+	return errors.Join(cerr, r.counted(r.nc.SetCacheCapacity(ctx, r.node, advertised)))
+}
+
+// roundUpMiB rounds n up to a whole MiB, so a figure held up for a commitment
+// is never below it. Footprints are whole chunks, so this is n itself in practice.
+func roundUpMiB(n int64) int64 {
+	return (n + mib - 1) &^ (mib - 1)
 }
 
 // counted counts a failed patch or clear by reason and returns it.
