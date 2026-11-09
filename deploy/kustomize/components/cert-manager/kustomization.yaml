@@ -10,7 +10,12 @@
 #   with tls.crt, tls.key and ca.crt) and never writes a Secret;
 # - its Secret create and update rights and its MutatingWebhookConfiguration
 #   right are removed; a get on that one Secret stays;
-# - cert-manager's cainjector writes the CA into the configuration (annotation).
+# - cert-manager's cainjector writes the CA into the configuration (annotation);
+# - the two policies that fence the controller's own writes, with their
+#   bindings, are removed: its patch of that configuration (policy
+#   miami-controller-webhook-config) and its creation of the self-signed
+#   Secret (miami-controller-secrets). The controller has neither right left
+#   for them to fence.
 #
 # certificate.yaml is cert-manager's usual bootstrap chain: a self-signed
 # Issuer signs a long-lived CA Certificate, a CA Issuer built on it signs the
@@ -35,14 +40,50 @@ patches:
         path: /spec/template/spec/containers/0/args/-
         value: --webhook-tls-secret=miami-webhook-tls-managed
   - target: {kind: MutatingWebhookConfiguration, name: miami-cache}
+    # A strategic-merge patch, so annotations an overlay put there stay. The
+    # value names the driver's namespace as a literal; a `namespace:` overlay
+    # must patch it (README, "Overlays that rename or move the driver").
     patch: |-
-      - op: add
-        path: /metadata/annotations
-        value:
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: MutatingWebhookConfiguration
+      metadata:
+        name: miami-cache
+        annotations:
           cert-manager.io/inject-ca-from: miami-system/miami-webhook
+  - target: {kind: ValidatingAdmissionPolicy, name: miami-controller-webhook-config}
+    patch: |-
+      $patch: delete
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      metadata:
+        name: miami-controller-webhook-config
+  - target: {kind: ValidatingAdmissionPolicyBinding, name: miami-controller-webhook-config}
+    patch: |-
+      $patch: delete
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      metadata:
+        name: miami-controller-webhook-config
+  - target: {kind: ValidatingAdmissionPolicy, name: miami-controller-secrets}
+    patch: |-
+      $patch: delete
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      metadata:
+        name: miami-controller-secrets
+  - target: {kind: ValidatingAdmissionPolicyBinding, name: miami-controller-secrets}
+    patch: |-
+      $patch: delete
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      metadata:
+        name: miami-controller-secrets
   # The configuration rule is the last one of the ClusterRole.
   - target: {kind: ClusterRole, name: miami-controller}
     patch: |-
+      - op: test
+        path: /rules/9/apiGroups
+        value: [admissionregistration.k8s.io]
       - op: test
         path: /rules/9/resources
         value: [mutatingwebhookconfigurations]
@@ -55,6 +96,9 @@ patches:
   - target: {kind: Role, name: miami-controller}
     patch: |-
       - op: test
+        path: /rules/1/apiGroups
+        value: [""]
+      - op: test
         path: /rules/1/resources
         value: [secrets]
       - op: test
@@ -63,6 +107,9 @@ patches:
       - op: test
         path: /rules/1/verbs
         value: [get, update]
+      - op: test
+        path: /rules/2/apiGroups
+        value: [""]
       - op: test
         path: /rules/2/resources
         value: [secrets]

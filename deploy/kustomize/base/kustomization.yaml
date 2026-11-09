@@ -70,6 +70,10 @@ resources:
   - clusterrole-node.yaml
   - validatingadmissionpolicy-node-capacity.yaml
   - validatingadmissionpolicybinding-node-capacity.yaml
+  - validatingadmissionpolicy-controller-webhook-config.yaml
+  - validatingadmissionpolicybinding-controller-webhook-config.yaml
+  - validatingadmissionpolicy-controller-secrets.yaml
+  - validatingadmissionpolicybinding-controller-secrets.yaml
   - clusterrolebinding-controller.yaml
   - role-controller.yaml
   - rolebinding-controller.yaml

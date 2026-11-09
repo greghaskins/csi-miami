@@ -5,8 +5,11 @@ package deploy
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -403,6 +406,88 @@ func TestFenceProbeAgainstThePolicy(t *testing.T) {
 	}
 	if _, found, _ := unstructured.NestedString(n.Object, "status", "capacity", "miami.csi.greghaskins.com/fence-probe"); found {
 		t.Error("the probe key was left on the node")
+	}
+}
+
+// recordingMetrics is the capacity metrics of a Runner, keeping what matters.
+type recordingMetrics struct {
+	states   []string
+	failures []string
+}
+
+func (m *recordingMetrics) SetCacheCapacity(int64, int64, int64) {}
+func (m *recordingMetrics) SetCacheCommitted(int64)              {}
+func (m *recordingMetrics) SetCacheAdvertised(int64)             {}
+func (m *recordingMetrics) IncCachePatchFailure(r string)        { m.failures = append(m.failures, r) }
+func (m *recordingMetrics) SetCacheFenceState(s string)          { m.states = append(m.states, s) }
+
+// TestRunnerProbeOverALeftoverKey: a probe key left on the node (by a run that
+// died between the probe's add and its remove, or placed by an admin) makes the
+// bare probe's add a no-op, which the API server skips admission for, so the
+// bare probe reads unfenced under a policy in force. The runner removes the
+// leftover first, so its probe reads fenced.
+func TestRunnerProbeOverALeftoverKey(t *testing.T) {
+	cfg := startEnvtest(t)
+	admin := dyn(t, cfg)
+	r := base(t)
+	createRendered(t, admin, r, "ClusterRole", "miami-node", clusterRole)
+	createRendered(t, admin, r, "ClusterRoleBinding", "miami-node", clusterBind)
+	createRendered(t, admin, r, "ValidatingAdmissionPolicy", "miami-node-capacity", vapGVR)
+	createRendered(t, admin, r, "ValidatingAdmissionPolicyBinding", "miami-node-capacity", bindingGVR)
+	freshNodes(t, admin)
+
+	pc := rest.CopyConfig(cfg)
+	pc.Impersonate = rest.ImpersonationConfig{
+		UserName: nodeSAUser,
+		Groups:   []string{"system:serviceaccounts", "system:authenticated"},
+		Extra:    map[string][]string{nodeNameKey: {"node-a"}},
+	}
+	plugin, err := kube.NewClient(pc, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		st, err := plugin.ProbeFence(context.Background(), "node-a")
+		if st == cachecap.Fenced {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the policy never fenced the probe: %v, %v", st, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	place := func() {
+		t.Helper()
+		if err := patchStatus(admin, "node-a", jsonPatch(op("add", "/status/capacity/miami.csi.greghaskins.com~1fence-probe", `"1"`))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	place()
+	if st, err := plugin.ProbeFence(context.Background(), "node-a"); st != cachecap.Unfenced {
+		t.Fatalf("the bare probe over a leftover key = %v, %v; the premise (a false unfenced) no longer holds", st, err)
+	}
+	// The bare probe's allowed no-op left the key in place and removed it again;
+	// put it back for the runner.
+	place()
+
+	m := &recordingMetrics{}
+	src := cachecap.NewSource(cachecap.Config{Accounting: true, Absolute: 1 << 30, HaveAbsolute: true}, "/", func(string) (int64, int64, error) { return 0, 0, nil })
+	run := cachecap.NewRunner(src, plugin, "node-a", func(context.Context) (int64, int, error) { return 0, 0, nil }, m,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), time.Minute, 30*time.Second, 0)
+	if err := run.Pass(context.Background()); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if !slices.Equal(m.states, []string{"fenced"}) {
+		t.Errorf("fence states = %v, want [fenced]: a leftover key must not read as unfenced", m.states)
+	}
+	n, err := admin.Resource(nodesGVR).Get(context.Background(), "node-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := unstructured.NestedString(n.Object, "status", "capacity", "miami.csi.greghaskins.com/fence-probe"); found {
+		t.Error("the leftover probe key is still on the node")
 	}
 }
 

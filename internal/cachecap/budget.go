@@ -47,6 +47,7 @@ type NodeCapacity interface {
 	// status patch is in force, by trying a patch it must deny (decision 66,
 	// 4.9). Fenced: the policy denied it. Unfenced: the patch was allowed
 	// (and is removed again). Unknown comes with the error that left it so.
+	// The verdict is reported; it does not gate the advertisement.
 	ProbeFence(ctx context.Context, node string) (FenceState, error)
 	// RemoveFenceProbe removes the probe's key if the node carries it.
 	RemoveFenceProbe(ctx context.Context, node string) error
@@ -72,8 +73,12 @@ const (
 type CapacityMetrics interface {
 	SetCacheCapacity(budget, fsSize, fsFree int64)
 	SetCacheCommitted(committed int64)
+	// SetCacheAdvertised records the figure the node is set to advertise:
+	// max(budget, committed). It differs from the budget only while a lowered
+	// budget is held up by volumes still on the node.
+	SetCacheAdvertised(bytes int64)
 	// IncCachePatchFailure counts a failed patch or clear of the node's
-	// capacity; reason is PatchDenied or PatchError.
+	// capacity; reason is PatchDenied, PatchError or PatchUnknown.
 	IncCachePatchFailure(reason string)
 	// SetCacheFenceState records the verdict of the last probe: "fenced",
 	// "unfenced" or "unknown" (see the Fence* names); exactly one is 1.

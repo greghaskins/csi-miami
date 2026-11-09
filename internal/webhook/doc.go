@@ -13,7 +13,9 @@
 //
 //   - Accounting is best effort and never gates admission. Every failure of
 //     the webhook's own (a lookup error, a pod it cannot read, a panic) allows
-//     the pod unchanged and is counted; the node's stage check is the net.
+//     the pod with the cache resource stripped and is counted as error; only a
+//     pod it cannot decode at all is allowed as it came. The node's stage check
+//     is the net.
 //   - Nothing a user wrote survives. The resource is removed from every
 //     container but the first regular one, and replaced there, so a small
 //     number set by hand cannot under-request.

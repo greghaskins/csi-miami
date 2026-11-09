@@ -8,6 +8,15 @@
 # excluded (the controller itself runs in the latter), and so is any namespace
 # labelled miami.csi.greghaskins.com/cache-accounting=disabled.
 #
+# Overlays that move or rename the driver (TestWebhookObjectsUnderOverlays pins
+# this list; the README has the full text). A `namespace:` overlay moves the
+# Service and the reference to it, but NOT the namespaceSelector's literal
+# miami-system below: patch it to the new namespace, or the driver's own pods
+# are sent to its webhook. A `namePrefix:` or `nameSuffix:` overlay renames the
+# Service and the reference to it, but NOT the controller's flags
+# --webhook-service (the certificate's names) and --webhook-config (this
+# object's name, for the caBundle): patch both.
+#
 # caBundle is empty here. With the default self-signed certificate the
 # controller writes the CA into it (so a GitOps tool must ignore differences on
 # webhooks[].clientConfig.caBundle; see the README); with the cert-manager

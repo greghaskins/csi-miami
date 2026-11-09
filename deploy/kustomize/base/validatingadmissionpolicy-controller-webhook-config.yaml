@@ -1,0 +1,81 @@
+# Fences the one write the controller gets on a MutatingWebhookConfiguration:
+# the CA bundle of its own (self-signed mode; the cert-manager component removes
+# both this policy and the controller's right to patch the configuration).
+#
+# The controller's ClusterRole grants `patch` on the one object miami-cache by
+# name, which RBAC cannot narrow to one field. Without this policy a
+# compromised controller could widen that configuration's rules to Secrets or
+# any other resource, widen its namespaceSelector, or point its clientConfig
+# elsewhere, and the API server would then send it every matching object as it
+# is written. A configuration is not exempt from a ValidatingAdmissionPolicy
+# (TestControllerWebhookConfigPolicy proves it against a real API server), so
+# this one holds: for the controller's ServiceAccount an UPDATE may change
+# nothing but webhooks[].clientConfig.caBundle.
+#
+#   [webhooks]  the same number of webhooks, and each equal to the old one in
+#               every projection but clientConfig.caBundle: name, rules,
+#               failurePolicy, matchPolicy, sideEffects, timeoutSeconds,
+#               admissionReviewVersions, reinvocationPolicy, namespaceSelector,
+#               objectSelector, matchConditions, clientConfig.service and
+#               clientConfig.url;
+#   [metadata]  labels, annotations, finalizers, ownerReferences and the Apply
+#               entries of managedFields are unchanged, as in the node policy.
+#               The API server honours managedFields in a patch of this main
+#               resource, so a forged Apply entry is real here (it is not on
+#               the status endpoint the node policy fences).
+#
+# The policy cannot protect itself: policies and their bindings are exempt from
+# API-based admission policies, so the policy and its binding are guarded by
+# RBAC alone. That is enough, because the controller has no right on either.
+#
+# A field the API adds to a webhook later is not in the projection and so is
+# not held still. That is the same trade as the node policy's field list;
+# TestControllerWebhookConfigPolicy covers the fields of the v1 type that exist
+# today.
+#
+# The matchCondition names the ServiceAccount without its namespace, so an
+# overlay that moves the driver to another namespace is still fenced, and it
+# fences more, never less. A `namePrefix:` or `nameSuffix:` overlay renames the
+# ServiceAccount: it MUST patch the matchCondition to the new name, as for the
+# node policy.
+#
+# This is a fence on the controller's own credential. It does not narrow what
+# the webhook itself may do to pods (README, trust model).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: miami-controller-webhook-config
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [admissionregistration.k8s.io]
+        apiVersions: ["v1"]
+        operations: [UPDATE]
+        resources: [mutatingwebhookconfigurations]
+  matchConditions:
+    - name: controller-only
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:') &&
+        request.userInfo.username.endsWith(':miami-controller')
+  variables:
+    - name: newWebhooks
+      expression: "has(object.webhooks) ? object.webhooks : []"
+    - name: oldWebhooks
+      expression: "has(oldObject.webhooks) ? oldObject.webhooks : []"
+  validations:
+    - reason: Forbidden
+      message: "[webhooks] the controller may change only webhooks[].clientConfig.caBundle of a webhook configuration"
+      expression: >-
+        size(variables.newWebhooks) == size(variables.oldWebhooks) &&
+        variables.newWebhooks.map(w, [dyn(has(w.name) ? w.name : ''), dyn(has(w.failurePolicy) ? w.failurePolicy : ''), dyn(has(w.matchPolicy) ? w.matchPolicy : ''), dyn(has(w.sideEffects) ? w.sideEffects : ''), dyn(has(w.reinvocationPolicy) ? w.reinvocationPolicy : ''), dyn(has(w.timeoutSeconds) ? w.timeoutSeconds : 0), dyn(has(w.admissionReviewVersions) ? w.admissionReviewVersions : []), dyn(has(w.rules) ? w.rules : []), dyn(has(w.matchConditions) ? w.matchConditions : []), dyn(has(w.namespaceSelector) ? w.namespaceSelector : {}), dyn(has(w.objectSelector) ? w.objectSelector : {}), dyn(has(w.clientConfig.service) ? w.clientConfig.service : {}), dyn(has(w.clientConfig.url) ? w.clientConfig.url : '')]) ==
+        variables.oldWebhooks.map(w, [dyn(has(w.name) ? w.name : ''), dyn(has(w.failurePolicy) ? w.failurePolicy : ''), dyn(has(w.matchPolicy) ? w.matchPolicy : ''), dyn(has(w.sideEffects) ? w.sideEffects : ''), dyn(has(w.reinvocationPolicy) ? w.reinvocationPolicy : ''), dyn(has(w.timeoutSeconds) ? w.timeoutSeconds : 0), dyn(has(w.admissionReviewVersions) ? w.admissionReviewVersions : []), dyn(has(w.rules) ? w.rules : []), dyn(has(w.matchConditions) ? w.matchConditions : []), dyn(has(w.namespaceSelector) ? w.namespaceSelector : {}), dyn(has(w.objectSelector) ? w.objectSelector : {}), dyn(has(w.clientConfig.service) ? w.clientConfig.service : {}), dyn(has(w.clientConfig.url) ? w.clientConfig.url : '')])
+    - reason: Forbidden
+      message: "[metadata] the controller may not change labels, annotations, finalizers, ownerReferences or the Apply entries of managedFields"
+      expression: >-
+        (has(object.metadata.labels) ? has(oldObject.metadata.labels) && object.metadata.labels == oldObject.metadata.labels : !has(oldObject.metadata.labels)) &&
+        (has(object.metadata.annotations) ? has(oldObject.metadata.annotations) && object.metadata.annotations == oldObject.metadata.annotations : !has(oldObject.metadata.annotations)) &&
+        (has(object.metadata.finalizers) ? has(oldObject.metadata.finalizers) && object.metadata.finalizers == oldObject.metadata.finalizers : !has(oldObject.metadata.finalizers)) &&
+        (has(object.metadata.ownerReferences) ? has(oldObject.metadata.ownerReferences) && object.metadata.ownerReferences == oldObject.metadata.ownerReferences : !has(oldObject.metadata.ownerReferences)) &&
+        (has(object.metadata.managedFields) ? object.metadata.managedFields.filter(e, e.operation == 'Apply') : []) ==
+        (has(oldObject.metadata.managedFields) ? oldObject.metadata.managedFields.filter(e, e.operation == 'Apply') : [])

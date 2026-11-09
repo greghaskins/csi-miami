@@ -860,7 +860,11 @@ func TestControllerDeployment(t *testing.T) {
 	if got := flagValue(t, m.Args, "transports-root"); got != "/var/lib/miami" {
 		t.Errorf("--transports-root = %q", got)
 	}
-	for _, a := range []string{"--webhook-addr=:9814", "--webhook-config=miami-cache"} {
+	// The webhook binds the pod's own IP (the node's, on the host network), in
+	// brackets so an IPv6 address stays a valid host:port. That does not restrict
+	// who can reach it: the API server does not authenticate to it, and the
+	// concurrency bound and the separate limiter are what bound a forged review.
+	for _, a := range []string{"--webhook-addr=[$(POD_IP)]:9814", "--webhook-config=miami-cache"} {
 		if !hasArg(m.Args, a) {
 			t.Errorf("miami lacks %s", a)
 		}
@@ -871,9 +875,12 @@ func TestControllerDeployment(t *testing.T) {
 			t.Errorf("the base sets %s; only the cert-manager component does", a)
 		}
 	}
-	wantEnv := []corev1.EnvVar{{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}}}
+	wantEnv := []corev1.EnvVar{
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
+	}
 	if !reflect.DeepEqual(m.Env, wantEnv) {
-		t.Errorf("miami env = %+v, want POD_NAMESPACE from the downward API", m.Env)
+		t.Errorf("miami env = %+v, want POD_NAMESPACE and POD_IP from the downward API", m.Env)
 	}
 	hasWebhookPort := false
 	for _, cp := range m.Ports {
@@ -994,7 +1001,7 @@ func TestPortsDistinct(t *testing.T) {
 	}
 	port := func(addr string) int {
 		t.Helper()
-		n, err := strconv.Atoi(strings.TrimPrefix(addr, ":"))
+		n, err := strconv.Atoi(addr[strings.LastIndex(addr, ":")+1:])
 		if err != nil {
 			t.Fatalf("address %q: %v", addr, err)
 		}
@@ -1197,8 +1204,8 @@ func TestNodeRBACExact(t *testing.T) {
 		t.Errorf("the base ships ValidatingWebhookConfiguration %v", n)
 	}
 	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
-		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
-			t.Errorf("the base ships %s %v, want only miami-node-capacity", kind, n)
+		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-controller-secrets", "miami-controller-webhook-config", "miami-node-capacity"}) {
+			t.Errorf("the base ships %s %v, want the controller's two and the node's", kind, n)
 		}
 	}
 
@@ -1491,6 +1498,92 @@ func TestBaseGolden(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Errorf("the rendered base differs from %s; review the change and regenerate it with `go test ./deploy -update`", path)
 	}
+}
+
+// TestControllerWebhookConfigPolicyShips: the policy that fences the
+// controller's patch of the webhook configuration comes with its binding, fails
+// closed, and matches only UPDATE of mutatingwebhookconfigurations for the
+// controller's ServiceAccount, whatever its namespace. The envtest runs it.
+func TestControllerWebhookConfigPolicyShips(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-controller-webhook-config", &pol)
+	var bind admissionv1.ValidatingAdmissionPolicyBinding
+	r.get(t, "ValidatingAdmissionPolicyBinding", "miami-controller-webhook-config", &bind)
+	if bind.Spec.PolicyName != pol.Name || !reflect.DeepEqual(bind.Spec.ValidationActions, []admissionv1.ValidationAction{admissionv1.Deny}) ||
+		bind.Spec.MatchResources != nil || bind.Spec.ParamRef != nil {
+		t.Errorf("binding = %+v, want an unscoped Deny binding of %s", bind.Spec, pol.Name)
+	}
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionv1.Fail {
+		t.Errorf("failurePolicy = %v, want Fail", pol.Spec.FailurePolicy)
+	}
+	rules := pol.Spec.MatchConstraints.ResourceRules
+	if len(rules) != 1 || !reflect.DeepEqual(rules[0].Operations, []admissionv1.OperationType{admissionv1.Update}) ||
+		!reflect.DeepEqual(rules[0].Resources, []string{"mutatingwebhookconfigurations"}) ||
+		!reflect.DeepEqual(rules[0].APIGroups, []string{"admissionregistration.k8s.io"}) {
+		t.Errorf("matchConstraints = %+v", pol.Spec.MatchConstraints)
+	}
+	if len(pol.Spec.MatchConditions) != 1 {
+		t.Fatalf("matchConditions = %+v", pol.Spec.MatchConditions)
+	}
+	e := pol.Spec.MatchConditions[0].Expression
+	if !strings.Contains(e, "system:serviceaccount:") || !strings.Contains(e, "endsWith(':miami-controller')") || strings.Contains(e, "miami-system") {
+		t.Errorf("matchCondition = %q: want the ServiceAccount name without its namespace", e)
+	}
+}
+
+// TestControllerSecretPolicyShips: the policy that pins the controller's Secret
+// creation comes with its binding, fails closed, matches only CREATE of
+// secrets for the controller's ServiceAccount in any namespace, and pins the
+// one name and type the controller creates. The envtest runs it.
+func TestControllerSecretPolicyShips(t *testing.T) {
+	t.Parallel()
+	r := base(t)
+	var pol admissionv1.ValidatingAdmissionPolicy
+	r.get(t, "ValidatingAdmissionPolicy", "miami-controller-secrets", &pol)
+	var bind admissionv1.ValidatingAdmissionPolicyBinding
+	r.get(t, "ValidatingAdmissionPolicyBinding", "miami-controller-secrets", &bind)
+	if bind.Spec.PolicyName != pol.Name || !reflect.DeepEqual(bind.Spec.ValidationActions, []admissionv1.ValidationAction{admissionv1.Deny}) ||
+		bind.Spec.MatchResources != nil || bind.Spec.ParamRef != nil {
+		t.Errorf("binding = %+v, want an unscoped Deny binding of %s", bind.Spec, pol.Name)
+	}
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionv1.Fail {
+		t.Errorf("failurePolicy = %v, want Fail", pol.Spec.FailurePolicy)
+	}
+	rules := pol.Spec.MatchConstraints.ResourceRules
+	if len(rules) != 1 || !reflect.DeepEqual(rules[0].Operations, []admissionv1.OperationType{admissionv1.Create}) ||
+		!reflect.DeepEqual(rules[0].Resources, []string{"secrets"}) || !reflect.DeepEqual(rules[0].APIGroups, []string{""}) {
+		t.Errorf("matchConstraints = %+v", pol.Spec.MatchConstraints)
+	}
+	if len(pol.Spec.MatchConditions) != 1 {
+		t.Fatalf("matchConditions = %+v", pol.Spec.MatchConditions)
+	}
+	if e := pol.Spec.MatchConditions[0].Expression; !strings.Contains(e, "endsWith(':miami-controller')") || strings.Contains(e, "miami-system") {
+		t.Errorf("matchCondition = %q: want the ServiceAccount name without its namespace", e)
+	}
+	var exprs []string
+	for _, v := range pol.Spec.Validations {
+		exprs = append(exprs, v.Expression)
+	}
+	if !reflect.DeepEqual(exprs, []string{"object.metadata.name == 'miami-webhook-tls'", "has(object.type) && object.type == 'kubernetes.io/tls'"}) {
+		t.Errorf("validations = %q", exprs)
+	}
+	// The name the policy allows is the one the controller creates.
+	var role rbacv1.Role
+	r.get(t, "Role", "miami-controller", &role)
+	if !hasRuleFor(role.Rules, "secrets", "miami-webhook-tls") {
+		t.Errorf("the Role names no Secret miami-webhook-tls: %+v", role.Rules)
+	}
+}
+
+func hasRuleFor(rules []rbacv1.PolicyRule, resource, name string) bool {
+	for _, ru := range rules {
+		if slices.Contains(ru.Resources, resource) && slices.Contains(ru.ResourceNames, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestPolicyAndBindingShip: a policy with no binding enforces nothing, and a
@@ -1909,7 +2002,7 @@ func TestCertManagerComponent(t *testing.T) {
 	if got := flagValue(t, m.Args, "webhook-tls-secret"); got != "miami-webhook-tls-managed" {
 		t.Errorf("--webhook-tls-secret = %q, want miami-webhook-tls-managed", got)
 	}
-	if got := flagValue(t, m.Args, "webhook-addr"); got != ":9814" {
+	if got := flagValue(t, m.Args, "webhook-addr"); got != "[$(POD_IP)]:9814" {
 		t.Errorf("--webhook-addr = %q", got)
 	}
 
@@ -1992,6 +2085,15 @@ func TestCertManagerComponent(t *testing.T) {
 		t.Errorf("dnsNames = %v, want %v", cert.Spec.DNSNames, wantNames)
 	}
 
+	// The controller's rights on the configuration and on creating Secrets are
+	// gone, so the two policies that fence them go too, with their bindings;
+	// the node policy stays.
+	for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+		if n := r.names(kind); !reflect.DeepEqual(n, []string{"miami-node-capacity"}) {
+			t.Errorf("with the component the render has %s %v, want only miami-node-capacity", kind, n)
+		}
+	}
+
 	// The base alone carries no cert-manager object.
 	if n := base(t).names("Certificate"); len(n) != 0 {
 		t.Errorf("the base ships Certificates %v", n)
@@ -2001,6 +2103,13 @@ func TestCertManagerComponent(t *testing.T) {
 // renderComponentOver renders the component over a base that an intermediate
 // kustomization has first patched with the given JSON patch on the target.
 func renderComponentOver(t *testing.T, kind, name, patch string) error {
+	t.Helper()
+	_, err := renderComponentOverR(t, kind, name, patch)
+	return err
+}
+
+// renderComponentOverR is renderComponentOver returning what it rendered.
+func renderComponentOverR(t *testing.T, kind, name, patch string) (rendered, error) {
 	t.Helper()
 	abs, err := filepath.Abs("kustomize")
 	if err != nil {
@@ -2033,8 +2142,37 @@ func renderComponentOver(t *testing.T, kind, name, patch string) error {
 	k := krusty.MakeKustomizer(krusty.MakeDefaultOptions())
 	kustomizeMu.Lock()
 	defer kustomizeMu.Unlock()
-	_, err = k.Run(filesys.MakeFsOnDisk(), top)
-	return err
+	m, err := k.Run(filesys.MakeFsOnDisk(), top)
+	if err != nil {
+		return rendered{}, err
+	}
+	r := rendered{}
+	for _, res := range m.Resources() {
+		js, err := res.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.objects = append(r.objects, object{kind: res.GetKind(), name: res.GetName(), json: js})
+	}
+	return r, nil
+}
+
+// TestCertManagerComponentKeepsExistingAnnotations: the component adds its one
+// annotation to the webhook configuration without replacing the ones an overlay
+// below it has put there.
+func TestCertManagerComponentKeepsExistingAnnotations(t *testing.T) {
+	t.Parallel()
+	patch := "      - op: add\n        path: /metadata/annotations\n        value: {example.com/keep: kept}\n"
+	r, err := renderComponentOverR(t, "MutatingWebhookConfiguration", "miami-cache", patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg admissionv1.MutatingWebhookConfiguration
+	r.get(t, "MutatingWebhookConfiguration", "miami-cache", &cfg)
+	want := map[string]string{"example.com/keep": "kept", "cert-manager.io/inject-ca-from": "miami-system/miami-webhook"}
+	if !reflect.DeepEqual(cfg.Annotations, want) {
+		t.Errorf("annotations = %v, want %v", cfg.Annotations, want)
+	}
 }
 
 // TestCertManagerComponentRefusesMovedRules: the component removes rules by
@@ -2053,6 +2191,11 @@ func TestCertManagerComponentRefusesMovedRules(t *testing.T) {
 		{"ClusterRole rule appended (removes nothing else)", "ClusterRole", app, false},
 		{"Role rule inserted first", "Role", ins, true},
 		{"Role rule appended (removes nothing else)", "Role", app, false},
+		// The guards check the group as well as the resource, so a rule that
+		// kept its index and resource but changed its group is refused.
+		{"ClusterRole configuration rule in another group", "ClusterRole", "      - op: replace\n        path: /rules/9/apiGroups\n        value: ['']\n", true},
+		{"Role Secret get rule in another group", "Role", "      - op: replace\n        path: /rules/1/apiGroups\n        value: [example.com]\n", true},
+		{"Role Secret create rule in another group", "Role", "      - op: replace\n        path: /rules/2/apiGroups\n        value: [example.com]\n", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2104,4 +2247,119 @@ func TestControllerRBACExact(t *testing.T) {
 	if !reflect.DeepEqual(role.Rules, wantRole) {
 		t.Errorf("controller Role = %+v\nwant %+v", role.Rules, wantRole)
 	}
+}
+
+// TestWebhookObjectsUnderOverlays pins what follows an overlay that moves or
+// renames the driver, for the webhook's objects, and what does not. It is the
+// webhook's counterpart of TestNodePolicyFollowsNamespaceOverlay. What does NOT
+// follow must be patched by the overlay (README, "Overlays that rename or move
+// the driver"); each such literal is named here so that nobody takes the test
+// for a promise.
+func TestWebhookObjectsUnderOverlays(t *testing.T) {
+	t.Parallel()
+	hostOf := func(r rendered, name string) (svcNS, svcName string, sel []string) {
+		t.Helper()
+		var cfg admissionv1.MutatingWebhookConfiguration
+		r.get(t, "MutatingWebhookConfiguration", name, &cfg)
+		w := cfg.Webhooks[0]
+		for _, e := range w.NamespaceSelector.MatchExpressions {
+			if e.Key == "kubernetes.io/metadata.name" {
+				sel = e.Values
+			}
+		}
+		return w.ClientConfig.Service.Namespace, w.ClientConfig.Service.Name, sel
+	}
+	argsOf := func(r rendered, name string) []string {
+		t.Helper()
+		var d appsv1.Deployment
+		r.get(t, "Deployment", name, &d)
+		return container(t, d.Spec.Template.Spec, "miami").Args
+	}
+
+	t.Run("namespace", func(t *testing.T) {
+		t.Parallel()
+		r := renderOverlay(t, "namespace: storage\n")
+		// Follows: the Service and the configuration's reference to it.
+		var svc corev1.Service
+		r.get(t, "Service", "miami-webhook", &svc)
+		ns, name, sel := hostOf(r, "miami-cache")
+		if svc.Namespace != "storage" || ns != "storage" || name != "miami-webhook" {
+			t.Errorf("service namespace %q, configuration points at %s/%s; want both in storage", svc.Namespace, ns, name)
+		}
+		// Follows at runtime: the certificate's names and the Secret's home come
+		// from POD_NAMESPACE (the downward API), and the flags carry no namespace.
+		args := argsOf(r, "miami-controller")
+		for _, a := range args {
+			if strings.Contains(a, "miami-system") || strings.HasPrefix(a, "--webhook-service") {
+				t.Errorf("the controller carries a literal that would not follow the namespace: %s", a)
+			}
+		}
+		var d appsv1.Deployment
+		r.get(t, "Deployment", "miami-controller", &d)
+		if m := container(t, d.Spec.Template.Spec, "miami"); m.Env[0].Name != "POD_NAMESPACE" || m.Env[0].ValueFrom == nil || m.Env[0].ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+			t.Errorf("env = %+v, want POD_NAMESPACE from the downward API first", m.Env)
+		}
+		// Does NOT follow: the namespaceSelector excludes the literal base namespace
+		// (a driver moved to storage is then not excluded from its own webhook, and
+		// its own pods are sent to it).
+		if !slices.Contains(sel, "miami-system") || slices.Contains(sel, "storage") {
+			t.Errorf("namespaceSelector excludes %v; the pinned behaviour is that the literal miami-system stays and the overlay must patch it", sel)
+		}
+	})
+
+	t.Run("namespace with the cert-manager component", func(t *testing.T) {
+		t.Parallel()
+		r := renderOverlay(t, "namespace: storage\ncomponents:\n  - ../kustomize/components/cert-manager\n")
+		var cfg admissionv1.MutatingWebhookConfiguration
+		r.get(t, "MutatingWebhookConfiguration", "miami-cache", &cfg)
+		// Does NOT follow: the CA injector is told where to look by a literal.
+		if got := cfg.Annotations["cert-manager.io/inject-ca-from"]; got != "miami-system/miami-webhook" {
+			t.Errorf("inject-ca-from = %q; the pinned behaviour is the literal miami-system/miami-webhook, which the overlay must patch", got)
+		}
+		// Does NOT follow: the serving certificate's names.
+		var cert struct {
+			Spec struct {
+				DNSNames []string `json:"dnsNames"`
+			} `json:"spec"`
+		}
+		for _, o := range r.objects {
+			if o.kind == "Certificate" && o.name == "miami-webhook" {
+				if err := json.Unmarshal(o.json, &cert); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		for _, n := range cert.Spec.DNSNames {
+			if !strings.Contains(n, ".miami-system.svc") {
+				t.Errorf("dnsName %q followed the namespace; update this test and the README if the component now does", n)
+			}
+		}
+		if len(cert.Spec.DNSNames) != 2 {
+			t.Errorf("dnsNames = %v", cert.Spec.DNSNames)
+		}
+	})
+
+	t.Run("namePrefix", func(t *testing.T) {
+		t.Parallel()
+		r := renderOverlay(t, "namePrefix: prod-\n")
+		_, name, _ := hostOf(r, "prod-miami-cache")
+		// Follows: the configuration's reference to the renamed Service.
+		if name != "prod-miami-webhook" {
+			t.Errorf("the configuration points at Service %q, want prod-miami-webhook", name)
+		}
+		// Does NOT follow: the controller's flags name the Service and the
+		// configuration by their base names (the certificate's names come from
+		// -webhook-service, whose default is miami-webhook, and -webhook-config
+		// names the configuration whose caBundle is kept). The overlay must patch
+		// both.
+		args := argsOf(r, "prod-miami-controller")
+		if !slices.Contains(args, "--webhook-config=miami-cache") {
+			t.Errorf("args = %v; the pinned behaviour is --webhook-config=miami-cache, which the overlay must patch", args)
+		}
+		for _, a := range args {
+			if strings.HasPrefix(a, "--webhook-service") {
+				t.Errorf("%s: the base sets no --webhook-service, so the default miami-webhook applies; update the README if that changed", a)
+			}
+		}
+	})
 }

@@ -56,6 +56,17 @@ const (
 	maxAttempts = 5
 )
 
+// TLSMetrics counts what the TLS source did that an operator must see.
+type TLSMetrics interface {
+	// SecretRefused counts a pass that found a Secret in the way and would not
+	// overwrite it (see TLSSource).
+	SecretRefused()
+}
+
+// errNotOurs is a Secret under the name this controller would write that it
+// did not create and will not overwrite.
+var errNotOurs = errors.New("webhook: the TLS Secret is not this controller's")
+
 // errNotReady is a managed Secret that is absent or incomplete: someone else
 // has yet to write it, and the next pass tries again.
 var errNotReady = errors.New("webhook: the TLS Secret is not ready")
@@ -75,6 +86,12 @@ type Material struct {
 // a race re-reads and adopts the winner's material when it is valid; it never
 // overwrites a different CA it has not looked at.
 //
+// A Secret that exists under the name but that the controller did not create
+// (it lacks the ownership label the controller sets on its own, or has no ca.key)
+// is never overwritten: a cert-manager Secret reached by forgetting
+// -webhook-tls-secret would otherwise lose its key and CA to ours. That is
+// logged at Error, naming the flag, and counted.
+//
 // Managed: someone else owns the Secret. The source only reads it and never
 // writes, however broken it is.
 type TLSSource struct {
@@ -85,8 +102,13 @@ type TLSSource struct {
 	Service string
 	Managed bool
 	// Now is the clock; nil means time.Now.
-	Now func() time.Time
-	Log *slog.Logger
+	Now     func() time.Time
+	Log     *slog.Logger
+	Metrics TLSMetrics // nil: not counted
+
+	// refusedLogged: the Error about a Secret in the way has been logged, and
+	// repeats go to Debug until a pass finds none.
+	refusedLogged bool
 }
 
 func (s *TLSSource) now() time.Time {
@@ -134,12 +156,19 @@ func (s *TLSSource) Load(ctx context.Context) (*Material, error) {
 		if m != nil {
 			return m, nil
 		}
+		if sec != nil && !s.ours(sec) {
+			return nil, s.refuse()
+		}
+		s.refusedLogged = false
 		fresh, m, err := s.generate(ca)
 		if err != nil {
 			return nil, err
 		}
 		if sec == nil {
-			err = s.Secrets.CreateSecret(ctx, &kube.Secret{Namespace: s.Namespace, Name: s.Name, Type: kube.SecretTypeTLS, Data: fresh})
+			err = s.Secrets.CreateSecret(ctx, &kube.Secret{
+				Namespace: s.Namespace, Name: s.Name, Type: kube.SecretTypeTLS, Data: fresh,
+				Labels: map[string]string{kube.SecretOwnerLabel: kube.SecretOwnerValue},
+			})
 			if err == nil {
 				s.log().Info("created the webhook TLS Secret", "secret", s.Name)
 			}
@@ -166,6 +195,28 @@ func (s *TLSSource) Load(ctx context.Context) (*Material, error) {
 		}
 	}
 	return nil, errors.New("webhook: the TLS Secret kept changing under us; will retry on the next pass")
+}
+
+// ours reports whether sec is a Secret this controller created: it carries the
+// ownership label and the CA key that only this controller writes.
+func (s *TLSSource) ours(sec *kube.Secret) bool {
+	return sec.Labels[kube.SecretOwnerLabel] == kube.SecretOwnerValue && len(sec.Data[keyCAKey]) > 0
+}
+
+// refuse reports a Secret in the way: counted every pass, logged at Error once.
+func (s *TLSSource) refuse() error {
+	if s.Metrics != nil {
+		s.Metrics.SecretRefused()
+	}
+	lvl := slog.LevelDebug
+	if !s.refusedLogged {
+		lvl = slog.LevelError
+		s.refusedLogged = true
+	}
+	s.log().Log(context.Background(), lvl, "the webhook TLS Secret exists but is not this controller's, so it is not being overwritten. "+
+		"If cert-manager (or anything else) manages it, run the controller with -webhook-tls-secret="+s.Name+"; otherwise delete the Secret and the controller will make its own",
+		"secret", s.Name, "namespace", s.Namespace)
+	return fmt.Errorf("%w: Secret %q exists and was not created by it (set -webhook-tls-secret to use a Secret something else manages)", errNotOurs, s.Name)
 }
 
 // loadManaged reads a Secret someone else manages. It never writes.
@@ -337,6 +388,16 @@ type CertStore struct {
 
 // Set replaces the certificate served from now on.
 func (c *CertStore) Set(cert *tls.Certificate) { c.cur.Store(cert) }
+
+// usable reports whether a certificate is loaded and valid at now.
+func (c *CertStore) usable(now time.Time) bool {
+	cert := c.cur.Load()
+	if cert == nil || len(cert.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	return err == nil && !now.Before(leaf.NotBefore) && now.Before(leaf.NotAfter)
+}
 
 // GetCertificate implements tls.Config.GetCertificate. Before the first
 // certificate is loaded it fails the handshake.

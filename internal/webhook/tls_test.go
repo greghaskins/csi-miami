@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
@@ -11,6 +12,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -95,6 +97,13 @@ func (f *fakeSecrets) UpdateSecret(_ context.Context, s *kube.Secret) error {
 }
 
 func (f *fakeSecrets) writes() int { f.mu.Lock(); defer f.mu.Unlock(); return f.creates + f.updates }
+
+// ownLabels is what the controller puts on the Secret it creates.
+var ownLabels = map[string]string{kube.SecretOwnerLabel: kube.SecretOwnerValue}
+
+// brokenOurs is data the controller wrote and that is no longer usable: it has
+// a ca.key, which only the controller writes, but nothing that parses.
+func brokenOurs() map[string][]byte { return map[string][]byte{"ca.key": []byte("w")} }
 
 var t0 = time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 
@@ -257,19 +266,12 @@ func TestBootstrapKeepsCAWhenRenewingServingCert(t *testing.T) {
 func TestBootstrapRegeneratesGarbage(t *testing.T) {
 	t.Parallel()
 	for name, data := range map[string]map[string][]byte{
-		"empty":   {},
-		"garbage": {"tls.crt": []byte("x"), "tls.key": []byte("y"), "ca.crt": []byte("z"), "ca.key": []byte("w")},
-		"no CA key": func() map[string][]byte {
-			f := &fakeSecrets{}
-			_, _ = newSource(f, t0).Load(context.Background())
-			d := maps.Clone(f.secret.Data)
-			delete(d, "ca.key")
-			return d
-		}(),
+		"only a CA key": brokenOurs(),
+		"garbage":       {"tls.crt": []byte("x"), "tls.key": []byte("y"), "ca.crt": []byte("z"), "ca.key": []byte("w")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Type: "kubernetes.io/tls", Data: data, ResourceVersion: "1"}, version: 1}
+			f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Type: "kubernetes.io/tls", Data: data, Labels: ownLabels, ResourceVersion: "1"}, version: 1}
 			m, err := newSource(f, t0).Load(context.Background())
 			if err != nil {
 				t.Fatal(err)
@@ -295,7 +297,7 @@ func TestBootstrapRegeneratesWhenSignedByAnotherCA(t *testing.T) {
 	}
 	mixed := maps.Clone(a.secret.Data)
 	mixed["tls.crt"], mixed["tls.key"] = b.secret.Data["tls.crt"], b.secret.Data["tls.key"]
-	f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Data: mixed, ResourceVersion: "1"}, version: 1}
+	f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Data: mixed, Labels: ownLabels, ResourceVersion: "1"}, version: 1}
 	if _, err := newSource(f, t0).Load(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +365,7 @@ func TestUpdateConflictRetriesThenSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Data: map[string][]byte{}, ResourceVersion: "1"}, version: 1}
+	f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Data: brokenOurs(), Labels: ownLabels, ResourceVersion: "1"}, version: 1}
 	f.beforeWrite = func(f *fakeSecrets) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -407,7 +409,7 @@ func TestCreateRaceConvergesOnOneCA(t *testing.T) {
 
 func TestPersistentConflictGivesUp(t *testing.T) {
 	t.Parallel()
-	f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Data: map[string][]byte{}, ResourceVersion: "1"}, version: 1}
+	f := &fakeSecrets{secret: &kube.Secret{Namespace: "miami-system", Name: "miami-webhook-tls", Data: brokenOurs(), Labels: ownLabels, ResourceVersion: "1"}, version: 1}
 	// Every write loses: the version moves under us each time.
 	src := newSource(f, t0)
 	src.Secrets = &alwaysConflict{fakeSecrets: f}
@@ -419,3 +421,82 @@ func TestPersistentConflictGivesUp(t *testing.T) {
 type alwaysConflict struct{ *fakeSecrets }
 
 func (alwaysConflict) UpdateSecret(context.Context, *kube.Secret) error { return kube.ErrConflict }
+
+func TestCreatedSecretCarriesTheOwnerLabel(t *testing.T) {
+	t.Parallel()
+	f := &fakeSecrets{}
+	if _, err := newSource(f, t0).Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.secret.Labels[kube.SecretOwnerLabel] != kube.SecretOwnerValue {
+		t.Errorf("labels = %v, want the ownership label", f.secret.Labels)
+	}
+}
+
+type refusals struct{ n int }
+
+func (r *refusals) SecretRefused() { r.n++ }
+
+// TestSelfSignedModeDoesNotOverwriteASecretItDidNotCreate: forgetting
+// -webhook-tls-secret must not cost a cert-manager Secret its key and CA. The
+// Secret is left as it was, the Error names the flag, and the refusal is
+// counted on every pass.
+func TestSelfSignedModeDoesNotOverwriteASecretItDidNotCreate(t *testing.T) {
+	t.Parallel()
+	g := &fakeSecrets{}
+	if _, err := newSource(g, t0).Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	withoutCAKey := maps.Clone(g.secret.Data)
+	delete(withoutCAKey, "ca.key")
+	for name, sec := range map[string]*kube.Secret{
+		"no ca.key (cert-manager's)": {Data: withoutCAKey, Labels: ownLabels},
+		"no ca.key and no label":     {Data: withoutCAKey},
+		"empty":                      {Data: map[string][]byte{}},
+		"no label":                   {Data: map[string][]byte{"ca.key": []byte("k"), "tls.crt": []byte("x")}},
+		"another owner's label":      {Data: brokenOurs(), Labels: map[string]string{kube.SecretOwnerLabel: "cert-manager"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			sec.Namespace, sec.Name, sec.Type, sec.ResourceVersion = "miami-system", "miami-webhook-tls", "kubernetes.io/tls", "1"
+			before := maps.Clone(sec.Data)
+			f := &fakeSecrets{secret: sec, version: 1, failWrites: true}
+			var logs bytes.Buffer
+			ref := &refusals{}
+			src := newSource(f, t0)
+			src.Log, src.Metrics = slog.New(slog.NewTextHandler(&logs, nil)), ref
+			for i := 0; i < 2; i++ {
+				if _, err := src.Load(context.Background()); !errors.Is(err, errNotOurs) {
+					t.Fatalf("pass %d: err = %v, want errNotOurs", i, err)
+				}
+			}
+			if f.creates+f.updates != 0 {
+				t.Errorf("the Secret was written (%d creates, %d updates)", f.creates, f.updates)
+			}
+			if !maps.EqualFunc(before, f.secret.Data, slices.Equal[[]byte]) {
+				t.Error("the Secret's data changed")
+			}
+			if ref.n != 2 {
+				t.Errorf("refusals counted = %d, want 2", ref.n)
+			}
+			if n := strings.Count(logs.String(), "level=ERROR"); n != 1 || !strings.Contains(logs.String(), "-webhook-tls-secret") {
+				t.Errorf("want one Error naming -webhook-tls-secret, got %d:\n%s", n, logs.String())
+			}
+		})
+	}
+}
+
+// TestAValidSecretIsUsedWhoseverItIs: nothing is written, so nothing is refused.
+func TestAValidSecretIsUsedWhoseverItIs(t *testing.T) {
+	t.Parallel()
+	g := &fakeSecrets{}
+	if _, err := newSource(g, t0).Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sec := *g.secret
+	sec.Labels = nil
+	f := &fakeSecrets{secret: &sec, version: 1, failWrites: true}
+	if _, err := newSource(f, t0).Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -9,8 +9,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-// Runner keeps the node's advertised cache capacity equal to its budget. It
-// runs in a goroutine of its own, so a slow API server cannot stall volume
+// Runner keeps the node's advertised cache capacity equal to its budget, or to
+// its committed figure when that is higher. It runs in a goroutine of its own, so a slow API server cannot stall volume
 // work.
 type Runner struct {
 	src       *Source
@@ -36,6 +36,14 @@ type Runner struct {
 	// warnedUnknown: the failed passes of the current unknown verdict have
 	// been logged at Warn once already.
 	warnedUnknown bool
+	// lastHeld is the figure advertised on the last pass that could read the
+	// commitment; an unreadable commitment never drops the figure below it.
+	lastHeld int64
+	// advertised: a figure has been advertised since the runner started.
+	advertised bool
+	// holding: the advertised figure is being held at the committed figure
+	// (it exceeds the budget); the Warn for the episode has been logged.
+	holding bool
 }
 
 // DefaultProbeInterval is how often the fence probe runs while the node is
@@ -78,19 +86,17 @@ func NewRunner(src *Source, nc NodeCapacity, node string, committed func(context
 // plugin's status patch.
 const FencePolicy = "miami-node-capacity"
 
-// ErrUnfenced is returned by a Pass that found the plugin's grant not
-// narrowed by FencePolicy.
-var ErrUnfenced = errors.New("cachecap: the admission policy " + FencePolicy + " does not fence the node plugin")
-
-// ErrFenceUnknown is returned by a Pass that has no verdict on the fence, so
-// it did not advertise.
-var ErrFenceUnknown = errors.New("cachecap: not advertising: the admission policy " + FencePolicy + " has not been confirmed in force")
+// ErrFenceUnknown is returned by a Pass whose probe could not tell whether
+// FencePolicy is in force and that therefore left the last advertised figure
+// as it was.
+var ErrFenceUnknown = errors.New("cachecap: the admission policy " + FencePolicy + " has not been confirmed in force; keeping the last advertised figure")
 
 // probeIfDue runs the fence probe when none has run, or the last verdict is
 // older than its wait, and records the verdict. Only a Fenced verdict waits the
 // probe interval; Unfenced and Unknown are retried at the normal pass interval,
 // so a node that probed before the policy was enforced (as at install) recovers
-// within a pass. It returns the probe's own error.
+// within a pass. It returns the probe's own error, or that of the removal of a
+// leftover probe key that stopped it from running.
 func (r *Runner) probeIfDue(ctx context.Context) error {
 	wait := r.interval
 	if r.verdict == Fenced {
@@ -98,6 +104,18 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 	}
 	if !r.probedAt.IsZero() && r.now().Sub(r.probedAt) < wait {
 		return nil
+	}
+	// A probe key already on the node (left by an earlier run that was killed
+	// between the probe's add and its remove, or placed by an admin) would make
+	// the probe's add a no-op that the policy allows, and read as unfenced. So
+	// the node itself is read and the key removed first; the in-memory flag only
+	// knows about this process. If that cannot be done the probe is not run and
+	// the verdict stays as it was. (A key this process knows it left is the
+	// business of retryProbeCleanup, which has just tried and reported.)
+	if !r.probeKeyLeft {
+		if err := r.nc.RemoveFenceProbe(ctx, r.node); err != nil {
+			return r.counted(err)
+		}
 	}
 	prev := r.verdict
 	state, perr := r.nc.ProbeFence(ctx, r.node)
@@ -117,7 +135,7 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 		if prev != Unfenced {
 			lvl = slog.LevelError
 		}
-		r.log.Log(ctx, lvl, "the admission policy "+FencePolicy+" does not fence this node plugin; it will advertise no cache capacity until a probe is denied. "+
+		r.log.Log(ctx, lvl, "the admission policy "+FencePolicy+" does not fence this node plugin; the node keeps advertising its cache capacity, but a compromised plugin is not held to its own node and key. "+
 			"Patch the policy's matchCondition and binding for the renamed or moved ServiceAccount",
 			"policy", FencePolicy, "subject", subject, "node", r.node)
 		if perr != nil {
@@ -146,9 +164,10 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 }
 
 // retryProbeCleanup removes the fence probe's key if an allowed probe left it,
-// on every pass and whatever the verdict has become since. If the policy
-// itself now denies the removal (it denies touching any key but ours), the
-// key is stranded and an operator has to remove it: that is said once.
+// on every pass and whatever the verdict has become since. The policy allows
+// the removal of that key, so a removal that keeps failing is RBAC or the API
+// server; the key is then stranded until an operator removes it, which is said
+// once.
 func (r *Runner) retryProbeCleanup(ctx context.Context) error {
 	if !r.probeKeyLeft {
 		return nil
@@ -160,7 +179,7 @@ func (r *Runner) retryProbeCleanup(ctx context.Context) error {
 	}
 	if !r.cleanupWarned {
 		r.cleanupWarned = true
-		r.log.Warn("the fence probe key is still on the node and could not be removed; an operator must remove status.capacity[miami.csi.greghaskins.com/fence-probe] if the admission policy now denies it",
+		r.log.Warn("the fence probe key is still on the node and could not be removed; remove status.capacity[miami.csi.greghaskins.com/fence-probe] by hand if this keeps failing (the admission policy allows its removal, so look at the plugin's RBAC and the API server)",
 			"node", r.node, "error", err)
 	}
 	return r.counted(err)
@@ -189,43 +208,75 @@ func (r *Runner) Pass(ctx context.Context) error {
 	committed, _, cerr := r.committed(ctx)
 	size, free := r.src.Stats()
 	r.metrics.SetCacheCapacity(budget, size, free)
-	if cerr == nil {
+	committedKnown := cerr == nil
+	if committedKnown {
 		r.metrics.SetCacheCommitted(committed)
 	}
 
-	// The plugin advertises only under the admission policy that narrows its
-	// grant; an overlay that renames the ServiceAccount can leave the policy
-	// matching nobody, which no static check sees. So the runner asks the API
-	// server, at start and then every probe interval while fenced (every pass
-	// while unfenced or unknown), and fails closed. Each probe is a denied
-	// request by design, so a fenced node does not make it on every pass.
+	// The admission policy that narrows the plugin's grant is probed before
+	// the first advertisement, at start and then every probe interval while
+	// fenced (every pass while unfenced or unknown), because an overlay that
+	// renames the ServiceAccount can leave the policy matching nobody, which no
+	// static check sees. The verdict is reported, not enforced: a lost fence
+	// is logged at Error, shown by miami_cache_fence_state and paged on, and
+	// the node keeps advertising. Removing our own key would not constrain a
+	// compromised plugin, and would turn a configuration mistake into a
+	// scheduling outage for every new pod that mounts a volume of ours.
 	// An allowed probe's key is removed on every pass, whatever the verdict.
 	cerr = errors.Join(cerr, r.retryProbeCleanup(ctx))
-	if perr := r.probeIfDue(ctx); perr != nil {
-		return errors.Join(cerr, perr)
-	}
-	switch r.verdict {
-	case Fenced:
-	case Unfenced:
-		// Whatever the cause, nothing of ours stays on the node.
-		_, present, err := r.nc.CacheCapacity(ctx, r.node)
-		if err == nil && present {
-			err = r.counted(r.nc.RemoveCacheCapacity(ctx, r.node))
-		}
-		return errors.Join(cerr, ErrUnfenced, err)
-	default:
-		// No verdict yet, or the last probe could not tell: no advertising.
+	cerr = errors.Join(cerr, r.probeIfDue(ctx))
+	if r.verdict == FenceUnknown && r.advertised {
+		// The probe could not tell. Keep the last figure, neither updating nor
+		// removing it: removing it on an API server blip would stop the
+		// scheduling of new pods cluster-wide, and the figure only goes stale
+		// until the next probe answers. Before any advertisement (a fresh
+		// start) the node advertises anyway.
 		return errors.Join(cerr, ErrFenceUnknown)
 	}
+
+	// The node never advertises less than it has committed. The kubelet
+	// re-admits every running pod against the advertised figure when it
+	// restarts, and fails the ones that no longer fit; a lowered budget must
+	// not do that, so it takes effect as volumes leave. The stage check still
+	// uses the budget, so no new volume is let in over it. An unreadable
+	// commitment is no reason to advertise less than the last figure held: the
+	// pods it covered are still there.
+	advertised := max(budget, r.lastHeld)
+	if committedKnown && committed > budget {
+		advertised = roundUpMiB(committed)
+		if !r.holding {
+			r.holding = true
+			r.log.Warn("holding the advertised cache capacity at the committed figure; lower budgets take effect as volumes leave",
+				"node", r.node, "budget", budget, "committed", committed)
+		}
+	} else if committedKnown {
+		r.holding = false
+		advertised = budget
+	}
+	if committedKnown {
+		r.lastHeld = advertised
+	}
+	r.metrics.SetCacheAdvertised(advertised)
 
 	have, present, err := r.nc.CacheCapacity(ctx, r.node)
 	if err != nil {
 		return errors.Join(cerr, err)
 	}
-	if present && have == budget {
+	if present && have == advertised {
+		r.advertised = true
 		return cerr
 	}
-	return errors.Join(cerr, r.counted(r.nc.SetCacheCapacity(ctx, r.node, budget)))
+	serr := r.counted(r.nc.SetCacheCapacity(ctx, r.node, advertised))
+	if serr == nil {
+		r.advertised = true
+	}
+	return errors.Join(cerr, serr)
+}
+
+// roundUpMiB rounds n up to a whole MiB, so a figure held up for a commitment
+// is never below it. Footprints are whole chunks, so this is n itself in practice.
+func roundUpMiB(n int64) int64 {
+	return (n + mib - 1) &^ (mib - 1)
 }
 
 // counted counts a failed patch or clear by reason and returns it.

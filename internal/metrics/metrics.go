@@ -64,11 +64,25 @@ const (
 
 	NameCacheBudget    = "miami_cache_budget_bytes"
 	NameCacheCommitted = "miami_cache_committed_bytes"
-	NameCacheFSSize    = "miami_cache_fs_size_bytes"
-	NameCacheFSFree    = "miami_cache_fs_free_bytes"
+	// NameCacheAdvertised is the figure the node is set to advertise:
+	// max(budget, committed).
+	NameCacheAdvertised = "miami_cache_advertised_bytes"
+	NameCacheFSSize     = "miami_cache_fs_size_bytes"
+	NameCacheFSFree     = "miami_cache_fs_free_bytes"
 
 	NameWebhookMutations  = "miami_webhook_mutations_total"
 	NameWebhookUnresolved = "miami_webhook_unresolved_total"
+
+	// NameWebhookServing is 1 while the webhook has a valid serving
+	// certificate loaded, in both TLS modes. With failurePolicy Ignore a webhook that
+	// cannot serve skips accounting silently; with cert-manager's Secret absent
+	// or incomplete this is the only signal.
+	NameWebhookServing = "miami_webhook_serving"
+
+	// NameWebhookSecretRefused counts passes that found a Secret under the
+	// webhook's TLS Secret name that the controller did not create and so
+	// would not overwrite.
+	NameWebhookSecretRefused = "miami_webhook_tls_secret_refused_total" //nolint:gosec // a metric name
 
 	// NameWebhookConfigOK is 1 while the MutatingWebhookConfiguration carries
 	// the controller's CA in every webhook's caBundle, 0 otherwise. Without it
@@ -77,13 +91,14 @@ const (
 
 	// NameCachePatchFailures counts failed patches of the node's advertised
 	// capacity, by reason: denied (a 403 or 422: RBAC or the admission policy
-	// refused) or error (anything else).
+	// refused), unknown (a fence probe that could not tell) or error (anything
+	// else).
 	NameCachePatchFailures = "miami_cache_capacity_patch_failures_total"
 
 	// NameCacheFenceState is the verdict of the last fence probe, one series
 	// per state with exactly one at 1: fenced, unfenced or unknown (the probe
-	// could not tell, so the node advertises nothing; also the state before
-	// the first probe).
+	// could not tell, so the node keeps its last advertised figure; also the
+	// state before the first probe).
 	NameCacheFenceState = "miami_cache_fence_state"
 )
 
@@ -146,11 +161,13 @@ type Registry struct {
 	cacheBytes    *prometheus.GaugeVec
 	fetches       *fetchCollector
 
-	cacheBudget, cacheCommitted, cacheFSSize, cacheFSFree prometheus.Gauge
+	cacheBudget, cacheCommitted, cacheAdvertised, cacheFSSize, cacheFSFree prometheus.Gauge
 
 	webhookMutations  *prometheus.CounterVec
 	webhookUnresolved prometheus.Counter
+	webhookRefused    prometheus.Counter
 	webhookConfigOK   prometheus.Gauge
+	webhookServing    prometheus.Gauge
 
 	cachePatchFailures *prometheus.CounterVec
 	cacheFenceState    *prometheus.GaugeVec
@@ -165,7 +182,7 @@ var (
 // Option configures New.
 type Option func(*options)
 
-type options struct{ reconciler, cacheCapacity, webhook, webhookConfig bool }
+type options struct{ reconciler, cacheCapacity, cachePatchFailures, webhook, webhookConfig bool }
 
 // WithReconciler registers the reconciler's family (the intents, transports,
 // reconcile duration and error, timeout, garbage and load-failure metrics).
@@ -179,6 +196,12 @@ func WithReconciler() Option { return func(o *options) { o.reconciler = true } }
 // committed, and the cache filesystem's size and free space). Only a node with
 // cache accounting on carries them; SetCacheCapacity works either way.
 func WithCacheCapacity() Option { return func(o *options) { o.cacheCapacity = true } }
+
+// WithCachePatchFailures registers miami_cache_capacity_patch_failures_total
+// alone. The capacity runner runs on a node with accounting off too, where it
+// removes a key left behind, and a failure of that must be visible; with
+// WithCacheCapacity the counter is registered anyway.
+func WithCachePatchFailures() Option { return func(o *options) { o.cachePatchFailures = true } }
 
 // WithWebhook registers the admission webhook's counters: the mutations by
 // outcome and the volumes it could not resolve. Only the controller runs the
@@ -264,14 +287,15 @@ func New(opts ...Option) *Registry {
 		return prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
 	}
 	r.cacheBudget = gauge(NameCacheBudget, "Bytes of node-local cache this node offers the scheduler.")
-	r.cacheCommitted = gauge(NameCacheCommitted, "Bytes of cache footprint committed to the volumes staged on this node.")
+	r.cacheCommitted = gauge(NameCacheCommitted, "Bytes of cache footprint committed on this node: the sum over all drain records in the cache directory (staged volumes, and caches awaiting a drain).")
+	r.cacheAdvertised = gauge(NameCacheAdvertised, "Bytes of node-local cache this node is set to advertise to the scheduler: the budget, or the committed figure when that is higher (a lowered budget takes effect as volumes leave).")
 	r.cacheFSSize = gauge(NameCacheFSSize, "Size in bytes of the filesystem the volume caches live on.")
 	r.cacheFSFree = gauge(NameCacheFSFree, "Bytes available on the filesystem the volume caches live on.")
 	r.cachePatchFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: NameCachePatchFailures, Help: "Failed patches or clears of this node's advertised cache capacity, by reason: denied (the API server answered 403 or 422, so RBAC or the admission policy refused), unknown (a fence probe that could not tell) or error. A budget the node computes but cannot advertise leaves pods pending.",
 	}, []string{"reason"})
 	r.cacheFenceState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: NameCacheFenceState, Help: "The verdict of the node's last fence probe, one series per state with exactly one at 1: fenced, unfenced (the admission policy does not fence this node plugin) or unknown (the probe could not tell, e.g. the policy was renamed or the API server failed). The node advertises only while fenced.",
+		Name: NameCacheFenceState, Help: "The verdict of the node's last fence probe, one series per state with exactly one at 1: fenced, unfenced (the admission policy does not fence this node plugin) or unknown (the probe could not tell, e.g. the policy was renamed or the API server failed). The node keeps advertising whatever the state; an unfenced state is for paging.",
 	}, []string{"state"})
 	r.SetCacheFenceState("unknown")
 	for _, reason := range []string{"denied", "error", "unknown"} {
@@ -279,11 +303,15 @@ func New(opts ...Option) *Registry {
 	}
 
 	r.webhookMutations = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: NameWebhookMutations, Help: "Pods the admission webhook handled, by outcome: mutated (a cache request set), stripped (a stray request removed), unchanged or error (allowed unchanged because of a lookup failure).",
+		Name: NameWebhookMutations, Help: "Pods the admission webhook handled, by outcome: mutated (a cache request set), stripped (a stray request removed), unchanged or error (the webhook failed, so the pod was allowed with the resource stripped).",
 	}, []string{"outcome"})
 	r.webhookUnresolved = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: NameWebhookUnresolved, Help: "Pod volumes the admission webhook could not account for (a claim that does not exist yet, or one it could not make sense of).",
+		Name: NameWebhookUnresolved, Help: "Pod volumes the admission webhook could not account for: a claim that does not exist, a class or a bound volume that does not exist, class parameters, a volume context or a request it cannot use, or a pod over the 64-claim cap (counted once).",
 	})
+	r.webhookRefused = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: NameWebhookSecretRefused, Help: "Passes in which the self-signed webhook found a Secret under its TLS Secret name that it did not create (no ownership label, or no ca.key) and so left alone. Something else probably manages it: run the controller with -webhook-tls-secret naming it.",
+	})
+	r.webhookServing = gauge(NameWebhookServing, "Whether the webhook has a valid serving certificate loaded: 1 it has, 0 it has not (the Secret is absent or unusable, the first sync has not run, or the loaded certificate has expired and nothing replaced it). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	r.webhookConfigOK = gauge(NameWebhookConfigOK, "Whether the webhook configuration carries this controller's CA in the caBundle of every webhook: 1 it does, 0 it does not (or could not be read). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	for _, o := range WebhookOutcomes {
 		r.webhookMutations.WithLabelValues(o)
@@ -320,15 +348,27 @@ func New(opts ...Option) *Registry {
 		)
 	}
 	if o.cacheCapacity {
-		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheFSSize, r.cacheFSFree, r.cachePatchFailures, r.cacheFenceState)
+		r.reg.MustRegister(r.cacheBudget, r.cacheCommitted, r.cacheAdvertised, r.cacheFSSize, r.cacheFSFree, r.cacheFenceState)
+	}
+	if o.cacheCapacity || o.cachePatchFailures {
+		r.reg.MustRegister(r.cachePatchFailures)
 	}
 	if o.webhook {
-		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved)
+		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved, r.webhookRefused, r.webhookServing)
 	}
 	if o.webhookConfig {
 		r.reg.MustRegister(r.webhookConfigOK)
 	}
 	return r
+}
+
+// SetWebhookServing sets miami_webhook_serving.
+func (r *Registry) SetWebhookServing(serving bool) {
+	v := 0.0
+	if serving {
+		v = 1
+	}
+	r.webhookServing.Set(v)
 }
 
 // SetWebhookConfigOK sets miami_webhook_config_ok.
@@ -347,6 +387,10 @@ func (r *Registry) Outcome(outcome string) {
 		r.webhookMutations.WithLabelValues(outcome).Inc()
 	}
 }
+
+// SecretRefused counts a pass that left a Secret in the way alone (see
+// webhook.TLSMetrics).
+func (r *Registry) SecretRefused() { r.webhookRefused.Inc() }
 
 // Unresolved counts one pod volume the webhook could not account for.
 func (r *Registry) Unresolved() { r.webhookUnresolved.Inc() }
@@ -381,6 +425,9 @@ func (r *Registry) SetCacheFenceState(state string) {
 		r.cacheFenceState.WithLabelValues(s).Set(v)
 	}
 }
+
+// SetCacheAdvertised sets the advertised gauge (see cachecap.CapacityMetrics).
+func (r *Registry) SetCacheAdvertised(advertised int64) { r.cacheAdvertised.Set(float64(advertised)) }
 
 // SetCacheCommitted sets the committed gauge (see cachecap.CapacityMetrics).
 func (r *Registry) SetCacheCommitted(committed int64) { r.cacheCommitted.Set(float64(committed)) }

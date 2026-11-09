@@ -37,15 +37,28 @@ var (
 // SecretTypeTLS is the type of the webhook's Secret.
 const SecretTypeTLS = "kubernetes.io/tls" //nolint:gosec // a Secret type, not a credential
 
-// Secret is a Secret's type, data and resourceVersion; the metadata beyond
-// that is not read.
+// The label the controller puts on the Secret it creates, so that a later pass
+// can tell its own Secret from one it must not overwrite.
+const (
+	SecretOwnerLabel = "app.kubernetes.io/managed-by" //nolint:gosec // a label key, not a credential
+	SecretOwnerValue = "miami-controller"
+)
+
+// Secret is a Secret's type, data, labels and resourceVersion. Nothing else of
+// its metadata is modelled; UpdateSecret keeps what GetSecret read.
 type Secret struct {
 	Namespace, Name string
 	Type            string
 	Data            map[string][]byte
+	// Labels are set by CreateSecret and read by GetSecret.
+	Labels map[string]string
 	// ResourceVersion is set by GetSecret and is what UpdateSecret sends, so
 	// an update of a Secret someone else changed is refused with ErrConflict.
 	ResourceVersion string
+
+	// raw is the object GetSecret read, so that UpdateSecret changes the data
+	// and nothing else of it.
+	raw *unstructured.Unstructured
 }
 
 // GetSecret returns the Secret. If there is none, the error wraps ErrNotFound.
@@ -59,7 +72,7 @@ func (c *Client) GetSecret(ctx context.Context, namespace, name string) (*Secret
 	if err != nil {
 		return nil, readFailure(err, "secrets", name, "Secret")
 	}
-	s := &Secret{Namespace: namespace, Name: name, ResourceVersion: obj.GetResourceVersion(), Data: map[string][]byte{}}
+	s := &Secret{Namespace: namespace, Name: name, ResourceVersion: obj.GetResourceVersion(), Data: map[string][]byte{}, Labels: obj.GetLabels(), raw: obj.DeepCopy()}
 	if s.Type, _, err = unstructured.NestedString(obj.Object, "type"); err != nil {
 		return nil, fmt.Errorf("kube: Secret %q: %w", name, err)
 	}
@@ -86,6 +99,9 @@ func secretObject(s *Secret) *unstructured.Unstructured {
 		"apiVersion": "v1", "kind": "Secret", "type": s.Type, "data": data,
 		"metadata": map[string]any{"name": s.Name, "namespace": s.Namespace},
 	}}
+	if len(s.Labels) > 0 {
+		obj.SetLabels(s.Labels)
+	}
 	if s.ResourceVersion != "" {
 		obj.SetResourceVersion(s.ResourceVersion)
 	}
@@ -108,16 +124,25 @@ func (c *Client) CreateSecret(ctx context.Context, s *Secret) error {
 }
 
 // UpdateSecret replaces the Secret's data at the resourceVersion read; a
-// Secret changed since is an error wrapping ErrConflict. A Secret with no
-// ResourceVersion is refused: an unconditional replace would overwrite
-// whatever another replica wrote.
+// Secret changed since is an error wrapping ErrConflict. Everything else of the
+// object GetSecret read (labels, annotations, finalizers, owner references)
+// is sent back as it was. A Secret with no ResourceVersion is refused: an
+// unconditional replace would overwrite whatever another replica wrote.
 func (c *Client) UpdateSecret(ctx context.Context, s *Secret) error {
 	if s.ResourceVersion == "" {
 		return errors.New("kube: updating a Secret needs the resourceVersion it was read at")
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.deadline)
 	defer cancel()
-	_, err := c.dyn.Resource(secretResource).Namespace(s.Namespace).Update(ctx, secretObject(s), metav1.UpdateOptions{FieldManager: ControllerFieldManager})
+	obj := secretObject(s)
+	if s.raw != nil {
+		// Keep the object as read; only the data, and the resourceVersion the
+		// caller read at, are ours to set.
+		obj = s.raw.DeepCopy()
+		obj.Object["data"] = secretObject(s).Object["data"]
+		obj.SetResourceVersion(s.ResourceVersion)
+	}
+	_, err := c.dyn.Resource(secretResource).Namespace(s.Namespace).Update(ctx, obj, metav1.UpdateOptions{FieldManager: ControllerFieldManager})
 	if err != nil {
 		if apierrors.IsConflict(err) {
 			return fmt.Errorf("%w: Secret %q", ErrConflict, s.Name)
@@ -179,8 +204,10 @@ type bundleOp struct {
 }
 
 // PatchCABundle sets clientConfig.caBundle of the webhooks at the given
-// indexes to bundle with one JSON patch: a replace per index and nothing else,
-// so no other field of the configuration is touched.
+// indexes to bundle with one JSON patch: an add per index and nothing else, so
+// no other field of the configuration is touched. An add sets the member
+// whether or not it is there (the field is omitted when empty, and a stricter
+// JSON-patch implementation refuses a replace of a missing member).
 func (c *Client) PatchCABundle(ctx context.Context, name string, indexes []int, bundle []byte) error {
 	if name == "" {
 		return errors.New("kube: a webhook configuration name is required")
@@ -191,7 +218,7 @@ func (c *Client) PatchCABundle(ctx context.Context, name string, indexes []int, 
 	v := base64.StdEncoding.EncodeToString(bundle)
 	ops := make([]bundleOp, 0, len(indexes))
 	for _, i := range indexes {
-		ops = append(ops, bundleOp{Op: "replace", Path: fmt.Sprintf("/webhooks/%d/clientConfig/caBundle", i), Value: v})
+		ops = append(ops, bundleOp{Op: "add", Path: fmt.Sprintf("/webhooks/%d/clientConfig/caBundle", i), Value: v})
 	}
 	body, err := json.Marshal(ops)
 	if err != nil {

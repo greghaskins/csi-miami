@@ -28,7 +28,7 @@ import (
 
 // Defaults of the webhook's flags.
 const (
-	defaultWebhookAddr       = ":9814"
+	defaultWebhookAddr       = ":9814"             // the manifests bind [$(POD_IP)]:9814 instead
 	defaultWebhookSecret     = "miami-webhook-tls" //nolint:gosec // a Secret's name
 	defaultWebhookConfig     = "miami-cache"
 	defaultWebhookService    = "miami-webhook"
@@ -173,7 +173,17 @@ func serveController(ctx context.Context, cfg controllerConfig, log *slog.Logger
 	if err != nil {
 		return err
 	}
-	return serveControllerWith(ctx, cfg, pvs, mount.New(cfg.deadline), webhookBackend{claims: pvs, secrets: pvs, configs: pvs}, log)
+	// The webhook reads and writes through a client of its own, with its own
+	// rate limiter, so it and the CSI controller cannot starve each other.
+	var wb webhookBackend
+	if cfg.webhookAddr != "" {
+		whc, err := kube.NewWebhookClient(restCfg, cfg.deadline)
+		if err != nil {
+			return err
+		}
+		wb = webhookBackend{claims: whc, secrets: whc, configs: whc}
+	}
+	return serveControllerWith(ctx, cfg, pvs, mount.New(cfg.deadline), wb, log)
 }
 
 // serveControllerWith serves with the given PV reader, mounter and webhook
@@ -290,9 +300,9 @@ func newWebhookServer(cfg controllerConfig, wb webhookBackend, reg *metrics.Regi
 	syncer := &webhook.Syncer{
 		TLS: &webhook.TLSSource{
 			Secrets: wb.secrets, Namespace: cfg.namespace, Name: name, Service: cfg.webhookService,
-			Managed: managed, Log: log,
+			Managed: managed, Log: log, Metrics: reg,
 		},
-		Store: store, Interval: cfg.webhookSyncInterval, Log: log,
+		Store: store, Interval: cfg.webhookSyncInterval, Log: log, Serving: reg,
 	}
 	if !managed {
 		// With a Secret someone else manages, the configuration is theirs too

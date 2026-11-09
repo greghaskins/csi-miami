@@ -25,6 +25,10 @@ var _ Configs = (*kube.Client)(nil)
 // the bundle (miami_webhook_config_ok).
 type ConfigGauge interface{ SetWebhookConfigOK(ok bool) }
 
+// ServingGauge is where the syncer reports whether a serving certificate has
+// been loaded (miami_webhook_serving).
+type ServingGauge interface{ SetWebhookServing(serving bool) }
+
 // CABundleAsserter keeps the caBundle of every webhook of one
 // MutatingWebhookConfiguration equal to the CA the controller serves with. The
 // base ships the field empty and a re-apply of it wipes the bundle, so this
@@ -100,6 +104,11 @@ type Syncer struct {
 	Store    *CertStore
 	Interval time.Duration
 	Log      *slog.Logger
+	// Serving, when set, reports whether a valid certificate is loaded: 0
+	// until the first pass that loads one, 1 while it is valid, and 0 again
+	// if it expires without a replacement. In managed mode it is the
+	// only sign that the Secret cert-manager writes is there and usable.
+	Serving ServingGauge
 }
 
 func (s *Syncer) log() *slog.Logger {
@@ -109,15 +118,26 @@ func (s *Syncer) log() *slog.Logger {
 	return slog.Default()
 }
 
+// reportServing sets the gauge: 1 while the loaded certificate is valid now,
+// 0 when there is none or it has expired.
+func (s *Syncer) reportServing() {
+	if s.Serving != nil {
+		s.Serving.SetWebhookServing(s.Store.usable(s.TLS.now()))
+	}
+}
+
 // Pass runs one sync. The caBundle asserted is the CA of the material just
 // loaded, which is the CA in the Secret, so the two cannot disagree.
 func (s *Syncer) Pass(ctx context.Context) error {
 	m, err := s.TLS.Load(ctx)
 	if err != nil {
+		// What is already loaded keeps serving until it expires.
+		s.reportServing()
 		return err
 	}
 	cert := m.Cert
 	s.Store.Set(&cert)
+	s.reportServing()
 	if s.Asserter != nil {
 		return s.Asserter.Assert(ctx, m.CA)
 	}

@@ -49,6 +49,10 @@ metadata:
   namespace: miami-system
 spec:
   secretName: miami-webhook-tls-managed
+  # These names carry the namespace and the Service name as literals: a
+  # `namespace:` or `namePrefix:` overlay must patch them, as it must patch the
+  # inject-ca-from annotation of the component's kustomization.yaml
+  # (TestWebhookObjectsUnderOverlays pins that they do not follow).
   dnsNames:
     - miami-webhook.miami-system.svc
     - miami-webhook.miami-system.svc.cluster.local
