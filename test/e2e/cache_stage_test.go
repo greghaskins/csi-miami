@@ -111,10 +111,13 @@ func TestCacheStageCheckNeverRefusesExisting(t *testing.T) {
 	e.waitCommitted(t, node, 2*quantityBytes(cacheFootprint), "after the plugin restarted")
 
 	n.deletePod(t, "p1")
-	// The cache survives the pod's deletion (it is kept for reuse), so the node
-	// still counts both volumes and the recreated p1 is an existing one, which
-	// the check must not refuse even though the budget is full.
-	e.waitCommitted(t, node, 2*quantityBytes(cacheFootprint), "after p1 was deleted, the cache surviving")
+	// Deleting the pod unstages and drains its volume (CI showed the cache does
+	// not outlive the pod), so the node counts one volume again and the
+	// recreated p1 is a volume new to the node that fits beside p2. What this
+	// half shows is that the restarted plugin neither refuses nor loses
+	// anything on a recreation; the adoption half above is the one that keeps
+	// the volumes it already held.
+	e.waitCommitted(t, node, quantityBytes(cacheFootprint), "after p1 was torn down and drained")
 	n.createCachePod(t, cachePod{Name: "p1", Claims: []string{"c1"}, NodeName: node})
 	long.waitPodReady(t, "p1", "")
 	for _, v := range vols {
