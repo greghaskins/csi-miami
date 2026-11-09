@@ -92,7 +92,8 @@ var ErrFenceUnknown = errors.New("cachecap: the admission policy " + FencePolicy
 // older than its wait, and records the verdict. Only a Fenced verdict waits the
 // probe interval; Unfenced and Unknown are retried at the normal pass interval,
 // so a node that probed before the policy was enforced (as at install) recovers
-// within a pass. It returns the probe's own error.
+// within a pass. It returns the probe's own error, or that of the removal of a
+// leftover probe key that stopped it from running.
 func (r *Runner) probeIfDue(ctx context.Context) error {
 	wait := r.interval
 	if r.verdict == Fenced {
@@ -100,6 +101,18 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 	}
 	if !r.probedAt.IsZero() && r.now().Sub(r.probedAt) < wait {
 		return nil
+	}
+	// A probe key already on the node (left by an earlier run that was killed
+	// between the probe's add and its remove, or placed by an admin) would make
+	// the probe's add a no-op that the policy allows, and read as unfenced. So
+	// the node itself is read and the key removed first; the in-memory flag only
+	// knows about this process. If that cannot be done the probe is not run and
+	// the verdict stays as it was. (A key this process knows it left is the
+	// business of retryProbeCleanup, which has just tried and reported.)
+	if !r.probeKeyLeft {
+		if err := r.nc.RemoveFenceProbe(ctx, r.node); err != nil {
+			return r.counted(err)
+		}
 	}
 	prev := r.verdict
 	state, perr := r.nc.ProbeFence(ctx, r.node)

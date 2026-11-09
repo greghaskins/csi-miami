@@ -100,6 +100,8 @@ type fakeNC struct {
 	probeCleanErr       error
 	removeProbeErr      error
 	removeProbes        int
+	probeKeyOnNode      bool // a probe key sits on the node: RemoveFenceProbe removes it (and counts)
+	leftoverProbeKey    bool // that key was there before the probe: an add over it is a no-op the policy allows, so the probe reads unfenced
 	probeErr            error
 	probes              int
 	calls               []string
@@ -129,16 +131,29 @@ func (n *fakeNC) SetCacheCapacity(_ context.Context, node string, b int64) error
 func (n *fakeNC) ProbeFence(context.Context, string) (FenceState, error) {
 	n.probes++
 	switch {
+	case n.leftoverProbeKey && n.probeKeyOnNode:
+		return Unfenced, nil
 	case n.probeErr != nil:
 		return FenceUnknown, n.probeErr
 	case n.unfenced:
+		if n.probeCleanErr != nil {
+			n.probeKeyOnNode = true // the key the probe could not remove
+		}
 		return Unfenced, n.probeCleanErr
 	}
 	return Fenced, nil
 }
 
+// RemoveFenceProbe is the real client's: nothing to do, and no request, when
+// the node carries no probe key.
 func (n *fakeNC) RemoveFenceProbe(context.Context, string) error {
+	if !n.probeKeyOnNode {
+		return nil
+	}
 	n.removeProbes++
+	if n.removeProbeErr == nil {
+		n.probeKeyOnNode = false
+	}
 	return n.removeProbeErr
 }
 
@@ -1010,5 +1025,45 @@ func TestAdvertisedFallsBackToBudgetWhenCommittedUnreadable(t *testing.T) {
 	_ = r.Pass(context.Background())
 	if len(nc.setBytes) != 1 || nc.setBytes[0] != 95*gib {
 		t.Fatalf("set = %v, want the budget", nc.setBytes)
+	}
+}
+
+// TestFenceProbeRemovesALeftoverKeyFirst: a probe key already on the node, from
+// a run that died mid-probe or from an admin, is removed before the probe, so
+// the probe's add is not a no-op the policy allows and the verdict is the real
+// one. The in-memory flag knows nothing of such a key.
+func TestFenceProbeRemovesALeftoverKeyFirst(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{probeKeyOnNode: true, leftoverProbeKey: true}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	if r.probeKeyLeft {
+		t.Fatal("test setup: the runner remembers no leftover")
+	}
+	if err := r.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if nc.probeKeyOnNode || nc.removeProbes == 0 {
+		t.Errorf("the leftover key was not removed (removals %d)", nc.removeProbes)
+	}
+	if !slices.Equal(m.states, []string{"fenced"}) {
+		t.Errorf("fence states = %v, want [fenced]: a leftover key must not read as unfenced", m.states)
+	}
+}
+
+// TestFenceProbeSkippedWhenTheLeftoverCannotGo: if the node cannot be cleaned
+// the probe would read the leftover as unfenced, so it does not run; the
+// failure is counted and the verdict stays.
+func TestFenceProbeSkippedWhenTheLeftoverCannotGo(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{probeKeyOnNode: true, removeProbeErr: statusErr(403, metav1.StatusReasonForbidden)}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	r := fenceRunner(nc, m, c)
+	if err := r.Pass(context.Background()); err == nil {
+		t.Fatal("no error")
+	}
+	if nc.probes != 0 || len(m.states) != 0 {
+		t.Errorf("probes %d, states %v; want the probe skipped", nc.probes, m.states)
+	}
+	if !slices.Contains(m.failures, "denied") {
+		t.Errorf("failures = %v, want the denied removal counted", m.failures)
 	}
 }
