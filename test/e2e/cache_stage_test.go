@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/greghaskins/csi-miami/internal/metrics"
@@ -35,6 +36,10 @@ func TestCacheStageCheckRefusesAndRecovers(t *testing.T) {
 
 	ev := e.waitPVEvent(t, vols[2].PV, reasonCacheBudgetExceeded)
 	t.Logf("the third volume was refused: %s %s: %s", ev.Type, ev.Reason, ev.Message)
+	const fixed = "the volume was not staged on node %s because the node's cache budget is exhausted; it is retried, and the scheduler should place it where the cache has room"
+	if ev.Type != corev1.EventTypeWarning || ev.Message != fmt.Sprintf(fixed, node) {
+		t.Errorf("the refusal event is %s %q, want a Warning with the fixed text", ev.Type, ev.Message)
+	}
 	n.holdNotReady(t, "p3", 20*time.Second)
 	ctx, cancel := e.withDeadline()
 	phase, creating, _, err := n.podState(ctx, "p3")
@@ -106,6 +111,10 @@ func TestCacheStageCheckNeverRefusesExisting(t *testing.T) {
 	e.waitCommitted(t, node, 2*quantityBytes(cacheFootprint), "after the plugin restarted")
 
 	n.deletePod(t, "p1")
+	// The cache survives the pod's deletion (it is kept for reuse), so the node
+	// still counts both volumes and the recreated p1 is an existing one, which
+	// the check must not refuse even though the budget is full.
+	e.waitCommitted(t, node, 2*quantityBytes(cacheFootprint), "after p1 was deleted, the cache surviving")
 	n.createCachePod(t, cachePod{Name: "p1", Claims: []string{"c1"}, NodeName: node})
 	long.waitPodReady(t, "p1", "")
 	for _, v := range vols {

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -326,7 +327,7 @@ func (e *env) servedSerialErr() (string, error) {
 	if p.Status.HostIP == "" {
 		return "", fmt.Errorf("controller pod %s has no host IP yet", p.Name)
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", net.JoinHostPort(p.Status.HostIP, "9814"),
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", net.JoinHostPort(p.Status.HostIP, strconv.Itoa(webhookPort)),
 		&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // only the served certificate's serial is read
 	if err != nil {
 		return "", err

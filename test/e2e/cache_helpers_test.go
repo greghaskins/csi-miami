@@ -394,3 +394,19 @@ func (e *env) discardStrandedCache(t *testing.T, node string, vol volumeInfo) {
 		}
 	})
 }
+
+// wantNoPVEventSince is wantNoPVEvent for events that happened after a time.
+func (e *env) wantNoPVEventSince(t *testing.T, pv, reason string, since time.Time) {
+	t.Helper()
+	ctx, cancel := e.withDeadline()
+	defer cancel()
+	evs, err := e.pvReasonEvents(ctx, pv, reason)
+	if err != nil {
+		t.Fatalf("listing events of PV %s: %v", pv, err)
+	}
+	for _, ev := range evs {
+		if ev.LastTimestamp.After(since) {
+			t.Errorf("PV %s has an event %s after %s: %s", pv, ev.Reason, since.Format(time.RFC3339), ev.Message)
+		}
+	}
+}

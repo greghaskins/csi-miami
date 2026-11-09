@@ -38,6 +38,7 @@ const (
 const (
 	nodePort       = 9810
 	controllerPort = 9811
+	webhookPort    = 9814
 )
 
 // testNS is the namespace one test works in.

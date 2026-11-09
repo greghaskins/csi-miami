@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -174,18 +173,7 @@ func TestCacheWebhookUsesPodNamespace(t *testing.T) {
 		ca = s.Data["ca.crt"]
 		return fmt.Sprintf("keys %d, ca.crt %d bytes", len(s.Data), len(ca)), len(ca) > 0 && len(s.Data["tls.crt"]) > 0 && len(s.Data["tls.key"]) > 0, nil
 	})
-	e.waitFor(t, "the caBundle of MutatingWebhookConfiguration miami-cache to equal the Secret's ca.crt", func(ctx context.Context) (string, bool, error) {
-		bundles, err := e.webhookBundles(ctx)
-		if err != nil {
-			return "", false, err
-		}
-		for _, b := range bundles {
-			if len(b) == 0 || !bytes.Equal(b, ca) {
-				return fmt.Sprintf("a bundle of %d bytes, the Secret's CA is %d bytes", len(b), len(ca)), false, nil
-			}
-		}
-		return "equal", len(bundles) > 0, nil
-	})
+	e.waitBundle(t, ca, "the Secret's ca.crt")
 }
 
 // webhookBundles are the caBundles of the cache webhook configuration.
@@ -257,11 +245,21 @@ func TestCacheSchedulerHoldsTheLine(t *testing.T) {
 	t.Logf("the fifth pod is held: %s", msg)
 	n.holdNotReady(t, "p5", 15*time.Second)
 
+	// The scheduler frees p1's request as soon as the pod is gone from the API,
+	// but the node's committed figure falls only after the unstage and the
+	// cache drain, so p5 may land on p1's node while the node still counts p1
+	// and be refused once, then retried: that is by design, the node's check
+	// being the backstop for a scheduler that runs ahead. So wait for the freed
+	// node's committed figure to fall, and only then require that no refusal
+	// happens.
+	freed := nodes1(t, n, "p1")
 	n.deletePod(t, "p1")
+	e.waitCommitted(t, freed, quantityBytes(cacheFootprint), "after p1 was torn down and drained")
+	mark := time.Now()
 	p5 := long.waitPodReady(t, "p5", "")
 	t.Logf("after p1 was deleted, p5 runs on %s", p5.Spec.NodeName)
 	for _, v := range vols {
-		e.wantNoPVEvent(t, v.PV, reasonCacheBudgetExceeded)
+		e.wantNoPVEventSince(t, v.PV, reasonCacheBudgetExceeded, mark)
 	}
 }
 
@@ -278,12 +276,6 @@ func TestCacheWebhookFailsOpen(t *testing.T) {
 
 	e.scaleController(t, 0)
 	n.createCachePod(t, cachePod{Name: "open", Claims: []string{"data"}})
-	ctx, cancel := e.withDeadline()
-	_, err := e.controllerPod(ctx)
-	cancel()
-	if err == nil {
-		t.Fatal("the controller is still running, so the admission was not made without it")
-	}
 	n.wantNoRequest(t, "open")
 	t.Logf("with no controller the pod was admitted with no %s", cacheKey)
 
@@ -327,4 +319,16 @@ func (e *env) scaleController(t *testing.T, replicas int) {
 		done := len(pods.Items) == replicas && ready == replicas
 		return fmt.Sprintf("%d pods, %d ready", len(pods.Items), ready), done, nil
 	})
+}
+
+// nodes1 is the node a running pod is on.
+func nodes1(t *testing.T, n *testNS, pod string) string {
+	t.Helper()
+	ctx, cancel := n.e.withDeadline()
+	defer cancel()
+	p, err := n.e.Client.CoreV1().Pods(n.Name).Get(ctx, pod, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Spec.NodeName
 }
