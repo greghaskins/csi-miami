@@ -174,6 +174,19 @@ if [ "$transport" = nfs3 ]; then
     TestVolumeNodeRebootReusesCache
     TestVolumeRestoreDrill
     TestVolumeExpandOnline
+    TestCacheCapacityAdvertised
+    TestCacheVAPTypeChecks
+    TestCacheFenced
+    TestCacheCommittedTracksStages
+    TestCacheWebhookUsesPodNamespace
+    TestCacheWebhookRequestsFootprint
+    TestCacheSchedulerHoldsTheLine
+    TestCacheStageCheckRefusesAndRecovers
+    TestCacheStageCheckNeverRefusesExisting
+    TestCacheWebhookFailsOpen
+    TestCachePolicyNegative
+    TestCacheRepatchAfterRemoval
+    TestCacheCertManagerComponent
   )
 else
   expected=(
