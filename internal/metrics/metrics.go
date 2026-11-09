@@ -73,6 +73,11 @@ const (
 	NameWebhookMutations  = "miami_webhook_mutations_total"
 	NameWebhookUnresolved = "miami_webhook_unresolved_total"
 
+	// NameWebhookSecretRefused counts passes that found a Secret under the
+	// webhook's TLS Secret name that the controller did not create and so
+	// would not overwrite.
+	NameWebhookSecretRefused = "miami_webhook_tls_secret_refused_total" //nolint:gosec // a metric name
+
 	// NameWebhookConfigOK is 1 while the MutatingWebhookConfiguration carries
 	// the controller's CA in every webhook's caBundle, 0 otherwise. Without it
 	// (failurePolicy Ignore) a wiped bundle skips accounting silently.
@@ -153,6 +158,7 @@ type Registry struct {
 
 	webhookMutations  *prometheus.CounterVec
 	webhookUnresolved prometheus.Counter
+	webhookRefused    prometheus.Counter
 	webhookConfigOK   prometheus.Gauge
 
 	cachePatchFailures *prometheus.CounterVec
@@ -294,6 +300,9 @@ func New(opts ...Option) *Registry {
 	r.webhookUnresolved = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: NameWebhookUnresolved, Help: "Pod volumes the admission webhook could not account for (a claim that does not exist yet, or one it could not make sense of).",
 	})
+	r.webhookRefused = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: NameWebhookSecretRefused, Help: "Passes in which the self-signed webhook found a Secret under its TLS Secret name that it did not create (no ownership label, or no ca.key) and so left alone. Something else probably manages it: run the controller with -webhook-tls-secret naming it.",
+	})
 	r.webhookConfigOK = gauge(NameWebhookConfigOK, "Whether the webhook configuration carries this controller's CA in the caBundle of every webhook: 1 it does, 0 it does not (or could not be read). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	for _, o := range WebhookOutcomes {
 		r.webhookMutations.WithLabelValues(o)
@@ -336,7 +345,7 @@ func New(opts ...Option) *Registry {
 		r.reg.MustRegister(r.cachePatchFailures)
 	}
 	if o.webhook {
-		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved)
+		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved, r.webhookRefused)
 	}
 	if o.webhookConfig {
 		r.reg.MustRegister(r.webhookConfigOK)
@@ -360,6 +369,10 @@ func (r *Registry) Outcome(outcome string) {
 		r.webhookMutations.WithLabelValues(outcome).Inc()
 	}
 }
+
+// SecretRefused counts a pass that left a Secret in the way alone (see
+// webhook.TLSMetrics).
+func (r *Registry) SecretRefused() { r.webhookRefused.Inc() }
 
 // Unresolved counts one pod volume the webhook could not account for.
 func (r *Registry) Unresolved() { r.webhookUnresolved.Inc() }

@@ -812,3 +812,16 @@ func TestPatchFailuresRegisteredWithoutAccounting(t *testing.T) {
 	// With accounting on as well it is registered once, not twice.
 	New(WithCacheCapacity(), WithCachePatchFailures())
 }
+
+func TestWebhookSecretRefusedCounter(t *testing.T) {
+	t.Parallel()
+	if family(t, New(WithReconciler()), NameWebhookSecretRefused) != nil {
+		t.Errorf("%s exposed without WithWebhook", NameWebhookSecretRefused)
+	}
+	on := New(WithWebhook())
+	on.SecretRefused()
+	on.SecretRefused()
+	if got := family(t, on, NameWebhookSecretRefused).GetMetric()[0].GetCounter().GetValue(); got != 2 {
+		t.Errorf("refused = %v, want 2", got)
+	}
+}

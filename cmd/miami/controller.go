@@ -300,7 +300,7 @@ func newWebhookServer(cfg controllerConfig, wb webhookBackend, reg *metrics.Regi
 	syncer := &webhook.Syncer{
 		TLS: &webhook.TLSSource{
 			Secrets: wb.secrets, Namespace: cfg.namespace, Name: name, Service: cfg.webhookService,
-			Managed: managed, Log: log,
+			Managed: managed, Log: log, Metrics: reg,
 		},
 		Store: store, Interval: cfg.webhookSyncInterval, Log: log,
 	}
