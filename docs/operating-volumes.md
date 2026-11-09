@@ -158,6 +158,40 @@ not rely on it.
   longer than 4096 bytes is refused at stage and publish with
   `InvalidArgument` (the message gives the length, never the key); make one
   with `openssl rand -base64 48`.
+- **`cache-budget-exceeded`** (event `CacheBudgetExceeded`, Warning, on the PV;
+  the pod stays `ContainerCreating`). The node's cache budget cannot hold this
+  volume besides the ones it already commits to. The error names three
+  numbers: the budget, the commitment with its volume count, and what this
+  volume needs. Only a volume new to the node is ever refused; an adopted
+  mount, a server restart, a reboot with a surviving cache, a drain and a
+  teardown never are. It is retryable (`Unavailable`): kubelet retries, and
+  the stage goes through when something unstages or a drain ends. To act:
+  - Find what is committed: `miami_cache_committed_bytes` against
+    `miami_cache_budget_bytes` for the node, and the node's volumes in
+    `miami_volumes_served`. A node whose committed figure stays above the sum
+    of its served volumes' footprints holds caches awaiting a discard, for
+    example a volume taken over by another node whose old holder has not
+    discarded its cache yet. Such a cache still occupies disk and is
+    deliberately counted; the `publish-refused` condition and event on that
+    node show it.
+  - A pod admitted before accounting shipped carries no request, so the
+    scheduler could place it on a committed node. Recreate such pods (a
+    rolling restart of each Deployment and StatefulSet) so the webhook gives
+    them a request; this is step 3 of the rollout under Upgrades.
+  - The scheduler can run ahead of the node. It frees a deleted pod's request
+    at once; the node's committed figure falls only after unstage and drain. A
+    pod placed in that gap can see one `CacheBudgetExceeded` refusal before it
+    runs, and then runs on kubelet's retry. This is not a fault.
+  - To raise the budget, set `-cache-budget` (an absolute quantity, for
+    example `100Gi`) or change `-cache-budget-share` and
+    `-cache-budget-reserve` on the node DaemonSet. `-cache-budget 0` is a
+    budget of zero: it advertises `0` and refuses every fresh volume.
+    `-cache-accounting=false` is the off switch: the node removes its key and
+    skips the check.
+  - Applying the new base while volumes are already staged refuses nothing for
+    them; only fresh stages are checked.
+  - Two pods that share one RWO claim on a node are counted twice by the
+    scheduler and once by the node. This costs packing, never safety.
 
 ## A compromised key
 
@@ -297,6 +331,96 @@ reason and carries the node, never an error (the node's log has that):
 | `ServerRestarted` | Normal | the blockd unit restarted; the device and mounts were kept |
 | `UnstageStuck`, `DrainStuck` | Normal | an unstage or a drain has retried for 30 minutes; the log beside it has the cause and the way out |
 
+### Cache accounting
+
+The node plugin advertises `miami.csi.greghaskins.com/cache` on its own node
+(its budget), a mutating webhook in the controller gives each pod that mounts
+volumes a request for their footprint, and the node refuses a fresh stage that
+would exceed the budget. The footprint of a volume is
+`min(size, cacheSize) + dirtyWatermark + 16 MiB`, at the size the volume is
+served at (an expanded volume counts its grown size). The node's committed
+figure is the stage check's own sum over all drain records: it includes caches
+awaiting a drain or a discard, and a fresh stage leaves out the volume's own
+record. Host ports in use: node 9810 (metrics) and 9812 (health), controller
+9811 (metrics), 9813 (health) and 9814 (webhook).
+
+On the node:
+
+| Family | Labels | Meaning |
+|---|---|---|
+| `miami_cache_budget_bytes` | | the advertised budget |
+| `miami_cache_committed_bytes` | | the footprint committed on the node |
+| `miami_cache_fs_size_bytes`, `miami_cache_fs_free_bytes` | | `statfs` of the cache directory's file system |
+| `miami_cache_capacity_patch_failures_total` | `reason`: `denied`, `error`, `unknown` | a budget the node computed but could not advertise; `unknown` counts fence probes that could not tell |
+| `miami_cache_fence_state` | `state`: `fenced`, `unfenced`, `unknown` | one series at 1: the verdict of the fence probe (see the README) |
+
+On the controller:
+
+| Family | Labels | Meaning |
+|---|---|---|
+| `miami_webhook_mutations_total` | `outcome`: `mutated`, `unchanged`, `stripped`, `error` | pods the webhook handled; `error` is its own failure |
+| `miami_webhook_unresolved_total` | | volumes whose claim did not exist yet, so nothing was requested for them |
+| `miami_webhook_config_ok` | | 1 when the webhook configuration carries its `caBundle`; registered in self-signed mode only, absent with the cert-manager component |
+
+The webhook never fails admission. On any error of its own (its 7 second
+deadline, a pod with more than 64 claims, a panic) it admits the pod with its
+resource removed and counts `error`; the node's stage check is then the net.
+A request body is bounded at 8 MiB.
+
+The fence probe runs at start and then every `-cache-fence-probe-interval`
+(default 10 minutes) while fenced, and on every pass (`-reconcile-interval`)
+while unfenced or unknown. Its denials are by design: about one per node per
+probe interval while fenced, up to one per pass while unknown. Do not chase
+them in `apiserver_validating_admission_policy_check_total`.
+
+Alerts, as examples (the thresholds are placeholders for your overlay; `<reserve>`
+is the node's `-cache-budget-reserve` in bytes):
+
+```yaml
+- alert: MiamiCacheOvercommitted
+  expr: miami_cache_committed_bytes > miami_cache_budget_bytes
+  for: 10m
+- alert: MiamiCacheDiskLow
+  expr: miami_cache_fs_free_bytes < <reserve>
+  for: 10m
+- alert: MiamiCacheFenceNotInForce
+  # every fresh install shows unfenced or unknown for one pass by design: the
+  # first probe can beat the policy's enforcement, so require it to persist
+  expr: miami_cache_fence_state{state!="fenced"} == 1
+  for: 10m
+- alert: MiamiWebhookFailingOpen
+  expr: rate(apiserver_admission_webhook_fail_open_count{name=~".*miami.*"}[5m]) > 0
+  for: 10m
+- alert: MiamiWebhookConfigMissing    # self-signed mode only
+  expr: miami_webhook_config_ok == 0
+  for: 10m
+- alert: MiamiUnaccountedCache
+  expr: miami_cache_unaccounted_bytes > 0
+  for: 2h    # longer than a rollout takes
+```
+
+The last alert uses a recording rule for the commitment that no pod accounts
+for (pods that predate the rollout):
+
+```yaml
+- record: miami_cache_unaccounted_bytes
+  expr: |
+    miami_cache_committed_bytes
+      - on(node) sum by (node) (
+          kube_pod_container_resource_requests{resource="miami_csi_greghaskins_com_cache"}
+        )
+```
+
+kube-state-metrics sanitises the resource name by turning every character
+that is not a letter, digit or underscore into `_`, so
+`miami.csi.greghaskins.com/cache` is
+`miami_csi_greghaskins_com_cache`; check the label value your version emits.
+The node's `node` label may need a `relabel` to match the nodes of the
+Kubernetes series. An absolute budget in an overlay is a node argument, for
+example `-cache-budget 100Gi` on small disks and `200Gi` on large ones (the
+numbers here are placeholders); with the defaults (`share 0.5`, `reserve 15Gi`)
+the budget is half the cache file system less 15Gi.
+
 ## VolumeCondition
 
 The node reports whether a volume's device is abnormal in
@@ -325,6 +449,29 @@ than the volume kind drops the volume parameters, epoch and grown size too and
 cannot serve the volume. Do not run an older plugin on a node with staged
 volumes of the newer kind. Block servers stay on the binary they started with
 until the volume is next staged.
+
+**Cache accounting rollout.** Apply the driver release (all of accounting is on
+by default in the base); then the node plugins advertise and begin checking
+while existing pods are unaccounted, and the `miami_cache_unaccounted_bytes`
+rule above shows the gap; then restart the workloads with volumes in the order
+you prefer so the webhook gives them a request; then enable the alerts.
+Applying the new base with volumes already staged refuses nothing for them.
+
+A GitOps tool must ignore `webhooks[].clientConfig.caBundle` of the
+`miami-cache` MutatingWebhookConfiguration (the Argo CD `ignoreDifferences`
+entry is in the README), in both TLS modes. The cert-manager component is
+opt-in; `-cache-accounting=false` turns the node's side off, and labelling a
+namespace `miami.csi.greghaskins.com/cache-accounting=disabled` takes it out
+of the webhook (admin-only, as in the README).
+
+**Switching a running self-signed install to the cert-manager component.**
+cert-manager's cainjector merges a new CA into an existing `caBundle` and drops
+only expired entries. After enabling the component, once: empty
+`webhooks[].clientConfig.caBundle` (the cainjector refills it with the managed
+CA alone) and delete the Secret `miami-webhook-tls`, which holds the old CA's
+key. Admission works either way; this only retires the old trust anchor. The
+reverse switch needs nothing, because the controller replaces the bundle
+rather than merging.
 
 ## Restore
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Draft, for the architect's review. Go-ahead is the owner's approval of the design (given 2026-11-07).
+**Status:** Implemented (T1 to T9, 2026-11-09). Go-ahead was the owner's approval of the design (given 2026-11-07); the design carries the amendments.
 **Created:** 2026-11-08
 
 **Goal:** a node advertises its cache budget as the extended resource `miami.csi.greghaskins.com/cache`, a mutating webhook makes each pod request the footprint of the volumes it mounts, and the node plugin refuses a fresh stage that would exceed the budget.

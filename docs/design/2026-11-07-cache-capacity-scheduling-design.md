@@ -1,6 +1,6 @@
 # Scheduling node-local cache capacity
 
-**Status:** Approved by the owner on 2026-11-07 (decision 66); the implementation plan follows
+**Status:** Implemented (2026-11-09), with the amendments marked below; approved by the owner on 2026-11-07 (decision 66). The plan is `2026-11-08-cache-capacity-implementation-plan.md`
 **Created:** 2026-11-07
 **Reads with:** `2026-11-03-chunk-backed-volumes-design.md` (4.3, the cache; decisions 54, 59), `2026-10-30-architecture-brief.md` (decision log), `docs/operating-volumes.md` (node layout, monitoring)
 
@@ -156,6 +156,22 @@ base's policy fails closed (the patch is refused, the node advertises nothing,
 the stage check still runs on the flags' budget); no controller-side fallback
 is built for that case.
 
+> **Amendment 2026-11-09.** The status endpoint does not reset `metadata`, so
+> the policy pins more than one capacity key: `metadata.labels`, `annotations`,
+> `finalizers` and `ownerReferences` hold still too, and so does every
+> `managedFields` entry whose operation is `Apply` (the rest of `managedFields`
+> is free, since the node's own patches change it). The node also probes the
+> fence: at start, then every `-cache-fence-probe-interval` (default 10
+> minutes) while fenced, and every pass while unfenced or unknown, it sends a
+> patch the policy must deny. The verdict is `miami_cache_fence_state{state}`,
+> one series at 1 of `fenced`, `unfenced`, `unknown`. Unless `fenced`, the node
+> advertises nothing (an `unfenced` node also removes what it wrote). The
+> expected denials are one per node per probe interval while fenced, and up to
+> one per pass while unknown. Every fresh install shows `unfenced` or
+> `unknown` for one pass, since the first probe can beat the policy's
+> enforcement; alert on `miami_cache_fence_state{state!="fenced"} == 1` with
+> `for: 10m`.
+
 **Alternative considered:** the controller patching every node's capacity
 from a budget it computes from `status.capacity.ephemeral-storage`. One
 principal and no per-node token trick, but it cannot see a cache directory
@@ -166,7 +182,7 @@ the policy; it stays the fallback if the token extra is unavailable.
 ### 4.4 The webhook
 
 **Where it runs.** In the controller Deployment, as a second listener
-(`-webhook-addr`, default `:9812`), because the controller already holds the
+(`-webhook-addr`, default `:9814`; amended 2026-11-09, see "Reaching it"), because the controller already holds the
 cluster-wide read access the lookups need, is the one place that knows the
 class parameters' defaults, and is a single replica whose restart is quick. A
 `MutatingWebhookConfiguration` in the base matches pods, `CREATE` only,
@@ -208,8 +224,9 @@ containers get nothing. A pod with no volume of this kind is admitted
 unchanged, except that a stray request of the resource is removed.
 
 **Reaching it.** The controller runs on the host network, so the webhook's
-port is a host port: `9812` is one of the four the driver already reserves
-(`9810` to `9813`), and a ClusterIP Service selecting the controller pod gives
+port is a host port. *Amended 2026-11-09:* it is `9814`, a fifth reserved
+port beside `9810` to `9813`; `9812` is the node's health port and both pods
+are host-network, so reusing it would collide. A ClusterIP Service selecting the controller pod gives
 the API server a stable name for it (a Service selects host-network pods like
 any other; its endpoint is the node's address and the host port).
 
@@ -232,6 +249,21 @@ rule is needed in both modes: the cainjector writes the live field just as the
 controller does, Argo CD's default diff does not ignore it, so self-heal would
 flap it between empty and filled; and in managed mode `miami_webhook_config_ok`
 is absent by design, so the flap would be invisible.
+
+> **Amendment 2026-11-09.** The webhook never fails admission. On an error of
+> its own (a lookup error, the 7 second deadline, more than 64 distinct claims
+> in a pod, a panic) it admits the pod with the cache resource removed from
+> every container, counted as `miami_webhook_mutations_total{outcome="error"}`,
+> so a hand-set value cannot survive by making the webhook fail. A request
+> body is bounded at 8 MiB, above the API server's own limit. The cert-manager
+> component bootstraps a CA chain: a self-signed Issuer, a long-lived CA
+> Certificate, a CA Issuer from it, and the serving Certificate signed by that,
+> with the injector annotation naming the serving Certificate. The serving
+> certificate then renews without the CA changing. `miami_webhook_config_ok` is
+> registered in self-signed mode only. Enabling the component on a running
+> self-signed install needs a one-time cleanup, because the cainjector merges a
+> new CA into the existing `caBundle`: empty `webhooks[].clientConfig.caBundle`
+> and delete the Secret `miami-webhook-tls`.
 
 **Failure policy.** `Ignore`, with the stage check as the net. With `Fail`,
 the controller being down (an upgrade, a crash loop, a node drain) stops every
@@ -315,6 +347,14 @@ into that window is refused retryably and proceeds when the drain ends; that
 is the intended outcome, not a bug, and the drain's own stuck alert covers a
 drain that never ends.
 
+> **Amendment 2026-11-09.** The footprints are at the served size (the grown
+> size raises both the size and the whole-volume cache bound, as `raiseSize`
+> does). `miami_cache_committed_bytes` is the check's own sum over all drain
+> records, so it includes caches awaiting a discard (a volume taken over by
+> another node before its old holder discarded). It is not "staged volumes
+> only", so an alert on committed over budget and the check agree. A fresh
+> stage leaves out the volume's own record. Intent records are not read.
+
 **Metrics** (node, per pass): `miami_cache_budget_bytes`,
 `miami_cache_committed_bytes` (the sum above, staged volumes only),
 `miami_cache_fs_size_bytes` and `miami_cache_fs_free_bytes` (`statfs` of the
@@ -346,8 +386,10 @@ delete or evict anything.
    and check, the webhook and the policy. All of it is on by default in the
    base (the webhook with `Ignore`, the advertisement with the default share
    and reserve): a base that ships the check off ships the problem. An overlay
-   that must opt out sets `-cache-budget 0`, which advertises nothing and
-   disables the check, and labels its namespaces out of the webhook.
+   that must opt out sets `-cache-accounting=false` and labels its namespaces
+   out of the webhook. *Amended 2026-11-09:* `-cache-budget 0` is a budget of
+   zero (advertises `0`, refuses every fresh volume), as 4.3 says; it is not
+   an off switch.
 2. In the cluster: the node plugins advertise and begin checking; existing
    pods are unaccounted (4.6); the recording rule shows the gap.
 3. Rolling restarts of the workloads with volumes, in the order the operator
