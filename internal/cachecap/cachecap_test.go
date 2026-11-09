@@ -29,8 +29,8 @@ func TestBudgetFormula(t *testing.T) {
 		cfg    Config
 		budget int64
 	}{
-		{"220Gi", 220 * gib, c, 95 * gib},
-		{"466Gi", 466 * gib, c, 218 * gib},
+		{"200Gi", 200 * gib, c, 85 * gib},
+		{"500Gi", 500 * gib, c, 235 * gib},
 		{"small fs clamps to zero", 20 * gib, c, 0},
 		{"rounds down to a whole MiB", 10*gib + 700<<10, Config{Accounting: true, Share: 0.5}, 5 * gib},
 	} {
@@ -43,13 +43,13 @@ func TestBudgetFormula(t *testing.T) {
 func TestBudgetAbsoluteWins(t *testing.T) {
 	t.Parallel()
 	c := Config{Accounting: true, Share: 0.5, Reserve: 15 * gib, Absolute: 100 * gib, HaveAbsolute: true}
-	for _, fs := range []int64{20 * gib, 466 * gib} {
+	for _, fs := range []int64{20 * gib, 500 * gib} {
 		if got := Budget(fs, c); got != 100*gib {
 			t.Errorf("fs %d: Budget = %d, want 100Gi", fs, got)
 		}
 	}
 	z := Config{Accounting: true, Share: 0.5, Absolute: 0, HaveAbsolute: true}
-	s := NewSource(z, "/c", fakeStat(&fsFigures{size: 466 * gib, free: gib}))
+	s := NewSource(z, "/c", fakeStat(&fsFigures{size: 500 * gib, free: gib}))
 	b, enabled, err := s.Current(context.Background())
 	if err != nil || !enabled || b != 0 {
 		t.Errorf("Current = %d, %v, %v; want 0, true, nil", b, enabled, err)
