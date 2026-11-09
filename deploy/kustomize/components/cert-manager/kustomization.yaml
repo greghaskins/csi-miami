@@ -40,10 +40,15 @@ patches:
         path: /spec/template/spec/containers/0/args/-
         value: --webhook-tls-secret=miami-webhook-tls-managed
   - target: {kind: MutatingWebhookConfiguration, name: miami-cache}
+    # A strategic-merge patch, so annotations an overlay put there stay. The
+    # value names the driver's namespace as a literal; a `namespace:` overlay
+    # must patch it (README, "Overlays that rename or move the driver").
     patch: |-
-      - op: add
-        path: /metadata/annotations
-        value:
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: MutatingWebhookConfiguration
+      metadata:
+        name: miami-cache
+        annotations:
           cert-manager.io/inject-ca-from: miami-system/miami-webhook
   - target: {kind: ValidatingAdmissionPolicy, name: miami-controller-webhook-config}
     patch: |-
@@ -77,6 +82,9 @@ patches:
   - target: {kind: ClusterRole, name: miami-controller}
     patch: |-
       - op: test
+        path: /rules/9/apiGroups
+        value: [admissionregistration.k8s.io]
+      - op: test
         path: /rules/9/resources
         value: [mutatingwebhookconfigurations]
       - op: test
@@ -88,6 +96,9 @@ patches:
   - target: {kind: Role, name: miami-controller}
     patch: |-
       - op: test
+        path: /rules/1/apiGroups
+        value: [""]
+      - op: test
         path: /rules/1/resources
         value: [secrets]
       - op: test
@@ -96,6 +107,9 @@ patches:
       - op: test
         path: /rules/1/verbs
         value: [get, update]
+      - op: test
+        path: /rules/2/apiGroups
+        value: [""]
       - op: test
         path: /rules/2/resources
         value: [secrets]

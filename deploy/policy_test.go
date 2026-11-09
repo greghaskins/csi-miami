@@ -2103,6 +2103,13 @@ func TestCertManagerComponent(t *testing.T) {
 // kustomization has first patched with the given JSON patch on the target.
 func renderComponentOver(t *testing.T, kind, name, patch string) error {
 	t.Helper()
+	_, err := renderComponentOverR(t, kind, name, patch)
+	return err
+}
+
+// renderComponentOverR is renderComponentOver returning what it rendered.
+func renderComponentOverR(t *testing.T, kind, name, patch string) (rendered, error) {
+	t.Helper()
 	abs, err := filepath.Abs("kustomize")
 	if err != nil {
 		t.Fatal(err)
@@ -2134,8 +2141,37 @@ func renderComponentOver(t *testing.T, kind, name, patch string) error {
 	k := krusty.MakeKustomizer(krusty.MakeDefaultOptions())
 	kustomizeMu.Lock()
 	defer kustomizeMu.Unlock()
-	_, err = k.Run(filesys.MakeFsOnDisk(), top)
-	return err
+	m, err := k.Run(filesys.MakeFsOnDisk(), top)
+	if err != nil {
+		return rendered{}, err
+	}
+	r := rendered{}
+	for _, res := range m.Resources() {
+		js, err := res.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.objects = append(r.objects, object{kind: res.GetKind(), name: res.GetName(), json: js})
+	}
+	return r, nil
+}
+
+// TestCertManagerComponentKeepsExistingAnnotations: the component adds its one
+// annotation to the webhook configuration without replacing the ones an overlay
+// below it has put there.
+func TestCertManagerComponentKeepsExistingAnnotations(t *testing.T) {
+	t.Parallel()
+	patch := "      - op: add\n        path: /metadata/annotations\n        value: {example.com/keep: kept}\n"
+	r, err := renderComponentOverR(t, "MutatingWebhookConfiguration", "miami-cache", patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg admissionv1.MutatingWebhookConfiguration
+	r.get(t, "MutatingWebhookConfiguration", "miami-cache", &cfg)
+	want := map[string]string{"example.com/keep": "kept", "cert-manager.io/inject-ca-from": "miami-system/miami-webhook"}
+	if !reflect.DeepEqual(cfg.Annotations, want) {
+		t.Errorf("annotations = %v, want %v", cfg.Annotations, want)
+	}
 }
 
 // TestCertManagerComponentRefusesMovedRules: the component removes rules by
@@ -2154,6 +2190,11 @@ func TestCertManagerComponentRefusesMovedRules(t *testing.T) {
 		{"ClusterRole rule appended (removes nothing else)", "ClusterRole", app, false},
 		{"Role rule inserted first", "Role", ins, true},
 		{"Role rule appended (removes nothing else)", "Role", app, false},
+		// The guards check the group as well as the resource, so a rule that
+		// kept its index and resource but changed its group is refused.
+		{"ClusterRole configuration rule in another group", "ClusterRole", "      - op: replace\n        path: /rules/9/apiGroups\n        value: ['']\n", true},
+		{"Role Secret get rule in another group", "Role", "      - op: replace\n        path: /rules/1/apiGroups\n        value: [example.com]\n", true},
+		{"Role Secret create rule in another group", "Role", "      - op: replace\n        path: /rules/2/apiGroups\n        value: [example.com]\n", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
