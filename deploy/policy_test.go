@@ -2247,3 +2247,118 @@ func TestControllerRBACExact(t *testing.T) {
 		t.Errorf("controller Role = %+v\nwant %+v", role.Rules, wantRole)
 	}
 }
+
+// TestWebhookObjectsUnderOverlays pins what follows an overlay that moves or
+// renames the driver, for the webhook's objects, and what does not. It is the
+// webhook's counterpart of TestNodePolicyFollowsNamespaceOverlay. What does NOT
+// follow must be patched by the overlay (README, "Overlays that rename or move
+// the driver"); each such literal is named here so that nobody takes the test
+// for a promise.
+func TestWebhookObjectsUnderOverlays(t *testing.T) {
+	t.Parallel()
+	hostOf := func(r rendered, name string) (svcNS, svcName string, sel []string) {
+		t.Helper()
+		var cfg admissionv1.MutatingWebhookConfiguration
+		r.get(t, "MutatingWebhookConfiguration", name, &cfg)
+		w := cfg.Webhooks[0]
+		for _, e := range w.NamespaceSelector.MatchExpressions {
+			if e.Key == "kubernetes.io/metadata.name" {
+				sel = e.Values
+			}
+		}
+		return w.ClientConfig.Service.Namespace, w.ClientConfig.Service.Name, sel
+	}
+	argsOf := func(r rendered, name string) []string {
+		t.Helper()
+		var d appsv1.Deployment
+		r.get(t, "Deployment", name, &d)
+		return container(t, d.Spec.Template.Spec, "miami").Args
+	}
+
+	t.Run("namespace", func(t *testing.T) {
+		t.Parallel()
+		r := renderOverlay(t, "namespace: storage\n")
+		// Follows: the Service and the configuration's reference to it.
+		var svc corev1.Service
+		r.get(t, "Service", "miami-webhook", &svc)
+		ns, name, sel := hostOf(r, "miami-cache")
+		if svc.Namespace != "storage" || ns != "storage" || name != "miami-webhook" {
+			t.Errorf("service namespace %q, configuration points at %s/%s; want both in storage", svc.Namespace, ns, name)
+		}
+		// Follows at runtime: the certificate's names and the Secret's home come
+		// from POD_NAMESPACE (the downward API), and the flags carry no namespace.
+		args := argsOf(r, "miami-controller")
+		for _, a := range args {
+			if strings.Contains(a, "miami-system") || strings.HasPrefix(a, "--webhook-service") {
+				t.Errorf("the controller carries a literal that would not follow the namespace: %s", a)
+			}
+		}
+		var d appsv1.Deployment
+		r.get(t, "Deployment", "miami-controller", &d)
+		if m := container(t, d.Spec.Template.Spec, "miami"); m.Env[0].Name != "POD_NAMESPACE" || m.Env[0].ValueFrom == nil || m.Env[0].ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+			t.Errorf("env = %+v, want POD_NAMESPACE from the downward API first", m.Env)
+		}
+		// Does NOT follow: the namespaceSelector excludes the literal base namespace
+		// (a driver moved to storage is then not excluded from its own webhook, and
+		// its own pods are sent to it).
+		if !slices.Contains(sel, "miami-system") || slices.Contains(sel, "storage") {
+			t.Errorf("namespaceSelector excludes %v; the pinned behaviour is that the literal miami-system stays and the overlay must patch it", sel)
+		}
+	})
+
+	t.Run("namespace with the cert-manager component", func(t *testing.T) {
+		t.Parallel()
+		r := renderOverlay(t, "namespace: storage\ncomponents:\n  - ../kustomize/components/cert-manager\n")
+		var cfg admissionv1.MutatingWebhookConfiguration
+		r.get(t, "MutatingWebhookConfiguration", "miami-cache", &cfg)
+		// Does NOT follow: the CA injector is told where to look by a literal.
+		if got := cfg.Annotations["cert-manager.io/inject-ca-from"]; got != "miami-system/miami-webhook" {
+			t.Errorf("inject-ca-from = %q; the pinned behaviour is the literal miami-system/miami-webhook, which the overlay must patch", got)
+		}
+		// Does NOT follow: the serving certificate's names.
+		var cert struct {
+			Spec struct {
+				DNSNames []string `json:"dnsNames"`
+			} `json:"spec"`
+		}
+		for _, o := range r.objects {
+			if o.kind == "Certificate" && o.name == "miami-webhook" {
+				if err := json.Unmarshal(o.json, &cert); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		for _, n := range cert.Spec.DNSNames {
+			if !strings.Contains(n, ".miami-system.svc") {
+				t.Errorf("dnsName %q followed the namespace; update this test and the README if the component now does", n)
+			}
+		}
+		if len(cert.Spec.DNSNames) != 2 {
+			t.Errorf("dnsNames = %v", cert.Spec.DNSNames)
+		}
+	})
+
+	t.Run("namePrefix", func(t *testing.T) {
+		t.Parallel()
+		r := renderOverlay(t, "namePrefix: prod-\n")
+		_, name, _ := hostOf(r, "prod-miami-cache")
+		// Follows: the configuration's reference to the renamed Service.
+		if name != "prod-miami-webhook" {
+			t.Errorf("the configuration points at Service %q, want prod-miami-webhook", name)
+		}
+		// Does NOT follow: the controller's flags name the Service and the
+		// configuration by their base names (the certificate's names come from
+		// -webhook-service, whose default is miami-webhook, and -webhook-config
+		// names the configuration whose caBundle is kept). The overlay must patch
+		// both.
+		args := argsOf(r, "prod-miami-controller")
+		if !slices.Contains(args, "--webhook-config=miami-cache") {
+			t.Errorf("args = %v; the pinned behaviour is --webhook-config=miami-cache, which the overlay must patch", args)
+		}
+		for _, a := range args {
+			if strings.HasPrefix(a, "--webhook-service") {
+				t.Errorf("%s: the base sets no --webhook-service, so the default miami-webhook applies; update the README if that changed", a)
+			}
+		}
+	})
+}
