@@ -40,7 +40,7 @@ const SecretTypeTLS = "kubernetes.io/tls" //nolint:gosec // a Secret type, not a
 // The label the controller puts on the Secret it creates, so that a later pass
 // can tell its own Secret from one it must not overwrite.
 const (
-	SecretOwnerLabel = "app.kubernetes.io/managed-by"
+	SecretOwnerLabel = "app.kubernetes.io/managed-by" //nolint:gosec // a label key, not a credential
 	SecretOwnerValue = "miami-controller"
 )
 
