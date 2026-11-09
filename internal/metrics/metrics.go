@@ -85,8 +85,8 @@ const (
 
 	// NameCacheFenceState is the verdict of the last fence probe, one series
 	// per state with exactly one at 1: fenced, unfenced or unknown (the probe
-	// could not tell, so the node advertises nothing; also the state before
-	// the first probe).
+	// could not tell, so the node keeps its last advertised figure; also the
+	// state before the first probe).
 	NameCacheFenceState = "miami_cache_fence_state"
 )
 
@@ -281,7 +281,7 @@ func New(opts ...Option) *Registry {
 		Name: NameCachePatchFailures, Help: "Failed patches or clears of this node's advertised cache capacity, by reason: denied (the API server answered 403 or 422, so RBAC or the admission policy refused), unknown (a fence probe that could not tell) or error. A budget the node computes but cannot advertise leaves pods pending.",
 	}, []string{"reason"})
 	r.cacheFenceState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: NameCacheFenceState, Help: "The verdict of the node's last fence probe, one series per state with exactly one at 1: fenced, unfenced (the admission policy does not fence this node plugin) or unknown (the probe could not tell, e.g. the policy was renamed or the API server failed). The node advertises only while fenced.",
+		Name: NameCacheFenceState, Help: "The verdict of the node's last fence probe, one series per state with exactly one at 1: fenced, unfenced (the admission policy does not fence this node plugin) or unknown (the probe could not tell, e.g. the policy was renamed or the API server failed). The node keeps advertising whatever the state; an unfenced state is for paging.",
 	}, []string{"state"})
 	r.SetCacheFenceState("unknown")
 	for _, reason := range []string{"denied", "error", "unknown"} {

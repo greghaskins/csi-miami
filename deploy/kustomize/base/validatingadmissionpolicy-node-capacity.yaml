@@ -56,13 +56,17 @@
 # start, every -cache-fence-probe-interval (10 minutes) while fenced, and every
 # pass while unfenced or unknown, it tries a
 # patch this policy must deny; if the patch is allowed it logs an error naming
-# this policy and its subject, removes what it wrote, sets
-# miami_cache_fence_state to unfenced, and advertises nothing until a probe is denied.
+# this policy and its subject, removes what it wrote and sets
+# miami_cache_fence_state to unfenced. It keeps advertising: removing its own
+# key would not constrain a compromised plugin, and would turn a configuration
+# mistake into a scheduling outage. The alert on the state is what asks for the
+# fix.
 # The probe recognises only this policy's own denial (the API server's text
 # "ValidatingAdmissionPolicy 'miami-node-capacity' ... denied request:
 # [capacity]"), so an overlay must keep the policy and its binding named
 # miami-node-capacity (patch the ServiceAccount name, not the policy's); a
-# renamed policy reads as unknown and the node advertises nothing.
+# renamed policy reads as unknown, and the node keeps the last figure it
+# advertised (a fresh start advertises once regardless).
 # Each probe is a denial by design, so while fenced this policy's expected
 # denial rate is one per node per probe interval; while the node cannot tell
 # (unknown: a renamed policy, an API server failing, a cluster before 1.32) it

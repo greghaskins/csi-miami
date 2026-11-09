@@ -485,34 +485,38 @@ func TestFenceProbeCadence(t *testing.T) {
 	}
 }
 
-// TestFenceUnfencedFailsClosed: an allowed probe stops the advertisement and
-// removes our key, until a later probe is denied.
-func TestFenceUnfencedFailsClosed(t *testing.T) {
+// TestFenceUnfencedKeepsAdvertising: an allowed probe is reported and does not
+// stop the advertisement or remove our key (design decision 66, amended
+// 2026-11-09): removing our own key would not constrain a compromised plugin
+// and would turn a configuration mistake into a scheduling outage.
+func TestFenceUnfencedKeepsAdvertising(t *testing.T) {
 	t.Parallel()
-	nc, m, c := &fakeNC{unfenced: true, have: true, bytes: 95 * gib}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	nc, m, c := &fakeNC{unfenced: true, have: true, bytes: 50 * gib}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
 	r := fenceRunner(nc, m, c)
 	ctx := context.Background()
-	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) {
-		t.Fatalf("err = %v, want ErrUnfenced", err)
+	if err := r.Pass(ctx); err != nil {
+		t.Fatalf("err = %v, want nil: an unfenced node still advertises", err)
 	}
-	if len(nc.setBytes) != 0 || !slices.Equal(nc.calls, []string{"remove"}) {
-		t.Errorf("calls = %v, sets = %v; want a removal and no set", nc.calls, nc.setBytes)
+	if !slices.Equal(nc.setBytes, []int64{95 * gib}) || slices.Contains(nc.calls, "remove") {
+		t.Errorf("calls = %v, sets = %v; want the budget set and no removal", nc.calls, nc.setBytes)
 	}
 	if !slices.Equal(m.states, []string{"unfenced"}) {
 		t.Errorf("fence states = %v, want [unfenced]", m.states)
 	}
-	// An unfenced verdict is re-probed on every pass: no set, and a key that
-	// came back is removed again.
+	// An unfenced verdict is re-probed on every pass, and the budget keeps
+	// being updated as if fenced.
+	f := &fsFigures{size: 150 * gib}
+	r.src = NewSource(Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}, "/c", fakeStat(f))
 	c.t = c.t.Add(time.Minute)
-	nc.have = true
-	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) || nc.probes != 2 || len(nc.setBytes) != 0 || len(nc.calls) != 2 {
-		t.Errorf("second pass: err %v, probes %d, calls %v", err, nc.probes, nc.calls)
+	nc.bytes = 95 * gib
+	if err := r.Pass(ctx); err != nil || nc.probes != 2 || !slices.Equal(nc.setBytes, []int64{95 * gib, 60 * gib}) || slices.Contains(nc.calls, "remove") {
+		t.Errorf("second pass: err %v, probes %d, sets %v, calls %v", err, nc.probes, nc.setBytes, nc.calls)
 	}
-	// A later probe that is denied lifts it.
+	// A later probe that is denied changes nothing but the state.
 	nc.unfenced = false
 	c.t = c.t.Add(time.Minute)
-	nc.have = false
-	if err := r.Pass(ctx); err != nil || nc.probes != 3 || len(nc.setBytes) != 1 {
+	nc.bytes = 60 * gib
+	if err := r.Pass(ctx); err != nil || nc.probes != 3 || len(nc.setBytes) != 2 {
 		t.Errorf("after a denied probe: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
 	}
 	if !slices.Equal(m.states, []string{"unfenced", "unfenced", "fenced"}) {
@@ -520,32 +524,64 @@ func TestFenceUnfencedFailsClosed(t *testing.T) {
 	}
 }
 
-// TestFenceUnknownSkipsAndRetriesSoon: a probe that cannot tell leaves the
-// gauge alone, advertises nothing, counts a failure, and is retried at the
-// pass interval and not the probe interval.
-func TestFenceUnknownSkipsAndRetriesSoon(t *testing.T) {
+// TestFenceFirstProbeBeforeFirstAdvertisement: on a fresh start the probe runs
+// first, but its verdict, whatever it is, does not gate the advertisement.
+func TestFenceFirstProbeBeforeFirstAdvertisement(t *testing.T) {
 	t.Parallel()
-	nc, m, c := &fakeNC{probeErr: errors.New("timeout")}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+	for _, tt := range []struct {
+		name string
+		nc   *fakeNC
+	}{
+		{"fenced", &fakeNC{}},
+		{"unfenced", &fakeNC{unfenced: true}},
+		{"unknown", &fakeNC{probeErr: errors.New("timeout")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m, c := &fakeMetrics{}, &clock{time.Unix(1000, 0)}
+			r := fenceRunner(tt.nc, m, c)
+			_ = r.Pass(context.Background())
+			if tt.nc.probes != 1 || !slices.Equal(tt.nc.setBytes, []int64{95 * gib}) {
+				t.Errorf("probes %d, sets %v; want one probe and the budget advertised", tt.nc.probes, tt.nc.setBytes)
+			}
+		})
+	}
+}
+
+// TestFenceUnknownKeepsTheLastFigure: once the node has advertised, a probe
+// that cannot tell leaves the figure alone (it neither updates nor removes it,
+// which would stop scheduling cluster-wide on an API blip), counts a failure,
+// and is retried at the pass interval and not the probe interval.
+func TestFenceUnknownKeepsTheLastFigure(t *testing.T) {
+	t.Parallel()
+	nc, m, c := &fakeNC{}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
 	r := fenceRunner(nc, m, c)
 	ctx := context.Background()
+	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 1 {
+		t.Fatalf("first pass: err %v, sets %v", err, nc.setBytes)
+	}
+	nc.have, nc.bytes = true, 95*gib
+	nc.probeErr = errors.New("timeout")
+	c.t = c.t.Add(11 * time.Minute)
 	if err := r.Pass(ctx); err == nil {
 		t.Fatal("no error from an unknown probe")
 	}
-	if len(nc.setBytes) != 0 || !slices.Equal(m.states, []string{"unknown"}) || !slices.Equal(m.failures, []string{"unknown"}) {
-		t.Errorf("sets %v, states %v, failures %v", nc.setBytes, m.states, m.failures)
+	if len(nc.setBytes) != 1 || slices.Contains(nc.calls, "remove") || !slices.Equal(m.states, []string{"fenced", "unknown"}) || !slices.Equal(m.failures, []string{"unknown"}) {
+		t.Errorf("sets %v, calls %v, states %v, failures %v", nc.setBytes, nc.calls, m.states, m.failures)
 	}
-	// Under the pass interval nothing is probed, and nothing is advertised.
+	// A new budget is not advertised while the verdict is unknown, either.
+	r.src = NewSource(Config{Accounting: true, Share: 0.5, Reserve: 15 * gib}, "/c", fakeStat(&fsFigures{size: 150 * gib}))
 	c.t = c.t.Add(30 * time.Second)
-	if err := r.Pass(ctx); !errors.Is(err, ErrFenceUnknown) || nc.probes != 1 || len(nc.setBytes) != 0 {
-		t.Errorf("early pass: err %v, probes %d", err, nc.probes)
+	if err := r.Pass(ctx); !errors.Is(err, ErrFenceUnknown) || nc.probes != 2 || len(nc.setBytes) != 1 {
+		t.Errorf("early pass: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
 	}
 	// At the pass interval it probes again, and a clean answer advertises.
 	nc.probeErr = nil
 	c.t = c.t.Add(time.Minute)
-	if err := r.Pass(ctx); err != nil || nc.probes != 2 || len(nc.setBytes) != 1 {
+	if err := r.Pass(ctx); err != nil || nc.probes != 3 || len(nc.setBytes) != 2 {
 		t.Errorf("retry: err %v, probes %d, sets %v", err, nc.probes, nc.setBytes)
 	}
-	if !slices.Equal(m.states, []string{"unknown", "fenced"}) {
+	if !slices.Equal(m.states, []string{"fenced", "unknown", "fenced"}) {
 		t.Errorf("fence states = %v", m.states)
 	}
 }
@@ -588,7 +624,7 @@ func TestFenceProbeCleanupRetriedEveryPass(t *testing.T) {
 	}
 	nc.removeProbeErr = nil
 	c.t = c.t.Add(time.Minute)
-	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) || errors.Is(err, boom) || nc.removeProbes != 2 {
+	if err := r.Pass(ctx); err != nil || nc.removeProbes != 2 {
 		t.Errorf("third pass: err %v, cleanups %d", err, nc.removeProbes)
 	}
 	c.t = c.t.Add(time.Minute)
@@ -722,19 +758,19 @@ func TestFenceUnfencedReprobesNextPass(t *testing.T) {
 	}
 }
 
-// TestFenceUnfencedThenFencedAdvertises: once the policy is enforced the next
-// pass is denied and the node advertises, long before the probe interval.
+// TestFenceUnfencedThenFencedAdvertises: the node advertises while unfenced,
+// and once the policy is enforced the next pass is denied and it still does.
 func TestFenceUnfencedThenFencedAdvertises(t *testing.T) {
 	t.Parallel()
 	nc, m, c := &fakeNC{unfenced: true}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
 	r := fenceRunner(nc, m, c)
 	ctx := context.Background()
-	if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) {
-		t.Fatalf("first pass err = %v, want ErrUnfenced", err)
+	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 1 {
+		t.Fatalf("first pass err = %v, sets %v; want an advertisement while unfenced", err, nc.setBytes)
 	}
 	nc.unfenced = false
 	c.t = c.t.Add(time.Minute)
-	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 1 {
+	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 2 {
 		t.Errorf("next pass: err %v, sets %v, want an advertisement", err, nc.setBytes)
 	}
 }
@@ -790,7 +826,7 @@ func TestFenceUnfencedErrorLoggedOnTransition(t *testing.T) {
 }
 
 // TestFenceUnfencedThenFencedLeavesNoProbeKey: the allowed probe's key is
-// removed at once, and the denied probe on the next pass advertises.
+// removed at once, and the node advertises on both passes.
 func TestFenceUnfencedThenFencedLeavesNoProbeKey(t *testing.T) {
 	t.Parallel()
 	nc, m, c := &fakeNC{unfenced: true}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
@@ -802,13 +838,13 @@ func TestFenceUnfencedThenFencedLeavesNoProbeKey(t *testing.T) {
 	}
 	nc.unfenced = false
 	c.t = c.t.Add(time.Minute)
-	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 1 || r.probeKeyLeft || nc.removeProbes != 0 {
+	if err := r.Pass(ctx); err != nil || len(nc.setBytes) != 2 || r.probeKeyLeft || nc.removeProbes != 0 {
 		t.Errorf("err %v, sets %v, keyLeft %v, cleanups %d", err, nc.setBytes, r.probeKeyLeft, nc.removeProbes)
 	}
 }
 
-// TestFenceFencedThenUnfenced: a node that was advertising stops, its key is
-// removed, the probe key is gone, and the Error is logged exactly once.
+// TestFenceFencedThenUnfenced: a node that was advertising keeps its key and
+// keeps updating it, the probe key is gone, and the Error is logged exactly once.
 func TestFenceFencedThenUnfenced(t *testing.T) {
 	t.Parallel()
 	nc, m, c := &fakeNC{}, &fakeMetrics{}, &clock{time.Unix(1000, 0)}
@@ -822,12 +858,12 @@ func TestFenceFencedThenUnfenced(t *testing.T) {
 	nc.have, nc.bytes, nc.unfenced = true, nc.setBytes[0], true
 	for i := 0; i < 3; i++ {
 		c.t = c.t.Add(11 * time.Minute)
-		if err := r.Pass(ctx); !errors.Is(err, ErrUnfenced) {
-			t.Fatalf("pass %d: err %v, want ErrUnfenced", i, err)
+		if err := r.Pass(ctx); err != nil {
+			t.Fatalf("pass %d: err %v, want nil", i, err)
 		}
 	}
-	if len(nc.setBytes) != 1 || nc.calls[len(nc.calls)-1] != "remove" || r.probeKeyLeft {
-		t.Errorf("sets %v, calls %v, keyLeft %v", nc.setBytes, nc.calls, r.probeKeyLeft)
+	if len(nc.setBytes) != 1 || slices.Contains(nc.calls, "remove") || r.probeKeyLeft {
+		t.Errorf("sets %v, calls %v, keyLeft %v; want the key left as it was", nc.setBytes, nc.calls, r.probeKeyLeft)
 	}
 	if n := strings.Count(logs.String(), "level=ERROR"); n != 1 {
 		t.Errorf("%d Error lines, want 1:\n%s", n, logs.String())

@@ -47,6 +47,7 @@ type NodeCapacity interface {
 	// status patch is in force, by trying a patch it must deny (decision 66,
 	// 4.9). Fenced: the policy denied it. Unfenced: the patch was allowed
 	// (and is removed again). Unknown comes with the error that left it so.
+	// The verdict is reported; it does not gate the advertisement.
 	ProbeFence(ctx context.Context, node string) (FenceState, error)
 	// RemoveFenceProbe removes the probe's key if the node carries it.
 	RemoveFenceProbe(ctx context.Context, node string) error
