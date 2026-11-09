@@ -91,7 +91,8 @@ const (
 
 	// NameCachePatchFailures counts failed patches of the node's advertised
 	// capacity, by reason: denied (a 403 or 422: RBAC or the admission policy
-	// refused) or error (anything else).
+	// refused), unknown (a fence probe that could not tell) or error (anything
+	// else).
 	NameCachePatchFailures = "miami_cache_capacity_patch_failures_total"
 
 	// NameCacheFenceState is the verdict of the last fence probe, one series
@@ -286,7 +287,7 @@ func New(opts ...Option) *Registry {
 		return prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
 	}
 	r.cacheBudget = gauge(NameCacheBudget, "Bytes of node-local cache this node offers the scheduler.")
-	r.cacheCommitted = gauge(NameCacheCommitted, "Bytes of cache footprint committed to the volumes staged on this node.")
+	r.cacheCommitted = gauge(NameCacheCommitted, "Bytes of cache footprint committed on this node: the sum over all drain records in the cache directory (staged volumes, and caches awaiting a drain).")
 	r.cacheAdvertised = gauge(NameCacheAdvertised, "Bytes of node-local cache this node is set to advertise to the scheduler: the budget, or the committed figure when that is higher (a lowered budget takes effect as volumes leave).")
 	r.cacheFSSize = gauge(NameCacheFSSize, "Size in bytes of the filesystem the volume caches live on.")
 	r.cacheFSFree = gauge(NameCacheFSFree, "Bytes available on the filesystem the volume caches live on.")
@@ -302,10 +303,10 @@ func New(opts ...Option) *Registry {
 	}
 
 	r.webhookMutations = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: NameWebhookMutations, Help: "Pods the admission webhook handled, by outcome: mutated (a cache request set), stripped (a stray request removed), unchanged or error (allowed unchanged because of a lookup failure).",
+		Name: NameWebhookMutations, Help: "Pods the admission webhook handled, by outcome: mutated (a cache request set), stripped (a stray request removed), unchanged or error (the webhook failed, so the pod was allowed with the resource stripped).",
 	}, []string{"outcome"})
 	r.webhookUnresolved = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: NameWebhookUnresolved, Help: "Pod volumes the admission webhook could not account for (a claim that does not exist yet, or one it could not make sense of).",
+		Name: NameWebhookUnresolved, Help: "Pod volumes the admission webhook could not account for: a claim that does not exist, a class or a bound volume that does not exist, class parameters, a volume context or a request it cannot use, or a pod over the 64-claim cap (counted once).",
 	})
 	r.webhookRefused = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: NameWebhookSecretRefused, Help: "Passes in which the self-signed webhook found a Secret under its TLS Secret name that it did not create (no ownership label, or no ca.key) and so left alone. Something else probably manages it: run the controller with -webhook-tls-secret naming it.",

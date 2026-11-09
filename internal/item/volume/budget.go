@@ -42,8 +42,10 @@ import (
 // in the cache directory. A drain record is written before every block server
 // starts and removed with a clean release, so the records cover every staged
 // volume and every cache awaiting a drain, one per volume. No volume is
-// excluded by name: a discarded cache keeps its record, and a fresh volume has
-// none yet. A record Orphans would skip is skipped here, and warned about once.
+// excluded by name here: a discarded cache keeps its record, and a fresh volume
+// has none yet. (The stage check, which sums the same records, leaves out the
+// record of the volume being staged, because that stage replaces it.) A record
+// Orphans would skip is skipped here, and warned about once.
 func (it *Item) Committed(ctx context.Context) (int64, int, error) {
 	by, err := it.committedByName(ctx)
 	if err != nil {

@@ -78,7 +78,7 @@ type CapacityMetrics interface {
 	// budget is held up by volumes still on the node.
 	SetCacheAdvertised(bytes int64)
 	// IncCachePatchFailure counts a failed patch or clear of the node's
-	// capacity; reason is PatchDenied or PatchError.
+	// capacity; reason is PatchDenied, PatchError or PatchUnknown.
 	IncCachePatchFailure(reason string)
 	// SetCacheFenceState records the verdict of the last probe: "fenced",
 	// "unfenced" or "unknown" (see the Fence* names); exactly one is 1.

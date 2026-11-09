@@ -34,7 +34,7 @@ const (
 	outcomeMutated   = "mutated"   // the cache request was set or changed
 	outcomeUnchanged = "unchanged" // nothing to do
 	outcomeStripped  = "stripped"  // no volume of ours, and a stray request was removed
-	outcomeError     = "error"     // our own failure; the pod was allowed unchanged
+	outcomeError     = "error"     // our own failure; the pod was allowed with the resource stripped
 )
 
 const (

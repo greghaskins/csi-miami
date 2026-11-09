@@ -161,9 +161,10 @@ func (r *Runner) probeIfDue(ctx context.Context) error {
 }
 
 // retryProbeCleanup removes the fence probe's key if an allowed probe left it,
-// on every pass and whatever the verdict has become since. If the policy
-// itself now denies the removal (it denies touching any key but ours), the
-// key is stranded and an operator has to remove it: that is said once.
+// on every pass and whatever the verdict has become since. The policy allows
+// the removal of that key, so a removal that keeps failing is RBAC or the API
+// server; the key is then stranded until an operator removes it, which is said
+// once.
 func (r *Runner) retryProbeCleanup(ctx context.Context) error {
 	if !r.probeKeyLeft {
 		return nil
@@ -175,7 +176,7 @@ func (r *Runner) retryProbeCleanup(ctx context.Context) error {
 	}
 	if !r.cleanupWarned {
 		r.cleanupWarned = true
-		r.log.Warn("the fence probe key is still on the node and could not be removed; an operator must remove status.capacity[miami.csi.greghaskins.com/fence-probe] if the admission policy now denies it",
+		r.log.Warn("the fence probe key is still on the node and could not be removed; remove status.capacity[miami.csi.greghaskins.com/fence-probe] by hand if this keeps failing (the admission policy allows its removal, so look at the plugin's RBAC and the API server)",
 			"node", r.node, "error", err)
 	}
 	return r.counted(err)
