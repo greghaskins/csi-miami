@@ -161,16 +161,10 @@ is built for that case.
 > `finalizers` and `ownerReferences` hold still too, and so does every
 > `managedFields` entry whose operation is `Apply` (the rest of `managedFields`
 > is free, since the node's own patches change it). The node also probes the
-> fence: at start, then every `-cache-fence-probe-interval` (default 10
-> minutes) while fenced, and every pass while unfenced or unknown, it sends a
-> patch the policy must deny. The verdict is `miami_cache_fence_state{state}`,
-> one series at 1 of `fenced`, `unfenced`, `unknown`. Unless `fenced`, the node
-> advertises nothing (an `unfenced` node also removes what it wrote). The
-> expected denials are one per node per probe interval while fenced, and up to
-> one per pass while unknown. Every fresh install shows `unfenced` or
-> `unknown` for one pass, since the first probe can beat the policy's
-> enforcement; alert on `miami_cache_fence_state{state!="fenced"} == 1` with
-> `for: 10m`.
+> fence and exports the verdict as `miami_cache_fence_state{state}`; unless it
+> is `fenced` the node advertises nothing. The cadence, the expected denial
+> rates and the alert are in the README ("Cache capacity metrics and the fence
+> probe"), which holds the full text.
 
 **Alternative considered:** the controller patching every node's capacity
 from a budget it computes from `status.capacity.ephemeral-storage`. One
@@ -356,7 +350,7 @@ drain that never ends.
 > stage leaves out the volume's own record. Intent records are not read.
 
 **Metrics** (node, per pass): `miami_cache_budget_bytes`,
-`miami_cache_committed_bytes` (the sum above, staged volumes only),
+`miami_cache_committed_bytes` (the sum above; amended 2026-11-09: over all drain records, not staged volumes only),
 `miami_cache_fs_size_bytes` and `miami_cache_fs_free_bytes` (`statfs` of the
 cache directory's file system), and the webhook's `miami_webhook_mutations_total`
 by outcome and `miami_webhook_unresolved_total`.
@@ -372,7 +366,7 @@ recording rule above being non-zero for longer than a rollout; and
 
 | Principal | New permission | Narrowing |
 |---|---|---|
-| node plugin | `nodes/status` patch | ValidatingAdmissionPolicy: own node only (bound-token `node-name`), one capacity key only |
+| node plugin | `nodes/status` patch | ValidatingAdmissionPolicy: own node only (bound-token `node-name`), one capacity key only (amended 2026-11-09: metadata is pinned too, see 4.3) |
 | controller | `persistentvolumeclaims` get (all namespaces), `storageclasses` get | reads only; both already readable by the sidecars |
 | controller | `mutatingwebhookconfigurations` get and patch | `resourceNames` of the one object; only when self-signed TLS is used |
 | controller | `secrets` get, create and update in `miami-system` | `resourceNames: [miami-webhook-tls]`; absent when `-webhook-tls-secret` names a managed Secret |

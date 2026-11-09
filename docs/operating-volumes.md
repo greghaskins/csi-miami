@@ -168,7 +168,10 @@ not rely on it.
   the stage goes through when something unstages or a drain ends. To act:
   - Find what is committed: `miami_cache_committed_bytes` against
     `miami_cache_budget_bytes` for the node, and the node's volumes in
-    `miami_volumes_served`. A node whose committed figure stays above the sum
+    `miami_cache_bytes{volume=...}`, one series per volume the node holds a
+    cache for. The sum of footprints is not exported on its own, only the
+    total; each volume's footprint is `min(size, cacheSize) + dirtyWatermark +
+    16 MiB` from its class and size. A node whose committed figure stays above the sum
     of its served volumes' footprints holds caches awaiting a discard, for
     example a volume taken over by another node whose old holder has not
     discarded its cache yet. Such a cache still occupies disk and is
@@ -183,7 +186,7 @@ not rely on it.
     pod placed in that gap can see one `CacheBudgetExceeded` refusal before it
     runs, and then runs on kubelet's retry. This is not a fault.
   - To raise the budget, set `-cache-budget` (an absolute quantity, for
-    example `100Gi`) or change `-cache-budget-share` and
+    example `<budget>`) or change `-cache-budget-share` and
     `-cache-budget-reserve` on the node DaemonSet. `-cache-budget 0` is a
     budget of zero: it advertises `0` and refuses every fresh volume.
     `-cache-accounting=false` is the off switch: the node removes its key and
@@ -379,10 +382,10 @@ is the node's `-cache-budget-reserve` in bytes):
 ```yaml
 - alert: MiamiCacheOvercommitted
   expr: miami_cache_committed_bytes > miami_cache_budget_bytes
-  for: 10m
+  for: 10m    # a stage is refused at the budget, so a sustained excess is unaccounted pods
 - alert: MiamiCacheDiskLow
   expr: miami_cache_fs_free_bytes < <reserve>
-  for: 10m
+  for: 10m    # ignores a transient spike (an image pull); the kubelet acts on sustained pressure
 - alert: MiamiCacheFenceNotInForce
   # every fresh install shows unfenced or unknown for one pass by design: the
   # first probe can beat the policy's enforcement, so require it to persist
@@ -405,20 +408,36 @@ for (pods that predate the rollout):
 ```yaml
 - record: miami_cache_unaccounted_bytes
   expr: |
-    miami_cache_committed_bytes
-      - on(node) sum by (node) (
-          kube_pod_container_resource_requests{resource="miami_csi_greghaskins_com_cache"}
-        )
+    clamp_min(
+      miami_cache_committed_bytes
+        - on(node) (
+          sum by (node) (
+            kube_pod_container_resource_requests{resource="miami_csi_greghaskins_com_cache"}
+          )
+          or (0 * miami_cache_committed_bytes)
+        ),
+      0)
 ```
+
+The `or` term gives a node with no accounted pod at all (every pod predates the
+rollout, the case this rule exists for) a right-hand side of zero; without it
+the subtraction drops that node and the rule yields nothing there.
 
 kube-state-metrics sanitises the resource name by turning every character
 that is not a letter, digit or underscore into `_`, so
 `miami.csi.greghaskins.com/cache` is
 `miami_csi_greghaskins_com_cache`; check the label value your version emits.
-The node's `node` label may need a `relabel` to match the nodes of the
-Kubernetes series. An absolute budget in an overlay is a node argument, for
-example `-cache-budget 100Gi` on small disks and `200Gi` on large ones (the
-numbers here are placeholders); with the defaults (`share 0.5`, `reserve 15Gi`)
+The node plugin's gauges carry no `node` label of their own, so the scrape
+configuration must attach one, or the `on(node)` join matches nothing. With
+Prometheus-style pod discovery, a relabel rule such as:
+
+```yaml
+- source_labels: [__meta_kubernetes_pod_node_name]
+  target_label: node
+```
+
+An absolute budget is a node argument (`-cache-budget <budget>`, a quantity
+such as `50Gi`, an example only); with the defaults (`share 0.5`, `reserve 15Gi`)
 the budget is half the cache file system less 15Gi.
 
 ## VolumeCondition
