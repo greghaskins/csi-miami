@@ -128,6 +128,25 @@ func TestControllerFlagsWebhook(t *testing.T) {
 			}
 		}
 	})
+	t.Run("bracketed pod IP addresses are valid, IPv4 and IPv6", func(t *testing.T) {
+		for _, addr := range []string{"[10.1.2.3]:9814", "[fd00::1]:9814", "[2001:db8::7]:9814"} {
+			cfg := controllerConfig{webhookAddr: addr, webhookSyncInterval: time.Second, namespace: "ns", webhookService: "s", webhookConfig: "c"}
+			if msg := cfg.validateWebhook(); msg != "" {
+				t.Errorf("%s: %s", addr, msg)
+			}
+		}
+		// What the manifest expands to when POD_IP is an IPv6 address would not
+		// be valid without the brackets.
+		cfg := controllerConfig{webhookAddr: "fd00::1:9814", webhookSyncInterval: time.Second, namespace: "ns", webhookService: "s", webhookConfig: "c"}
+		if cfg.validateWebhook() == "" {
+			t.Error("an unbracketed IPv6 address passed validation")
+		}
+		l, err := net.Listen("tcp", "[127.0.0.1]:0")
+		if err != nil {
+			t.Fatalf("a bracketed IPv4 address cannot be listened on: %v", err)
+		}
+		_ = l.Close()
+	})
 	t.Run("bad address exits 2", func(t *testing.T) {
 		t.Setenv("POD_NAMESPACE", "miami-system")
 		var errb bytes.Buffer

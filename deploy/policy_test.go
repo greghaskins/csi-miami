@@ -860,10 +860,11 @@ func TestControllerDeployment(t *testing.T) {
 	if got := flagValue(t, m.Args, "transports-root"); got != "/var/lib/miami" {
 		t.Errorf("--transports-root = %q", got)
 	}
-	// The webhook binds the pod's own IP (the host's, on the host network), not
-	// every interface of the node: the API server does not authenticate to it,
-	// and the port is reachable from the node's whole network.
-	for _, a := range []string{"--webhook-addr=$(POD_IP):9814", "--webhook-config=miami-cache"} {
+	// The webhook binds the pod's own IP (the node's, on the host network), in
+	// brackets so an IPv6 address stays a valid host:port. That does not restrict
+	// who can reach it: the API server does not authenticate to it, and the
+	// concurrency bound and the separate limiter are what bound a forged review.
+	for _, a := range []string{"--webhook-addr=[$(POD_IP)]:9814", "--webhook-config=miami-cache"} {
 		if !hasArg(m.Args, a) {
 			t.Errorf("miami lacks %s", a)
 		}
@@ -2001,7 +2002,7 @@ func TestCertManagerComponent(t *testing.T) {
 	if got := flagValue(t, m.Args, "webhook-tls-secret"); got != "miami-webhook-tls-managed" {
 		t.Errorf("--webhook-tls-secret = %q, want miami-webhook-tls-managed", got)
 	}
-	if got := flagValue(t, m.Args, "webhook-addr"); got != "$(POD_IP):9814" {
+	if got := flagValue(t, m.Args, "webhook-addr"); got != "[$(POD_IP)]:9814" {
 		t.Errorf("--webhook-addr = %q", got)
 	}
 

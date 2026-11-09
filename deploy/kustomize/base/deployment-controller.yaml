@@ -44,10 +44,13 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --transports-root=/var/lib/miami
             - --metrics-addr=:9811
-            # The pod's own IP, not every interface of the node: the API server
-            # does not authenticate to the webhook, and the pod is on the host
-            # network. The kubelet expands $(POD_IP) from the env below.
-            - --webhook-addr=$(POD_IP):9814
+            # The pod's own IP, not every address of the host. This does NOT
+            # restrict who can reach the webhook: on the host network the pod IP
+            # is the node's, and the API server does not authenticate to it. What
+            # bounds a forged review is the webhook's concurrency limit and its
+            # own rate limiter. The brackets keep an IPv6 address a valid
+            # host:port. The kubelet expands $(POD_IP) from the env below.
+            - --webhook-addr=[$(POD_IP)]:9814
             - --webhook-config=miami-cache
           env:
             # The namespace of the webhook's Secret.

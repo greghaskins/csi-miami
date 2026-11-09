@@ -28,7 +28,7 @@ import (
 
 // Defaults of the webhook's flags.
 const (
-	defaultWebhookAddr       = ":9814"             // the manifests bind $(POD_IP):9814 instead
+	defaultWebhookAddr       = ":9814"             // the manifests bind [$(POD_IP)]:9814 instead
 	defaultWebhookSecret     = "miami-webhook-tls" //nolint:gosec // a Secret's name
 	defaultWebhookConfig     = "miami-cache"
 	defaultWebhookService    = "miami-webhook"

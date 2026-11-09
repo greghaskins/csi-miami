@@ -650,9 +650,9 @@ func TestCacheMetrics(t *testing.T) {
 		}
 	}
 	on := New(WithCacheCapacity())
-	on.SetCacheCapacity(95<<30, 220<<30, 100<<30)
+	on.SetCacheCapacity(100<<30, 256<<30, 64<<30)
 	on.SetCacheCommitted(30 << 30)
-	want := []float64{95 << 30, 30 << 30, 220 << 30, 100 << 30}
+	want := []float64{100 << 30, 30 << 30, 256 << 30, 64 << 30}
 	for i, n := range names {
 		f := family(t, on, n)
 		if f == nil || len(f.GetMetric()) != 1 {

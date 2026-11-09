@@ -536,7 +536,7 @@ spec:
         - --endpoint=unix:///csi/csi.sock
         - --transports-root=/var/lib/miami
         - --metrics-addr=:9811
-        - --webhook-addr=$(POD_IP):9814
+        - --webhook-addr=[$(POD_IP)]:9814
         - --webhook-config=miami-cache
         env:
         - name: POD_NAMESPACE

@@ -298,9 +298,12 @@ is absent by design, so the flap would be invisible.
 > deletes, nor the other way round), and at most 16 `Mutate` calls resolve
 > claims at once: a call over the bound is answered at once with the strip
 > patch and counted as `error`, never blocked. It listens on the pod's own IP
-> (`--webhook-addr=$(POD_IP):9814`, the downward API) instead of every
-> interface of the host-network pod, since the API server does not authenticate
-> to it and anything on the node's network could otherwise post forged reviews.
+> (`--webhook-addr=[$(POD_IP)]:9814`, the downward API) instead of every
+> address of the host (the brackets keep an IPv6 address valid). That does not
+> restrict who can reach it: on the host network the pod IP is the node's, and
+> the API server does not authenticate to the webhook, so anything on the node's
+> network can still post forged reviews. What bounds them is the concurrency
+> limit and the separate rate limiter above.
 > In self-signed mode the controller labels the Secret it creates
 > (`app.kubernetes.io/managed-by: miami-controller`) and never overwrites a
 > Secret it did not create or one without `ca.key`: that is an Error naming

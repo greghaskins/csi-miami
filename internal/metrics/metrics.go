@@ -73,8 +73,8 @@ const (
 	NameWebhookMutations  = "miami_webhook_mutations_total"
 	NameWebhookUnresolved = "miami_webhook_unresolved_total"
 
-	// NameWebhookServing is 1 once the webhook has loaded a serving
-	// certificate, in both TLS modes. With failurePolicy Ignore a webhook that
+	// NameWebhookServing is 1 while the webhook has a valid serving
+	// certificate loaded, in both TLS modes. With failurePolicy Ignore a webhook that
 	// cannot serve skips accounting silently; with cert-manager's Secret absent
 	// or incomplete this is the only signal.
 	NameWebhookServing = "miami_webhook_serving"
@@ -311,7 +311,7 @@ func New(opts ...Option) *Registry {
 	r.webhookRefused = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: NameWebhookSecretRefused, Help: "Passes in which the self-signed webhook found a Secret under its TLS Secret name that it did not create (no ownership label, or no ca.key) and so left alone. Something else probably manages it: run the controller with -webhook-tls-secret naming it.",
 	})
-	r.webhookServing = gauge(NameWebhookServing, "Whether the webhook has loaded a serving certificate: 1 it has, 0 it has not (the Secret is absent or unusable, or the first sync has not run). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
+	r.webhookServing = gauge(NameWebhookServing, "Whether the webhook has a valid serving certificate loaded: 1 it has, 0 it has not (the Secret is absent or unusable, the first sync has not run, or the loaded certificate has expired and nothing replaced it). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	r.webhookConfigOK = gauge(NameWebhookConfigOK, "Whether the webhook configuration carries this controller's CA in the caBundle of every webhook: 1 it does, 0 it does not (or could not be read). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	for _, o := range WebhookOutcomes {
 		r.webhookMutations.WithLabelValues(o)

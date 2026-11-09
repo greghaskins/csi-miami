@@ -275,8 +275,8 @@ func TestNodeFlagsCacheBudget(t *testing.T) {
 	if err != nil || got != (cachecap.Config{Accounting: true, Share: 0.5, Reserve: 15 * gi}) {
 		t.Errorf("defaults = %+v, %v", got, err)
 	}
-	if got, err = parse("-cache-budget=100Gi"); err != nil || !got.HaveAbsolute || got.Absolute != 100*gi {
-		t.Errorf("-cache-budget=100Gi = %+v, %v", got, err)
+	if got, err = parse("-cache-budget=64Gi"); err != nil || !got.HaveAbsolute || got.Absolute != 64*gi {
+		t.Errorf("-cache-budget=64Gi = %+v, %v", got, err)
 	}
 	if got, err = parse("-cache-budget=0"); err != nil || !got.HaveAbsolute || got.Absolute != 0 {
 		t.Errorf("-cache-budget=0 = %+v, %v", got, err)

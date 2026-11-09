@@ -389,6 +389,16 @@ type CertStore struct {
 // Set replaces the certificate served from now on.
 func (c *CertStore) Set(cert *tls.Certificate) { c.cur.Store(cert) }
 
+// usable reports whether a certificate is loaded and valid at now.
+func (c *CertStore) usable(now time.Time) bool {
+	cert := c.cur.Load()
+	if cert == nil || len(cert.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	return err == nil && !now.Before(leaf.NotBefore) && now.Before(leaf.NotAfter)
+}
+
 // GetCertificate implements tls.Config.GetCertificate. Before the first
 // certificate is loaded it fails the handshake.
 func (c *CertStore) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {

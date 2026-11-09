@@ -36,6 +36,9 @@ type Runner struct {
 	// warnedUnknown: the failed passes of the current unknown verdict have
 	// been logged at Warn once already.
 	warnedUnknown bool
+	// lastHeld is the figure advertised on the last pass that could read the
+	// commitment; an unreadable commitment never drops the figure below it.
+	lastHeld int64
 	// advertised: a figure has been advertised since the runner started.
 	advertised bool
 	// holding: the advertised figure is being held at the committed figure
@@ -236,8 +239,9 @@ func (r *Runner) Pass(ctx context.Context) error {
 	// restarts, and fails the ones that no longer fit; a lowered budget must
 	// not do that, so it takes effect as volumes leave. The stage check still
 	// uses the budget, so no new volume is let in over it. An unreadable
-	// commitment is no reason to advertise anything but the budget.
-	advertised := budget
+	// commitment is no reason to advertise less than the last figure held: the
+	// pods it covered are still there.
+	advertised := max(budget, r.lastHeld)
 	if committedKnown && committed > budget {
 		advertised = roundUpMiB(committed)
 		if !r.holding {
@@ -247,6 +251,10 @@ func (r *Runner) Pass(ctx context.Context) error {
 		}
 	} else if committedKnown {
 		r.holding = false
+		advertised = budget
+	}
+	if committedKnown {
+		r.lastHeld = advertised
 	}
 	r.metrics.SetCacheAdvertised(advertised)
 

@@ -186,6 +186,8 @@ func TestControllerWebhookConfigPolicy(t *testing.T) {
 		{"a label", "[metadata]", jsonPatch(op("add", "/metadata/labels", `{"example.com/x":"y"}`))},
 		{"an annotation", "[metadata]", jsonPatch(op("add", "/metadata/annotations", `{"example.com/x":"y"}`))},
 		{"forging an Apply managedFields entry", "[metadata]", jsonPatch(op("add", "/metadata/managedFields/-", `{"manager":"someone","operation":"Apply","apiVersion":"admissionregistration.k8s.io/v1","fieldsType":"FieldsV1","fieldsV1":{"f:webhooks":{}}}`))},
+		{"changing ownerReferences", "[metadata]", jsonPatch(op("add", "/metadata/ownerReferences", `[{"apiVersion":"v1","kind":"ConfigMap","name":"o","uid":"00000000-0000-0000-0000-000000000001"}]`))},
+		{"removing the webhook entry", "[webhooks]", jsonPatch(op("remove", "/webhooks/0", ""))},
 		{"a finalizer", "[metadata]", jsonPatch(op("add", "/metadata/finalizers", `["example.com/f"]`))},
 	}
 	for _, f := range forbidden {
