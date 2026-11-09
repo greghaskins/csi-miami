@@ -1,6 +1,6 @@
 # Scheduling node-local cache capacity
 
-**Status:** Approved by the owner on 2026-11-07 (decision 66); the implementation plan follows
+**Status:** Implemented (2026-11-09), with the amendments marked below; approved by the owner on 2026-11-07 (decision 66). The plan is `2026-11-08-cache-capacity-implementation-plan.md`
 **Created:** 2026-11-07
 **Reads with:** `2026-11-03-chunk-backed-volumes-design.md` (4.3, the cache; decisions 54, 59), `2026-10-30-architecture-brief.md` (decision log), `docs/operating-volumes.md` (node layout, monitoring)
 
@@ -156,6 +156,16 @@ base's policy fails closed (the patch is refused, the node advertises nothing,
 the stage check still runs on the flags' budget); no controller-side fallback
 is built for that case.
 
+> **Amendment 2026-11-09.** The status endpoint does not reset `metadata`, so
+> the policy pins more than one capacity key: `metadata.labels`, `annotations`,
+> `finalizers` and `ownerReferences` hold still too, and so does every
+> `managedFields` entry whose operation is `Apply` (the rest of `managedFields`
+> is free, since the node's own patches change it). The node also probes the
+> fence and exports the verdict as `miami_cache_fence_state{state}`; unless it
+> is `fenced` the node advertises nothing. The cadence, the expected denial
+> rates and the alert are in the README ("Cache capacity metrics and the fence
+> probe"), which holds the full text.
+
 **Alternative considered:** the controller patching every node's capacity
 from a budget it computes from `status.capacity.ephemeral-storage`. One
 principal and no per-node token trick, but it cannot see a cache directory
@@ -166,7 +176,7 @@ the policy; it stays the fallback if the token extra is unavailable.
 ### 4.4 The webhook
 
 **Where it runs.** In the controller Deployment, as a second listener
-(`-webhook-addr`, default `:9812`), because the controller already holds the
+(`-webhook-addr`, default `:9814`; amended 2026-11-09, see "Reaching it"), because the controller already holds the
 cluster-wide read access the lookups need, is the one place that knows the
 class parameters' defaults, and is a single replica whose restart is quick. A
 `MutatingWebhookConfiguration` in the base matches pods, `CREATE` only,
@@ -208,8 +218,9 @@ containers get nothing. A pod with no volume of this kind is admitted
 unchanged, except that a stray request of the resource is removed.
 
 **Reaching it.** The controller runs on the host network, so the webhook's
-port is a host port: `9812` is one of the four the driver already reserves
-(`9810` to `9813`), and a ClusterIP Service selecting the controller pod gives
+port is a host port. *Amended 2026-11-09:* it is `9814`, a fifth reserved
+port beside `9810` to `9813`; `9812` is the node's health port and both pods
+are host-network, so reusing it would collide. A ClusterIP Service selecting the controller pod gives
 the API server a stable name for it (a Service selects host-network pods like
 any other; its endpoint is the node's address and the host port).
 
@@ -232,6 +243,21 @@ rule is needed in both modes: the cainjector writes the live field just as the
 controller does, Argo CD's default diff does not ignore it, so self-heal would
 flap it between empty and filled; and in managed mode `miami_webhook_config_ok`
 is absent by design, so the flap would be invisible.
+
+> **Amendment 2026-11-09.** The webhook never fails admission. On an error of
+> its own (a lookup error, the 7 second deadline, more than 64 distinct claims
+> in a pod, a panic) it admits the pod with the cache resource removed from
+> every container, counted as `miami_webhook_mutations_total{outcome="error"}`,
+> so a hand-set value cannot survive by making the webhook fail. A request
+> body is bounded at 8 MiB, above the API server's own limit. The cert-manager
+> component bootstraps a CA chain: a self-signed Issuer, a long-lived CA
+> Certificate, a CA Issuer from it, and the serving Certificate signed by that,
+> with the injector annotation naming the serving Certificate. The serving
+> certificate then renews without the CA changing. `miami_webhook_config_ok` is
+> registered in self-signed mode only. Enabling the component on a running
+> self-signed install needs a one-time cleanup, because the cainjector merges a
+> new CA into the existing `caBundle`: empty `webhooks[].clientConfig.caBundle`
+> and delete the Secret `miami-webhook-tls`.
 
 **Failure policy.** `Ignore`, with the stage check as the net. With `Fail`,
 the controller being down (an upgrade, a crash loop, a node drain) stops every
@@ -315,8 +341,16 @@ into that window is refused retryably and proceeds when the drain ends; that
 is the intended outcome, not a bug, and the drain's own stuck alert covers a
 drain that never ends.
 
+> **Amendment 2026-11-09.** The footprints are at the served size (the grown
+> size raises both the size and the whole-volume cache bound, as `raiseSize`
+> does). `miami_cache_committed_bytes` is the check's own sum over all drain
+> records, so it includes caches awaiting a discard (a volume taken over by
+> another node before its old holder discarded). It is not "staged volumes
+> only", so an alert on committed over budget and the check agree. A fresh
+> stage leaves out the volume's own record. Intent records are not read.
+
 **Metrics** (node, per pass): `miami_cache_budget_bytes`,
-`miami_cache_committed_bytes` (the sum above, staged volumes only),
+`miami_cache_committed_bytes` (the sum above; amended 2026-11-09: over all drain records, not staged volumes only),
 `miami_cache_fs_size_bytes` and `miami_cache_fs_free_bytes` (`statfs` of the
 cache directory's file system), and the webhook's `miami_webhook_mutations_total`
 by outcome and `miami_webhook_unresolved_total`.
@@ -332,7 +366,7 @@ recording rule above being non-zero for longer than a rollout; and
 
 | Principal | New permission | Narrowing |
 |---|---|---|
-| node plugin | `nodes/status` patch | ValidatingAdmissionPolicy: own node only (bound-token `node-name`), one capacity key only |
+| node plugin | `nodes/status` patch | ValidatingAdmissionPolicy: own node only (bound-token `node-name`), one capacity key only (amended 2026-11-09: metadata is pinned too, see 4.3) |
 | controller | `persistentvolumeclaims` get (all namespaces), `storageclasses` get | reads only; both already readable by the sidecars |
 | controller | `mutatingwebhookconfigurations` get and patch | `resourceNames` of the one object; only when self-signed TLS is used |
 | controller | `secrets` get, create and update in `miami-system` | `resourceNames: [miami-webhook-tls]`; absent when `-webhook-tls-secret` names a managed Secret |
@@ -346,8 +380,10 @@ delete or evict anything.
    and check, the webhook and the policy. All of it is on by default in the
    base (the webhook with `Ignore`, the advertisement with the default share
    and reserve): a base that ships the check off ships the problem. An overlay
-   that must opt out sets `-cache-budget 0`, which advertises nothing and
-   disables the check, and labels its namespaces out of the webhook.
+   that must opt out sets `-cache-accounting=false` and labels its namespaces
+   out of the webhook. *Amended 2026-11-09:* `-cache-budget 0` is a budget of
+   zero (advertises `0`, refuses every fresh volume), as 4.3 says; it is not
+   an off switch.
 2. In the cluster: the node plugins advertise and begin checking; existing
    pods are unaccounted (4.6); the recording rule shows the gap.
 3. Rolling restarts of the workloads with volumes, in the order the operator
