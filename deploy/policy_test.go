@@ -860,7 +860,10 @@ func TestControllerDeployment(t *testing.T) {
 	if got := flagValue(t, m.Args, "transports-root"); got != "/var/lib/miami" {
 		t.Errorf("--transports-root = %q", got)
 	}
-	for _, a := range []string{"--webhook-addr=:9814", "--webhook-config=miami-cache"} {
+	// The webhook binds the pod's own IP (the host's, on the host network), not
+	// every interface of the node: the API server does not authenticate to it,
+	// and the port is reachable from the node's whole network.
+	for _, a := range []string{"--webhook-addr=$(POD_IP):9814", "--webhook-config=miami-cache"} {
 		if !hasArg(m.Args, a) {
 			t.Errorf("miami lacks %s", a)
 		}
@@ -871,9 +874,12 @@ func TestControllerDeployment(t *testing.T) {
 			t.Errorf("the base sets %s; only the cert-manager component does", a)
 		}
 	}
-	wantEnv := []corev1.EnvVar{{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}}}
+	wantEnv := []corev1.EnvVar{
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+		{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
+	}
 	if !reflect.DeepEqual(m.Env, wantEnv) {
-		t.Errorf("miami env = %+v, want POD_NAMESPACE from the downward API", m.Env)
+		t.Errorf("miami env = %+v, want POD_NAMESPACE and POD_IP from the downward API", m.Env)
 	}
 	hasWebhookPort := false
 	for _, cp := range m.Ports {
@@ -994,7 +1000,7 @@ func TestPortsDistinct(t *testing.T) {
 	}
 	port := func(addr string) int {
 		t.Helper()
-		n, err := strconv.Atoi(strings.TrimPrefix(addr, ":"))
+		n, err := strconv.Atoi(addr[strings.LastIndex(addr, ":")+1:])
 		if err != nil {
 			t.Fatalf("address %q: %v", addr, err)
 		}
@@ -1909,7 +1915,7 @@ func TestCertManagerComponent(t *testing.T) {
 	if got := flagValue(t, m.Args, "webhook-tls-secret"); got != "miami-webhook-tls-managed" {
 		t.Errorf("--webhook-tls-secret = %q, want miami-webhook-tls-managed", got)
 	}
-	if got := flagValue(t, m.Args, "webhook-addr"); got != ":9814" {
+	if got := flagValue(t, m.Args, "webhook-addr"); got != "$(POD_IP):9814" {
 		t.Errorf("--webhook-addr = %q", got)
 	}
 

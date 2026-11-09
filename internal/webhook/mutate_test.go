@@ -928,6 +928,48 @@ func TestSlowClaimsHitTheDeadline(t *testing.T) {
 	errored(t, h, resp, pod)
 }
 
+func TestFullSemaphoreStripsAtOnce(t *testing.T) {
+	h := newHarness(t)
+	h.claims.hang = make(chan struct{})
+	t.Cleanup(func() { close(h.claims.hang) })
+	h.m.MaxInFlight = 1
+	h.m.Deadline = time.Minute
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		h.m.Mutate(context.Background(), review(rawOf(t, strayPod(claimVol("v", "data")))))
+	}()
+	// Wait until the first call holds the only slot.
+	deadline := time.Now().Add(5 * time.Second)
+	for h.m.inflight.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the first call never took a slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	start := time.Now()
+	resp, pod := h.run(rawOf(t, strayPod(claimVol("v", "data"))))
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the full call blocked for %v", d)
+	}
+	errored(t, h, resp, pod)
+	if got := h.m.inflight.Load(); got != 1 {
+		t.Fatalf("in flight = %d after the refused call, want 1 (the first)", got)
+	}
+}
+
+func TestSlotIsReleasedAfterTheCall(t *testing.T) {
+	h := newHarness(t)
+	h.m.MaxInFlight = 1
+	for i := 0; i < 3; i++ {
+		h.met.outcomes = nil
+		h.run(rawOf(t, testPod()))
+	}
+	if got := h.m.inflight.Load(); got != 0 {
+		t.Fatalf("in flight = %d, want 0", got)
+	}
+}
+
 func TestDefaultDeadlineIsBelowTheWebhookTimeout(t *testing.T) {
 	if mutateDeadline >= 10*time.Second {
 		t.Fatalf("mutateDeadline %v must be below the webhook's timeoutSeconds 10", mutateDeadline)

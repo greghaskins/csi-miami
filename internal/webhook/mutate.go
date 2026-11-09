@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -47,19 +48,32 @@ const (
 	// makes the webhook look up, so a pod with thousands of volumes cannot
 	// turn one CREATE into thousands of API reads.
 	maxClaimLookups = 64
+
+	// maxInFlight bounds the Mutate calls that resolve claims at once. Each
+	// costs API reads, so a flood of reviews (a burst of pods, or forged
+	// reviews from the node's network) must not turn into an unbounded number
+	// of reads. A call over the bound is answered at once with the strip patch
+	// and counted as error; it never waits.
+	maxInFlight = 16
 )
 
 // errTooManyClaims is the pod having more claims than maxClaimLookups.
 var errTooManyClaims = errors.New("the pod has more claims than the webhook will look up")
 
 // Mutator turns a pod CREATE into the JSON patch that requests the pod's
-// cache footprint. It holds no state and is safe for concurrent use.
+// cache footprint. It is safe for concurrent use; its only state is the count
+// of calls in flight.
 type Mutator struct {
 	Claims  Claims
 	Metrics Metrics
 	Log     *slog.Logger
 	// Deadline bounds one Mutate call; zero means mutateDeadline.
 	Deadline time.Duration
+	// MaxInFlight bounds the concurrent calls that resolve claims; zero means
+	// maxInFlight.
+	MaxInFlight int
+
+	inflight atomic.Int32
 }
 
 // NewMutator returns a Mutator, or an error when it would have nothing to
@@ -131,6 +145,16 @@ func (m *Mutator) Mutate(ctx context.Context, req *admissionv1.AdmissionRequest)
 		m.outcome(outcomeUnchanged)
 		return resp
 	}
+
+	limit := m.MaxInFlight
+	if limit <= 0 {
+		limit = maxInFlight
+	}
+	if int(m.inflight.Add(1)) > limit {
+		m.inflight.Add(-1)
+		return m.failed(resp, raw, req, errors.New("too many admissions in flight"))
+	}
+	defer m.inflight.Add(-1)
 
 	sum, err := m.footprint(ctx, req.Namespace, &pod)
 	if err != nil {

@@ -44,7 +44,10 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --transports-root=/var/lib/miami
             - --metrics-addr=:9811
-            - --webhook-addr=:9814
+            # The pod's own IP, not every interface of the node: the API server
+            # does not authenticate to the webhook, and the pod is on the host
+            # network. The kubelet expands $(POD_IP) from the env below.
+            - --webhook-addr=$(POD_IP):9814
             - --webhook-config=miami-cache
           env:
             # The namespace of the webhook's Secret.
@@ -52,6 +55,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Where the webhook binds (see --webhook-addr).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - name: metrics
               containerPort: 9811
