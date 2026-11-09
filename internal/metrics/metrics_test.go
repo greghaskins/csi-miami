@@ -825,3 +825,23 @@ func TestWebhookSecretRefusedCounter(t *testing.T) {
 		t.Errorf("refused = %v, want 2", got)
 	}
 }
+
+func TestWebhookServingGauge(t *testing.T) {
+	t.Parallel()
+	if family(t, New(WithReconciler()), NameWebhookServing) != nil {
+		t.Errorf("%s exposed without WithWebhook", NameWebhookServing)
+	}
+	r := New(WithWebhook())
+	get := func() float64 { return family(t, r, NameWebhookServing).GetMetric()[0].GetGauge().GetValue() }
+	if get() != 0 {
+		t.Errorf("serving starts at %v, want 0", get())
+	}
+	r.SetWebhookServing(true)
+	if get() != 1 {
+		t.Errorf("serving = %v, want 1", get())
+	}
+	r.SetWebhookServing(false)
+	if get() != 0 {
+		t.Errorf("serving = %v, want 0", get())
+	}
+}

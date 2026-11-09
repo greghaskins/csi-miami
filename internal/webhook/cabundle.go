@@ -25,6 +25,10 @@ var _ Configs = (*kube.Client)(nil)
 // the bundle (miami_webhook_config_ok).
 type ConfigGauge interface{ SetWebhookConfigOK(ok bool) }
 
+// ServingGauge is where the syncer reports whether a serving certificate has
+// been loaded (miami_webhook_serving).
+type ServingGauge interface{ SetWebhookServing(serving bool) }
+
 // CABundleAsserter keeps the caBundle of every webhook of one
 // MutatingWebhookConfiguration equal to the CA the controller serves with. The
 // base ships the field empty and a re-apply of it wipes the bundle, so this
@@ -100,6 +104,10 @@ type Syncer struct {
 	Store    *CertStore
 	Interval time.Duration
 	Log      *slog.Logger
+	// Serving, when set, reports whether a certificate has been loaded: 0
+	// until the first pass that loads one, then 1. In managed mode it is the
+	// only sign that the Secret cert-manager writes is there and usable.
+	Serving ServingGauge
 }
 
 func (s *Syncer) log() *slog.Logger {
@@ -118,6 +126,9 @@ func (s *Syncer) Pass(ctx context.Context) error {
 	}
 	cert := m.Cert
 	s.Store.Set(&cert)
+	if s.Serving != nil {
+		s.Serving.SetWebhookServing(true)
+	}
 	if s.Asserter != nil {
 		return s.Asserter.Assert(ctx, m.CA)
 	}

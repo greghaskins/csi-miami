@@ -302,7 +302,7 @@ func newWebhookServer(cfg controllerConfig, wb webhookBackend, reg *metrics.Regi
 			Secrets: wb.secrets, Namespace: cfg.namespace, Name: name, Service: cfg.webhookService,
 			Managed: managed, Log: log, Metrics: reg,
 		},
-		Store: store, Interval: cfg.webhookSyncInterval, Log: log,
+		Store: store, Interval: cfg.webhookSyncInterval, Log: log, Serving: reg,
 	}
 	if !managed {
 		// With a Secret someone else manages, the configuration is theirs too

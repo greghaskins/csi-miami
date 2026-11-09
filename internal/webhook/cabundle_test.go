@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -223,6 +224,50 @@ func TestSyncerManagedNeverTouchesTheConfiguration(t *testing.T) {
 	}
 	if _, err := store.GetCertificate(nil); err != nil {
 		t.Error(err)
+	}
+}
+
+type servingGauge struct{ vals []bool }
+
+func (g *servingGauge) SetWebhookServing(v bool) { g.vals = append(g.vals, v) }
+
+// TestSyncerReportsServing: the gauge says a certificate is loaded in both TLS
+// modes, and stays unset while the Secret is not ready.
+func TestSyncerReportsServing(t *testing.T) {
+	t.Parallel()
+	for _, managed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "self-signed", true: "managed"}[managed], func(t *testing.T) {
+			t.Parallel()
+			g := &fakeSecrets{}
+			if managed {
+				h := &fakeSecrets{}
+				_, _ = newSource(h, t0).Load(context.Background())
+				d := maps.Clone(h.secret.Data)
+				delete(d, "ca.key")
+				g.secret = &kube.Secret{Data: d}
+			}
+			src := newSource(g, t0)
+			src.Managed = managed
+			gauge := &servingGauge{}
+			s := &Syncer{TLS: src, Store: &CertStore{}, Interval: time.Hour, Serving: gauge, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			if err := s.Pass(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(gauge.vals) != 1 || !gauge.vals[0] {
+				t.Errorf("serving reports = %v, want [true]", gauge.vals)
+			}
+		})
+	}
+	// Not ready: nothing is reported, so the gauge stays at its initial 0.
+	src := newSource(&fakeSecrets{}, t0)
+	src.Managed = true
+	gauge := &servingGauge{}
+	s := &Syncer{TLS: src, Store: &CertStore{}, Interval: time.Hour, Serving: gauge, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if err := s.Pass(context.Background()); err == nil {
+		t.Fatal("a pass without a Secret succeeded")
+	}
+	if len(gauge.vals) != 0 {
+		t.Errorf("serving reports = %v, want none", gauge.vals)
 	}
 }
 

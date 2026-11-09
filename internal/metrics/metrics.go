@@ -73,6 +73,12 @@ const (
 	NameWebhookMutations  = "miami_webhook_mutations_total"
 	NameWebhookUnresolved = "miami_webhook_unresolved_total"
 
+	// NameWebhookServing is 1 once the webhook has loaded a serving
+	// certificate, in both TLS modes. With failurePolicy Ignore a webhook that
+	// cannot serve skips accounting silently; with cert-manager's Secret absent
+	// or incomplete this is the only signal.
+	NameWebhookServing = "miami_webhook_serving"
+
 	// NameWebhookSecretRefused counts passes that found a Secret under the
 	// webhook's TLS Secret name that the controller did not create and so
 	// would not overwrite.
@@ -160,6 +166,7 @@ type Registry struct {
 	webhookUnresolved prometheus.Counter
 	webhookRefused    prometheus.Counter
 	webhookConfigOK   prometheus.Gauge
+	webhookServing    prometheus.Gauge
 
 	cachePatchFailures *prometheus.CounterVec
 	cacheFenceState    *prometheus.GaugeVec
@@ -303,6 +310,7 @@ func New(opts ...Option) *Registry {
 	r.webhookRefused = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: NameWebhookSecretRefused, Help: "Passes in which the self-signed webhook found a Secret under its TLS Secret name that it did not create (no ownership label, or no ca.key) and so left alone. Something else probably manages it: run the controller with -webhook-tls-secret naming it.",
 	})
+	r.webhookServing = gauge(NameWebhookServing, "Whether the webhook has loaded a serving certificate: 1 it has, 0 it has not (the Secret is absent or unusable, or the first sync has not run). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	r.webhookConfigOK = gauge(NameWebhookConfigOK, "Whether the webhook configuration carries this controller's CA in the caBundle of every webhook: 1 it does, 0 it does not (or could not be read). With failurePolicy Ignore a 0 means every pod skips cache accounting.")
 	for _, o := range WebhookOutcomes {
 		r.webhookMutations.WithLabelValues(o)
@@ -345,12 +353,21 @@ func New(opts ...Option) *Registry {
 		r.reg.MustRegister(r.cachePatchFailures)
 	}
 	if o.webhook {
-		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved, r.webhookRefused)
+		r.reg.MustRegister(r.webhookMutations, r.webhookUnresolved, r.webhookRefused, r.webhookServing)
 	}
 	if o.webhookConfig {
 		r.reg.MustRegister(r.webhookConfigOK)
 	}
 	return r
+}
+
+// SetWebhookServing sets miami_webhook_serving.
+func (r *Registry) SetWebhookServing(serving bool) {
+	v := 0.0
+	if serving {
+		v = 1
+	}
+	r.webhookServing.Set(v)
 }
 
 // SetWebhookConfigOK sets miami_webhook_config_ok.
