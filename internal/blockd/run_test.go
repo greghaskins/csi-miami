@@ -5,9 +5,13 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/greghaskins/csi-miami/internal/nbd"
 )
@@ -24,6 +28,8 @@ type fakeKernel struct {
 	reconnects   int
 	disconnects  []int
 	drops        int
+	killFirst    int // the first killFirst reconnects adopt a socket the kernel then shuts down
+	live         int // reconnects that adopted a socket still usable
 	reconnectErr error
 	onTouch      func() // runs in touch before the request is sent
 	resizes      []int64
@@ -72,7 +78,52 @@ func (k *fakeKernel) reconnect(_ context.Context, _ int, sock *os.File) error {
 	if k.reconnectErr != nil {
 		return k.reconnectErr
 	}
+	if k.reconnects <= k.killFirst {
+		// The kernel adopts the socket and its stale receive thread then marks
+		// the slot dead, shutting the socket down before a request is sent.
+		if err := shutdownFile(sock); err != nil {
+			return err
+		}
+	}
+	// Only a socket that is not shut down can carry the held request.
+	if hungUp(sock) {
+		return k.hold(sock)
+	}
+	k.live++
 	return k.hold(sock)
+}
+
+func hungUp(f *os.File) bool {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return true
+	}
+	var hup bool
+	_ = rc.Control(func(fd uintptr) {
+		fds := []unix.PollFd{{Fd: int32(fd)}} //nolint:gosec // fd fits int32
+		if n, err := unix.Poll(fds, 0); err == nil && n > 0 {
+			hup = fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0
+		}
+	})
+	return hup
+}
+
+func shutdownFile(f *os.File) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if err := rc.Control(func(fd uintptr) { serr = unix.Shutdown(int(fd), unix.SHUT_RDWR) }); err != nil {
+		return err
+	}
+	return serr
+}
+
+// serveGoroutines counts running nbd.Serve loops.
+func serveGoroutines() int {
+	buf := make([]byte, 1<<20)
+	return strings.Count(string(buf[:runtime.Stack(buf, true)]), "internal/nbd.Serve(")
 }
 
 func (k *fakeKernel) disconnect(_ context.Context, idx int) error {
@@ -101,7 +152,7 @@ func (k *fakeKernel) touch(ctx context.Context, _ int, b nbd.Backend) error {
 	}
 	for {
 		k.mu.Lock()
-		kept := k.reconnects > k.drops
+		kept := k.live > k.drops
 		k.mu.Unlock()
 		if kept {
 			_, err := b.ReadAt(make([]byte, 4096), 0)
@@ -739,5 +790,71 @@ func TestGrowRefusedBeforeTheDeviceIsServed(t *testing.T) {
 	}
 	if s.back.Size() != testSize {
 		t.Fatalf("cache size changed to %d", s.back.Size())
+	}
+}
+
+// The kernel can adopt a re-pointed socket and then shut it down before any
+// request reaches it. The socket is a corpse; issuing the reconfigure again with
+// it can never be confirmed, so the retry must use a fresh socket.
+func TestRunReconfigureRetriesOnAFreshSocketWhenTheKernelShutTheFirst(t *testing.T) {
+	shortConfirm(t)
+	cfg, _ := testConfig(t)
+	seedCache(t, cfg)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}, killFirst: 1}
+	k.cleanup(t)
+	base := serveGoroutines()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+	if _, r, _ := k.counts(); r < 2 {
+		t.Fatalf("reconnects %d, want at least 2 (one shut down, one fresh)", r)
+	}
+	stopRun(t, cancel, done)
+	k.close()
+	assertServeGoroutines(t, base)
+}
+
+func TestRunRepointRetriesOnAFreshSocketWhenTheKernelShutTheFirst(t *testing.T) {
+	shortConfirm(t)
+	cfg, _ := testConfig(t)
+	k := &fakeKernel{connectIdx: 5, killFirst: 1}
+	k.cleanup(t)
+	base := serveGoroutines()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 5)
+	k.close() // the kernel shuts the served socket down; the server re-points
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, r, _ := k.counts(); r >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the device was never re-pointed on a fresh socket")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("run returned %v: the re-point failed", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	stopRun(t, cancel, done)
+	k.close()
+	assertServeGoroutines(t, base)
+}
+
+// Sockets abandoned by a retry are closed and their serve loops end: nothing is
+// left behind once Run returns.
+func assertServeGoroutines(t *testing.T, base int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for serveGoroutines() > base {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d serve loops left running, started with %d", serveGoroutines(), base)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

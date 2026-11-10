@@ -88,11 +88,34 @@ func runChildServer() int {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	if err := Run(ctx, cfg, log); err != nil {
+	var k kernelAPI = realKernel{sysfs: "/sys"}
+	if os.Getenv("BD_SHUT_FIRST_RECONNECT") == "1" {
+		k = &shutFirstReconnect{kernelAPI: k}
+	}
+	if err := runOn(ctx, cfg, log, k); err != nil {
 		fmt.Fprintf(os.Stderr, "child blockd: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// shutFirstReconnect shuts the first socket handed to reconnect down before the
+// kernel gets it, so the kernel adopts a socket that is already dead: the state
+// its stale receive thread leaves when it marks the slot dead after the new
+// socket went in. The child has no left device, so the first reconnect is the
+// re-point. Reachable only from this test binary.
+type shutFirstReconnect struct {
+	kernelAPI
+	once sync.Once
+}
+
+func (k *shutFirstReconnect) reconnect(ctx context.Context, idx int, sock *os.File) error {
+	var err error
+	k.once.Do(func() { err = shutdownFile(sock) })
+	if err != nil {
+		return err
+	}
+	return k.kernelAPI.reconnect(ctx, idx, sock)
 }
 
 // childTimeout is the child's nbd request timeout: BD_TIMEOUT, else 30 s.
@@ -585,8 +608,19 @@ func TestSmokeBlockdRestartKeepsDeviceAndMount(t *testing.T) {
 // throughout. The stall is a Flush made to sleep past a 1 s timeout, by the
 // test child's hook (see runChildServer), triggered by a file the test creates.
 func TestSmokeBlockdRepointsAfterARequestTimeout(t *testing.T) {
+	smokeRepoint(t, "-repoint")
+}
+
+// The same, with the kernel adopting a re-pointed socket that is already shut
+// down (see shutFirstReconnect): the server must retry on a fresh socket
+// rather than reissue the dead one until the device fails its requests.
+func TestSmokeBlockdRepointsWhenTheKernelDropsTheAdoptedSocket(t *testing.T) {
+	smokeRepoint(t, "-repoint-shut", "BD_SHUT_FIRST_RECONNECT=1")
+}
+
+func smokeRepoint(t *testing.T, volSuffix string, extraEnv ...string) {
 	smokeEnv(t)
-	childVolume = smokeVol + "-repoint"
+	childVolume = smokeVol + volSuffix
 	t.Cleanup(func() { childVolume = smokeVol })
 
 	base := t.TempDir()
@@ -623,7 +657,7 @@ func TestSmokeBlockdRepointsAfterARequestTimeout(t *testing.T) {
 		_ = h.Release(rctx)
 	})
 
-	childExtraEnv = []string{"BD_TIMEOUT=1s", "BD_STALL_FILE=" + trigger, "BD_STALL_FOR=3s"}
+	childExtraEnv = append([]string{"BD_TIMEOUT=1s", "BD_STALL_FILE=" + trigger, "BD_STALL_FOR=3s"}, extraEnv...)
 	t.Cleanup(func() { childExtraEnv = nil })
 	cmd := startChild(t, store, cache, control, epoch)
 	cli := dialWait(t, control)
