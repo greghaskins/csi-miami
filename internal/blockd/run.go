@@ -525,7 +525,7 @@ func replaceServing(ctx, runCtx context.Context, s *server, idx int, old *servin
 		return old, fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
 	}
 	_ = old.cli.Close()
-	_ = <-old.err // taken so nothing is left behind; the socket's own death, not news
+	<-old.err //nolint:errcheck // taken so nothing is left behind; the socket's own death, not news
 	if err := nbd.Handshake(ctx, nsv.cli, s.cfg.Size); err != nil {
 		return nsv, fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
 	}
