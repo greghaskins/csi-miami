@@ -85,6 +85,19 @@ func runChildServer() int {
 			}
 		}
 	}
+	if b, err := strconv.ParseInt(os.Getenv("BD_CACHE_BOUND"), 10, 64); err == nil {
+		cfg.CacheBound = b // below the size, so the cache is not prefetched
+	}
+	if f := os.Getenv("BD_STALL_BASE_FILE"); f != "" {
+		// Stall one base fetch of a write, once, for longer than the process
+		// lives, when the test creates the trigger file. Reachable only from
+		// this test binary: baseFetchHook is set nowhere else.
+		baseFetchHook = func(uint32) {
+			if os.Remove(f) == nil {
+				time.Sleep(time.Hour)
+			}
+		}
+	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -725,6 +738,235 @@ func smokeRepoint(t *testing.T, volSuffix string, extraEnv ...string) {
 	unmount(t, mnt)
 	sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer scancel()
+	if err := cli.Stop(sctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	_ = cli.Close()
+}
+
+// directDev is a block device opened for aligned, uncached I/O, so that a
+// write is a request to the server and a read comes from it.
+type directDev struct {
+	fd  int
+	buf []byte
+}
+
+func openDirect(t *testing.T, dev string) *directDev {
+	t.Helper()
+	fd, err := unix.Open(dev, unix.O_RDWR|unix.O_DIRECT|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", dev, err)
+	}
+	buf, err := unix.Mmap(-1, 0, smokeChk, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	if err != nil {
+		t.Fatalf("map buffer: %v", err)
+	}
+	return &directDev{fd: fd, buf: buf}
+}
+
+func (d *directDev) close() {
+	if d.buf == nil {
+		return
+	}
+	_ = unix.Close(d.fd)
+	_ = unix.Munmap(d.buf)
+	d.buf = nil
+}
+
+func (d *directDev) writeAt(p []byte, off int64) error {
+	n := copy(d.buf, p)
+	_, err := unix.Pwrite(d.fd, d.buf[:n], off)
+	return err
+}
+
+func (d *directDev) readAt(n int, off int64) ([]byte, error) {
+	if _, err := unix.Pread(d.fd, d.buf[:n], off); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), d.buf[:n]...), nil
+}
+
+// A write that is stuck in the server's base fetch when the kernel's request
+// timeout shuts the socket must not land after the writes that follow it. The
+// server therefore exits, rather than re-pointing in process, while the stuck
+// request is still in its backend (decision 67); the unit restarts it, and the
+// next server answers the kernel's resend of the write (W1), then the guest's
+// later write to the same blocks (W2). The stuck fetch never finishes: its
+// process is gone, so W2 is what the blocks hold, and the published chunk is
+// the one W2 left. The stall is a base fetch made to sleep by the test child's
+// hook (see runChildServer), triggered by a file the test creates.
+func TestSmokeBlockdExitsInsteadOfRepointingWithAWriteInFlight(t *testing.T) {
+	smokeEnv(t)
+	childVolume = smokeVol + "-fence"
+	t.Cleanup(func() { childVolume = smokeVol })
+
+	base := t.TempDir()
+	store := filepath.Join(base, childVolume)
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunk.Open(store); err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(t.TempDir(), "cache")
+	ctlDir, err := os.MkdirTemp("/tmp", "bd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(ctlDir) })
+	control := filepath.Join(ctlDir, "c.sock")
+	trigger := filepath.Join(ctlDir, "stall")
+
+	actx, acancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer acancel()
+	h, err := holder.Acquire(actx, base, childVolume, smokeNode, holder.Judgement{})
+	if err != nil {
+		t.Fatalf("acquire holder: %v", err)
+	}
+	epoch := h.Epoch()
+	t.Cleanup(func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer rcancel()
+		_ = h.Release(rctx)
+	})
+
+	// Chunk 20 holds a known base, published, so that a server starting from a
+	// fresh cache has to fetch it to write part of it.
+	const target = 20
+	off := int64(target)*smokeChk + 8192
+	baseData := pattern(0x40, smokeChk)
+	cmd := startChild(t, store, cache, control, epoch)
+	cli := dialWait(t, control)
+	d := openDirect(t, deviceFor(t, cli))
+	if err := d.writeAt(baseData, int64(target)*smokeChk); err != nil {
+		t.Fatalf("write the base chunk: %v", err)
+	}
+	d.close()
+	pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer pcancel()
+	if err := cli.Boundary(pctx); err != nil {
+		t.Fatalf("Boundary: %v", err)
+	}
+	if _, err := cli.Publish(pctx, "request"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := cli.Stop(pctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	_ = cli.Close()
+	_ = cmd.Wait()
+
+	// A server on a fresh cache, with a 1 s request timeout and a base fetch
+	// that stalls once.
+	cache = filepath.Join(t.TempDir(), "cache2")
+	childExtraEnv = []string{
+		"BD_TIMEOUT=1s",
+		"BD_CACHE_BOUND=" + strconv.Itoa(smokeSize-smokeChk),
+		"BD_STALL_BASE_FILE=" + trigger,
+	}
+	t.Cleanup(func() { childExtraEnv = nil })
+	cmd = startChild(t, store, cache, control, epoch)
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	cli = dialWait(t, control)
+	idx := deviceIndex(t, cli)
+	_ = cli.Close()
+	dev := fmt.Sprintf("/dev/nbd%d", idx)
+	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w1 := pattern(0x11, 4096)
+	w1done := make(chan error, 1)
+	go func() {
+		wd := openDirect(t, dev)
+		defer wd.close()
+		w1done <- wd.writeAt(w1, off)
+	}()
+
+	select {
+	case <-exited:
+	case <-time.After(60 * time.Second):
+		dumpNBD(t)
+		t.Fatalf("the server did not exit with a write stuck in its backend; its log:\n%s", childLog(cmd))
+	}
+	if code := cmd.ProcessState.ExitCode(); code <= 0 {
+		t.Fatalf("server exit code %d, want a non-zero exit; its log:\n%s", code, childLog(cmd))
+	}
+	if !strings.Contains(childLog(cmd), "still in the backend") {
+		t.Fatalf("the server exited for another reason; its log:\n%s", childLog(cmd))
+	}
+	devs, err := nbd.Devices("/sys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, dv := range devs {
+		if dv.Index == idx {
+			found = dv.Pid != 0 && dv.Backend == childVolume
+		}
+	}
+	if !found {
+		t.Fatalf("nbd%d was disconnected by the exit: %+v", idx, devs)
+	}
+
+	// The next server takes the device back, the kernel resends W1, and the
+	// guest then writes W2 to the same blocks.
+	childExtraEnv = []string{"BD_TIMEOUT=1s", "BD_CACHE_BOUND=" + strconv.Itoa(smokeSize-smokeChk)}
+	cmd = startChild(t, store, cache, control, epoch)
+	cli = dialWait(t, control)
+	if got := deviceIndex(t, cli); got != idx {
+		t.Fatalf("the restart moved the volume from nbd%d to nbd%d", idx, got)
+	}
+	select {
+	case err := <-w1done:
+		if err != nil {
+			dumpNBD(t)
+			t.Fatalf("W1 across the restart: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		dumpNBD(t)
+		t.Fatalf("W1 did not complete after the restart; its log:\n%s", childLog(cmd))
+	}
+	d = openDirect(t, dev)
+	defer d.close()
+	w2 := pattern(0x22, 4096)
+	if err := d.writeAt(w2, off); err != nil {
+		t.Fatalf("W2: %v", err)
+	}
+	want := append([]byte(nil), baseData...)
+	copy(want[8192:], w2)
+	got, err := d.readAt(smokeChk, int64(target)*smokeChk)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("the chunk does not hold W2 over its base")
+	}
+	if err := cli.Boundary(pctx); err != nil {
+		t.Fatalf("Boundary: %v", err)
+	}
+	if _, err := cli.Publish(pctx, "request"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	verifyStore(t, store)
+	sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer scancel()
+	st, err := chunk.Open(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, _, err := st.Current(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.ReadManifest(sctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Chunks[target] != chunk.Sum(want) {
+		t.Fatalf("the published chunk %d is not the one W2 left", target)
+	}
+	d.close()
 	if err := cli.Stop(sctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}

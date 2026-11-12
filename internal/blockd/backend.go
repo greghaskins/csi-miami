@@ -334,6 +334,9 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 	// The chunk has a non-zero base and was not resident when the cache took its
 	// lock. Fetch the base and retry; base is then non-nil, so this cannot
 	// recurse into ErrNotResident.
+	if baseFetchHook != nil {
+		baseFetchHook(i)
+	}
 	ctx, cancel := b.fetchCtx()
 	defer cancel()
 	basep := b.getBuf()
@@ -347,6 +350,12 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 	}
 	return b.cache.WriteAt(i, intra, buf, *basep, false)
 }
+
+// baseFetchHook, when set, runs in a write just before it fetches the base of
+// a chunk the cache does not hold, to stall that fetch. Nothing in the program
+// sets it: only tests do (the smoke tests' child process from a _test.go file
+// that is not part of the binary).
+var baseFetchHook func(chunk uint32)
 
 // flushHook, when set, runs at the start of every Flush. Nothing in the
 // program sets it: only the smoke tests' child process does, from a _test.go

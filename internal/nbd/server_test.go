@@ -552,3 +552,47 @@ func BenchmarkServeRead(b *testing.B) {
 		}
 	}
 }
+
+// A request still in the backend when Serve returns is counted by Inflight,
+// and Wait reports it until it leaves.
+func TestInflightWaitReportsARequestStuckAfterServeReturns(t *testing.T) {
+	t.Parallel()
+	b := &blockingBackend{memBackend: newMem(testSize), release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	inf := new(Inflight)
+	o := defaultOpts
+	o.Inflight = inf
+	s := negotiated(t, b, o)
+	s.send(t, cmdRead, 0, 1, 0, 4096, nil)
+	<-b.entered
+	_ = s.c.Close() // the peer is gone; Serve returns with the read still parked
+	<-s.done
+	if n := inf.Wait(50 * time.Millisecond); n != 1 {
+		t.Fatalf("Wait with a parked request = %d, want 1", n)
+	}
+	close(b.release)
+	if n := inf.Wait(5 * time.Second); n != 0 {
+		t.Fatalf("Wait after release = %d, want 0", n)
+	}
+}
+
+// A job still queued when the connection dies never reaches the backend.
+func TestWorkerDropsAJobQueuedAfterDeath(t *testing.T) {
+	t.Parallel()
+	m := newMem(testSize)
+	s := &session{b: m, inflight: new(Inflight), free: make(chan *job, 1), work: make(chan *job, 1)}
+	s.dead.Store(true)
+	j := &job{req: request{typ: cmdWrite, length: 4096}, buf: getBuf(4096)}
+	s.inflight.begin()
+	s.work <- j
+	close(s.work)
+	s.worker()
+	if n := s.inflight.Wait(time.Second); n != 0 {
+		t.Fatalf("inflight %d after the queue drained", n)
+	}
+	m.mu.Lock()
+	w := m.writes
+	m.mu.Unlock()
+	if w != 0 {
+		t.Fatal("a dead session's queued job reached the backend")
+	}
+}

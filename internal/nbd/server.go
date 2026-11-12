@@ -8,6 +8,8 @@ import (
 	"math/bits"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Backend is what the server serves. Offsets and lengths are byte values the
@@ -29,6 +31,45 @@ type ServeOptions struct {
 	ReadOnly   bool
 	BlockSize  uint32
 	MaxRequest uint32
+	// Inflight, when set, counts the requests this Serve hands to the
+	// backend, so that the caller can wait for them once Serve has returned.
+	Inflight *Inflight
+}
+
+// Inflight tracks the requests a Serve has handed to its backend and that
+// have not returned from it. Serve returns without waiting for them (its
+// context may end while the backend is stuck), and a request left running
+// can still write after Serve's caller has moved on. Wait is how the caller
+// learns whether any is.
+//
+// Use one Inflight per Serve. Wait may be called only after that Serve has
+// returned: the reader is then stopped, so no request can be dispatched while
+// Wait runs (a sync.WaitGroup must not be Added to concurrently with Wait at
+// zero). A request still queued but not started when Serve returns is
+// dropped, never started: see session.worker.
+type Inflight struct {
+	wg sync.WaitGroup
+	n  atomic.Int64
+}
+
+func (f *Inflight) begin() { f.n.Add(1); f.wg.Add(1) }
+func (f *Inflight) end()   { f.n.Add(-1); f.wg.Done() }
+
+// Wait waits up to d for every request to leave the backend and returns how
+// many have not: zero when all have. A request that has not left stays in the
+// backend; the goroutine used to wait for it is abandoned with it, which is
+// acceptable only because the caller then exits the process.
+func (f *Inflight) Wait(d time.Duration) int {
+	done := make(chan struct{})
+	go func() { f.wg.Wait(); close(done) }()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return 0
+	case <-t.C:
+		return int(f.n.Load())
+	}
 }
 
 // workers is how many requests are in the backend at once.
@@ -79,7 +120,10 @@ func Serve(ctx context.Context, conn net.Conn, b Backend, o ServeOptions) error 
 	if !enter {
 		return nil
 	}
-	s := &session{conn: conn, b: b, o: o, free: make(chan *job, workers), work: make(chan *job, workers)}
+	s := &session{conn: conn, b: b, o: o, free: make(chan *job, workers), work: make(chan *job, workers), inflight: o.Inflight}
+	if s.inflight == nil {
+		s.inflight = new(Inflight)
+	}
 	for i := range s.jobs {
 		s.free <- &s.jobs[i]
 	}
@@ -87,6 +131,9 @@ func Serve(ctx context.Context, conn net.Conn, b Backend, o ServeOptions) error 
 		go s.worker()
 	}
 	defer close(s.work)
+	// Runs before close(work): from here on a worker takes no queued job into
+	// the backend. The reader has returned, so nothing more is dispatched.
+	defer s.dead.Store(true)
 	err = s.read(ctx)
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -113,6 +160,11 @@ type session struct {
 	conn net.Conn
 	b    Backend
 	o    ServeOptions
+
+	// inflight counts the jobs handed to the workers and not yet handled.
+	// dead is set once the reader has stopped, whatever the reason.
+	inflight *Inflight
+	dead     atomic.Bool
 
 	wmu  sync.Mutex // serializes replies on conn
 	free chan *job
@@ -195,6 +247,7 @@ func (s *session) read(ctx context.Context) error {
 				return fmt.Errorf("nbd: read write payload: %w", err)
 			}
 		}
+		s.inflight.begin()
 		s.work <- j // never blocks: there are only `workers` jobs
 	}
 }
@@ -239,7 +292,18 @@ func (s *session) drain(ctx context.Context) error {
 
 func (s *session) worker() {
 	for j := range s.work {
-		s.handle(j)
+		// A job queued when the connection died is dropped: the peer will
+		// resend it on its next connection, and starting it here could write
+		// after that resend has been answered.
+		if s.dead.Load() {
+			if j.buf != nil {
+				putBuf(j.buf)
+				j.buf = nil
+			}
+		} else {
+			s.handle(j)
+		}
+		s.inflight.end()
 		s.free <- j // never blocks: free holds every job
 	}
 }
