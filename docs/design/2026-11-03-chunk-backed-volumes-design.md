@@ -971,33 +971,41 @@ is retired.
 67. **No stale write may land after a re-point** (adds to 51). The block
     server's connection can die (the kernel's request timeout shuts the
     socket) while a request of it is still in the backend, for example a
-    sub-chunk write stalled fetching its base from the store. Serving the
-    device on a new socket in the same process then lets that old request
-    finish later: the kernel has resent it on the new connection, it was
-    acked, the guest wrote later data over the same blocks (and maybe a
-    flush, acked), and the old request's pwrite then puts its stale bytes over
+    write stalled fetching a chunk's base from the store. The server re-points
+    the device in the same process, always: the kernel resends the request on
+    the new connection, the guest writes later data over the same blocks once
+    that is acked, and the old request must not then land its stale bytes over
     them. The cache writes outside its lock by design (the `gapHook` seam), so
-    nothing inside the process can order that write. The fence is at the
-    process boundary. When a serve loop dies, `nbd.Serve` having stopped its
-    reader and dropped any request it had queued but not started, the server
-    waits `fenceWait` (3 s) for that connection's in-flight requests to leave
-    the backend. If all have, it re-points in process as decision 51 says.
-    If any has not, it exits non-zero without disconnecting the device, logging
-    the count; the unit restarts it and the next process re-points. This is
-    complete because the process ending kills a thread blocked in the store
-    before it can write (one already in a pwrite finishes that syscall first),
-    and the next process starts only after the old one is gone, so any write of
-    the old request lands before the kernel's resend is served. The bound is
-    short because waiting cannot help a store that is down, and the fetch
-    budget already bounds a stalled request's life. The cost: a request that
-    stalls longer than the bound turns the fast in-process re-point into a
-    unit restart, as before decision 51, still inside the dead-connection
-    timeout; it is a stall, never EIO. Rejected: a generation check under the
-    cache lock (only narrows the window, since the pwrite is outside it), and
-    per-connection contexts or a context in `nbd.Backend` (out of scope). A
-    per-chunk write lock that makes the new connection's write to a chunk
-    wait for the old one is a possible later design if the fast re-point
-    under stalls is wanted back.
+    ordering has to come from the backend. It already did for a single chunk:
+    a write held its chunk's stripe across the base fetch, so its resend
+    queued behind it. The gap was a write over several chunks, which took each
+    stripe only for its own segment, so a segment not yet started when the
+    connection died could land after the resend and the writes behind it.
+    Now `WriteAt` and `Trim` take the stripes of every chunk they touch, sorted
+    and each once, before the first segment, and hold them across every base
+    fetch and cache write; a FUA sync runs after they are released, so no
+    stripe is held across an fsync. A resend, and anything after it that
+    touches one of those chunks, queues behind the original however long its
+    fetch stalls (Go's mutex hands over in arrival order after a millisecond of
+    waiting, which a stall exceeds). Lock order: stripes ascending, before
+    anything else; the base-manifest mutex and the cache's `c.mu` are only
+    taken after a stripe, and nothing that holds either takes a stripe (reads,
+    `Sync`, `Insert` and publish take none). `nbd.Serve` counts the requests in
+    its backend and drops any it has queued but not started when the connection
+    dies; a job that has started is counted, not dropped, and the re-point logs
+    a Warning with the count and carries on. A crash needs no such ordering:
+    `exit_group` kills the threads before they can write (one in a pwrite
+    finishes that syscall first) and the next process starts after it, so any
+    old write lands before the resend is served. The same change makes a
+    read's insert of a fetched chunk conditional on the chunk's base hash still
+    being the one fetched (a fetch that outlived a publish and an eviction
+    would otherwise install the old bytes). Rejected: a generation check under
+    the cache lock (the pwrite is outside it, so it only narrows the window);
+    exiting when a request is still in flight at re-point (the restart opens
+    the store before it re-points the device, and the only request that
+    outlasts a few seconds is one stuck on an unreachable store, so every
+    store outage became EIO at the dead-connection timeout); and a new
+    per-chunk lock type (the stripes suffice).
 
 ## 7. Milestones
 
