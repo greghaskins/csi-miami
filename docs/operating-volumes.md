@@ -186,6 +186,14 @@ a key or `e2fsck`. Requests that arrive while the connection is dead wait up
 to the nbd dead-connection timeout (60 s) and then fail with EIO; the restart
 is well inside it. Unpublished writes are in the cache and are served again.
 
+When a request outlasts the nbd request timeout the kernel shuts the server's
+socket, and the server normally re-points the device itself without exiting.
+If a request of that dead connection is still running in the server after 3 s
+(a base fetch stalled on a store that is down), the server exits non-zero
+instead and logs `still in the backend` with the count; systemd restarts it
+and the new process re-points as after a crash (decision 67). Requests wait
+meanwhile, within the dead-connection timeout; none fails.
+
 The `ServerRestarted` event (Normal) means "the blockd unit restarted": the
 plugin saw a different main process under the volume's unit, or started the
 unit again onto a surviving device. It misses a restart that happened while

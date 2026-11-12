@@ -968,6 +968,36 @@ is retired.
     is rejected: it is consulted at provisioning only and pins topology. The
     webhook fails open; RWX volumes wait for M3; pods sharing one RWO claim on
     a node are counted conservatively.
+67. **No stale write may land after a re-point** (adds to 51). The block
+    server's connection can die (the kernel's request timeout shuts the
+    socket) while a request of it is still in the backend, for example a
+    sub-chunk write stalled fetching its base from the store. Serving the
+    device on a new socket in the same process then lets that old request
+    finish later: the kernel has resent it on the new connection, it was
+    acked, the guest wrote later data over the same blocks (and maybe a
+    flush, acked), and the old request's pwrite then puts its stale bytes over
+    them. The cache writes outside its lock by design (the `gapHook` seam), so
+    nothing inside the process can order that write. The fence is at the
+    process boundary. When a serve loop dies, `nbd.Serve` having stopped its
+    reader and dropped any request it had queued but not started, the server
+    waits `fenceWait` (3 s) for that connection's in-flight requests to leave
+    the backend. If all have, it re-points in process as decision 51 says.
+    If any has not, it exits non-zero without disconnecting the device, logging
+    the count; the unit restarts it and the next process re-points. This is
+    complete because the process ending kills a thread blocked in the store
+    before it can write (one already in a pwrite finishes that syscall first),
+    and the next process starts only after the old one is gone, so any write of
+    the old request lands before the kernel's resend is served. The bound is
+    short because waiting cannot help a store that is down, and the fetch
+    budget already bounds a stalled request's life. The cost: a request that
+    stalls longer than the bound turns the fast in-process re-point into a
+    unit restart, as before decision 51, still inside the dead-connection
+    timeout; it is a stall, never EIO. Rejected: a generation check under the
+    cache lock (only narrows the window, since the pwrite is outside it), and
+    per-connection contexts or a context in `nbd.Backend` (out of scope). A
+    per-chunk write lock that makes the new connection's write to a chunk
+    wait for the old one is a possible later design if the fast re-point
+    under stalls is wanted back.
 
 ## 7. Milestones
 
