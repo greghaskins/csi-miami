@@ -191,8 +191,9 @@ socket, and the server re-points the device itself without exiting, however
 long that request stays stuck. The kernel's resend of a stuck write queues
 behind it on its chunks, so a write that lands late still lands first
 (decision 67). The log warns `requests of the dead connection still in flight`
-with the count while it does. Requests wait meanwhile, within the
-dead-connection timeout.
+with the count while it does. Requests behind a stuck one wait as long as it is
+stuck, each kernel timeout re-pointing again; none fails while the server keeps
+re-pointing.
 
 The `ServerRestarted` event (Normal) means "the blockd unit restarted": the
 plugin saw a different main process under the volume's unit, or started the

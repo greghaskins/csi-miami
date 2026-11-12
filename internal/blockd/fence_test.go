@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -56,6 +58,17 @@ func waitEntered(t *testing.T, entered <-chan struct{}) {
 // the cache, so a sub-chunk write to it fetches the base.
 func fenceConfig(t *testing.T) (Config, *fakeKernel) {
 	t.Helper()
+	cfg := fenceStore(t)
+	seedCache(t, cfg)
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, cfg.Size)}}
+	k.cleanup(t)
+	return cfg, k
+}
+
+// fenceStore is a store of four chunks, chunk i holding pattern(i+1), and a
+// config for a cache of three that is not prefetched.
+func fenceStore(t *testing.T) Config {
+	t.Helper()
 	cfg, _ := testConfig(t)
 	cfg.Size = 4 * testChunk
 	cfg.CacheBound = 3 * testChunk // less than the size: no prefetch makes the chunks resident
@@ -65,10 +78,57 @@ func fenceConfig(t *testing.T) (Config, *fakeKernel) {
 		hs[i] = putChunk(t, store, pattern(byte(i+1), testChunk))
 	}
 	writeCurrent(t, store, 1, 1, hs)
-	seedCache(t, cfg)
-	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, cfg.Size)}}
-	k.cleanup(t)
-	return cfg, k
+	return cfg
+}
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// servings records the servings Run starts, oldest first.
+type servings struct {
+	mu  sync.Mutex
+	all []*serving
+}
+
+func recordServings(t *testing.T) *servings {
+	t.Helper()
+	r := &servings{}
+	onServing = func(sv *serving) {
+		r.mu.Lock()
+		r.all = append(r.all, sv)
+		r.mu.Unlock()
+	}
+	t.Cleanup(func() { onServing = nil })
+	return r
+}
+
+// waitIdle waits for every request of the oldest serving to leave the backend.
+func (r *servings) waitIdle(t *testing.T) {
+	t.Helper()
+	r.mu.Lock()
+	old := r.all[0]
+	r.mu.Unlock()
+	deadline := time.Now().Add(10 * time.Second)
+	for old.inflight.Count() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d requests of the old connection never left the backend", old.inflight.Count())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (k *fakeKernel) lastHeld(t *testing.T) net.Conn {
@@ -185,11 +245,12 @@ func TestRunRepointsInProcessWhileAWriteIsStuckAndOrdersTheResend(t *testing.T) 
 	}
 }
 
-// Q1: a write over two chunks whose second chunk's base fetch stalls holds the
-// first chunk too, so the resend and a later write to the first chunk both wait
-// for it. Without that, the later write would be acked while the original still
-// had a stale write in front of it.
-func TestAStalledTwoChunkWriteHoldsItsFirstChunkAgainstTheResendAndLaterWrites(t *testing.T) {
+// Q1: a write over two chunks whose second chunk's base fetch stalls blocks
+// only that chunk. The resend waits for the stall, but a later write to the
+// first chunk is served at once (a stuck chunk does not hold its neighbours),
+// and when the stall ends the data is ordered: the first chunk holds the later
+// write, the second the write's own second half.
+func TestAStalledTwoChunkWriteBlocksOnlyItsStuckChunk(t *testing.T) {
 	cfg, k := fenceConfig(t)
 	entered, release := stallBase(t, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -205,20 +266,20 @@ func TestAStalledTwoChunkWriteHoldsItsFirstChunkAgainstTheResendAndLaterWrites(t
 	waitRepoint(t, k, cfg, done)
 	c := k.lastHeld(t)
 	w2 := pattern(77, 4096)
-	nbdSend(t, c, 1, 2, off, 8192, w1) // W1'
-	time.Sleep(100 * time.Millisecond) // W1' is queued first
-	nbdSend(t, c, 1, 3, off, 4096, w2) // W2, to the first chunk only
-	nbdSilent(t, c, 300*time.Millisecond)
+	nbdSend(t, c, 1, 2, off, 8192, w1) // W1': its first half lands, its second waits
+	time.Sleep(100 * time.Millisecond)
+	nbdSend(t, c, 1, 3, off, 4096, w2) // a later write to the first chunk only
+	nbdRecv(t, c, 3, 0)                // is not held up by the stuck second chunk
+	nbdSilent(t, c, 200*time.Millisecond)
 	release()
 	nbdRecv(t, c, 2, 0)
-	nbdRecv(t, c, 3, 0)
 	nbdSend(t, c, 0, 4, 0, 2*testChunk, nil)
 	got := nbdRecv(t, c, 4, 2*testChunk)
 	want := append(pattern(1, testChunk), pattern(2, testChunk)...)
 	copy(want[off:], w1)
 	copy(want[off:], w2)
 	if !bytes.Equal(got, want) {
-		t.Fatal("the chunks do not hold W1' then W2")
+		t.Fatal("the chunks do not hold W2 over W1's first half and W1's second half")
 	}
 	select {
 	case err := <-done:
@@ -229,44 +290,41 @@ func TestAStalledTwoChunkWriteHoldsItsFirstChunkAgainstTheResendAndLaterWrites(t
 }
 
 // The first request on a re-pointed socket confirms it even while a stuck write
-// holds chunk 0's stripe: the backend is entered before any stripe is taken.
+// holds the chunk it reads. The stuck write goes to the first serving, which
+// awaits no confirmation, so only the re-pointed socket's read can confirm.
 func TestConfirmationDoesNotWaitForAStuckWritesChunk(t *testing.T) {
-	cfg, k := fenceConfig(t)
+	cfg := fenceStore(t)
+	k := &fakeKernel{connectIdx: 3, viaSocket: true}
+	k.cleanup(t)
 	entered, release := stallBase(t, 0)
-	nbdBlocked := make(chan struct{})
-	// Chunk 0 is not resident until something reads it; the write below, to
-	// the left device's first socket, stalls there before the confirmation.
-	k.onTouch = func() { <-nbdBlocked }
+	logs := &syncBuf{}
+	log := slog.New(slog.NewTextHandler(logs, nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runAsync(ctx, cfg, k)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		k.mu.Lock()
-		n := len(k.held)
-		k.mu.Unlock()
-		if n > 0 {
-			break
-		}
+	done := make(chan error, 1)
+	go func() { done <- runOn(ctx, cfg, log, k) }()
+	waitIndex(t, cfg.ControlSocket, 3)
+
+	nbdSend(t, k.lastHeld(t), 1, 1, 4096, 4096, pattern(9, 4096)) // chunk 0, not resident
+	waitEntered(t, entered)
+	k.close()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "path=repoint") { // logged once the re-point is confirmed
 		if time.Now().After(deadline) {
-			t.Fatal("no socket")
+			t.Fatalf("the re-point was never confirmed while the write held chunk 0:\n%s", logs.String())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	nbdSend(t, k.lastHeld(t), 1, 1, 4096, 4096, pattern(9, 4096))
-	waitEntered(t, entered) // the write holds chunk 0 and waits for its base
-	close(nbdBlocked)
-	waitIndex(t, cfg.ControlSocket, 3) // the touch read of chunk 0 still confirms
 	release()
 	stopRun(t, cancel, done)
 }
 
-// Q3: an old write that is queued, or only now getting to take its stripes,
-// after its connection died does nothing. W0 holds chunk 2 (stuck in its base
-// fetch); the old connection's W1 to the chunk has not yet taken its stripes
-// when the device is re-pointed; the resend W1' and the guest's W2 then run,
-// in that order, and only afterwards does the old W1 get the chunk. Whatever
-// order the stripe is handed over in, the old W1 must find its
+// Q3: an old write that reaches its chunk after the device was re-pointed,
+// the resend and the guest's next write having run first, does nothing. W0
+// holds chunk 2 (stuck in its base fetch); the old connection's W1 to the chunk
+// is held back before taking its stripe; the device is re-pointed; the resend
+// W1' and then W2 run after W0 releases; only then does the old W1 get the
+// chunk. Whatever order the stripe is handed over in, it must find its
 // connection dead and leave W2 alone.
 func TestAnOldWriteThatTakesItsChunkAfterTheResendIsDropped(t *testing.T) {
 	cfg, k := fenceConfig(t)
@@ -275,8 +333,8 @@ func TestAnOldWriteThatTakesItsChunkAfterTheResendIsDropped(t *testing.T) {
 	gate := make(chan struct{})
 	atHook := make(chan struct{}, 1)
 	var seen sync.Once
-	beforeStripesHook = func(p []byte) {
-		if !bytes.Equal(p, w1) {
+	beforeSegmentHook = func(_ uint32, src []byte) {
+		if !bytes.Equal(src, w1) {
 			return
 		}
 		first := false
@@ -286,7 +344,8 @@ func TestAnOldWriteThatTakesItsChunkAfterTheResendIsDropped(t *testing.T) {
 			<-gate
 		}
 	}
-	t.Cleanup(func() { beforeStripesHook = nil })
+	t.Cleanup(func() { beforeSegmentHook = nil })
+	svs := recordServings(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runAsync(ctx, cfg, k)
@@ -297,7 +356,7 @@ func TestAnOldWriteThatTakesItsChunkAfterTheResendIsDropped(t *testing.T) {
 	w0 := pattern(3, 4096)
 	nbdSend(t, c0, 1, 1, base, 4096, w0) // W0 stalls in its base fetch, holding chunk 2
 	waitEntered(t, entered)
-	nbdSend(t, c0, 1, 2, base+8192, 4096, w1) // the old W1, held before its stripes
+	nbdSend(t, c0, 1, 2, base+8192, 4096, w1) // the old W1, held before its stripe
 	select {
 	case <-atHook:
 	case <-time.After(10 * time.Second):
@@ -314,7 +373,7 @@ func TestAnOldWriteThatTakesItsChunkAfterTheResendIsDropped(t *testing.T) {
 	nbdSend(t, c, 1, 4, base+8192, 4096, w2) // W2, after W1' was acked
 	nbdRecv(t, c, 4, 0)
 	close(gate) // now the old W1 takes the chunk: its connection is dead
-	time.Sleep(200 * time.Millisecond)
+	svs.waitIdle(t)
 	nbdSend(t, c, 0, 5, base, testChunk, nil)
 	got := nbdRecv(t, c, 5, testChunk)
 	want := pattern(3, testChunk)
@@ -322,6 +381,68 @@ func TestAnOldWriteThatTakesItsChunkAfterTheResendIsDropped(t *testing.T) {
 	copy(want[8192:], w2)
 	if !bytes.Equal(got, want) {
 		t.Fatal("the old W1 landed after W2")
+	}
+	stopRun(t, cancel, done)
+}
+
+// Q3, multi-segment: an old write whose first segment held its chunk across the
+// death finishes that segment ahead of its resend, and its second segment,
+// reaching the next chunk only after the resend and the next write have run,
+// is refused. W1 spans the end of chunk 2 and the start of chunk 3; chunk 2's
+// base fetch stalls with W1 holding it; its segment for chunk 3 is held back
+// until W1' and W2 are done.
+func TestAnOldWritesLaterSegmentIsRefusedAfterTheResend(t *testing.T) {
+	cfg, k := fenceConfig(t)
+	entered, release := stallBase(t, 2)
+	const off = 3*testChunk - 4096
+	w1 := pattern(5, 8192)
+	gate := make(chan struct{})
+	atHook := make(chan struct{}, 1)
+	var seen sync.Once
+	beforeSegmentHook = func(i uint32, src []byte) {
+		if i != 3 || !bytes.Equal(src, w1[4096:]) {
+			return
+		}
+		first := false
+		seen.Do(func() { first = true })
+		if first { // the old W1's second segment: held back until the test lets it go
+			atHook <- struct{}{}
+			<-gate
+		}
+	}
+	t.Cleanup(func() { beforeSegmentHook = nil })
+	svs := recordServings(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+
+	nbdSend(t, k.lastHeld(t), 1, 1, off, 8192, w1) // segment 0 stalls in chunk 2's base fetch
+	waitEntered(t, entered)
+	k.close()
+	waitRepoint(t, k, cfg, done)
+	c := k.lastHeld(t)
+	nbdSend(t, c, 1, 2, off, 8192, w1) // W1', the resend, waits on chunk 2
+	nbdSilent(t, c, 200*time.Millisecond)
+	release() // the old segment 0 finishes ahead of W1'; its segment 1 is held back
+	select {
+	case <-atHook:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the old W1 never reached its second segment")
+	}
+	nbdRecv(t, c, 2, 0)
+	w2 := pattern(77, 4096)
+	nbdSend(t, c, 1, 3, 3*testChunk, 4096, w2) // W2, to the second chunk, after W1' was acked
+	nbdRecv(t, c, 3, 0)
+	close(gate) // the old segment 1 takes chunk 3 now: its connection is dead
+	svs.waitIdle(t)
+	nbdSend(t, c, 0, 4, 2*testChunk, 2*testChunk, nil)
+	got := nbdRecv(t, c, 4, 2*testChunk)
+	want := append(pattern(3, testChunk), pattern(4, testChunk)...)
+	copy(want[testChunk-4096:], w1[:4096])
+	copy(want[testChunk:], w2)
+	if !bytes.Equal(got, want) {
+		t.Fatal("the old W1's second segment landed after W2")
 	}
 	stopRun(t, cancel, done)
 }

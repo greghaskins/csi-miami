@@ -3,6 +3,7 @@ package blockd
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -49,9 +50,9 @@ type kernelAPI interface {
 	// resize sets the device's size, sending no socket.
 	resize(ctx context.Context, idx int, size int64) error
 	// touch sends one request through the device to offset 0 and returns
-	// once it completes. b is the backend that serves the device's socket;
-	// the kernel reaches it over the socket, a fake may call it directly.
-	touch(ctx context.Context, idx int, b nbd.Backend) error
+	// once it completes. The kernel reaches the server over the socket; a fake
+	// may read through b directly, which also marks the confirmation.
+	touch(ctx context.Context, idx int, b io.ReaderAt) error
 }
 
 // realKernel is the host's nbd.
@@ -84,7 +85,7 @@ func (realKernel) resize(ctx context.Context, idx int, size int64) error {
 // touch reads one block at offset 0 of /dev/nbdN with O_DIRECT, so the read
 // goes to the server rather than the page cache. The read blocks while the
 // connection is dead, and cannot be interrupted; ctx only stops it starting.
-func (realKernel) touch(ctx context.Context, idx int, _ nbd.Backend) error {
+func (realKernel) touch(ctx context.Context, idx int, _ io.ReaderAt) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -109,34 +110,30 @@ func (realKernel) touch(ctx context.Context, idx int, _ nbd.Backend) error {
 // reconfigure the kernel dropped sends nothing to the new socket, so a request
 // arriving on it is the proof that the device is served by this process.
 type notifyBackend struct {
-	nbd.Backend
+	rd     io.ReaderAt // what a kernel fake's touch reads through; nothing else is served from here
 	served chan struct{}
 	once   sync.Once
 }
 
-func newNotifyBackend(b nbd.Backend) *notifyBackend {
-	return &notifyBackend{Backend: b, served: make(chan struct{})}
+func newNotifyBackend(rd io.ReaderAt) *notifyBackend {
+	return &notifyBackend{rd: rd, served: make(chan struct{})}
 }
 
 func (n *notifyBackend) mark() { n.once.Do(func() { close(n.served) }) }
 
+// ReadAt is the request a kernel fake sends through the device to confirm a
+// re-point (the real kernel sends it over the socket, to connBackend). It marks
+// and reads. notifyBackend serves no writes: those go through connBackend, which
+// checks its connection is alive (decision 67).
 func (n *notifyBackend) ReadAt(p []byte, off int64) (int, error) {
 	n.mark()
-	return n.Backend.ReadAt(p, off)
+	return n.rd.ReadAt(p, off)
 }
-
-func (n *notifyBackend) WriteAt(p []byte, off int64, fua bool) (int, error) {
-	n.mark()
-	return n.Backend.WriteAt(p, off, fua)
-}
-
-func (n *notifyBackend) Flush() error { n.mark(); return n.Backend.Flush() }
-
-func (n *notifyBackend) Trim(off, nn int64) error { n.mark(); return n.Backend.Trim(off, nn) }
 
 // connBackend is the backend one serve loop serves: it passes everything to
 // the shared backend, but a write or trim asks whether this connection is still
-// alive once it holds its chunks, and does nothing if it is not (decision 67).
+// alive once it holds each chunk it works on, and does nothing if it is not
+// (decision 67).
 // It is installed by startServe around the backend so nbd.Backend is unchanged.
 // dead is set when the connection's Serve has returned, before the device is
 // pointed at any other socket, so a request that holds its chunks after that is
@@ -351,9 +348,12 @@ type serving struct {
 	inflight *nbd.Inflight
 }
 
+// onServing, when set, sees every serving as it starts. Test only.
+var onServing func(*serving)
+
 // startServe starts a serve loop on a new socketpair; cli is the end for the
-// kernel. A non-nil notify is the backend, wrapping s.back, that marks the first
-// request any of its servings sees; it is shared by every serving of one
+// kernel. A non-nil notify is marked by the first request any of its servings
+// sees (connBackend does the marking); it is shared by every serving of one
 // reconfigure, so a request on any of their sockets is a confirmation.
 func startServe(ctx context.Context, s *server, notify *notifyBackend) (*serving, error) {
 	srvConn, cliFile, err := socketpair()
@@ -363,11 +363,19 @@ func startServe(ctx context.Context, s *server, notify *notifyBackend) (*serving
 	sv := &serving{cli: cliFile, err: make(chan error, 1), done: make(chan struct{}), notify: notify, inflight: new(nbd.Inflight)}
 	dead := new(atomic.Bool)
 	back := connBackend{be: s.back, notify: notify, dead: dead}
+	if onServing != nil {
+		onServing(sv)
+	}
 	go func() {
 		err := nbd.Serve(ctx, srvConn, back, nbd.ServeOptions{
 			ReadOnly: s.cfg.ReadOnly, BlockSize: blockSize, MaxRequest: maxRequest, Inflight: sv.inflight,
 		})
-		dead.Store(true) // before anyone learns the loop ended, so before any re-point
+		// Before the result is sent and before done is closed, on every path:
+		// Run's loop learns of the death from err, replaceServing from done, and
+		// the device is pointed at another socket only after one of them. That
+		// happens-before is what guarantees the kernel's resend exists only
+		// after the flag is set (decision 67). Keep it first.
+		dead.Store(true)
 		sv.err <- err
 		close(sv.done)
 	}()
@@ -376,12 +384,13 @@ func startServe(ctx context.Context, s *server, notify *notifyBackend) (*serving
 
 // warnInflight logs the requests of sv's dead connection that are still in the
 // backend when the device is served on another socket. They are not waited for
-// and nothing exits: the backend holds every chunk such a request touches until
-// it finishes, so the kernel's resend of it, and whatever follows, queues
-// behind it (decision 67). Call it after sv's Serve has returned.
+// and nothing exits: the backend holds the chunk each such request is working on
+// until its segment finishes, so the kernel's resend of it, and whatever
+// follows, queues behind it, and a segment it has not started is refused
+// (decision 67). Call it after sv's Serve has returned.
 func (sv *serving) warnInflight(log *slog.Logger, s *server) {
 	if n := sv.inflight.Count(); n > 0 {
-		log.Warn(fmt.Sprintf("%d requests of the dead connection still in flight; their chunks stay locked until they finish", n),
+		log.Warn(fmt.Sprintf("%d requests of the dead connection still in flight; their chunks stay locked until they finish or are refused", n),
 			"volume", s.cfg.Volume, "inflight", n)
 	}
 }

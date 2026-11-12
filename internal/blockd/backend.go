@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,28 +22,30 @@ const fetchConcurrency = 8
 // the caller to serialise writes to a single chunk; the backend does that here,
 // one stripe per chunk index (modulo this).
 //
-// Lock order (decision 67), which is what makes a stalled request safe to
-// leave running while the device is served on a new socket:
+// Ordering and lock order (decision 67), which is what makes a stalled request
+// safe to leave running while the device is served on a new socket:
 //
-//   - A WriteAt or Trim takes the stripes of every chunk it touches, in
-//     ascending stripe order and each once, before its first segment, and holds
-//     them across every segment's base fetch and cache write. So a request
-//     that arrives later and touches any of the same chunks (the kernel's
-//     resend of it, then whatever the guest writes after that) queues behind
-//     it, however long its store fetch stalls.
-//   - Once it holds them, a request of a connection that has since died does
-//     nothing (writeAt). That check, inside the critical section, is what
-//     orders an old request that was itself still waiting for a stripe against
-//     its resend: the order the mutex hands the stripe over in is not relied on.
-//   - They are released before any FUA sync, so no stripe is held across an
-//     fsync: a write landing between the data and its FUA is fine, FUA owes
+//   - A write or trim works one chunk at a time, taking that chunk's stripe for
+//     the segment (its base fetch and cache write, or its MarkZero). Never more
+//     than one stripe is held, so there is no hold-and-wait: a stuck segment
+//     blocks only requests for its own chunk (and chunks sharing its stripe).
+//   - Once it holds a stripe, a request of a connection that has since died
+//     does nothing (alive, in writeAt and trim): it returns, touching no cache
+//     state, and the kernel resends it. A segment that held its stripe while the
+//     connection was alive is ahead of the resend, which waits on the same
+//     stripe; a later segment of the old request finds the connection dead and
+//     stops. The check and the segment are one critical section against every
+//     other write to that chunk, so which of an old request and its resend the
+//     mutex serves first does not matter.
+//   - The stripe is released before any FUA sync, so none is held across the FUA
+//     sync (the cache's own fsyncs of a boundary copy or a new file still run
+//     under it): a write landing between the data and its FUA is fine, FUA owes
 //     only the first write's durability.
-//   - A stripe is taken before anything else and never while holding another
-//     lock: b.mu (the base manifest) and the cache's c.mu are only ever taken
-//     after a stripe, never the reverse. Nothing that holds c.mu (Sync,
-//     Insert, publish's SetBase) or b.mu takes a stripe, and the cache and
-//     publish know nothing of stripes. fetchSem is likewise only waited for
-//     under stripes, and its holders (store reads) take none.
+//   - b.mu (the base manifest) and the cache's c.mu are never held while a stripe
+//     is acquired; under a stripe they are taken, and where both are, b.mu comes
+//     first (insertIfCurrent). Nothing holding either takes a stripe, and the
+//     cache and publish know nothing of stripes. fetchSem is only waited for
+//     under a stripe and its holders (store reads) take none.
 //   - Reads take no stripe.
 const writeStripes = 1024
 
@@ -116,33 +117,7 @@ func (b *backend) getBuf() *[]byte { return b.bufPool.Get().(*[]byte) }
 
 func (b *backend) putBuf(p *[]byte) { b.bufPool.Put(p) }
 
-// lockChunks takes the stripes of chunks first..last (inclusive) in ascending
-// stripe order, each once, and returns them for unlockStripes. buf is scratch
-// for the common case of a request of a few chunks.
-func (b *backend) lockChunks(buf []uint32, first, last uint32) []uint32 {
-	ss := buf[:0]
-	if last-first+1 >= writeStripes {
-		for i := range uint32(writeStripes) {
-			ss = append(ss, i)
-		}
-	} else {
-		for i := first; i <= last; i++ {
-			ss = append(ss, i%writeStripes)
-		}
-		slices.Sort(ss)
-		ss = slices.Compact(ss)
-	}
-	for _, i := range ss {
-		b.stripes[i].Lock()
-	}
-	return ss
-}
-
-func (b *backend) unlockStripes(ss []uint32) {
-	for k := len(ss) - 1; k >= 0; k-- {
-		b.stripes[ss[k]].Unlock()
-	}
-}
+func (b *backend) stripe(i uint32) *sync.Mutex { return &b.stripes[i%writeStripes] }
 
 // chunkHash is the base-manifest hash of chunk i, or ok false when i is beyond
 // the base manifest (a new or grown region that reads as zeros).
@@ -362,42 +337,24 @@ func (b *backend) WriteAt(p []byte, off int64, fua bool) (int, error) {
 var errConnDead = errors.New("blockd: the request's connection is dead")
 
 // writeAt is WriteAt for a request of one connection. alive, when set, is
-// asked once the request holds its stripes: a request whose connection died
-// before that does nothing and returns errConnDead, touching no cache state. A
-// request that holds its stripes while the connection is still alive goes
-// ahead, and the kernel's resend of it, which can only come after the death,
-// queues behind it on those stripes. The check and the whole write are one
-// critical section against every other write to these chunks, so the order of
-// an old request against its resend and the writes after it does not depend on
-// which of them the mutex hands the stripe to (decision 67). alive must report
-// death no later than the device is served on another socket.
+// asked by each segment once it holds its chunk's stripe: a segment of a
+// request whose connection died before that does nothing and returns
+// errConnDead, touching no cache state, and the request stops there. A segment
+// that holds its stripe while the connection is alive goes ahead, and the
+// kernel's resend of it, which can only come after the death, queues behind it
+// on that stripe. alive must report death no later than the device is served on
+// another socket.
 func (b *backend) writeAt(p []byte, off int64, fua bool, alive func() bool) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if beforeStripesHook != nil {
-		beforeStripesHook(p)
-	}
-	var stripeBuf [maxReadChunks]uint32
-	first, _, _ := b.segment(off, len(p))
-	last, _, _ := b.segment(off+int64(len(p))-1, 1)
-	stripes := b.lockChunks(stripeBuf[:], first, last)
-	if alive != nil && !alive() {
-		b.unlockStripes(stripes)
-		return 0, errConnDead
-	}
 	done := 0
 	var chunks []uint32
 	for done < len(p) {
 		i, intra, n := b.segment(off+int64(done), len(p)-done)
-		if err := b.writeSeg(i, intra, p[done:done+int(n)]); err != nil {
-			b.unlockStripes(stripes)
+		if err := b.writeSeg(i, intra, p[done:done+int(n)], alive); err != nil {
 			return done, err
 		}
 		chunks = append(chunks, i)
 		done += int(n)
 	}
-	b.unlockStripes(stripes) // before the sync: no stripe is held across an fsync
 	if fua {
 		if err := b.cache.SyncChunks(chunks...); err != nil {
 			return done, err
@@ -406,11 +363,27 @@ func (b *backend) writeAt(p []byte, off int64, fua bool, alive func() bool) (int
 	return done, nil
 }
 
-// writeSeg writes src into chunk i at offset intra. The caller holds chunk i's
-// stripe (WriteAt, for the whole request), so a concurrent write to the same
-// chunk cannot interleave. src is a slice of the nbd payload (not aligned), so
-// it is copied into an aligned buffer for the cache's O_DIRECT write.
-func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
+// writeSeg writes src into chunk i at offset intra, under the chunk's stripe
+// so a concurrent write to the same chunk cannot interleave, if the request's
+// connection is still alive once it holds it. src is a slice of the nbd payload
+// (not aligned), so it is copied into an aligned buffer for the cache's
+// O_DIRECT write.
+func (b *backend) writeSeg(i uint32, intra int64, src []byte, alive func() bool) error {
+	if beforeSegmentHook != nil {
+		beforeSegmentHook(i, src)
+	}
+	m := b.stripe(i)
+	m.Lock()
+	defer m.Unlock()
+	// The check is after the stripe is taken, never before: only then is it one
+	// critical section with the write, and a request that held the stripe while
+	// alive is ahead of its resend. A refusal returns errConnDead up through
+	// writeAt, which skips the FUA sync and reports the write as failed, never as
+	// done: the kernel resends it whole.
+	if alive != nil && !alive() {
+		return errConnDead
+	}
+
 	bufp := b.getBuf()
 	defer b.putBuf(bufp)
 	buf := (*bufp)[:len(src)]
@@ -459,10 +432,10 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 // that is not part of the binary).
 var baseFetchHook func(chunk uint32)
 
-// beforeStripesHook, when set, runs at the start of every WriteAt, before its
-// stripes are taken, to delay one write relative to another. Test only, like
+// beforeSegmentHook, when set, runs before each segment of a write takes its
+// chunk's stripe, to delay one write relative to another. Test only, like
 // baseFetchHook.
-var beforeStripesHook func(p []byte)
+var beforeSegmentHook func(chunk uint32, src []byte)
 
 // fetchHook, when set, runs in every store fetch after the chunk's base hash
 // has been read and before the store is asked for it, to stall a fetch. Test
@@ -488,24 +461,24 @@ func (b *backend) Flush() error {
 // call, one MarkZero per whole chunk.
 func (b *backend) Trim(off, n int64) error { return b.trim(off, n, nil) }
 
-// trim is Trim for a request of one connection; alive is as for writeAt.
+// trim is Trim for a request of one connection; alive is as for writeAt, asked
+// for each chunk once its stripe is held.
 func (b *backend) trim(off, n int64, alive func() bool) error {
 	first := (off + b.chunkSize - 1) / b.chunkSize // first wholly-covered chunk
 	last := (off + n) / b.chunkSize                // one past the last wholly-covered
-	if first >= last {
-		return nil
-	}
-	// All the stripes of the range up front, like a write: a resend of this
-	// Trim cannot overtake a stuck original and zero what a later write put
-	// there. A range of writeStripes chunks or more takes every stripe.
-	var stripeBuf [maxReadChunks]uint32
-	stripes := b.lockChunks(stripeBuf[:], uint32(first), uint32(last-1)) //nolint:gosec // bounded by the device size
-	defer b.unlockStripes(stripes)
-	if alive != nil && !alive() {
-		return errConnDead
-	}
 	for i := first; i < last; i++ {
-		if err := b.cache.MarkZero(uint32(i)); err != nil { //nolint:gosec // bounded by the device size
+		idx := uint32(i) //nolint:gosec // bounded by the device size
+		m := b.stripe(idx)
+		m.Lock()
+		var err error
+		// After the stripe is taken, as in writeSeg.
+		if alive != nil && !alive() {
+			err = errConnDead
+		} else {
+			err = b.cache.MarkZero(idx)
+		}
+		m.Unlock()
+		if err != nil {
 			return err
 		}
 	}

@@ -2,7 +2,9 @@ package blockd
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -34,6 +36,7 @@ type fakeKernel struct {
 	onTouch      func() // runs in touch before the request is sent
 	resizes      []int64
 	held         []net.Conn
+	viaSocket    bool // touch sends its read over the latest socket, as the kernel does, instead of calling the backend
 }
 
 // hold keeps a duplicate of sock, as the kernel keeps its own reference, so the
@@ -146,7 +149,7 @@ func (k *fakeKernel) setReconnectErr(err error) {
 	k.mu.Unlock()
 }
 
-func (k *fakeKernel) touch(ctx context.Context, _ int, b nbd.Backend) error {
+func (k *fakeKernel) touch(ctx context.Context, _ int, b io.ReaderAt) error {
 	if k.onTouch != nil {
 		k.onTouch()
 	}
@@ -155,6 +158,12 @@ func (k *fakeKernel) touch(ctx context.Context, _ int, b nbd.Backend) error {
 		kept := k.live > k.drops
 		k.mu.Unlock()
 		if kept {
+			if k.viaSocket {
+				k.mu.Lock()
+				c := k.held[len(k.held)-1]
+				k.mu.Unlock()
+				return readOverSocket(c)
+			}
 			_, err := b.ReadAt(make([]byte, 4096), 0)
 			return err
 		}
@@ -857,4 +866,18 @@ func assertServeGoroutines(t *testing.T, base int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// readOverSocket sends a one-block read of offset 0 on the serving end's peer c
+// and waits for the reply, as the kernel's resent request would.
+func readOverSocket(c net.Conn) error {
+	var h [28]byte
+	binary.BigEndian.PutUint32(h[0:4], 0x25609513)
+	binary.BigEndian.PutUint64(h[8:16], 99)
+	binary.BigEndian.PutUint32(h[24:28], 4096)
+	if _, err := c.Write(h[:]); err != nil {
+		return err
+	}
+	_, err := io.ReadFull(c, make([]byte, 16+4096))
+	return err
 }

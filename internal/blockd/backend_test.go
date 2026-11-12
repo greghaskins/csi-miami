@@ -246,3 +246,27 @@ func BenchmarkReadHit(b *testing.B) {
 		}
 	}
 }
+
+// A write whose connection dies between two segments stops there: the segment
+// it had finished stays, the next does nothing, and the write is reported as
+// failed (not done), with no FUA sync, so the kernel resends all of it.
+func TestAWriteOfADeadConnectionStopsAtTheNextSegmentAndFails(t *testing.T) {
+	cfg, _ := testConfig(t)
+	s := newTestServer(t, cfg)
+	calls := 0
+	alive := func() bool { calls++; return calls == 1 } // alive for chunk 0's segment only
+	p := pattern(7, 8192)
+	n, err := s.back.writeAt(p, testChunk-4096, true, alive)
+	if !errors.Is(err, errConnDead) || n != 4096 {
+		t.Fatalf("writeAt = %d, %v; want 4096, errConnDead", n, err)
+	}
+	if idx := s.back.cache.Index(); len(idx.Dirty) != 1 || idx.Dirty[0] != 0 {
+		t.Fatalf("dirty after the refused segment: %v, want chunk 0 only", idx.Dirty)
+	}
+	if err := s.back.trim(testChunk, testChunk, func() bool { return false }); !errors.Is(err, errConnDead) {
+		t.Fatalf("trim of a dead connection = %v, want errConnDead", err)
+	}
+	if hasChunk(s, 1) {
+		t.Fatal("a refused trim or segment touched chunk 1")
+	}
+}
