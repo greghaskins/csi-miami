@@ -2,8 +2,8 @@
 # stage holds the binary and the tools it runs (the list is hack/tools.txt) with
 # their shared libraries: no shell, no package manager.
 
-# golang:1.27.3, pinned by digest; keep the tag in step with go.mod and mise.toml.
-FROM --platform=$BUILDPLATFORM golang:1.27.3@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS build
+# golang:1.27.4, pinned by digest; keep the tag in step with go.mod and mise.toml.
+FROM --platform=$BUILDPLATFORM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS build
 ARG TARGETARCH
 ARG VERSION=dev
 ENV GOTOOLCHAIN=local
