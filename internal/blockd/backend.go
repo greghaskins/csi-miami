@@ -153,6 +153,23 @@ func (b *backend) chunkHash(i uint32) (chunk.Hash, bool) {
 	return b.manifest[i], true
 }
 
+// insertIfCurrent offers the cache chunk i as a clean copy of h, the hash it
+// was fetched under, unless the base lineage has moved on since: a fetch that
+// outlives a write, a publish and an eviction of the chunk would otherwise
+// install the old bytes as clean, and the cache would serve them. The check and
+// the insert are under b.mu, which setManifest takes to swap the base, so a
+// publish cannot land between them. A chunk dirtied meanwhile is refused by
+// Insert itself. Lock order: b.mu, then the cache's c.mu inside Insert; nothing
+// takes them the other way round, and no stripe is taken here (reads take none).
+func (b *backend) insertIfCurrent(i uint32, h chunk.Hash, buf []byte) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if int(i) >= len(b.manifest) || b.manifest[i] != h {
+		return nil // stale: the caller serves the fetched bytes once and caches nothing
+	}
+	return b.cache.Insert(i, buf)
+}
+
 // setManifest replaces the base lineage after a successful publish.
 func (b *backend) setManifest(m []chunk.Hash) {
 	b.mu.Lock()
@@ -225,7 +242,7 @@ func (b *backend) readSeg(i uint32, intra int64, buf []byte) error {
 	defer cancel()
 	wholep := b.getBuf()
 	defer b.putBuf(wholep)
-	fetched, err := b.fetchInto(ctx, i, *wholep)
+	fetched, h, err := b.fetchInto(ctx, i, *wholep)
 	if err != nil {
 		return err
 	}
@@ -235,7 +252,7 @@ func (b *backend) readSeg(i uint32, intra int64, buf []byte) error {
 	}
 	// Serve the request directly, and offer the chunk to the cache (a full
 	// cache just declines, which must not fail the read).
-	if ierr := b.cache.Insert(i, *wholep); ierr != nil && !errors.Is(ierr, cache.ErrFull) {
+	if ierr := b.insertIfCurrent(i, h, *wholep); ierr != nil && !errors.Is(ierr, cache.ErrFull) {
 		b.log.Warn("cache insert failed", "chunk", i, "err", ierr)
 	}
 	copy(buf, (*wholep)[intra:intra+int64(len(buf))])
@@ -278,32 +295,36 @@ func (b *backend) fetchMisses(chunks []uint32) error {
 	return first
 }
 
-// fetchInto fills buf (a whole chunk) with chunk i from the store. fetched is
-// false, with no error and buf untouched, for a zero-based or unnamed chunk
-// that the caller serves as zeros. It does not touch the cache.
-func (b *backend) fetchInto(ctx context.Context, i uint32, buf []byte) (fetched bool, err error) {
+// fetchInto fills buf (a whole chunk) with chunk i from the store and returns
+// the hash it fetched. fetched is false, with no error and buf untouched, for a
+// zero-based or unnamed chunk that the caller serves as zeros. It does not
+// touch the cache.
+func (b *backend) fetchInto(ctx context.Context, i uint32, buf []byte) (fetched bool, h chunk.Hash, err error) {
 	h, ok := b.chunkHash(i)
 	if !ok || h == b.zeroHash {
-		return false, nil
+		return false, h, nil
 	}
 	select {
 	case b.fetchSem <- struct{}{}:
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return false, h, ctx.Err()
 	}
 	defer func() { <-b.fetchSem }()
 
+	if fetchHook != nil {
+		fetchHook(i)
+	}
 	w := &sliceWriter{buf: buf}
 	began := time.Now()
 	err = b.store.Get(ctx, h, w)
 	b.fetches.record(time.Since(began), err)
 	if err != nil {
-		return false, err
+		return false, h, err
 	}
 	if w.n != len(buf) {
-		return false, fmt.Errorf("blockd: chunk %d (%s) is %d bytes, want %d", i, h, w.n, len(buf))
+		return false, h, fmt.Errorf("blockd: chunk %d (%s) is %d bytes, want %d", i, h, w.n, len(buf))
 	}
-	return true, nil
+	return true, h, nil
 }
 
 // fetchOne fetches chunk i and inserts it into the cache as a clean copy. A
@@ -312,11 +333,11 @@ func (b *backend) fetchInto(ctx context.Context, i uint32, buf []byte) (fetched 
 func (b *backend) fetchOne(ctx context.Context, i uint32) error {
 	bufp := b.getBuf()
 	defer b.putBuf(bufp)
-	fetched, err := b.fetchInto(ctx, i, *bufp)
+	fetched, h, err := b.fetchInto(ctx, i, *bufp)
 	if err != nil || !fetched {
 		return err
 	}
-	if err := b.cache.Insert(i, *bufp); err != nil && !errors.Is(err, cache.ErrFull) {
+	if err := b.insertIfCurrent(i, h, *bufp); err != nil && !errors.Is(err, cache.ErrFull) {
 		b.log.Warn("cache insert failed", "chunk", i, "err", err)
 	}
 	return nil
@@ -395,7 +416,7 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 	defer cancel()
 	basep := b.getBuf()
 	defer b.putBuf(basep)
-	fetched, ferr := b.fetchInto(ctx, i, *basep)
+	fetched, _, ferr := b.fetchInto(ctx, i, *basep)
 	if ferr != nil {
 		return ferr
 	}
@@ -410,6 +431,11 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 // sets it: only tests do (the smoke tests' child process from a _test.go file
 // that is not part of the binary).
 var baseFetchHook func(chunk uint32)
+
+// fetchHook, when set, runs in every store fetch after the chunk's base hash
+// has been read and before the store is asked for it, to stall a fetch. Test
+// only, like baseFetchHook.
+var fetchHook func(chunk uint32)
 
 // flushHook, when set, runs at the start of every Flush. Nothing in the
 // program sets it: only the smoke tests' child process does, from a _test.go
