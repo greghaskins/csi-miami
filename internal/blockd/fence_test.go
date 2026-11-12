@@ -260,3 +260,68 @@ func TestConfirmationDoesNotWaitForAStuckWritesChunk(t *testing.T) {
 	release()
 	stopRun(t, cancel, done)
 }
+
+// Q3: an old write that is queued, or only now getting to take its stripes,
+// after its connection died does nothing. W0 holds chunk 2 (stuck in its base
+// fetch); the old connection's W1 to the chunk has not yet taken its stripes
+// when the device is re-pointed; the resend W1' and the guest's W2 then run,
+// in that order, and only afterwards does the old W1 get the chunk. Whatever
+// order the stripe is handed over in, the old W1 must find its
+// connection dead and leave W2 alone.
+func TestAnOldWriteThatTakesItsChunkAfterTheResendIsDropped(t *testing.T) {
+	cfg, k := fenceConfig(t)
+	entered, release := stallBase(t, 2)
+	w1 := pattern(5, 4096)
+	gate := make(chan struct{})
+	atHook := make(chan struct{}, 1)
+	var seen sync.Once
+	beforeStripesHook = func(p []byte) {
+		if !bytes.Equal(p, w1) {
+			return
+		}
+		first := false
+		seen.Do(func() { first = true })
+		if first { // the old W1: held back until the test lets it go
+			atHook <- struct{}{}
+			<-gate
+		}
+	}
+	t.Cleanup(func() { beforeStripesHook = nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+
+	c0 := k.lastHeld(t)
+	const base = 2 * testChunk
+	w0 := pattern(3, 4096)
+	nbdSend(t, c0, 1, 1, base, 4096, w0) // W0 stalls in its base fetch, holding chunk 2
+	waitEntered(t, entered)
+	nbdSend(t, c0, 1, 2, base+8192, 4096, w1) // the old W1, held before its stripes
+	select {
+	case <-atHook:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the old W1 never reached the backend")
+	}
+	k.close()
+	waitRepoint(t, k, cfg, done)
+	c := k.lastHeld(t)
+	nbdSend(t, c, 1, 3, base+8192, 4096, w1) // W1', the resend
+	nbdSilent(t, c, 200*time.Millisecond)
+	release() // W0 lets go; W1' takes the chunk
+	nbdRecv(t, c, 3, 0)
+	w2 := pattern(77, 4096)
+	nbdSend(t, c, 1, 4, base+8192, 4096, w2) // W2, after W1' was acked
+	nbdRecv(t, c, 4, 0)
+	close(gate) // now the old W1 takes the chunk: its connection is dead
+	time.Sleep(200 * time.Millisecond)
+	nbdSend(t, c, 0, 5, base, testChunk, nil)
+	got := nbdRecv(t, c, 5, testChunk)
+	want := pattern(3, testChunk)
+	copy(want, w0)
+	copy(want[8192:], w2)
+	if !bytes.Equal(got, want) {
+		t.Fatal("the old W1 landed after W2")
+	}
+	stopRun(t, cancel, done)
+}

@@ -31,9 +31,11 @@ const fetchConcurrency = 8
 //     them across every segment's base fetch and cache write. So a request
 //     that arrives later and touches any of the same chunks (the kernel's
 //     resend of it, then whatever the guest writes after that) queues behind
-//     it, however long its store fetch stalls. Go's mutex hands over in arrival
-//     order once a waiter has waited a millisecond, which a stall always
-//     exceeds.
+//     it, however long its store fetch stalls.
+//   - Once it holds them, a request of a connection that has since died does
+//     nothing (writeAt). That check, inside the critical section, is what
+//     orders an old request that was itself still waiting for a stripe against
+//     its resend: the order the mutex hands the stripe over in is not relied on.
 //   - They are released before any FUA sync, so no stripe is held across an
 //     fsync: a write landing between the data and its FUA is fine, FUA owes
 //     only the first write's durability.
@@ -352,13 +354,38 @@ func (b *backend) fetchOne(ctx context.Context, i uint32) error {
 // fsync obligations for the FLUSH that owes them, which is what keeps a
 // journal commit's FLUSH-then-FUA from syncing everything twice.
 func (b *backend) WriteAt(p []byte, off int64, fua bool) (int, error) {
+	return b.writeAt(p, off, fua, nil)
+}
+
+// errConnDead is what a write or trim of a dead connection returns without
+// having touched anything. Its reply goes to a dead socket; the kernel resends.
+var errConnDead = errors.New("blockd: the request's connection is dead")
+
+// writeAt is WriteAt for a request of one connection. alive, when set, is
+// asked once the request holds its stripes: a request whose connection died
+// before that does nothing and returns errConnDead, touching no cache state. A
+// request that holds its stripes while the connection is still alive goes
+// ahead, and the kernel's resend of it, which can only come after the death,
+// queues behind it on those stripes. The check and the whole write are one
+// critical section against every other write to these chunks, so the order of
+// an old request against its resend and the writes after it does not depend on
+// which of them the mutex hands the stripe to (decision 67). alive must report
+// death no later than the device is served on another socket.
+func (b *backend) writeAt(p []byte, off int64, fua bool, alive func() bool) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if beforeStripesHook != nil {
+		beforeStripesHook(p)
 	}
 	var stripeBuf [maxReadChunks]uint32
 	first, _, _ := b.segment(off, len(p))
 	last, _, _ := b.segment(off+int64(len(p))-1, 1)
 	stripes := b.lockChunks(stripeBuf[:], first, last)
+	if alive != nil && !alive() {
+		b.unlockStripes(stripes)
+		return 0, errConnDead
+	}
 	done := 0
 	var chunks []uint32
 	for done < len(p) {
@@ -432,6 +459,11 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
 // that is not part of the binary).
 var baseFetchHook func(chunk uint32)
 
+// beforeStripesHook, when set, runs at the start of every WriteAt, before its
+// stripes are taken, to delay one write relative to another. Test only, like
+// baseFetchHook.
+var beforeStripesHook func(p []byte)
+
 // fetchHook, when set, runs in every store fetch after the chunk's base hash
 // has been read and before the store is asked for it, to stall a fetch. Test
 // only, like baseFetchHook.
@@ -454,7 +486,10 @@ func (b *backend) Flush() error {
 // Trim marks whole chunks inside the range as the all-zero chunk; a partial
 // chunk at either edge keeps its data. It accepts a multi-GiB range in one
 // call, one MarkZero per whole chunk.
-func (b *backend) Trim(off, n int64) error {
+func (b *backend) Trim(off, n int64) error { return b.trim(off, n, nil) }
+
+// trim is Trim for a request of one connection; alive is as for writeAt.
+func (b *backend) trim(off, n int64, alive func() bool) error {
 	first := (off + b.chunkSize - 1) / b.chunkSize // first wholly-covered chunk
 	last := (off + n) / b.chunkSize                // one past the last wholly-covered
 	if first >= last {
@@ -466,6 +501,9 @@ func (b *backend) Trim(off, n int64) error {
 	var stripeBuf [maxReadChunks]uint32
 	stripes := b.lockChunks(stripeBuf[:], uint32(first), uint32(last-1)) //nolint:gosec // bounded by the device size
 	defer b.unlockStripes(stripes)
+	if alive != nil && !alive() {
+		return errConnDead
+	}
 	for i := first; i < last; i++ {
 		if err := b.cache.MarkZero(uint32(i)); err != nil { //nolint:gosec // bounded by the device size
 			return err

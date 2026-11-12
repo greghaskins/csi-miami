@@ -986,8 +986,17 @@ is retired.
     fetch and cache write; a FUA sync runs after they are released, so no
     stripe is held across an fsync. A resend, and anything after it that
     touches one of those chunks, queues behind the original however long its
-    fetch stalls (Go's mutex hands over in arrival order after a millisecond of
-    waiting, which a stall exceeds). Lock order: stripes ascending, before
+    fetch stalls. That leaves the old request that was itself still waiting for
+    a stripe, which the resend could overtake: so a write or trim checks, once
+    it holds its stripes, that its connection is still alive, and a request of
+    a dead connection does nothing, touching no cache state (its ack goes to a
+    dead socket and the kernel resends). The check and the write are one
+    critical section against every other write to those chunks, so the order of
+    an old request against its resend does not depend on which the mutex
+    serves first. The flag is set when the connection's `nbd.Serve` returns,
+    before the device is pointed at another socket; a per-connection wrapper
+    around the backend, installed when the serve loop starts, carries it, and
+    `nbd.Backend` is unchanged. Lock order: stripes ascending, before
     anything else; the base-manifest mutex and the cache's `c.mu` are only
     taken after a stripe, and nothing that holds either takes a stripe (reads,
     `Sync`, `Insert` and publish take none). `nbd.Serve` counts the requests in

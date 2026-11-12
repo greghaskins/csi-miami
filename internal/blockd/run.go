@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -132,6 +133,41 @@ func (n *notifyBackend) WriteAt(p []byte, off int64, fua bool) (int, error) {
 func (n *notifyBackend) Flush() error { n.mark(); return n.Backend.Flush() }
 
 func (n *notifyBackend) Trim(off, nn int64) error { n.mark(); return n.Backend.Trim(off, nn) }
+
+// connBackend is the backend one serve loop serves: it passes everything to
+// the shared backend, but a write or trim asks whether this connection is still
+// alive once it holds its chunks, and does nothing if it is not (decision 67).
+// It is installed by startServe around the backend so nbd.Backend is unchanged.
+// dead is set when the connection's Serve has returned, before the device is
+// pointed at any other socket, so a request that holds its chunks after that is
+// the old connection's and is dropped, and one that held them before it is
+// ahead of the kernel's resend.
+type connBackend struct {
+	be     *backend
+	notify *notifyBackend // nil when the first request is not awaited
+	dead   *atomic.Bool
+}
+
+func (c connBackend) alive() bool { return !c.dead.Load() }
+
+func (c connBackend) mark() {
+	if c.notify != nil {
+		c.notify.mark()
+	}
+}
+
+func (c connBackend) ReadAt(p []byte, off int64) (int, error) { c.mark(); return c.be.ReadAt(p, off) }
+
+func (c connBackend) WriteAt(p []byte, off int64, fua bool) (int, error) {
+	c.mark()
+	return c.be.writeAt(p, off, fua, c.alive)
+}
+
+func (c connBackend) Flush() error { c.mark(); return c.be.Flush() }
+
+func (c connBackend) Trim(off, n int64) error { c.mark(); return c.be.trim(off, n, c.alive) }
+
+func (c connBackend) Size() int64 { return c.be.Size() }
 
 // kernelDevice is the real nbd device.
 type kernelDevice struct{ idx int }
@@ -325,14 +361,14 @@ func startServe(ctx context.Context, s *server, notify *notifyBackend) (*serving
 		return nil, err
 	}
 	sv := &serving{cli: cliFile, err: make(chan error, 1), done: make(chan struct{}), notify: notify, inflight: new(nbd.Inflight)}
-	var back nbd.Backend = s.back
-	if notify != nil {
-		back = notify
-	}
+	dead := new(atomic.Bool)
+	back := connBackend{be: s.back, notify: notify, dead: dead}
 	go func() {
-		sv.err <- nbd.Serve(ctx, srvConn, back, nbd.ServeOptions{
+		err := nbd.Serve(ctx, srvConn, back, nbd.ServeOptions{
 			ReadOnly: s.cfg.ReadOnly, BlockSize: blockSize, MaxRequest: maxRequest, Inflight: sv.inflight,
 		})
+		dead.Store(true) // before anyone learns the loop ended, so before any re-point
+		sv.err <- err
 		close(sv.done)
 	}()
 	return sv, nil
