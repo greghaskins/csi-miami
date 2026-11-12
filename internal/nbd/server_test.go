@@ -553,9 +553,9 @@ func BenchmarkServeRead(b *testing.B) {
 	}
 }
 
-// A request still in the backend when Serve returns is counted by Inflight,
-// and Wait reports it until it leaves.
-func TestInflightWaitReportsARequestStuckAfterServeReturns(t *testing.T) {
+// A request still in the backend when Serve returns is counted by Inflight
+// until it leaves.
+func TestInflightCountsARequestStuckAfterServeReturns(t *testing.T) {
 	t.Parallel()
 	b := &blockingBackend{memBackend: newMem(testSize), release: make(chan struct{}), entered: make(chan struct{}, 1)}
 	inf := new(Inflight)
@@ -566,12 +566,16 @@ func TestInflightWaitReportsARequestStuckAfterServeReturns(t *testing.T) {
 	<-b.entered
 	_ = s.c.Close() // the peer is gone; Serve returns with the read still parked
 	<-s.done
-	if n := inf.Wait(50 * time.Millisecond); n != 1 {
-		t.Fatalf("Wait with a parked request = %d, want 1", n)
+	if n := inf.Count(); n != 1 {
+		t.Fatalf("Count with a parked request = %d, want 1", n)
 	}
 	close(b.release)
-	if n := inf.Wait(5 * time.Second); n != 0 {
-		t.Fatalf("Wait after release = %d, want 0", n)
+	deadline := time.Now().Add(5 * time.Second)
+	for inf.Count() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Count after release = %d, want 0", inf.Count())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -586,7 +590,7 @@ func TestWorkerDropsAJobQueuedAfterDeath(t *testing.T) {
 	s.work <- j
 	close(s.work)
 	s.worker()
-	if n := s.inflight.Wait(time.Second); n != 0 {
+	if n := s.inflight.Count(); n != 0 {
 		t.Fatalf("inflight %d after the queue drained", n)
 	}
 	m.mu.Lock()

@@ -9,7 +9,6 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // Backend is what the server serves. Offsets and lengths are byte values the
@@ -32,45 +31,25 @@ type ServeOptions struct {
 	BlockSize  uint32
 	MaxRequest uint32
 	// Inflight, when set, counts the requests this Serve hands to the
-	// backend, so that the caller can wait for them once Serve has returned.
+	// backend, so that the caller can see what is left once Serve returns.
 	Inflight *Inflight
 }
 
-// Inflight tracks the requests a Serve has handed to its backend and that
+// Inflight counts the requests a Serve has handed to its backend and that
 // have not returned from it. Serve returns without waiting for them (its
-// context may end while the backend is stuck), and a request left running
-// can still write after Serve's caller has moved on. Wait is how the caller
-// learns whether any is.
+// context may end while the backend is stuck), so this is how the caller
+// learns that some are still running; the backend itself must order any such
+// request against those that follow it (blockd does, by chunk).
 //
-// Use one Inflight per Serve. Wait may be called only after that Serve has
-// returned: the reader is then stopped, so no request can be dispatched while
-// Wait runs (a sync.WaitGroup must not be Added to concurrently with Wait at
-// zero). A request still queued but not started when Serve returns is
-// dropped, never started: see session.worker.
-type Inflight struct {
-	wg sync.WaitGroup
-	n  atomic.Int64
-}
+// Use one Inflight per Serve. A request still queued but not started when
+// Serve returns is dropped, never started: see session.worker.
+type Inflight struct{ n atomic.Int64 }
 
-func (f *Inflight) begin() { f.n.Add(1); f.wg.Add(1) }
-func (f *Inflight) end()   { f.n.Add(-1); f.wg.Done() }
+func (f *Inflight) begin() { f.n.Add(1) }
+func (f *Inflight) end()   { f.n.Add(-1) }
 
-// Wait waits up to d for every request to leave the backend and returns how
-// many have not: zero when all have. A request that has not left stays in the
-// backend; the goroutine used to wait for it is abandoned with it, which is
-// acceptable only because the caller then exits the process.
-func (f *Inflight) Wait(d time.Duration) int {
-	done := make(chan struct{})
-	go func() { f.wg.Wait(); close(done) }()
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-done:
-		return 0
-	case <-t.C:
-		return int(f.n.Load())
-	}
-}
+// Count is the number of requests still in the backend.
+func (f *Inflight) Count() int { return int(f.n.Load()) }
 
 // workers is how many requests are in the backend at once.
 const workers = 8

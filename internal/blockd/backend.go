@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,10 +18,32 @@ import (
 // fetchConcurrency bounds how many chunk fetches from the store run at once.
 const fetchConcurrency = 8
 
-// writeStripes is the number of mutexes that serialise work on one chunk. The
+// writeStripes is the number of mutexes that serialise writes to a chunk. The
 // cache runs the per-request pread/pwrite outside its own lock and relies on
 // the caller to serialise writes to a single chunk; the backend does that here,
-// one stripe per chunk index.
+// one stripe per chunk index (modulo this).
+//
+// Lock order (decision 67), which is what makes a stalled request safe to
+// leave running while the device is served on a new socket:
+//
+//   - A WriteAt or Trim takes the stripes of every chunk it touches, in
+//     ascending stripe order and each once, before its first segment, and holds
+//     them across every segment's base fetch and cache write. So a request
+//     that arrives later and touches any of the same chunks (the kernel's
+//     resend of it, then whatever the guest writes after that) queues behind
+//     it, however long its store fetch stalls. Go's mutex hands over in arrival
+//     order once a waiter has waited a millisecond, which a stall always
+//     exceeds.
+//   - They are released before any FUA sync, so no stripe is held across an
+//     fsync: a write landing between the data and its FUA is fine, FUA owes
+//     only the first write's durability.
+//   - A stripe is taken before anything else and never while holding another
+//     lock: b.mu (the base manifest) and the cache's c.mu are only ever taken
+//     after a stripe, never the reverse. Nothing that holds c.mu (Sync,
+//     Insert, publish's SetBase) or b.mu takes a stripe, and the cache and
+//     publish know nothing of stripes. fetchSem is likewise only waited for
+//     under stripes, and its holders (store reads) take none.
+//   - Reads take no stripe.
 const writeStripes = 1024
 
 // maxReadChunks bounds the per-request stack array that records cache misses:
@@ -91,7 +114,33 @@ func (b *backend) getBuf() *[]byte { return b.bufPool.Get().(*[]byte) }
 
 func (b *backend) putBuf(p *[]byte) { b.bufPool.Put(p) }
 
-func (b *backend) stripe(i uint32) *sync.Mutex { return &b.stripes[i%writeStripes] }
+// lockChunks takes the stripes of chunks first..last (inclusive) in ascending
+// stripe order, each once, and returns them for unlockStripes. buf is scratch
+// for the common case of a request of a few chunks.
+func (b *backend) lockChunks(buf []uint32, first, last uint32) []uint32 {
+	ss := buf[:0]
+	if last-first+1 >= writeStripes {
+		for i := range uint32(writeStripes) {
+			ss = append(ss, i)
+		}
+	} else {
+		for i := first; i <= last; i++ {
+			ss = append(ss, i%writeStripes)
+		}
+		slices.Sort(ss)
+		ss = slices.Compact(ss)
+	}
+	for _, i := range ss {
+		b.stripes[i].Lock()
+	}
+	return ss
+}
+
+func (b *backend) unlockStripes(ss []uint32) {
+	for k := len(ss) - 1; k >= 0; k-- {
+		b.stripes[ss[k]].Unlock()
+	}
+}
 
 // chunkHash is the base-manifest hash of chunk i, or ok false when i is beyond
 // the base manifest (a new or grown region that reads as zeros).
@@ -282,16 +331,25 @@ func (b *backend) fetchOne(ctx context.Context, i uint32) error {
 // fsync obligations for the FLUSH that owes them, which is what keeps a
 // journal commit's FLUSH-then-FUA from syncing everything twice.
 func (b *backend) WriteAt(p []byte, off int64, fua bool) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	var stripeBuf [maxReadChunks]uint32
+	first, _, _ := b.segment(off, len(p))
+	last, _, _ := b.segment(off+int64(len(p))-1, 1)
+	stripes := b.lockChunks(stripeBuf[:], first, last)
 	done := 0
 	var chunks []uint32
 	for done < len(p) {
 		i, intra, n := b.segment(off+int64(done), len(p)-done)
 		if err := b.writeSeg(i, intra, p[done:done+int(n)]); err != nil {
+			b.unlockStripes(stripes)
 			return done, err
 		}
 		chunks = append(chunks, i)
 		done += int(n)
 	}
+	b.unlockStripes(stripes) // before the sync: no stripe is held across an fsync
 	if fua {
 		if err := b.cache.SyncChunks(chunks...); err != nil {
 			return done, err
@@ -300,15 +358,11 @@ func (b *backend) WriteAt(p []byte, off int64, fua bool) (int, error) {
 	return done, nil
 }
 
-// writeSeg writes src into chunk i at offset intra, under the chunk's stripe
-// lock so a concurrent write to the same chunk cannot interleave. src is a
-// slice of the nbd payload (not aligned), so it is copied into an aligned
-// buffer for the cache's O_DIRECT write.
+// writeSeg writes src into chunk i at offset intra. The caller holds chunk i's
+// stripe (WriteAt, for the whole request), so a concurrent write to the same
+// chunk cannot interleave. src is a slice of the nbd payload (not aligned), so
+// it is copied into an aligned buffer for the cache's O_DIRECT write.
 func (b *backend) writeSeg(i uint32, intra int64, src []byte) error {
-	m := b.stripe(i)
-	m.Lock()
-	defer m.Unlock()
-
 	bufp := b.getBuf()
 	defer b.putBuf(bufp)
 	buf := (*bufp)[:len(src)]
@@ -377,13 +431,17 @@ func (b *backend) Flush() error {
 func (b *backend) Trim(off, n int64) error {
 	first := (off + b.chunkSize - 1) / b.chunkSize // first wholly-covered chunk
 	last := (off + n) / b.chunkSize                // one past the last wholly-covered
+	if first >= last {
+		return nil
+	}
+	// All the stripes of the range up front, like a write: a resend of this
+	// Trim cannot overtake a stuck original and zero what a later write put
+	// there. A range of writeStripes chunks or more takes every stripe.
+	var stripeBuf [maxReadChunks]uint32
+	stripes := b.lockChunks(stripeBuf[:], uint32(first), uint32(last-1)) //nolint:gosec // bounded by the device size
+	defer b.unlockStripes(stripes)
 	for i := first; i < last; i++ {
-		idx := uint32(i) //nolint:gosec // bounded by the device size
-		m := b.stripe(idx)
-		m.Lock()
-		err := b.cache.MarkZero(idx)
-		m.Unlock()
-		if err != nil {
+		if err := b.cache.MarkZero(uint32(i)); err != nil { //nolint:gosec // bounded by the device size
 			return err
 		}
 	}

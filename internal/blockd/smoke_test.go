@@ -89,12 +89,13 @@ func runChildServer() int {
 		cfg.CacheBound = b // below the size, so the cache is not prefetched
 	}
 	if f := os.Getenv("BD_STALL_BASE_FILE"); f != "" {
-		// Stall one base fetch of a write, once, for longer than the process
-		// lives, when the test creates the trigger file. Reachable only from
-		// this test binary: baseFetchHook is set nowhere else.
+		// Stall one base fetch of a write, once, for BD_STALL_BASE_FOR, when
+		// the test creates the trigger file. Reachable only from this test
+		// binary: baseFetchHook is set nowhere else.
+		d, _ := time.ParseDuration(os.Getenv("BD_STALL_BASE_FOR"))
 		baseFetchHook = func(uint32) {
 			if os.Remove(f) == nil {
-				time.Sleep(time.Hour)
+				time.Sleep(d)
 			}
 		}
 	}
@@ -786,18 +787,19 @@ func (d *directDev) readAt(n int, off int64) ([]byte, error) {
 	return append([]byte(nil), d.buf[:n]...), nil
 }
 
-// A write that is stuck in the server's base fetch when the kernel's request
-// timeout shuts the socket must not land after the writes that follow it. The
-// server therefore exits, rather than re-pointing in process, while the stuck
-// request is still in its backend (decision 67); the unit restarts it, and the
-// next server answers the kernel's resend of the write (W1), then the guest's
-// later write to the same blocks (W2). The stuck fetch never finishes: its
-// process is gone, so W2 is what the blocks hold, and the published chunk is
-// the one W2 left. The stall is a base fetch made to sleep by the test child's
-// hook (see runChildServer), triggered by a file the test creates.
-func TestSmokeBlockdExitsInsteadOfRepointingWithAWriteInFlight(t *testing.T) {
+// A write stuck in the server's base fetch past the nbd request timeout makes
+// the kernel shut the socket; the server re-points in process and the kernel's
+// resend of the write queues behind the stuck original on its chunk (decision
+// 67). The stall here (5 s) is longer than the request timeout (1 s) and
+// shorter than the dead-connection timeout (20 s): the device rides it out. No
+// request fails, the server neither exits nor restarts, the original lands
+// before its resend, and W2, written after the resend was acked, is what the
+// chunk holds, in the cache and in the published chunk. The stall is a base
+// fetch made to sleep by the test child's hook (see runChildServer), triggered
+// by a file the test creates.
+func TestSmokeBlockdRidesOutAStalledWriteAcrossARepoint(t *testing.T) {
 	smokeEnv(t)
-	childVolume = smokeVol + "-fence"
+	childVolume = smokeVol + "-ride"
 	t.Cleanup(func() { childVolume = smokeVol })
 
 	base := t.TempDir()
@@ -842,7 +844,7 @@ func TestSmokeBlockdExitsInsteadOfRepointingWithAWriteInFlight(t *testing.T) {
 		t.Fatalf("write the base chunk: %v", err)
 	}
 	d.close()
-	pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer pcancel()
 	if err := cli.Boundary(pctx); err != nil {
 		t.Fatalf("Boundary: %v", err)
@@ -857,12 +859,13 @@ func TestSmokeBlockdExitsInsteadOfRepointingWithAWriteInFlight(t *testing.T) {
 	_ = cmd.Wait()
 
 	// A server on a fresh cache, with a 1 s request timeout and a base fetch
-	// that stalls once.
+	// that stalls once, for 5 s.
 	cache = filepath.Join(t.TempDir(), "cache2")
 	childExtraEnv = []string{
 		"BD_TIMEOUT=1s",
 		"BD_CACHE_BOUND=" + strconv.Itoa(smokeSize-smokeChk),
 		"BD_STALL_BASE_FILE=" + trigger,
+		"BD_STALL_BASE_FOR=5s",
 	}
 	t.Cleanup(func() { childExtraEnv = nil })
 	cmd = startChild(t, store, cache, control, epoch)
@@ -870,69 +873,33 @@ func TestSmokeBlockdExitsInsteadOfRepointingWithAWriteInFlight(t *testing.T) {
 	go func() { _ = cmd.Wait(); close(exited) }()
 	cli = dialWait(t, control)
 	idx := deviceIndex(t, cli)
-	_ = cli.Close()
 	dev := fmt.Sprintf("/dev/nbd%d", idx)
 	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	w1 := pattern(0x11, 4096)
-	w1done := make(chan error, 1)
-	go func() {
-		wd := openDirect(t, dev)
-		defer wd.close()
-		w1done <- wd.writeAt(w1, off)
-	}()
-
-	select {
-	case <-exited:
-	case <-time.After(60 * time.Second):
-		dumpNBD(t)
-		t.Fatalf("the server did not exit with a write stuck in its backend; its log:\n%s", childLog(cmd))
-	}
-	if code := cmd.ProcessState.ExitCode(); code <= 0 {
-		t.Fatalf("server exit code %d, want a non-zero exit; its log:\n%s", code, childLog(cmd))
-	}
-	if !strings.Contains(childLog(cmd), "still in the backend") {
-		t.Fatalf("the server exited for another reason; its log:\n%s", childLog(cmd))
-	}
-	devs, err := nbd.Devices("/sys")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var found bool
-	for _, dv := range devs {
-		if dv.Index == idx {
-			found = dv.Pid != 0 && dv.Backend == childVolume
-		}
-	}
-	if !found {
-		t.Fatalf("nbd%d was disconnected by the exit: %+v", idx, devs)
-	}
-
-	// The next server takes the device back, the kernel resends W1, and the
-	// guest then writes W2 to the same blocks.
-	childExtraEnv = []string{"BD_TIMEOUT=1s", "BD_CACHE_BOUND=" + strconv.Itoa(smokeSize-smokeChk)}
-	cmd = startChild(t, store, cache, control, epoch)
-	cli = dialWait(t, control)
-	if got := deviceIndex(t, cli); got != idx {
-		t.Fatalf("the restart moved the volume from nbd%d to nbd%d", idx, got)
-	}
-	select {
-	case err := <-w1done:
-		if err != nil {
-			dumpNBD(t)
-			t.Fatalf("W1 across the restart: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		dumpNBD(t)
-		t.Fatalf("W1 did not complete after the restart; its log:\n%s", childLog(cmd))
-	}
 	d = openDirect(t, dev)
 	defer d.close()
+	w1 := pattern(0x11, 4096)
+	if err := d.writeAt(w1, off); err != nil { // stalls, is timed out and resent
+		dumpNBD(t)
+		t.Fatalf("W1 across the stall: %v; the server's log:\n%s", err, childLog(cmd))
+	}
 	w2 := pattern(0x22, 4096)
 	if err := d.writeAt(w2, off); err != nil {
 		t.Fatalf("W2: %v", err)
 	}
+	select {
+	case <-exited:
+		t.Fatalf("the server exited; its log:\n%s", childLog(cmd))
+	default:
+	}
+	if log := childLog(cmd); !strings.Contains(log, "path=repoint") || !strings.Contains(log, "still in flight") {
+		t.Fatalf("the server did not re-point in process over the stuck write; its log:\n%s", log)
+	}
+	if got := deviceIndex(t, cli); got != idx {
+		t.Fatalf("status index moved from %d to %d", idx, got)
+	}
+
 	want := append([]byte(nil), baseData...)
 	copy(want[8192:], w2)
 	got, err := d.readAt(smokeChk, int64(target)*smokeChk)
@@ -949,17 +916,15 @@ func TestSmokeBlockdExitsInsteadOfRepointingWithAWriteInFlight(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 	verifyStore(t, store)
-	sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer scancel()
 	st, err := chunk.Open(store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	name, _, err := st.Current(sctx)
+	name, _, err := st.Current(pctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := st.ReadManifest(sctx, name)
+	m, err := st.ReadManifest(pctx, name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -967,7 +932,7 @@ func TestSmokeBlockdExitsInsteadOfRepointingWithAWriteInFlight(t *testing.T) {
 		t.Fatalf("the published chunk %d is not the one W2 left", target)
 	}
 	d.close()
-	if err := cli.Stop(sctx); err != nil {
+	if err := cli.Stop(pctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	_ = cli.Close()

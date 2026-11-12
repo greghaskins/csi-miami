@@ -31,11 +31,6 @@ const (
 var (
 	confirmAttempt = 3 * time.Second
 	confirmBudget  = 15 * time.Second
-	// fenceWait is how long a dead connection's requests are given to leave
-	// the backend before the server exits instead of re-pointing (decision 67).
-	// Waiting longer cannot help a store that is down, and fetchBudget already
-	// bounds how long a request can sit in a store fetch.
-	fenceWait = 3 * time.Second
 	// replacePause is the wait before a retry on a fresh socket.
 	replacePause = 100 * time.Millisecond
 )
@@ -278,10 +273,7 @@ loop:
 				break loop
 			}
 			log.Error("serve ended unexpectedly; re-pointing the device", "volume", s.cfg.Volume, "device", idx, "err", serr)
-			if err := dead.fence(log, s); err != nil {
-				fail = err
-				break loop
-			}
+			dead.warnInflight(log, s)
 			nsrv, err := repoint(runCtx, ctx, k, s, idx)
 			srv = nsrv
 			if err != nil {
@@ -346,32 +338,16 @@ func startServe(ctx context.Context, s *server, notify *notifyBackend) (*serving
 	return sv, nil
 }
 
-// fence is the condition for serving the device on another socket in this
-// process (decision 67). It must be called after sv's Serve has returned, so
-// the reader is stopped and no request can be dispatched while it waits, and
-// Serve drops any it had queued. A request already in the backend is not
-// stopped by its connection dying: it can still write its payload, and the
-// kernel will by then have resent that request on the new connection, been
-// acked, and written later data over the same blocks; a late write of the old
-// payload would silently replace it. The cache writes outside its lock, so
-// nothing below can order such a write after the new connection's.
-//
-// So the old requests are given fenceWait to finish: when they all have, none
-// can write any more and the caller re-points. When any is still running it
-// returns an error and the caller exits without disconnecting the device. Only
-// the process ending stops a thread blocked in the store (exit_group kills it
-// before it can write; one already in a pwrite completes that syscall first),
-// and the next process starts after this one is gone, so any write of the old
-// request lands before the kernel's resend is served. The unit restarts the
-// server, which re-points within the device's dead-connection timeout.
-func (sv *serving) fence(log *slog.Logger, s *server) error {
-	stuck := sv.inflight.Wait(fenceWait)
-	if stuck == 0 {
-		return nil
+// warnInflight logs the requests of sv's dead connection that are still in the
+// backend when the device is served on another socket. They are not waited for
+// and nothing exits: the backend holds every chunk such a request touches until
+// it finishes, so the kernel's resend of it, and whatever follows, queues
+// behind it (decision 67). Call it after sv's Serve has returned.
+func (sv *serving) warnInflight(log *slog.Logger, s *server) {
+	if n := sv.inflight.Count(); n > 0 {
+		log.Warn(fmt.Sprintf("%d requests of the dead connection still in flight; their chunks stay locked until they finish", n),
+			"volume", s.cfg.Volume, "inflight", n)
 	}
-	log.Warn("a request of the dead connection is still in the backend; exiting so the next server re-points the device",
-		"volume", s.cfg.Volume, "stuck", stuck, "waited", fenceWait)
-	return fmt.Errorf("blockd: %d request(s) of the dead connection still in the backend after %s; exiting without re-pointing, the next server takes the device", stuck, fenceWait)
 }
 
 // drain waits for the serve loop (whose context is cancelled) and logs how it ended.
@@ -560,11 +536,7 @@ func replaceServing(ctx, runCtx context.Context, s *server, idx int, old *servin
 	case <-ctx.Done():
 		return old, fmt.Errorf("blockd: reconfigure nbd%d: no request reached this server within %s; the device is left in place: %w", idx, confirmBudget, ctx.Err())
 	}
-	// old's loop has ended; as in Run, its requests must be out of the backend
-	// before another serving can take requests (decision 67).
-	if err := old.fence(s.log, s); err != nil {
-		return old, err
-	}
+	old.warnInflight(s.log, s) // old's loop has ended
 	nsv, err := startServe(runCtx, s, old.notify)
 	if err != nil {
 		return old, fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
