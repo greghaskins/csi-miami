@@ -629,6 +629,7 @@ the holder as the load-bearing node until takeover.
 | NAS unreachable and the cache fills with dirty chunks | writes get I/O errors; ext4 goes read-only and stays so until remounted | reports (the probe's `VolumeCondition`, `VolumeUnhealthy`, `miami_volume_probe_ok`, `GenerationOverdue`, dirty bytes) with a message to restart the pod once the store is back and the cache has drained; nothing else (decision 53) |
 | block server dies | requests wait while the connection is dead, up to the dead-connection timeout (60 s); systemd restarts the server within a second | systemd restarts it; it re-points the same nbd device from the cache index (dirty data intact); no pod deletion, no `e2fsck`; a `ServerRestarted` event (decision 51) |
 | node dies | the pod and attachment stay with the dead node; the volume stays held | nothing by itself: a pod elsewhere waits as `holder-contended`. The operator's emergency detach (annotation or `out-of-service` taint, 4.6) abandons what the holder had not published and restages from `current`; the node, if it returns first, drains (4.3) |
+| a new volume would exceed the node's cache budget (the scheduler placed it anyway) | the stage is refused before anything is acquired or written; adopt, restart, drain and teardown are never refused | the `cache-budget-exceeded` condition and a `CacheBudgetExceeded` event; retried until a volume leaves (decision 66) |
 | plugin pod restarts or upgrades | nothing: the server, device and mounts are the kernel's and systemd's | reconciles from observation |
 
 Brief 4.6's active probe stays, reading the first sector of the device the file
@@ -968,6 +969,57 @@ is retired.
     is rejected: it is consulted at provisioning only and pins topology. The
     webhook fails open; RWX volumes wait for M3; pods sharing one RWO claim on
     a node are counted conservatively.
+67. **No stale write may land after a re-point** (adds to 51). The block
+    server's connection can die (the kernel's request timeout shuts the
+    socket) while a request of it is still in the backend, for example a
+    write stalled fetching a chunk's base from the store. The server re-points
+    the device in the same process, always: the kernel resends the request on
+    the new connection, the guest writes later data over the same blocks once
+    that is acked, and the old request must not then land its stale bytes over
+    them. The cache writes outside its lock by design (the `gapHook` seam), so
+    ordering has to come from the backend. It already did for a request that
+    was holding its chunk's stripe, which its resend queued behind. The gap was
+    a request that had not yet taken a stripe when the connection died (a later
+    segment of a write over several chunks, or one queued behind another
+    stuck request): it could take the stripe after its resend and the writes
+    behind it, and overwrite them. So a write or trim works one chunk at a
+    time: for each segment it takes that chunk's stripe and, once it holds it,
+    checks that its connection is still alive; if not it does nothing, touching
+    no cache state, and stops (its ack goes to a dead socket and the kernel
+    resends). A segment that held its stripe while the connection was alive is
+    ahead of the resend, which waits on the same stripe; a later segment of the
+    old request finds the connection dead. The check and the segment are one
+    critical section against every other write to that chunk, so which of an
+    old request and its resend the mutex serves first does not matter. The flag
+    is set when the connection's `nbd.Serve` returns, before the device is
+    pointed at another socket; a per-connection wrapper around the backend,
+    installed when the serve loop starts, carries it, and `nbd.Backend` is
+    unchanged. At most one stripe is held at a time (none across the FUA
+    sync; the cache's own fsyncs of a boundary copy or a new file still run
+    under it), so a stuck segment blocks only requests for its own chunk. Lock
+    order: no stripe is taken while the base-manifest mutex or the cache's
+    `c.mu` is held; under a stripe either may be taken, and where both are,
+    the base-manifest mutex comes first (a read's insert of a fetched chunk);
+    nothing holding either takes a stripe (reads, `Sync`, `Insert` and publish
+    take none). `nbd.Serve` counts the requests in its backend and drops any it
+    has queued but not started when the connection dies; a job that has started
+    is counted, not dropped, and the re-point logs a Warning with the count and
+    carries on. A crash needs no such ordering: `exit_group` kills the threads
+    before they can write (one in a pwrite finishes that syscall first) and the
+    next process starts after it, so any old write lands before the resend is
+    served. The same change makes a read's insert of a fetched chunk
+    conditional on the chunk's base hash still being the one fetched (a fetch
+    that outlived a publish and an eviction would otherwise install the old
+    bytes). Rejected: a generation check under the cache lock (the pwrite is
+    outside it, so it only narrows the window); exiting when a request is still
+    in flight at re-point (the restart opens the store before it re-points the
+    device, and the only request that outlasts a few seconds is one stuck on an
+    unreachable store, so every store outage became EIO at the dead-connection
+    timeout); a new per-chunk lock type (the stripes suffice); and taking every
+    stripe of a request up front (it needs no check for a request that already
+    holds them, but it is hold-and-wait: during an outage one stuck chunk
+    blocks every write that shares a request with it, even to resident chunks,
+    and a large trim holds all of them across its fsyncs).
 
 ## 7. Milestones
 

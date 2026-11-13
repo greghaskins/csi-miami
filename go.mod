@@ -5,6 +5,7 @@ go 1.27.4
 require (
 	github.com/container-storage-interface/spec v1.12.0
 	github.com/coreos/go-systemd/v22 v22.7.0
+	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/mdlayher/genetlink v1.4.0
 	github.com/mdlayher/netlink v1.11.2
@@ -28,7 +29,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
-	github.com/evanphx/json-patch/v5 v5.9.11 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.1 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect

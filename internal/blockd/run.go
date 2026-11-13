@@ -3,12 +3,14 @@ package blockd
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -31,6 +33,8 @@ const (
 var (
 	confirmAttempt = 3 * time.Second
 	confirmBudget  = 15 * time.Second
+	// replacePause is the wait before a retry on a fresh socket.
+	replacePause = 100 * time.Millisecond
 )
 
 // kernelAPI is the nbd kernel interface Run needs; the kernel in production, a
@@ -46,9 +50,9 @@ type kernelAPI interface {
 	// resize sets the device's size, sending no socket.
 	resize(ctx context.Context, idx int, size int64) error
 	// touch sends one request through the device to offset 0 and returns
-	// once it completes. b is the backend that serves the device's socket;
-	// the kernel reaches it over the socket, a fake may call it directly.
-	touch(ctx context.Context, idx int, b nbd.Backend) error
+	// once it completes. The kernel reaches the server over the socket; a fake
+	// may read through b directly, which also marks the confirmation.
+	touch(ctx context.Context, idx int, b io.ReaderAt) error
 }
 
 // realKernel is the host's nbd.
@@ -81,7 +85,7 @@ func (realKernel) resize(ctx context.Context, idx int, size int64) error {
 // touch reads one block at offset 0 of /dev/nbdN with O_DIRECT, so the read
 // goes to the server rather than the page cache. The read blocks while the
 // connection is dead, and cannot be interrupted; ctx only stops it starting.
-func (realKernel) touch(ctx context.Context, idx int, _ nbd.Backend) error {
+func (realKernel) touch(ctx context.Context, idx int, _ io.ReaderAt) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -106,30 +110,61 @@ func (realKernel) touch(ctx context.Context, idx int, _ nbd.Backend) error {
 // reconfigure the kernel dropped sends nothing to the new socket, so a request
 // arriving on it is the proof that the device is served by this process.
 type notifyBackend struct {
-	nbd.Backend
+	rd     io.ReaderAt // what a kernel fake's touch reads through; nothing else is served from here
 	served chan struct{}
 	once   sync.Once
 }
 
-func newNotifyBackend(b nbd.Backend) *notifyBackend {
-	return &notifyBackend{Backend: b, served: make(chan struct{})}
+func newNotifyBackend(rd io.ReaderAt) *notifyBackend {
+	return &notifyBackend{rd: rd, served: make(chan struct{})}
 }
 
 func (n *notifyBackend) mark() { n.once.Do(func() { close(n.served) }) }
 
+// ReadAt is the request a kernel fake sends through the device to confirm a
+// re-point (the real kernel sends it over the socket, to connBackend). It marks
+// and reads. notifyBackend serves no writes: those go through connBackend, which
+// checks its connection is alive (decision 67).
 func (n *notifyBackend) ReadAt(p []byte, off int64) (int, error) {
 	n.mark()
-	return n.Backend.ReadAt(p, off)
+	return n.rd.ReadAt(p, off)
 }
 
-func (n *notifyBackend) WriteAt(p []byte, off int64, fua bool) (int, error) {
-	n.mark()
-	return n.Backend.WriteAt(p, off, fua)
+// connBackend is the backend one serve loop serves: it passes everything to
+// the shared backend, but a write or trim asks whether this connection is still
+// alive once it holds each chunk it works on, and does nothing if it is not
+// (decision 67).
+// It is installed by startServe around the backend so nbd.Backend is unchanged.
+// dead is set when the connection's Serve has returned, before the device is
+// pointed at any other socket, so a request that holds its chunks after that is
+// the old connection's and is dropped, and one that held them before it is
+// ahead of the kernel's resend.
+type connBackend struct {
+	be     *backend
+	notify *notifyBackend // nil when the first request is not awaited
+	dead   *atomic.Bool
 }
 
-func (n *notifyBackend) Flush() error { n.mark(); return n.Backend.Flush() }
+func (c connBackend) alive() bool { return !c.dead.Load() }
 
-func (n *notifyBackend) Trim(off, nn int64) error { n.mark(); return n.Backend.Trim(off, nn) }
+func (c connBackend) mark() {
+	if c.notify != nil {
+		c.notify.mark()
+	}
+}
+
+func (c connBackend) ReadAt(p []byte, off int64) (int, error) { c.mark(); return c.be.ReadAt(p, off) }
+
+func (c connBackend) WriteAt(p []byte, off int64, fua bool) (int, error) {
+	c.mark()
+	return c.be.writeAt(p, off, fua, c.alive)
+}
+
+func (c connBackend) Flush() error { c.mark(); return c.be.Flush() }
+
+func (c connBackend) Trim(off, n int64) error { c.mark(); return c.be.trim(off, n, c.alive) }
+
+func (c connBackend) Size() int64 { return c.be.Size() }
 
 // kernelDevice is the real nbd device.
 type kernelDevice struct{ idx int }
@@ -202,7 +237,11 @@ func runOn(ctx context.Context, cfg Config, log *slog.Logger, k kernelAPI) error
 	ctlErr := make(chan error, 1)
 	go func() { ctlErr <- s.serveControl(runCtx, lis) }()
 
-	srv, err := startServe(runCtx, s, left != nil)
+	var notify *notifyBackend
+	if left != nil {
+		notify = newNotifyBackend(s.back)
+	}
+	srv, err := startServe(runCtx, s, notify)
 	if err != nil {
 		cancel()
 		drainControl(log, s, ctlErr)
@@ -216,7 +255,8 @@ func runOn(ctx context.Context, cfg Config, log *slog.Logger, k kernelAPI) error
 	} else {
 		path = "reconfigure"
 		idx = left.Index
-		err = reconfigureDevice(ctx, k, s.cfg, idx, srv.cli, srv.notify)
+		// It may replace srv with a serving on a fresh socket.
+		srv, err = reconfigureDevice(ctx, runCtx, k, s, idx, srv)
 		if err == nil && left.Size < s.cfg.Size {
 			// Finish a grow that was interrupted before its kernel half.
 			err = k.resize(ctx, idx, s.cfg.Size)
@@ -252,6 +292,7 @@ loop:
 			log.Info("blockd stopping on signal; the device is left in place", "volume", s.cfg.Volume, "device", idx)
 			break loop
 		case serr := <-srv.err:
+			dead := srv
 			srv = nil // its result is taken
 			// Serve returned on its own. A request timing out makes the kernel
 			// shut our socket down, and it then holds requests for the
@@ -265,6 +306,7 @@ loop:
 				break loop
 			}
 			log.Error("serve ended unexpectedly; re-pointing the device", "volume", s.cfg.Volume, "device", idx, "err", serr)
+			dead.warnInflight(log, s)
 			nsrv, err := repoint(runCtx, ctx, k, s, idx)
 			srv = nsrv
 			if err != nil {
@@ -296,30 +338,61 @@ loop:
 
 // serving is one serve loop and the client end of its socket.
 type serving struct {
-	cli    *os.File
-	err    chan error
+	cli *os.File
+	err chan error
+	// done is closed once the loop has ended and its result is in err, so that
+	// it can be waited on without taking the result.
+	done   chan struct{}
 	notify *notifyBackend // nil when the first request is not awaited
+	// inflight counts the requests this serving handed to the backend.
+	inflight *nbd.Inflight
 }
 
+// onServing, when set, sees every serving as it starts. Test only.
+var onServing func(*serving)
+
 // startServe starts a serve loop on a new socketpair; cli is the end for the
-// kernel. With confirm set the backend marks the first request it sees.
-func startServe(ctx context.Context, s *server, confirm bool) (*serving, error) {
+// kernel. A non-nil notify is marked by the first request any of its servings
+// sees (connBackend does the marking); it is shared by every serving of one
+// reconfigure, so a request on any of their sockets is a confirmation.
+func startServe(ctx context.Context, s *server, notify *notifyBackend) (*serving, error) {
 	srvConn, cliFile, err := socketpair()
 	if err != nil {
 		return nil, err
 	}
-	sv := &serving{cli: cliFile, err: make(chan error, 1)}
-	var back nbd.Backend = s.back
-	if confirm {
-		sv.notify = newNotifyBackend(s.back)
-		back = sv.notify
+	sv := &serving{cli: cliFile, err: make(chan error, 1), done: make(chan struct{}), notify: notify, inflight: new(nbd.Inflight)}
+	dead := new(atomic.Bool)
+	back := connBackend{be: s.back, notify: notify, dead: dead}
+	if onServing != nil {
+		onServing(sv)
 	}
 	go func() {
-		sv.err <- nbd.Serve(ctx, srvConn, back, nbd.ServeOptions{
-			ReadOnly: s.cfg.ReadOnly, BlockSize: blockSize, MaxRequest: maxRequest,
+		err := nbd.Serve(ctx, srvConn, back, nbd.ServeOptions{
+			ReadOnly: s.cfg.ReadOnly, BlockSize: blockSize, MaxRequest: maxRequest, Inflight: sv.inflight,
 		})
+		// Before the result is sent and before done is closed, on every path:
+		// Run's loop learns of the death from err, replaceServing from done, and
+		// the device is pointed at another socket only after one of them. That
+		// happens-before is what guarantees the kernel's resend exists only
+		// after the flag is set (decision 67). Keep it first.
+		dead.Store(true)
+		sv.err <- err
+		close(sv.done)
 	}()
 	return sv, nil
+}
+
+// warnInflight logs the requests of sv's dead connection that are still in the
+// backend when the device is served on another socket. They are not waited for
+// and nothing exits: the backend holds the chunk each such request is working on
+// until its segment finishes, so the kernel's resend of it, and whatever
+// follows, queues behind it, and a segment it has not started is refused
+// (decision 67). Call it after sv's Serve has returned.
+func (sv *serving) warnInflight(log *slog.Logger, s *server) {
+	if n := sv.inflight.Count(); n > 0 {
+		log.Warn(fmt.Sprintf("%d requests of the dead connection still in flight; their chunks stay locked until they finish or are refused", n),
+			"volume", s.cfg.Volume, "inflight", n)
+	}
 }
 
 // drain waits for the serve loop (whose context is cancelled) and logs how it ended.
@@ -342,11 +415,11 @@ func drainControl(log *slog.Logger, s *server, ctlErr <-chan error) {
 // handshake, a reconfigure and the same confirmation as at start. On failure
 // the device is left as it is.
 func repoint(runCtx, ctx context.Context, k kernelAPI, s *server, idx int) (*serving, error) {
-	sv, err := startServe(runCtx, s, true)
+	sv, err := startServe(runCtx, s, newNotifyBackend(s.back))
 	if err != nil {
 		return nil, err
 	}
-	err = reconfigureDevice(ctx, k, s.cfg, idx, sv.cli, sv.notify)
+	sv, err = reconfigureDevice(ctx, runCtx, k, s, idx, sv)
 	_ = sv.cli.Close()
 	return sv, err
 }
@@ -422,45 +495,103 @@ func connectDevice(ctx context.Context, k kernelAPI, cfg Config, cliFile *os.Fil
 	return idx, nil
 }
 
-// reconfigureDevice re-points the left device at cliFile and confirms the
+// reconfigureDevice re-points the left device at sv's socket and confirms the
 // kernel took it. The kernel puts a new socket only into a connection slot
 // already marked dead, which the receive thread does the moment the old server
 // dies; with none it reports success and drops the socket. So after each
 // reconfigure it waits for a request to reach the served backend (a read
 // through the device, started once, is held by the dead connection and resent
-// on the new socket), and issues the reconfigure again if none does. It
-// returns an error when confirmBudget passes, never having disconnected: the
-// device carries a live mount, and the unit will start us again.
-func reconfigureDevice(ctx context.Context, k kernelAPI, cfg Config, idx int, cliFile *os.File, n *notifyBackend) error {
+// on the new socket), and issues the reconfigure again if none does.
+//
+// The kernel can also take a socket and then shut it down before any request
+// reaches it (the old connection's receive thread marking the slot dead after
+// the new socket went in). That socket's serve loop ends; reissuing the
+// reconfigure with it only installs a corpse. So a retry whose current serving
+// has ended first starts a fresh socketpair, serve loop and handshake, and the
+// confirmation is a request on any of them: all share sv.notify.
+//
+// It returns the serving that is current when it returns, which the caller
+// owns (closes cli, drains err); servings it replaced are ended and cleaned up
+// here. It returns an error when confirmBudget passes, never having
+// disconnected: the device carries a live mount, and the unit will start us
+// again. sv must have been started with a notify backend.
+func reconfigureDevice(ctx, runCtx context.Context, k kernelAPI, s *server, idx int, sv *serving) (*serving, error) {
+	cfg := s.cfg
+	n := sv.notify
 	bctx, cancel := context.WithTimeout(ctx, confirmBudget)
 	defer cancel()
-	// The handshake runs once: the serve loop is past it after this.
-	if err := nbd.Handshake(bctx, cliFile, cfg.Size); err != nil {
-		return fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
+	// The handshake runs once per socket: the serve loop is past it after this.
+	if err := nbd.Handshake(bctx, sv.cli, cfg.Size); err != nil {
+		return sv, fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
 	}
 	probeCtx, stopProbe := context.WithCancel(bctx)
 	defer stopProbe()
 	go func() { _ = k.touch(probeCtx, idx, n) }()
 	for {
-		if err := k.reconnect(bctx, idx, cliFile); err != nil {
-			return fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
+		if err := k.reconnect(bctx, idx, sv.cli); err != nil {
+			return sv, fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
 		}
 		t := time.NewTimer(confirmAttempt)
 		select {
 		case <-n.served:
 			t.Stop()
-			return nil
+			return sv, nil
+		case <-sv.done:
+			// The loop on this socket ended: the kernel shut it down. If it
+			// served a request first, that is the confirmation (Run's loop then
+			// sees this serving end and re-points again).
+			t.Stop()
+			select {
+			case <-n.served:
+				return sv, nil
+			default:
+			}
+			// Otherwise reissuing with this socket can never succeed: take a
+			// fresh one. A loop that has ended cannot serve more, so replacing
+			// it is safe whether or not the kernel still holds the old socket.
+			var err error
+			if sv, err = replaceServing(bctx, runCtx, s, idx, sv); err != nil {
+				return sv, err
+			}
 		case <-t.C:
+			// Still being served: the kernel dropped the socket silently (no
+			// dead slot yet). Resending the same socket is right.
 		case <-bctx.Done():
 			t.Stop()
 			select {
 			case <-n.served:
-				return nil
+				return sv, nil
 			default:
 			}
-			return fmt.Errorf("blockd: reconfigure nbd%d: no request reached this server within %s; the device is left in place: %w", idx, confirmBudget, bctx.Err())
+			return sv, fmt.Errorf("blockd: reconfigure nbd%d: no request reached this server within %s; the device is left in place: %w", idx, confirmBudget, bctx.Err())
 		}
 	}
+}
+
+// replaceServing returns a serving on a fresh socket, already through the
+// handshake and sharing old's notify backend, and closes old's socket and takes
+// its result; old's loop has ended. On an error it returns whichever serving
+// the caller must still close and drain: old if the new one was not started
+// (its loop has ended, so draining it does not block), else the new one. A
+// short pause first keeps a kernel that keeps shutting sockets from being spun
+// on; it also lets the receive thread that shut the last one finish.
+func replaceServing(ctx, runCtx context.Context, s *server, idx int, old *serving) (*serving, error) {
+	select {
+	case <-time.After(replacePause):
+	case <-ctx.Done():
+		return old, fmt.Errorf("blockd: reconfigure nbd%d: no request reached this server within %s; the device is left in place: %w", idx, confirmBudget, ctx.Err())
+	}
+	old.warnInflight(s.log, s) // old's loop has ended
+	nsv, err := startServe(runCtx, s, old.notify)
+	if err != nil {
+		return old, fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
+	}
+	_ = old.cli.Close()
+	<-old.err //nolint:errcheck // taken so nothing is left behind; the socket's own death, not news
+	if err := nbd.Handshake(ctx, nsv.cli, s.cfg.Size); err != nil {
+		return nsv, fmt.Errorf("blockd: reconfigure nbd%d: %w", idx, err)
+	}
+	return nsv, nil
 }
 
 // findOurDevice finds a configured device this process created: the backend

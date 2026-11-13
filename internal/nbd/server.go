@@ -8,6 +8,7 @@ import (
 	"math/bits"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 // Backend is what the server serves. Offsets and lengths are byte values the
@@ -29,7 +30,26 @@ type ServeOptions struct {
 	ReadOnly   bool
 	BlockSize  uint32
 	MaxRequest uint32
+	// Inflight, when set, counts the requests this Serve hands to the
+	// backend, so that the caller can see what is left once Serve returns.
+	Inflight *Inflight
 }
+
+// Inflight counts the requests a Serve has handed to its backend and that
+// have not returned from it. Serve returns without waiting for them (its
+// context may end while the backend is stuck), so this is how the caller
+// learns that some are still running; the backend itself must order any such
+// request against those that follow it (blockd does, by chunk).
+//
+// Use one Inflight per Serve. A request still queued but not started when
+// Serve returns is dropped, never started: see session.worker.
+type Inflight struct{ n atomic.Int64 }
+
+func (f *Inflight) begin() { f.n.Add(1) }
+func (f *Inflight) end()   { f.n.Add(-1) }
+
+// Count is the number of requests still in the backend.
+func (f *Inflight) Count() int { return int(f.n.Load()) }
 
 // workers is how many requests are in the backend at once.
 const workers = 8
@@ -79,7 +99,10 @@ func Serve(ctx context.Context, conn net.Conn, b Backend, o ServeOptions) error 
 	if !enter {
 		return nil
 	}
-	s := &session{conn: conn, b: b, o: o, free: make(chan *job, workers), work: make(chan *job, workers)}
+	s := &session{conn: conn, b: b, o: o, free: make(chan *job, workers), work: make(chan *job, workers), inflight: o.Inflight}
+	if s.inflight == nil {
+		s.inflight = new(Inflight)
+	}
 	for i := range s.jobs {
 		s.free <- &s.jobs[i]
 	}
@@ -87,6 +110,9 @@ func Serve(ctx context.Context, conn net.Conn, b Backend, o ServeOptions) error 
 		go s.worker()
 	}
 	defer close(s.work)
+	// Runs before close(work): from here on a worker takes no queued job into
+	// the backend. The reader has returned, so nothing more is dispatched.
+	defer s.dead.Store(true)
 	err = s.read(ctx)
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -113,6 +139,11 @@ type session struct {
 	conn net.Conn
 	b    Backend
 	o    ServeOptions
+
+	// inflight counts the jobs handed to the workers and not yet handled.
+	// dead is set once the reader has stopped, whatever the reason.
+	inflight *Inflight
+	dead     atomic.Bool
 
 	wmu  sync.Mutex // serializes replies on conn
 	free chan *job
@@ -195,6 +226,7 @@ func (s *session) read(ctx context.Context) error {
 				return fmt.Errorf("nbd: read write payload: %w", err)
 			}
 		}
+		s.inflight.begin()
 		s.work <- j // never blocks: there are only `workers` jobs
 	}
 }
@@ -239,7 +271,18 @@ func (s *session) drain(ctx context.Context) error {
 
 func (s *session) worker() {
 	for j := range s.work {
-		s.handle(j)
+		// A job queued when the connection died is dropped: the peer will
+		// resend it on its next connection, and starting it here could write
+		// after that resend has been answered.
+		if s.dead.Load() {
+			if j.buf != nil {
+				putBuf(j.buf)
+				j.buf = nil
+			}
+		} else {
+			s.handle(j)
+		}
+		s.inflight.end()
 		s.free <- j // never blocks: free holds every job
 	}
 }

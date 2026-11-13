@@ -1,0 +1,61 @@
+# The bootstrap chain: selfSigned Issuer -> CA Certificate (long-lived) -> CA
+# Issuer -> the serving Certificate. The serving certificate renews without the
+# CA changing, so the caBundle the cainjector writes stays valid across
+# renewals. With a CA issuer cert-manager puts the CA in the Secret's ca.crt.
+# The serving Certificate must not be signed by the selfSigned Issuer directly:
+# cert-manager then sets ca.crt to the leaf itself, so every renewal changes
+# the "CA", and for up to one sync pass the served certificate and the injected
+# bundle disagree. inject-ca-from names the serving Certificate, whose Secret's
+# ca.crt is then the stable CA.
+# An owner can point the serving Certificate's issuerRef at another issuer.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: miami-webhook-selfsigned
+  namespace: miami-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: miami-webhook-ca
+  namespace: miami-system
+spec:
+  isCA: true
+  commonName: miami-webhook-ca
+  secretName: miami-webhook-ca
+  duration: 87600h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    kind: Issuer
+    name: miami-webhook-selfsigned
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: miami-webhook-ca
+  namespace: miami-system
+spec:
+  ca:
+    secretName: miami-webhook-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: miami-webhook
+  namespace: miami-system
+spec:
+  secretName: miami-webhook-tls-managed
+  # These names carry the namespace and the Service name as literals: a
+  # `namespace:` or `namePrefix:` overlay must patch them, as it must patch the
+  # inject-ca-from annotation of the component's kustomization.yaml
+  # (TestWebhookObjectsUnderOverlays pins that they do not follow).
+  dnsNames:
+    - miami-webhook.miami-system.svc
+    - miami-webhook.miami-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: miami-webhook-ca

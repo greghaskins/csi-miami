@@ -1,0 +1,18 @@
+# The front of the cache admission webhook (mutatingwebhookconfiguration-cache.yaml).
+# The controller serves it on the host network, so the Service targets port
+# 9814 on the controller pods; the API server reaches it on 443. The controller
+# certificate is valid for this Service's two in-cluster names.
+apiVersion: v1
+kind: Service
+metadata:
+  name: miami-webhook
+  namespace: miami-system
+spec:
+  selector:
+    app.kubernetes.io/name: miami
+    app.kubernetes.io/component: controller
+  ports:
+    - name: https
+      port: 443
+      targetPort: 9814
+      protocol: TCP

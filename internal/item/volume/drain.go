@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/greghaskins/csi-miami/internal/cache"
+	"github.com/greghaskins/csi-miami/internal/chunk"
 	"github.com/greghaskins/csi-miami/internal/holder"
 	"github.com/greghaskins/csi-miami/internal/intent"
 	"github.com/greghaskins/csi-miami/internal/item"
@@ -54,7 +55,19 @@ func drainBytes(in intent.Intent) ([]byte, error) {
 // saveDrainRecord writes the record if it is not already what it should be:
 // atomically (a temporary file renamed over it) and durably.
 func (it *Item) saveDrainRecord(v vol) error {
-	want, err := drainBytes(v.in)
+	in := v.in
+	// The record carries the size the volume is served at, so that the node's
+	// commitment (Committed) is a sum over local files with no store read. v is
+	// the raised vol of ensureServer. Nothing acts on a raised GrownSize in the
+	// record: Drain serves the volume at the largest size any record holds
+	// anyway (a smaller one would be refused by the server), and the record is
+	// never saved to the intent store. A record written before this was made
+	// carries the intent's GrownSize only and counts at that lower size until
+	// the next start rewrites it.
+	if grown := chunk.RoundUp(v.params.Size, v.chunk); v.size > grown {
+		in.GrownSize = max(in.GrownSize, v.size)
+	}
+	want, err := drainBytes(in)
 	if err != nil {
 		return err
 	}

@@ -109,6 +109,14 @@ func (e *env) needVolumeKind(t *testing.T) {
 // name.
 func (e *env) volumeClass(t *testing.T, base string) string {
 	t.Helper()
+	return e.volumeClassBinding(t, base, nil)
+}
+
+// volumeClassBinding is volumeClass with the copy's binding mode set when mode
+// is not nil (the example classes bind at once; a claim that must stay unbound
+// until a pod uses it needs WaitForFirstConsumer).
+func (e *env) volumeClassBinding(t *testing.T, base string, mode *storagev1.VolumeBindingMode) string {
+	t.Helper()
 	ctx, cancel := e.withDeadline()
 	defer cancel()
 	sc, err := e.Client.StorageV1().StorageClasses().Get(ctx, base, metav1.GetOptions{})
@@ -135,6 +143,9 @@ func (e *env) volumeClass(t *testing.T, base string) string {
 		VolumeBindingMode:    sc.VolumeBindingMode,
 		AllowVolumeExpansion: sc.AllowVolumeExpansion,
 		MountOptions:         sc.MountOptions,
+	}
+	if mode != nil {
+		cp.VolumeBindingMode = mode
 	}
 	if _, err := e.Client.StorageV1().StorageClasses().Create(ctx, cp, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("creating StorageClass %s: %v", cp.Name, err)

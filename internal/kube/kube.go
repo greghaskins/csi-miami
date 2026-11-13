@@ -33,6 +33,17 @@ const (
 	clientBurst = 40
 )
 
+// Request rate of the webhook's own client. It is separate from the CSI
+// controller's so that the two cannot starve each other: a burst of pods
+// mounting claims must not eat the budget that the deletes of a namespace of
+// volumes need, nor the other way round. Each admitted pod costs a few reads,
+// and the webhook bounds its concurrent calls, so this is sized for a busy
+// cluster's pod creation, not for bulk work.
+const (
+	webhookClientQPS   = 30
+	webhookClientBurst = 60
+)
+
 // PV is the part of a PersistentVolume the controller reads, and nothing
 // else. A PV without a CSI source has an empty Driver.
 type PV struct {
@@ -42,6 +53,7 @@ type PV struct {
 	VolumeAttributes map[string]string // spec.csi.volumeAttributes
 	ReclaimPolicy    string            // spec.persistentVolumeReclaimPolicy: Delete, Retain or Recycle
 	Annotations      map[string]string // metadata.annotations
+	CapacityBytes    int64             // spec.capacity.storage in bytes; 0 when the PV states none
 }
 
 // AnnotationForceDetach is the PV annotation of the emergency detach
@@ -65,7 +77,9 @@ var pvResource = schema.GroupVersionResource{Version: "v1", Resource: "persisten
 type Client struct {
 	pvs      dynamic.NamespaceableResourceInterface
 	nodes    dynamic.NamespaceableResourceInterface
+	dyn      dynamic.Interface // for the claim reads (claims.go)
 	deadline time.Duration
+	subject  string
 }
 
 var _ PVReader = (*Client)(nil)
@@ -121,7 +135,28 @@ func NewClient(cfg *rest.Config, deadline time.Duration) (*Client, error) {
 	if deadline <= 0 {
 		deadline = DefaultDeadline
 	}
-	return &Client{pvs: dyn.Resource(pvResource), nodes: dyn.Resource(nodeResource), deadline: deadline}, nil
+	return &Client{pvs: dyn.Resource(pvResource), nodes: dyn.Resource(nodeResource), dyn: dyn, deadline: deadline, subject: tokenSubject(c)}, nil
+}
+
+// webhookRestConfig is a copy of cfg with the webhook's own rate limit and
+// user agent, whatever cfg says about either.
+func webhookRestConfig(cfg *rest.Config) *rest.Config {
+	c := rest.CopyConfig(cfg)
+	c.QPS = webhookClientQPS
+	c.Burst = webhookClientBurst
+	c.UserAgent = "csi-miami-webhook"
+	return c
+}
+
+// NewWebhookClient returns a Client for the admission webhook's reads and
+// writes. It has its own rate limiter, separate from the one of any client
+// NewClient returns, so the webhook and the CSI controller do not queue behind
+// each other.
+func NewWebhookClient(cfg *rest.Config, deadline time.Duration) (*Client, error) {
+	if cfg == nil {
+		return nil, errors.New("kube: a rest config is required")
+	}
+	return NewClient(webhookRestConfig(cfg), deadline)
 }
 
 // GetPV implements PVReader with one GET under the client's deadline.
@@ -236,6 +271,9 @@ func decodePV(obj *unstructured.Unstructured) (*PV, error) {
 		return nil, fmt.Errorf("kube: PV %q: %w", pv.Name, err)
 	}
 	if pv.VolumeAttributes, _, err = unstructured.NestedStringMap(obj.Object, "spec", "csi", "volumeAttributes"); err != nil {
+		return nil, fmt.Errorf("kube: PV %q: %w", pv.Name, err)
+	}
+	if pv.CapacityBytes, err = nestedQuantity(obj.Object, "spec", "capacity", "storage"); err != nil {
 		return nil, fmt.Errorf("kube: PV %q: %w", pv.Name, err)
 	}
 	return pv, nil

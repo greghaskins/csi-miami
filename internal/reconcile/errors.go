@@ -46,7 +46,7 @@ import (
 //	 6. ErrSuperseded                             ClassAborted           Aborted
 //	 7. mount.ErrTimeout                          ClassDeadlineExceeded  DeadlineExceeded
 //	 8. ErrIntentsUnknown, ErrTransportUnavailable, ClassUnavailable     Unavailable
-//	    ErrHolderContended, ErrServerDown,
+//	    ErrHolderContended, ErrServerDown, ErrCacheBudgetExceeded,
 //	    ErrUnstageIncomplete, ErrReleasePending,
 //	    ErrObserve, ErrNoOpenat2, mount.ErrBusy, mount.ErrChanged
 //	    (a mount replaced between judgement and unmount), ErrStopped, EBUSY,
@@ -126,7 +126,7 @@ func Classify(err error) Class {
 		return ClassAborted
 	case errors.Is(err, mount.ErrTimeout):
 		return ClassDeadlineExceeded
-	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrHolderContended), errors.Is(err, ErrServerDown), errors.Is(err, ErrUnstageIncomplete), errors.Is(err, ErrReleasePending), errors.Is(err, ErrObserve), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy), errors.Is(err, mount.ErrChanged),
+	case errors.Is(err, ErrIntentsUnknown), errors.Is(err, ErrTransportUnavailable), errors.Is(err, ErrHolderContended), errors.Is(err, ErrServerDown), errors.Is(err, ErrUnstageIncomplete), errors.Is(err, ErrReleasePending), errors.Is(err, ErrObserve), errors.Is(err, ErrCacheBudgetExceeded), errors.Is(err, ErrNoOpenat2), errors.Is(err, mount.ErrBusy), errors.Is(err, mount.ErrChanged),
 		errors.Is(err, ErrStopped), errors.Is(err, syscall.EBUSY), errors.Is(err, syscall.ESTALE):
 		return ClassUnavailable
 	default:
@@ -177,6 +177,10 @@ var (
 	// volume needs (see package item). The other errors of the volume kind
 	// below are the item's too, each its own condition (Condition*) and class.
 	ErrPrerequisiteMissing = item.ErrPrerequisiteMissing
+
+	// ErrCacheBudgetExceeded is the item's: a volume new to the node does not
+	// fit its cache budget.
+	ErrCacheBudgetExceeded = item.ErrCacheBudgetExceeded
 
 	// ErrHolderContended is returned when another node holds the volume.
 	ErrHolderContended = item.ErrHolderContended

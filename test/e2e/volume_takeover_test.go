@@ -57,6 +57,7 @@ func takeover(t *testing.T, e *env, mode string) {
 	n.createPod(t, podSpec{Name: "a", Claim: "data", Node: a, Run: loop})
 	podA := n.waitPodReady(t, "a", "")
 	vol := n.volumeVol(t, "data")
+	e.discardStrandedCache(t, a, vol)
 	e.waitVolumeStack(t, a, vol, podA.UID)
 	log := n.waitLog(t, "a", "ten writes", func(l string) bool { return lastWrote(l) >= 10 })
 	wroteBeforeGeneration := lastWrote(log)

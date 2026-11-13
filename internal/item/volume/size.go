@@ -9,6 +9,7 @@ import (
 	"github.com/greghaskins/csi-miami/internal/chunk"
 	"github.com/greghaskins/csi-miami/internal/deadline"
 	"github.com/greghaskins/csi-miami/internal/sizerec"
+	kinds "github.com/greghaskins/csi-miami/internal/volume"
 )
 
 // raiseSize returns v with its size raised to the largest size any record
@@ -50,13 +51,12 @@ func (it *Item) raiseSize(ctx context.Context, v vol, vs *vstate, cur current) (
 		size = max(size, vs.manSize)
 	}
 
-	if size > v.size {
-		// A class that caches the whole volume keeps doing so when it grows.
-		if v.params.CacheSize >= v.params.Size {
-			v.bound = size
-		}
-		v.size = size
-	}
+	// A class that caches the whole volume keeps doing so when it grows
+	// (the same rule the footprint accounting uses).
+	p := v.params
+	p.Size, p.CacheSize = v.size, v.bound
+	p = kinds.ServedParams(p, size)
+	v.size, v.bound = p.Size, p.CacheSize
 	return v, nil
 }
 

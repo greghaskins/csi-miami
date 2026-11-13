@@ -154,7 +154,7 @@ func TestVolumeConditionHasEveryConditionAtZeroAndNoOtherLabel(t *testing.T) {
 	}
 	want := []string{"ok", "unresponsive", "transport-unavailable", "transport-conflict", "stage-conflict",
 		"publish-conflict", "item-missing", "item-not-directory", "failed",
-		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused", "probe-failed"}
+		"prerequisite-missing", "holder-contended", "server-down", "key-required", "bad-key", "generation-overdue", "publish-refused", "probe-failed", "cache-budget-exceeded"}
 	if len(got) != len(want) {
 		t.Errorf("series = %v, want exactly %v", got, want)
 	}
@@ -635,5 +635,213 @@ func TestPublishAndServedMetrics(t *testing.T) {
 	}
 	if n := len(family(t, r, NameVolumesServed).GetMetric()); n != 3 {
 		t.Errorf("%d state series, want 3", n)
+	}
+}
+
+func TestCacheMetrics(t *testing.T) {
+	t.Parallel()
+	names := []string{"miami_cache_budget_bytes", "miami_cache_committed_bytes", "miami_cache_fs_size_bytes", "miami_cache_fs_free_bytes"}
+	off := New(WithReconciler())
+	off.SetCacheCapacity(1, 3, 4)
+	off.SetCacheCommitted(2)
+	for _, n := range names {
+		if family(t, off, n) != nil {
+			t.Errorf("%s exposed without WithCacheCapacity", n)
+		}
+	}
+	on := New(WithCacheCapacity())
+	on.SetCacheCapacity(100<<30, 256<<30, 64<<30)
+	on.SetCacheCommitted(30 << 30)
+	want := []float64{100 << 30, 30 << 30, 256 << 30, 64 << 30}
+	for i, n := range names {
+		f := family(t, on, n)
+		if f == nil || len(f.GetMetric()) != 1 {
+			t.Fatalf("%s: family = %v", n, f)
+		}
+		if got := f.GetMetric()[0].GetGauge().GetValue(); got != want[i] {
+			t.Errorf("%s = %v, want %v", n, got, want[i])
+		}
+	}
+	rec := httptest.NewRecorder()
+	on.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if want := "miami_cache_budget_bytes "; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("/metrics lacks %q", want)
+	}
+}
+
+func TestWebhookMetrics(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.Outcome("mutated")
+	off.Unresolved()
+	for _, n := range []string{NameWebhookMutations, NameWebhookUnresolved} {
+		if family(t, off, n) != nil {
+			t.Errorf("%s exposed without WithWebhook", n)
+		}
+	}
+	on := New(WithWebhook())
+	on.Outcome("mutated")
+	on.Outcome("mutated")
+	on.Outcome("error")
+	on.Outcome("some-path-or-address") // dropped: the label is a fixed list
+	on.Unresolved()
+	for outcome, want := range map[string]float64{"mutated": 2, "unchanged": 0, "stripped": 0, "error": 1} {
+		if got := sample(t, on, NameWebhookMutations, map[string]string{"outcome": outcome}).GetCounter().GetValue(); got != want {
+			t.Errorf("outcome %s = %v, want %v", outcome, got, want)
+		}
+	}
+	if n := len(family(t, on, NameWebhookMutations).GetMetric()); n != 4 {
+		t.Errorf("%d outcome series, want 4", n)
+	}
+	if got := family(t, on, NameWebhookUnresolved).GetMetric()[0].GetCounter().GetValue(); got != 1 {
+		t.Errorf("unresolved = %v, want 1", got)
+	}
+}
+
+func TestCachePatchFailures(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.IncCachePatchFailure("denied")
+	if family(t, off, NameCachePatchFailures) != nil {
+		t.Errorf("%s exposed without WithCacheCapacity", NameCachePatchFailures)
+	}
+	on := New(WithCacheCapacity())
+	// Both reasons exist at zero before any failure, so an alert can see them.
+	f := family(t, on, NameCachePatchFailures)
+	if f == nil || len(f.GetMetric()) != 3 {
+		t.Fatalf("family = %v, want three series", f)
+	}
+	on.IncCachePatchFailure("denied")
+	on.IncCachePatchFailure("denied")
+	on.IncCachePatchFailure("error")
+	on.IncCachePatchFailure("anything else")
+	got := map[string]float64{}
+	for _, m := range family(t, on, NameCachePatchFailures).GetMetric() {
+		got[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+	}
+	if len(got) != 3 || got["denied"] != 2 || got["error"] != 2 || got["unknown"] != 0 {
+		t.Errorf("series = %v, want denied 2, error 2, unknown 0", got)
+	}
+	on.IncCachePatchFailure("unknown")
+	for _, m := range family(t, on, NameCachePatchFailures).GetMetric() {
+		if m.GetLabel()[0].GetValue() == "unknown" && m.GetCounter().GetValue() != 1 {
+			t.Errorf("unknown = %v, want 1", m.GetCounter().GetValue())
+		}
+	}
+}
+
+func TestCacheFenceState(t *testing.T) {
+	t.Parallel()
+	on := New(WithCacheCapacity())
+	read := func() map[string]float64 {
+		out := map[string]float64{}
+		for _, m := range family(t, on, NameCacheFenceState).GetMetric() {
+			out[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
+		}
+		return out
+	}
+	for _, tc := range []struct{ set, want string }{{"", "unknown"}, {"fenced", "fenced"}, {"unfenced", "unfenced"}, {"nonsense", "unknown"}, {"fenced", "fenced"}} {
+		if tc.set != "" {
+			on.SetCacheFenceState(tc.set)
+		}
+		got := read()
+		if len(got) != 3 {
+			t.Fatalf("series = %v, want three", got)
+		}
+		for state, v := range got {
+			if (v == 1) != (state == tc.want) || (v != 0 && v != 1) {
+				t.Errorf("after %q: %v, want only %s at 1", tc.set, got, tc.want)
+			}
+		}
+	}
+	off := New(WithReconciler())
+	off.SetCacheFenceState("fenced")
+	if family(t, off, NameCacheFenceState) != nil {
+		t.Error("exposed without WithCacheCapacity")
+	}
+}
+
+func TestWebhookConfigOKGauge(t *testing.T) {
+	t.Parallel()
+	off := New(WithWebhook())
+	off.SetWebhookConfigOK(true)
+	if family(t, off, NameWebhookConfigOK) != nil {
+		t.Errorf("%s exposed without WithWebhookConfig", NameWebhookConfigOK)
+	}
+	on := New(WithWebhook(), WithWebhookConfig())
+	if got := family(t, on, NameWebhookConfigOK).GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Errorf("initial = %v, want 0", got)
+	}
+	on.SetWebhookConfigOK(true)
+	if got := family(t, on, NameWebhookConfigOK).GetMetric()[0].GetGauge().GetValue(); got != 1 {
+		t.Errorf("after true = %v, want 1", got)
+	}
+	on.SetWebhookConfigOK(false)
+	if got := family(t, on, NameWebhookConfigOK).GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Errorf("after false = %v, want 0", got)
+	}
+}
+
+func TestCacheAdvertisedGauge(t *testing.T) {
+	t.Parallel()
+	off := New(WithReconciler())
+	off.SetCacheAdvertised(1)
+	if family(t, off, NameCacheAdvertised) != nil {
+		t.Errorf("%s exposed without WithCacheCapacity", NameCacheAdvertised)
+	}
+	on := New(WithCacheCapacity())
+	on.SetCacheAdvertised(80 << 30)
+	f := family(t, on, NameCacheAdvertised)
+	if f == nil || len(f.GetMetric()) != 1 || f.GetMetric()[0].GetGauge().GetValue() != 80<<30 {
+		t.Fatalf("%s family = %v", NameCacheAdvertised, f)
+	}
+}
+
+// With accounting off the runner still removes a key left behind, and a failure
+// of that must be countable.
+func TestPatchFailuresRegisteredWithoutAccounting(t *testing.T) {
+	t.Parallel()
+	if family(t, New(WithReconciler()), NameCachePatchFailures) != nil {
+		t.Fatalf("%s exposed without an option", NameCachePatchFailures)
+	}
+	r := New(WithReconciler(), WithCachePatchFailures())
+	r.IncCachePatchFailure("denied")
+	if got := sample(t, r, NameCachePatchFailures, map[string]string{"reason": "denied"}).GetCounter().GetValue(); got != 1 {
+		t.Errorf("denied = %v, want 1", got)
+	}
+	// With accounting on as well it is registered once, not twice.
+	New(WithCacheCapacity(), WithCachePatchFailures())
+}
+
+func TestWebhookSecretRefusedCounter(t *testing.T) {
+	t.Parallel()
+	if family(t, New(WithReconciler()), NameWebhookSecretRefused) != nil {
+		t.Errorf("%s exposed without WithWebhook", NameWebhookSecretRefused)
+	}
+	on := New(WithWebhook())
+	on.SecretRefused()
+	on.SecretRefused()
+	if got := family(t, on, NameWebhookSecretRefused).GetMetric()[0].GetCounter().GetValue(); got != 2 {
+		t.Errorf("refused = %v, want 2", got)
+	}
+}
+
+func TestWebhookServingGauge(t *testing.T) {
+	t.Parallel()
+	if family(t, New(WithReconciler()), NameWebhookServing) != nil {
+		t.Errorf("%s exposed without WithWebhook", NameWebhookServing)
+	}
+	r := New(WithWebhook())
+	get := func() float64 { return family(t, r, NameWebhookServing).GetMetric()[0].GetGauge().GetValue() }
+	if get() != 0 {
+		t.Errorf("serving starts at %v, want 0", get())
+	}
+	r.SetWebhookServing(true)
+	if get() != 1 {
+		t.Errorf("serving = %v, want 1", get())
+	}
+	r.SetWebhookServing(false)
+	if get() != 0 {
+		t.Errorf("serving = %v, want 0", get())
 	}
 }

@@ -851,3 +851,7 @@ ed10a57fe313fa7185791a444a6a6c4ca380b201:ai-noreply-email:6
 # The plan text of one milestone 2 commit quoted the same trailer as a rule
 # for commit messages (removed from the plan since).
 e2ac30db69648cc492de8b568766b35f2a12af13:docs/design/2026-11-03-m2-implementation-plan.md:ai-noreply-email:40
+
+# A commit on main (the CODEOWNERS change) carries a co-author trailer naming
+# an automation account, which the private-agent rule matches.
+6955adf41c012a66068c383ca16d9eb4c7bb48f4:private-agent:3

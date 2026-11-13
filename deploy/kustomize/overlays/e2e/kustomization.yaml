@@ -87,3 +87,17 @@ patches:
         value:
           key: miami-e2e/plugin-off
           operator: DoesNotExist
+  # The node's cache budget is a fixed 4Gi on every worker (a 1Gi volume's
+  # footprint is 1552Mi, so two fit and three do not), and a pass every five
+  # seconds, so the end-to-end tests of the cache accounting wait seconds, not
+  # half a minute, for the node to advertise and to re-patch.
+  - target:
+      kind: DaemonSet
+      name: miami-node
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --cache-budget=4Gi
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --reconcile-interval=5s

@@ -1,0 +1,142 @@
+# Fences the one write the node plugin gets on a Node: its own node's cache
+# capacity (design decision 66, 4.3 and 4.9). The plugin's ClusterRole grants
+# `patch` on nodes/status, which RBAC cannot narrow to one node or one field;
+# this policy does. It applies only to the plugin's own ServiceAccount (the
+# matchCondition), so the kubelet, the control plane and every admin are not
+# touched by it. For the plugin it requires all of:
+#
+#   [node-name]  the bound token's node-name is the node being updated, so a
+#                compromised plugin on one node cannot write another's;
+#   [capacity]   status.capacity differs from the old one in no key but the
+#                cache resource (a key may be added, changed or removed). The
+#                node's fence-probe key may also be removed, so a leftover
+#                one can be cleaned up; adding or changing it stays denied,
+#                which is what the probe relies on;
+#   [status]     every other field of status is unchanged;
+#   [metadata]   so are labels, annotations, finalizers, ownerReferences
+#                (the status endpoint resets spec, not metadata), and the
+#                server-side-apply entries of managedFields.
+#
+# [metadata] also holds still every managedFields entry whose operation is
+# Apply, so a compromised plugin cannot forge, alter or drop another manager's
+# server-side-apply ownership (the next apply by that manager would then delete
+# fields it does not own, taints included). The rest of managedFields is free:
+# the API server rewrites the plugin's own operation: Update entry on every
+# patch. The rule holds only because the plugin's patches touch nothing but two
+# leaf keys under status.capacity that no other manager owns (its cache key and
+# the fence-probe key), and a JSON remove transfers ownership of nothing. If
+# the plugin ever wrote a field another manager owns, the server would rewrite
+# that manager's entry and this rule would deny the patch.
+# TestPluginPatchesTouchOnlyItsTwoKeys pins the paths. (On the status endpoint
+# the API server ignores managedFields sent in a patch, so this is depth.)
+#
+# [status] lists the fields of NodeStatus one by one, because CEL cannot
+# compare "all of status but one key". TestNodeStatusFieldsCovered fails when
+# the API gains a field this list lacks. A field a cluster's API does not have
+# only makes has() false (type-checking warns in the policy's status and never
+# blocks evaluation), so the list is safe on older clusters.
+#
+# Kubernetes versions: the policy needs ValidatingAdmissionPolicy v1 (1.30) and
+# the node-name token extra (GA in 1.32). Before 1.32 the [node-name] rule
+# denies every patch, which fails closed (the node advertises nothing; the
+# stage check still runs on the flags' budget). Before 1.30 the policy cannot
+# be created at all while the ClusterRole grant still applies, so the minimum
+# for this base is 1.32.
+#
+# The matchCondition names the ServiceAccount without its namespace, so an
+# overlay that moves the driver to another namespace (a kustomize `namespace:`
+# rewrites the ClusterRoleBinding subject but not CEL) is still fenced. It
+# fences more, never less: any ServiceAccount called miami-node is held to the
+# rules, and the rules only narrow what a patch may do.
+#
+# A `namePrefix:` or `nameSuffix:` overlay renames the ServiceAccount, and no
+# static match follows every rename: such an overlay MUST patch the
+# matchCondition to the new name (TestNodePolicyDetectsRenamingOverlays pins
+# that the base's does not follow). The backstop is the node plugin itself: at
+# start, every -cache-fence-probe-interval (10 minutes) while fenced, and every
+# pass while unfenced or unknown, it tries a
+# patch this policy must deny; if the patch is allowed it logs an error naming
+# this policy and its subject, removes what it wrote and sets
+# miami_cache_fence_state to unfenced. It keeps advertising: removing its own
+# key would not constrain a compromised plugin, and would turn a configuration
+# mistake into a scheduling outage. The alert on the state is what asks for the
+# fix.
+# The probe recognises only this policy's own denial (the API server's text
+# "ValidatingAdmissionPolicy 'miami-node-capacity' ... denied request:
+# [capacity]"), so an overlay must keep the policy and its binding named
+# miami-node-capacity (patch the ServiceAccount name, not the policy's); a
+# renamed policy reads as unknown, and the node keeps the last figure it
+# advertised (a fresh start advertises once regardless).
+# Each probe is a denial by design, so while fenced this policy's expected
+# denial rate is one per node per probe interval; while the node cannot tell
+# (unknown: a renamed policy, an API server failing, a cluster before 1.32) it
+# repeats at the pass interval, up to one per node per 30 seconds. While
+# unfenced the probe is allowed, so it is one add plus one remove per pass and
+# no denial. At install the policy and the DaemonSet are created together, so
+# the first probe can beat enforcement and read unfenced for a pass or two; the
+# node then recovers by itself. The node
+# reports the verdict as miami_cache_fence_state{state=fenced|unfenced|unknown}.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: miami-node-capacity
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [UPDATE]
+        resources: [nodes/status]
+  matchConditions:
+    - name: node-plugin-only
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:') &&
+        request.userInfo.username.endsWith(':miami-node')
+  variables:
+    - name: key
+      expression: "'miami.csi.greghaskins.com/cache'"
+    - name: newCap
+      expression: "has(object.status.capacity) ? object.status.capacity : {}"
+    - name: probeKey
+      expression: "'miami.csi.greghaskins.com/fence-probe'"
+    - name: oldCap
+      expression: "has(oldObject.status.capacity) ? oldObject.status.capacity : {}"
+  validations:
+    - reason: Forbidden
+      message: "[node-name] the node plugin may update only the node its token is bound to"
+      expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/node-name' in request.userInfo.extra &&
+        size(request.userInfo.extra['authentication.kubernetes.io/node-name']) == 1 &&
+        request.userInfo.extra['authentication.kubernetes.io/node-name'][0] == object.metadata.name
+    - reason: Forbidden
+      message: "[capacity] the node plugin may change only the miami.csi.greghaskins.com/cache key of status.capacity"
+      expression: >-
+        variables.newCap.all(k, k == variables.key || (k in variables.oldCap && variables.oldCap[k] == variables.newCap[k])) &&
+        variables.oldCap.all(k, k == variables.key || k == variables.probeKey || k in variables.newCap)
+    - reason: Forbidden
+      message: "[status] the node plugin may not change any field of status but capacity"
+      expression: >-
+        (has(object.status.allocatable) ? has(oldObject.status.allocatable) && object.status.allocatable == oldObject.status.allocatable : !has(oldObject.status.allocatable)) &&
+        (has(object.status.phase) ? has(oldObject.status.phase) && object.status.phase == oldObject.status.phase : !has(oldObject.status.phase)) &&
+        (has(object.status.conditions) ? has(oldObject.status.conditions) && object.status.conditions == oldObject.status.conditions : !has(oldObject.status.conditions)) &&
+        (has(object.status.addresses) ? has(oldObject.status.addresses) && object.status.addresses == oldObject.status.addresses : !has(oldObject.status.addresses)) &&
+        (has(object.status.daemonEndpoints) ? has(oldObject.status.daemonEndpoints) && object.status.daemonEndpoints == oldObject.status.daemonEndpoints : !has(oldObject.status.daemonEndpoints)) &&
+        (has(object.status.nodeInfo) ? has(oldObject.status.nodeInfo) && object.status.nodeInfo == oldObject.status.nodeInfo : !has(oldObject.status.nodeInfo)) &&
+        (has(object.status.images) ? has(oldObject.status.images) && object.status.images == oldObject.status.images : !has(oldObject.status.images)) &&
+        (has(object.status.volumesInUse) ? has(oldObject.status.volumesInUse) && object.status.volumesInUse == oldObject.status.volumesInUse : !has(oldObject.status.volumesInUse)) &&
+        (has(object.status.volumesAttached) ? has(oldObject.status.volumesAttached) && object.status.volumesAttached == oldObject.status.volumesAttached : !has(oldObject.status.volumesAttached)) &&
+        (has(object.status.config) ? has(oldObject.status.config) && object.status.config == oldObject.status.config : !has(oldObject.status.config)) &&
+        (has(object.status.runtimeHandlers) ? has(oldObject.status.runtimeHandlers) && object.status.runtimeHandlers == oldObject.status.runtimeHandlers : !has(oldObject.status.runtimeHandlers)) &&
+        (has(object.status.features) ? has(oldObject.status.features) && object.status.features == oldObject.status.features : !has(oldObject.status.features)) &&
+        (has(object.status.declaredFeatures) ? has(oldObject.status.declaredFeatures) && object.status.declaredFeatures == oldObject.status.declaredFeatures : !has(oldObject.status.declaredFeatures))
+    - reason: Forbidden
+      message: "[metadata] the node plugin may not change labels, annotations, finalizers, ownerReferences or the Apply entries of managedFields"
+      expression: >-
+        (has(object.metadata.labels) ? has(oldObject.metadata.labels) && object.metadata.labels == oldObject.metadata.labels : !has(oldObject.metadata.labels)) &&
+        (has(object.metadata.annotations) ? has(oldObject.metadata.annotations) && object.metadata.annotations == oldObject.metadata.annotations : !has(oldObject.metadata.annotations)) &&
+        (has(object.metadata.finalizers) ? has(oldObject.metadata.finalizers) && object.metadata.finalizers == oldObject.metadata.finalizers : !has(oldObject.metadata.finalizers)) &&
+        (has(object.metadata.ownerReferences) ? has(oldObject.metadata.ownerReferences) && object.metadata.ownerReferences == oldObject.metadata.ownerReferences : !has(oldObject.metadata.ownerReferences)) &&
+        (has(object.metadata.managedFields) ? object.metadata.managedFields.filter(e, e.operation == 'Apply') : []) ==
+        (has(oldObject.metadata.managedFields) ? oldObject.metadata.managedFields.filter(e, e.operation == 'Apply') : [])

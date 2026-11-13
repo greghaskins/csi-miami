@@ -85,14 +85,51 @@ func runChildServer() int {
 			}
 		}
 	}
+	if b, err := strconv.ParseInt(os.Getenv("BD_CACHE_BOUND"), 10, 64); err == nil {
+		cfg.CacheBound = b // below the size, so the cache is not prefetched
+	}
+	if f := os.Getenv("BD_STALL_BASE_FILE"); f != "" {
+		// Stall one base fetch of a write, once, for BD_STALL_BASE_FOR, when
+		// the test creates the trigger file. Reachable only from this test
+		// binary: baseFetchHook is set nowhere else.
+		d, _ := time.ParseDuration(os.Getenv("BD_STALL_BASE_FOR"))
+		baseFetchHook = func(uint32) {
+			if os.Remove(f) == nil {
+				time.Sleep(d)
+			}
+		}
+	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	if err := Run(ctx, cfg, log); err != nil {
+	var k kernelAPI = realKernel{sysfs: "/sys"}
+	if os.Getenv("BD_SHUT_FIRST_RECONNECT") == "1" {
+		k = &shutFirstReconnect{kernelAPI: k}
+	}
+	if err := runOn(ctx, cfg, log, k); err != nil {
 		fmt.Fprintf(os.Stderr, "child blockd: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// shutFirstReconnect shuts the first socket handed to reconnect down before the
+// kernel gets it, so the kernel adopts a socket that is already dead: the state
+// its stale receive thread leaves when it marks the slot dead after the new
+// socket went in. The child has no left device, so the first reconnect is the
+// re-point. Reachable only from this test binary.
+type shutFirstReconnect struct {
+	kernelAPI
+	once sync.Once
+}
+
+func (k *shutFirstReconnect) reconnect(ctx context.Context, idx int, sock *os.File) error {
+	var err error
+	k.once.Do(func() { err = shutdownFile(sock) })
+	if err != nil {
+		return err
+	}
+	return k.kernelAPI.reconnect(ctx, idx, sock)
 }
 
 // childTimeout is the child's nbd request timeout: BD_TIMEOUT, else 30 s.
@@ -585,8 +622,19 @@ func TestSmokeBlockdRestartKeepsDeviceAndMount(t *testing.T) {
 // throughout. The stall is a Flush made to sleep past a 1 s timeout, by the
 // test child's hook (see runChildServer), triggered by a file the test creates.
 func TestSmokeBlockdRepointsAfterARequestTimeout(t *testing.T) {
+	smokeRepoint(t, "-repoint")
+}
+
+// The same, with the kernel adopting a re-pointed socket that is already shut
+// down (see shutFirstReconnect): the server must retry on a fresh socket
+// rather than reissue the dead one until the device fails its requests.
+func TestSmokeBlockdRepointsWhenTheKernelDropsTheAdoptedSocket(t *testing.T) {
+	smokeRepoint(t, "-repoint-shut", "BD_SHUT_FIRST_RECONNECT=1")
+}
+
+func smokeRepoint(t *testing.T, volSuffix string, extraEnv ...string) {
 	smokeEnv(t)
-	childVolume = smokeVol + "-repoint"
+	childVolume = smokeVol + volSuffix
 	t.Cleanup(func() { childVolume = smokeVol })
 
 	base := t.TempDir()
@@ -623,7 +671,7 @@ func TestSmokeBlockdRepointsAfterARequestTimeout(t *testing.T) {
 		_ = h.Release(rctx)
 	})
 
-	childExtraEnv = []string{"BD_TIMEOUT=1s", "BD_STALL_FILE=" + trigger, "BD_STALL_FOR=3s"}
+	childExtraEnv = append([]string{"BD_TIMEOUT=1s", "BD_STALL_FILE=" + trigger, "BD_STALL_FOR=3s"}, extraEnv...)
 	t.Cleanup(func() { childExtraEnv = nil })
 	cmd := startChild(t, store, cache, control, epoch)
 	cli := dialWait(t, control)
@@ -692,6 +740,199 @@ func TestSmokeBlockdRepointsAfterARequestTimeout(t *testing.T) {
 	sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer scancel()
 	if err := cli.Stop(sctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	_ = cli.Close()
+}
+
+// directDev is a block device opened for aligned, uncached I/O, so that a
+// write is a request to the server and a read comes from it.
+type directDev struct {
+	fd  int
+	buf []byte
+}
+
+func openDirect(t *testing.T, dev string) *directDev {
+	t.Helper()
+	fd, err := unix.Open(dev, unix.O_RDWR|unix.O_DIRECT|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", dev, err)
+	}
+	buf, err := unix.Mmap(-1, 0, smokeChk, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	if err != nil {
+		t.Fatalf("map buffer: %v", err)
+	}
+	return &directDev{fd: fd, buf: buf}
+}
+
+func (d *directDev) close() {
+	if d.buf == nil {
+		return
+	}
+	_ = unix.Close(d.fd)
+	_ = unix.Munmap(d.buf)
+	d.buf = nil
+}
+
+func (d *directDev) writeAt(p []byte, off int64) error {
+	n := copy(d.buf, p)
+	_, err := unix.Pwrite(d.fd, d.buf[:n], off)
+	return err
+}
+
+func (d *directDev) readAt(n int, off int64) ([]byte, error) {
+	if _, err := unix.Pread(d.fd, d.buf[:n], off); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), d.buf[:n]...), nil
+}
+
+// A write stuck in the server's base fetch past the nbd request timeout makes
+// the kernel shut the socket; the server re-points in process and the kernel's
+// resend of the write queues behind the stuck original on its chunk (decision
+// 67). The stall here (5 s) is longer than the request timeout (1 s) and
+// shorter than the dead-connection timeout (20 s): the device rides it out. No
+// request fails, the server neither exits nor restarts, the original lands
+// before its resend, and W2, written after the resend was acked, is what the
+// chunk holds, in the cache and in the published chunk. The stall is a base
+// fetch made to sleep by the test child's hook (see runChildServer), triggered
+// by a file the test creates.
+func TestSmokeBlockdRidesOutAStalledWriteAcrossARepoint(t *testing.T) {
+	smokeEnv(t)
+	childVolume = smokeVol + "-ride"
+	t.Cleanup(func() { childVolume = smokeVol })
+
+	base := t.TempDir()
+	store := filepath.Join(base, childVolume)
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunk.Open(store); err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(t.TempDir(), "cache")
+	ctlDir, err := os.MkdirTemp("/tmp", "bd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(ctlDir) })
+	control := filepath.Join(ctlDir, "c.sock")
+	trigger := filepath.Join(ctlDir, "stall")
+
+	actx, acancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer acancel()
+	h, err := holder.Acquire(actx, base, childVolume, smokeNode, holder.Judgement{})
+	if err != nil {
+		t.Fatalf("acquire holder: %v", err)
+	}
+	epoch := h.Epoch()
+	t.Cleanup(func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer rcancel()
+		_ = h.Release(rctx)
+	})
+
+	// Chunk 20 holds a known base, published, so that a server starting from a
+	// fresh cache has to fetch it to write part of it.
+	const target = 20
+	off := int64(target)*smokeChk + 8192
+	baseData := pattern(0x40, smokeChk)
+	cmd := startChild(t, store, cache, control, epoch)
+	cli := dialWait(t, control)
+	d := openDirect(t, deviceFor(t, cli))
+	if err := d.writeAt(baseData, int64(target)*smokeChk); err != nil {
+		t.Fatalf("write the base chunk: %v", err)
+	}
+	d.close()
+	pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer pcancel()
+	if err := cli.Boundary(pctx); err != nil {
+		t.Fatalf("Boundary: %v", err)
+	}
+	if _, err := cli.Publish(pctx, "request"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := cli.Stop(pctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	_ = cli.Close()
+	_ = cmd.Wait()
+
+	// A server on a fresh cache, with a 1 s request timeout and a base fetch
+	// that stalls once, for 5 s.
+	cache = filepath.Join(t.TempDir(), "cache2")
+	childExtraEnv = []string{
+		"BD_TIMEOUT=1s",
+		"BD_CACHE_BOUND=" + strconv.Itoa(smokeSize-smokeChk),
+		"BD_STALL_BASE_FILE=" + trigger,
+		"BD_STALL_BASE_FOR=5s",
+	}
+	t.Cleanup(func() { childExtraEnv = nil })
+	cmd = startChild(t, store, cache, control, epoch)
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	cli = dialWait(t, control)
+	idx := deviceIndex(t, cli)
+	dev := fmt.Sprintf("/dev/nbd%d", idx)
+	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d = openDirect(t, dev)
+	defer d.close()
+	w1 := pattern(0x11, 4096)
+	if err := d.writeAt(w1, off); err != nil { // stalls, is timed out and resent
+		dumpNBD(t)
+		t.Fatalf("W1 across the stall: %v; the server's log:\n%s", err, childLog(cmd))
+	}
+	w2 := pattern(0x22, 4096)
+	if err := d.writeAt(w2, off); err != nil {
+		t.Fatalf("W2: %v", err)
+	}
+	select {
+	case <-exited:
+		t.Fatalf("the server exited; its log:\n%s", childLog(cmd))
+	default:
+	}
+	if log := childLog(cmd); !strings.Contains(log, "path=repoint") || !strings.Contains(log, "still in flight") {
+		t.Fatalf("the server did not re-point in process over the stuck write; its log:\n%s", log)
+	}
+	if got := deviceIndex(t, cli); got != idx {
+		t.Fatalf("status index moved from %d to %d", idx, got)
+	}
+
+	want := append([]byte(nil), baseData...)
+	copy(want[8192:], w2)
+	got, err := d.readAt(smokeChk, int64(target)*smokeChk)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("the chunk does not hold W2 over its base")
+	}
+	if err := cli.Boundary(pctx); err != nil {
+		t.Fatalf("Boundary: %v", err)
+	}
+	if _, err := cli.Publish(pctx, "request"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	verifyStore(t, store)
+	st, err := chunk.Open(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, _, err := st.Current(pctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.ReadManifest(pctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Chunks[target] != chunk.Sum(want) {
+		t.Fatalf("the published chunk %d is not the one W2 left", target)
+	}
+	d.close()
+	if err := cli.Stop(pctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	_ = cli.Close()
