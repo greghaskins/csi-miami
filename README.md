@@ -183,7 +183,7 @@ kubectl apply -k deploy/kustomize/base
 kubectl apply -k deploy/kustomize/examples
 ```
 
-Edit the examples first: in `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rwo-plain.yaml` (and `miami-remote-dir-rwx.yaml`, the internal directory kind's class) set `transport.server` and `transport.export`. `miami-local-dir-rwo.yaml` is the retired `local` transport and goes with it (decision 63).
+Edit the examples first: in `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rwo-plain.yaml` set `transport.server` and `transport.export`. Both are volume classes; there is no directory class to deploy (decision 62).
 
 ## StorageClass parameters
 
@@ -191,7 +191,7 @@ Edit the examples first: in `miami-remote-vol-rwo.yaml` and `miami-remote-vol-rw
 
 | Parameter | Values | Required | Meaning |
 |---|---|---|---|
-| `kind` | `volume` (`directory` is internal, below) | yes | Item type |
+| `kind` | `volume` | yes | Item type. `directory` is internal and refused (below) |
 | `transport.kind` | `nfs3` | yes | Transport type. `local` is retired (decision 63) and refused for a volume: a chunk store on the node's own disk would only back up the node to itself |
 | `transport.server` | IPv4 (lower case), hostname (lower case) | yes | NFS server; IPv6 and ports not supported |
 | `transport.export` | absolute path | yes | NFS export path |
@@ -220,9 +220,11 @@ A volume is ext4 (`csi.storage.k8s.io/fstype: ext4`, or no `fsType` at all; any 
 
 ## The directory kind (internal)
 
-`kind: directory` binds a subdirectory of the NAS export straight into the pod: no device, no cache, no daemon, no holder, no encryption and no fencing. It is kept as plumbing (decision 62), not as a product: blobd's replicas will mount their store this way, M3's RWX volumes mount the holder node's re-export this way, and a file share for something outside Kubernetes would too. Applications choose a volume. The example class `miami-remote-dir-rwx` stays for the driver's own use and its canary.
+`kind: directory` binds a subdirectory of the NAS export straight into the pod: no device, no cache, no daemon, no holder, no encryption and no fencing. It is kept as plumbing (decision 62), not as a product: blobd's replicas will mount their store this way, M3's RWX volumes mount the holder node's re-export this way, and a file share for something outside Kubernetes would too. Applications choose a volume.
 
-What it accepts, for completeness: the transport parameters above, `subdir`, and `mode` (1 to 4 octal digits; the mode of the directory when created, default `0755`; `0777` for root-squashed exports and `2775` setgid are the common ones; setuid is refused; an existing directory is adopted and never chmod'ed). Access modes `SINGLE_NODE_WRITER`, `SINGLE_NODE_MULTI_WRITER`, `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY`; no `fsType`; a class that sets a volume parameter is refused. Its semantics are NFSv3's (see "Limitations"), and its cross-node locking is the helper below.
+The controller refuses to provision it: `CreateVolume` for a class of `kind: directory` returns `InvalidArgument`, naming decision 62 and `kind: "volume"` as the fix. Directory volumes that already exist keep staging, publishing and deleting until they are deleted. No example class offers the kind; the end-to-end suite carries its own (`deploy/kustomize/overlays/e2e`) and turns the kind on in its controller, and the driver's own manifests will do the same where they need it.
+
+What an existing directory volume's class accepts, for completeness: the transport parameters above, `subdir`, and `mode` (1 to 4 octal digits; the mode of the directory when created, default `0755`; `0777` for root-squashed exports and `2775` setgid are the common ones; setuid is refused; an existing directory is adopted and never chmod'ed). Access modes `SINGLE_NODE_WRITER`, `SINGLE_NODE_MULTI_WRITER`, `MULTI_NODE_MULTI_WRITER` and `MULTI_NODE_READER_ONLY`; no `fsType`; a class that sets a volume parameter is refused. Its semantics are NFSv3's (see "Limitations"), and its cross-node locking is the helper below.
 
 ## Locking across nodes
 
@@ -267,7 +269,7 @@ The helper runs the command in its own process group. SIGTERM or SIGINT sent to 
 - **The directory kind has none of the volume machinery.** No encryption, fencing, expansion or exclusivity; it is internal (decision 62). There is no filesystem-image item (a loop device over a file on the NAS): a volume replaced it. Blobs are the blob store, blobd, a separate project.
 - **Transport options are fixed in code.** The NFSv3 profile (`vers=3,proto=tcp,softerr,timeo=100,retrans=17,nolock,lookupcache=positive,actimeo=30,noacl`) is not configurable per StorageClass.
 - **Old profiles.** A transport mounted by an older option profile is reported as a conflict until it is unmounted by hand.
-- **The `local` transport is retired** (decision 63). The code and the `miami-local-dir-rwo` example are removed in a follow-up; until then a `local` class still works for the directory kind only, is not deleted by the controller (the directory stays on the node's disk), and does not require its path to be a mount point.
+- **The `local` transport is retired** (decision 63). The code is removed in a follow-up, and the `miami-local-dir-rwo` example is gone (it lives on in the end-to-end overlay); until then an existing `local` volume still works for the directory kind only, is not deleted by the controller (the directory stays on the node's disk), and does not require its path to be a mount point.
 
 **Volumes**
 

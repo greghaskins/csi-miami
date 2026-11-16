@@ -925,9 +925,13 @@ is retired.
     substrate blobd's replicas mount, the non-holder side of M3's RWX volumes
     (every other node mounts the holder's re-export and binds a subdirectory,
     which is this item's transport layer), and the hook for a file share
-    outside Kubernetes later. Its StorageClass is not offered to applications;
-    the `miami-remote-dir-rwx` example remains for the driver's own use and its
-    canary. The `miami lock` helper stays with it.
+    outside Kubernetes later. Its StorageClass is not offered to applications.
+    Amended: the controller refuses to provision the kind (`CreateVolume`
+    returns `InvalidArgument`) unless started with `--allow-directory-kind`,
+    which only the driver's own manifests set (today the end-to-end overlay;
+    blobd's may later). The examples carry no directory class. Directory
+    volumes that already exist keep staging, publishing and deleting. The
+    `miami lock` helper stays with it.
 63. **The `local` transport is retired** (removes a dimension of brief 4.1).
     Nothing uses a directory on a node's own disk, and the role of a node-local
     class passes to volumes, which are NAS-backed and so can move between nodes.

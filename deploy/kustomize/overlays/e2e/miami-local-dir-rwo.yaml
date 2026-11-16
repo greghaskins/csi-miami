@@ -1,3 +1,5 @@
+# The retired local transport (decision 63) with the internal directory kind
+# (decision 62), for the end-to-end tests only.
 # Named miami-LOCATION-TYPE-SHARING: dir is a directory item, local is the
 # node's own disk, rwo is one node. The path is on the node the pod runs on, so
 # the class waits for a consumer to learn which node that is.
