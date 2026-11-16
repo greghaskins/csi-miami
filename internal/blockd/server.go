@@ -202,6 +202,7 @@ func (s *server) loadBase(ctx context.Context, baseName string, local *chunk.Man
 			s.mu.Lock()
 			s.baseMismatch = errBaseCopyMismatch
 			s.mu.Unlock()
+			s.back.disableAdoption()
 			s.log.Error("blockd: the store's base manifest differs from the cache's copy; publishing is stopped", "volume", s.cfg.Volume, "base", baseName)
 			return
 		}

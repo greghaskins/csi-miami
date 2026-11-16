@@ -83,7 +83,14 @@ type Cache struct {
 	bcopy    map[uint32]struct{} // boundary chunks with a b/<i> file
 	clean    *lru
 	lruMu    sync.Mutex // guards clean's order where readers hold only mu.RLock
-	scratch  []byte
+	// unverified holds the full-size chunk files a resume found that the
+	// index does not name (decision 68): a clean copy, or a write a crash
+	// beat to the index. Such a file counts toward the bound and is evicted
+	// first, and is never served until Adopt has checked its content against
+	// the base the index names; any write, insert or trim of the chunk drops
+	// it from here.
+	unverified map[uint32]struct{}
+	scratch    []byte
 	// unsynced is the fsync obligation set: chunks with writes the next FLUSH
 	// must fdatasync. A chunk is added after its pwrite, and removed only by
 	// the fdatasync that covers it (or when its file is gone); publishing a
@@ -134,7 +141,7 @@ func newCache(dir string, idx Index, bound int64) *Cache {
 	return &Cache{
 		dir: dir, bound: bound, idx: idx,
 		dirty: map[uint32]struct{}{}, zero: map[uint32]struct{}{},
-		bcopy: map[uint32]struct{}{}, clean: newLRU(), unsynced: map[uint32]struct{}{}, pendingUnlink: map[uint32]struct{}{},
+		bcopy: map[uint32]struct{}{}, clean: newLRU(), unverified: map[uint32]struct{}{}, unsynced: map[uint32]struct{}{}, pendingUnlink: map[uint32]struct{}{},
 		idxChunks: map[uint32]struct{}{}, pinned: map[uint32]struct{}{}, newFiles: map[uint32]struct{}{},
 	}
 }
@@ -184,10 +191,13 @@ func Create(dir string, idx Index, bound int64) (*Cache, error) {
 	return c, nil
 }
 
-// Open resumes the cache in dir from its index. Only the index is trusted:
-// a chunk file it does not name is deleted, which loses nothing the guest was
-// told is safe, because a write that newly dirties a chunk is not acknowledged
-// until an index naming the chunk is on disk (see WriteAt). It returns
+// Open resumes the cache in dir from its index. Only the index, and the
+// hashes of the base it names, are trusted: a full-size chunk file the index
+// does not name is kept as unverified and never served until Adopt has found
+// its content equal to the base's (decision 68). A write that a crash beat to
+// the index cannot pass that check, so it is never served, which loses nothing
+// the guest was told is safe: a write that newly dirties a chunk is not
+// acknowledged until an index naming the chunk is on disk (see WriteAt). It returns
 // ErrNoIndex when there is none and an error wrapping ErrCorrupt when the
 // index or the chunk files disagree with it. The caller compares Index() with
 // the geometry it expects.
@@ -276,9 +286,13 @@ func (c *Cache) scanChunks() error {
 			seen[i] = struct{}{}
 		default:
 			// Not in the index: either a clean copy or a write whose index
-			// update a crash beat to disk. Only the index is trusted, so a
-			// resumed cache starts cold for clean data.
-			_ = os.Remove(path)
+			// update a crash beat to disk. Kept, but not served: Adopt checks
+			// it against the base before it is (decision 68).
+			if _, inBoundary := c.boundary[i]; inBoundary {
+				_ = os.Remove(path)
+				continue
+			}
+			c.unverified[i] = struct{}{}
 		}
 	}
 	for v := range c.dirty {
@@ -448,7 +462,54 @@ func (c *Cache) dirtyBytes() int64 {
 }
 
 func (c *Cache) usedBytes() int64 {
-	return c.dirtyBytes() + int64(c.clean.len())*c.idx.Chunk
+	return c.dirtyBytes() + int64(c.clean.len()+len(c.unverified))*c.idx.Chunk
+}
+
+// Unverified reports whether chunk i has a file awaiting Adopt.
+func (c *Cache) Unverified(i uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.unverified[i]
+	return ok
+}
+
+// Adopt makes chunk i's unverified file a clean copy if match, given its
+// path, says its content is the base's chunk i; otherwise the file is
+// deleted. It reports whether i is now resident. match runs without the
+// cache lock held, so the caller must keep other writers of chunk i out (the
+// block server holds the chunk's stripe); a write, insert, trim or eviction
+// of i meanwhile wins, and Adopt then adopts nothing.
+func (c *Cache) Adopt(i uint32, match func(path string) (bool, error)) (bool, error) {
+	c.mu.RLock()
+	_, ok := c.unverified[i]
+	c.mu.RUnlock()
+	if !ok {
+		return false, nil
+	}
+	same, err := match(c.cpath(i))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, still := c.unverified[i]; !still {
+		return c.hasLocked(i), nil
+	}
+	delete(c.unverified, i)
+	if err != nil || !same {
+		_ = os.Remove(c.cpath(i))
+		return false, err
+	}
+	c.clean.touch(i)
+	return true, nil
+}
+
+// DropUnverified deletes every unverified file: after its base turned out
+// not to be the store's, nothing more is adopted.
+func (c *Cache) DropUnverified() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.unverified {
+		_ = os.Remove(c.cpath(i))
+		delete(c.unverified, i)
+	}
 }
 
 // DirtyBytes is the bytes of unpublished dirty chunks, not counting trimmed
@@ -469,6 +530,13 @@ func (c *Cache) Used() int64 {
 // evictLocked drops least-recently-used clean chunks until extra more bytes
 // fit under the bound, or no clean chunk is left.
 func (c *Cache) evictLocked(extra int64) {
+	for i := range c.unverified { // unchecked files go first
+		if c.usedBytes()+extra <= c.bound {
+			return
+		}
+		delete(c.unverified, i)
+		_ = os.Remove(c.cpath(i))
+	}
 	for c.usedBytes()+extra > c.bound {
 		i, ok := c.clean.oldestWhere(func(i uint32) bool { _, held := c.pinned[i]; return !held })
 		if !ok {
@@ -509,6 +577,7 @@ func (c *Cache) Write(i uint32, buf []byte) error {
 		return err
 	}
 	c.clean.remove(i)
+	delete(c.unverified, i)
 	delete(c.zero, i)
 	delete(c.pendingUnlink, i)
 	delete(c.pinned, i)
@@ -584,6 +653,7 @@ func (c *Cache) Insert(i uint32, buf []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	delete(c.unverified, i) // replaced by fetched bytes
 	c.clean.touch(i)
 	return nil
 }
@@ -758,9 +828,11 @@ func (c *Cache) MarkZero(i uint32) error {
 	// written (see flushLocked), so a crash in between never leaves a dirty
 	// chunk with no file and no Zero flag. A chunk with no file needs no
 	// unlink at all, which is the common case after mkfs discards a device.
-	if _, isDirty := c.dirty[i]; isDirty || c.clean.has(i) {
+	_, isUnverified := c.unverified[i]
+	if _, isDirty := c.dirty[i]; isDirty || c.clean.has(i) || isUnverified {
 		c.pendingUnlink[i] = struct{}{}
 	}
+	delete(c.unverified, i)
 	c.clean.remove(i)
 	delete(c.unsynced, i)
 	c.dirty[i] = struct{}{}

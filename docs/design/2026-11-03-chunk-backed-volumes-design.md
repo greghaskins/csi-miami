@@ -629,7 +629,7 @@ the holder as the load-bearing node until takeover.
 |---|---|---|
 | NAS unreachable | pods keep running on local data; generations wait | reports (transport gauge, generation age); nothing else |
 | NAS unreachable and the cache fills with dirty chunks | writes get I/O errors; ext4 goes read-only and stays so until remounted | reports (the probe's `VolumeCondition`, `VolumeUnhealthy`, `miami_volume_probe_ok`, `GenerationOverdue`, dirty bytes) with a message to restart the pod once the store is back and the cache has drained; nothing else (decision 53) |
-| block server dies | requests wait while the connection is dead, up to the dead-connection timeout (60 s); systemd restarts the server within a second. If the store is unreachable too, the resumed cache serves dirty and base-zero chunks and takes whole-chunk writes; clean chunks (dropped on resume) need the store and fail with EIO after the request budget | systemd restarts it; it re-points the same nbd device from the cache index (dirty data intact), without waiting for the store (decision 68); no pod deletion, no `e2fsck`; a `ServerRestarted` event (decision 51) |
+| block server dies | requests wait while the connection is dead, up to the dead-connection timeout (60 s); systemd restarts the server within a second. If the store is unreachable too, the resumed cache serves what it held (dirty chunks, and clean copies once their hash matches the base) and base-zero chunks; only chunks the cache did not hold need the store, failing with EIO after the request budget | systemd restarts it; it re-points the same nbd device from the cache index (dirty data intact), without waiting for the store (decision 68); no pod deletion, no `e2fsck`; a `ServerRestarted` event (decision 51) |
 | node dies | the pod and attachment stay with the dead node; the volume stays held | nothing by itself: a pod elsewhere waits as `holder-contended`. The operator's emergency detach (annotation or `out-of-service` taint, 4.6) abandons what the holder had not published and restages from `current`; the node, if it returns first, drains (4.3) |
 | a new volume would exceed the node's cache budget (the scheduler placed it anyway) | the stage is refused before anything is acquired or written; adopt, restart, drain and teardown are never refused | the `cache-budget-exceeded` condition and a `CacheBudgetExceeded` event; retried until a volume leaves (decision 66) |
 | plugin pod restarts or upgrades | nothing: the server, device and mounts are the kernel's and systemd's | reconciles from observation |
@@ -1036,18 +1036,32 @@ is retired.
     it never stands in for the store's `current`, and reuse after a reboot and
     the drain are unchanged. With it a resumed server serves dirty and
     base-zero chunks and takes whole-chunk and base-zero partial writes while
-    the store is away; a clean chunk (the resume drops clean copies, only the
-    index is trusted) and a fetch wait for the store within the request budget,
-    and a publish fails with the dirty set kept. When the store's base loads it
+    the store is away. A resume trusts the index and the hashes of the base it
+    names, and nothing else: a full-size chunk file the index does not name (a
+    clean copy, or a write a crash beat to the index) is kept as unverified.
+    It counts toward the bound, is evicted first, and is never served until
+    it is adopted: chunk i's file is adopted, on first use and under i's
+    stripe (never at open, which would bring back #102's EIO), only if i is
+    not dirty (the zero set is inside the dirty set), not in the boundary
+    set, inside the volume, a whole chunk, and its SHA-256 equals i's hash in
+    the manifest the index's base names, the verified local copy or the
+    store's once loaded. With neither, the file is kept and not served; on a
+    mismatch it is deleted. A write that a crash beat to the index cannot
+    match the base, so it is never served. The rule is the same for every
+    open (a resume, a reuse after a reboot, a drain) and needs only the index
+    and its base. So a resumed server serves clean chunks too, and ext4's
+    journal writes into them proceed offline; only a chunk the cache does not
+    hold at all needs the store, waiting within the request budget, and a
+    publish fails with the dirty set kept. When the store's base loads it
     must equal the copy: a difference is `cache.ErrCorrupt`, the server
-    publishes nothing more, its status says so and the node raises a
-    `BaseCopyMismatch` Warning; the volume waits for a person, as for an
-    unreadable index. A copy is at most 65536 lines of 65 bytes, about 4.3 MB,
+    publishes nothing more, adopts nothing more (the unverified files are
+    deleted), its status says so and the node raises a `BaseCopyMismatch`
+    Warning; the volume waits for a person, as for an unreadable index. A copy is at most 65536 lines of 65 bytes, about 4.3 MB,
     and two exist across a publish, inside the 16 MiB `indexSlack`, so the
-    footprint is unchanged. Rejected for now: adopting the unindexed chunk
-    files on resume by hash against the base copy, which would keep clean
-    chunks too; it is the follow-up if a block server kill during a store
-    outage shows writes failing or ext4 going read-only.
+    footprint is unchanged. The end-to-end test that kills the block server
+    during an NFS outage under an fsync'd writer showed why the adoption is
+    needed: without it the journal's next write, into a chunk published before
+    the kill, waited for the store and the writer stopped.
 
 ## 7. Milestones
 

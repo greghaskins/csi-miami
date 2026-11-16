@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -95,6 +96,10 @@ type backend struct {
 	// cached chunk is served as usual, and a fetch or a publish waits.
 	known, ready chan struct{}
 	knownOnce    sync.Once
+
+	// noAdopt is set once the store's base turned out to differ from the
+	// cache's copy: nothing more is adopted (decision 68).
+	noAdopt atomic.Bool
 }
 
 // newBackend builds the backend over an open cache and store.
@@ -180,6 +185,48 @@ func waitOn(ctx context.Context, c chan struct{}) error {
 	}
 }
 
+// adoptLocked makes chunk i's unverified file (one a resume kept, decision
+// 68) a clean copy if its SHA-256 is chunk i's hash in the base, or deletes
+// it. The caller holds i's stripe, so no write of i runs meanwhile. Without a
+// known base, or after a base mismatch, it adopts nothing and keeps the file.
+func (b *backend) adoptLocked(i uint32) bool {
+	if b.noAdopt.Load() || !b.baseKnown() || !b.cache.Unverified(i) {
+		return false
+	}
+	want, ok := b.chunkHash(i)
+	if !ok {
+		want = b.zeroHash // beyond the base: zeros
+	}
+	adopted, err := b.cache.Adopt(i, func(path string) (bool, error) {
+		data, err := os.ReadFile(path) //nolint:gosec // the server's own cache file
+		if err != nil {
+			return false, err
+		}
+		return int64(len(data)) == b.chunkSize && chunk.Sum(data) == want, nil
+	})
+	if err != nil {
+		b.log.Warn("cache: checking a resumed chunk failed; it is fetched instead", "chunk", i, "err", err)
+	}
+	return adopted
+}
+
+// adopt is adoptLocked for a caller that does not hold i's stripe.
+func (b *backend) adopt(i uint32) bool {
+	if !b.cache.Unverified(i) {
+		return false
+	}
+	m := b.stripe(i)
+	m.Lock()
+	defer m.Unlock()
+	return b.adoptLocked(i)
+}
+
+// disableAdoption stops adopting and deletes the files still unverified.
+func (b *backend) disableAdoption() {
+	b.noAdopt.Store(true)
+	b.cache.DropUnverified()
+}
+
 // Size is the current device size in bytes.
 func (b *backend) Size() int64 { return b.size.Load() }
 
@@ -246,7 +293,7 @@ func (b *backend) ReadAt(p []byte, off int64) (int, error) {
 	miss := missBuf[:0]
 	for pos := off; pos < off+int64(len(p)); {
 		i, _, n := b.segment(pos, int(off+int64(len(p))-pos))
-		if !b.cache.Has(i) && len(miss) < cap(miss) {
+		if !b.cache.Has(i) && !b.adopt(i) && len(miss) < cap(miss) {
 			// Before the base is known a miss's hash is unknown; its fetch
 			// waits for it.
 			if !b.baseKnown() {
@@ -286,6 +333,9 @@ func (b *backend) ReadAt(p []byte, off int64) (int, error) {
 // succeeds even into a dirty-full cache — only the cache insert is skipped.
 func (b *backend) readSeg(i uint32, intra int64, buf []byte) error {
 	err := b.cache.ReadAt(i, intra, buf)
+	if errors.Is(err, cache.ErrMiss) && b.adopt(i) {
+		err = b.cache.ReadAt(i, intra, buf)
+	}
 	if !errors.Is(err, cache.ErrMiss) {
 		return err
 	}
@@ -486,6 +536,9 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte, alive func() bool)
 		}
 	}
 	err := b.cache.WriteAt(i, intra, buf, nil, zeroBase)
+	if errors.Is(err, cache.ErrNotResident) && b.adoptLocked(i) {
+		err = b.cache.WriteAt(i, intra, buf, nil, zeroBase) // resident now
+	}
 	if !errors.Is(err, cache.ErrNotResident) {
 		return err
 	}

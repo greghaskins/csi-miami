@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -358,4 +359,125 @@ func TestBaseCopyFollowsTheBase(t *testing.T) {
 	if got := copies(); len(got) != 1 || got[0] != names[2] {
 		t.Errorf("after a resume with the store: copies %v, want [%s]", got, names[2])
 	}
+}
+
+// Decision 68, option 3: a resumed cache keeps its clean copies unverified and
+// adopts one on first use when its SHA-256 is the base's. With the store away,
+// a read of a clean chunk and a partial write into one (what ext4's journal
+// does) succeed, and the next publish holds the acknowledged bytes.
+func TestRunAdoptsCleanChunksWhileTheStoreIsUnreachable(t *testing.T) {
+	shortConfirm(t)
+	shortBaseRetry(t)
+	cfg, _ := testConfig(t)
+	store := openStore(t, cfg)
+	a, b := pattern(1, testChunk), pattern(2, testChunk)
+	writeCurrent(t, store, 1, 1, []chunk.Hash{putChunk(t, store, a), putChunk(t, store, b)})
+	s, err := newServer(context.Background(), cfg, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, off := range []int64{0, testChunk} { // fetched: clean copies, in no index
+		if _, err := s.back.ReadAt(make([]byte, testChunk), off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+	away := cfg.StoreDir + ".away"
+	if err := os.Rename(cfg.StoreDir, away); err != nil {
+		t.Fatal(err)
+	}
+
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	k.cleanup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+	k.mu.Lock()
+	c := k.held[len(k.held)-1]
+	k.mu.Unlock()
+
+	got, err := nbdIO(c, nbdRead, 1, testChunk+4096, nil, 4096)
+	if err != nil || !bytes.Equal(got, b[4096:8192]) {
+		t.Fatalf("read of a clean chunk with the store away: err %v, match %v", err, bytes.Equal(got, b[4096:8192]))
+	}
+	w := bytes.Repeat([]byte{0x5a}, 4096)
+	if _, err := nbdIO(c, nbdWrite, 2, 8192, w, len(w)); err != nil {
+		t.Fatalf("partial write into a clean chunk with the store away: %v", err)
+	}
+	if _, err := nbdIO(c, nbdFlush, 3, 0, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Rename(away, cfg.StoreDir); err != nil {
+		t.Fatal(err)
+	}
+	cli := dialT(t, cfg.ControlSocket)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := cli.Boundary(ctx)
+		if err == nil {
+			_, err = cli.Publish(ctx, "test")
+		}
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no publish after the store came back: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	stopRun(t, cancel, done)
+	name, _, _ := openStore(t, cfg).Current(context.Background())
+	m, err := openStore(t, cfg).ReadManifest(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want0 := append([]byte(nil), a...)
+	copy(want0[8192:], w)
+	if m.Chunks[0] != chunk.Sum(want0) || m.Chunks[1] != chunk.Sum(b) {
+		t.Errorf("%s does not hold the acknowledged bytes", name)
+	}
+}
+
+// The crash rule (decision 68): a chunk file the index does not name whose
+// content is not the base's (a write that a crash beat to the index) is never
+// served; the chunk reads as the base.
+func TestRunNeverServesAnUnindexedFileThatIsNotTheBase(t *testing.T) {
+	shortConfirm(t)
+	shortBaseRetry(t)
+	cfg, _ := testConfig(t)
+	store := openStore(t, cfg)
+	a := pattern(1, testChunk)
+	writeCurrent(t, store, 1, 1, []chunk.Hash{putChunk(t, store, a), chunk.ZeroHash(testChunk)})
+	s, err := newServer(context.Background(), cfg, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+	stray := pattern(9, testChunk)
+	if err := os.WriteFile(filepath.Join(cfg.CacheDir, "c", "0"), stray, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	k := &fakeKernel{devs: []nbd.Device{ourDevice(3, testSize)}}
+	k.cleanup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAsync(ctx, cfg, k)
+	waitIndex(t, cfg.ControlSocket, 3)
+	k.mu.Lock()
+	c := k.held[len(k.held)-1]
+	k.mu.Unlock()
+	got, err := nbdIO(c, nbdRead, 1, 0, nil, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(got, stray[:4096]) || !bytes.Equal(got, a[:4096]) {
+		t.Fatalf("chunk 0 read %x..., want the base's %x...", got[:4], a[:4])
+	}
+	stopRun(t, cancel, done)
 }
