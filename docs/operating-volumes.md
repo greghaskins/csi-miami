@@ -574,17 +574,37 @@ cannot serve the volume. Do not run an older plugin on a node with staged
 volumes of the newer kind. Block servers stay on the binary they started with
 until the volume is next staged.
 
-**The CSI socket moved to `csi/csi.sock`** under the driver's directory
-(csi-miami#95). Before, the sidecars mounted the driver's whole directory by
-subPath, the kubelet's bind of it received the transport mounts, and the old
-pod of every roll stayed Terminating on a node with a transport mounted. The
-roll onto this layout is the last one that does so: the old pods still carry
-the old subPath. They hold nothing the new pod needs (their containers have
-exited, and the new pod serves every volume), and they go at the node's next
-reboot. Do not unmount the mounts under their `volume-subpaths` by hand: those
-are propagated copies of the live transports, and an unmount there can
-propagate back to the real one. The old `csi.sock` file is left behind and is
-harmless. Rolling back to the old layout brings the stuck pods back.
+### The CSI socket moved (csi-miami#95)
+
+Upgrading from any build before csi-miami#105: the CSI socket is now
+`plugins/<driver>/csi/csi.sock`. Before, the sidecars mounted the driver's
+whole directory by subPath. The kubelet's bind of it received the transport
+mounts, and the old pod of every roll stayed Terminating on a node with a
+transport mounted.
+
+**The roll onto this layout is the last one that does so.** The old pods still
+carry the old subPath. Nodes with no transport mounted roll cleanly.
+
+- **Symptom:** `kubectl -n miami-system get pods -l app.kubernetes.io/component=node`
+  shows an old-template pod Terminating beside the new one. The node's
+  kubelet log repeats "device or resource busy" (or "target is busy") for a
+  path under `pods/<uid>/volume-subpaths/.../csi-node-driver-registrar` or
+  `.../livenessprobe`.
+- **Harmless to wait:** its containers have exited, and the new pod serves
+  every volume on the node.
+- **Fix:** a normal drain and reboot of the node clears it. The mounts go with
+  the reboot, and the kubelet then finishes the teardown. It is resolved
+  when no old-template node pod is left on the node.
+- `kubectl delete pod --force --grace-period=0` on it removes only the API
+  object. That is safe for data, since nothing in it serves a volume, but it
+  does not release the mounts: the kubelet keeps retrying the orphaned
+  directory until the reboot. (Not tested on a real node.)
+- **Do not unmount the mounts under its `volume-subpaths` by hand.** They are
+  propagated copies of the live transports, and an unmount there can
+  propagate back to the real one.
+
+The old `csi.sock` file is left behind and is harmless. After a rollback to
+the old layout, every later roll leaves Terminating pods again.
 
 **Drain records written before the upgrade** count at the class size until the
 plugin's next start rewrites them.
