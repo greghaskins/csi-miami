@@ -180,8 +180,10 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 	// (the decision-32 window), so re-check immediately before Prune.
 	if mine, merr := s.cfg.Holder.Mine(ctx); merr != nil || !mine {
 		s.log.Warn("skipping prune: holder no longer ours", "volume", s.cfg.Volume, "err", merr)
-	} else if _, _, perr := s.store.Prune(ctx, s.cfg.Keep); perr != nil {
-		s.log.Warn("prune after publish failed", "volume", s.cfg.Volume, "err", perr)
+	} else if manifests, chunks, perr := s.store.Prune(ctx, s.cfg.Keep); perr != nil {
+		s.log.Warn("prune after publish failed", "volume", s.cfg.Volume, "keep", s.cfg.Keep, "err", perr)
+	} else {
+		s.log.Info("pruned", "volume", s.cfg.Volume, "keep", s.cfg.Keep, "manifestsRemoved", manifests, "chunksRemoved", chunks)
 	}
 	s.log.Info("published generation", "volume", s.cfg.Volume, "trigger", trigger, "manifest", m.Name(), "uploaded", uploaded)
 	return PublishReply{Name: m.Name(), Uploaded: uploaded}, nil
