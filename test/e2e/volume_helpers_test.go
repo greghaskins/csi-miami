@@ -117,6 +117,12 @@ func (e *env) volumeClass(t *testing.T, base string) string {
 // until a pod uses it needs WaitForFirstConsumer).
 func (e *env) volumeClassBinding(t *testing.T, base string, mode *storagev1.VolumeBindingMode) string {
 	t.Helper()
+	return e.volumeClassWith(t, base, mode, nil)
+}
+
+// volumeClassWith is volumeClassBinding with extra parameters on the copy.
+func (e *env) volumeClassWith(t *testing.T, base string, mode *storagev1.VolumeBindingMode, extra map[string]string) string {
+	t.Helper()
 	ctx, cancel := e.withDeadline()
 	defer cancel()
 	sc, err := e.Client.StorageV1().StorageClasses().Get(ctx, base, metav1.GetOptions{})
@@ -133,6 +139,9 @@ func (e *env) volumeClassBinding(t *testing.T, base string, mode *storagev1.Volu
 	}
 	params[volume.ParamGenInterval] = testGenInterval
 	params[volume.ParamGenMaxAge] = testGenMaxAge
+	for k, v := range extra {
+		params[k] = v
+	}
 	// The copy's template keeps ${pvc.namespace}/${pvc.name}, so its volumes
 	// are in the test's own directory of the export.
 	cp := &storagev1.StorageClass{
