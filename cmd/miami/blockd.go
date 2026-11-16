@@ -28,7 +28,7 @@ type blockdFlags struct {
 	cacheBound int64
 	epoch      uint64
 	node       string
-	keep int
+	keep       int
 	readOnly   bool
 	timeout    time.Duration
 	deadConn   time.Duration
