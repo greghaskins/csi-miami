@@ -155,9 +155,19 @@ first:
   name.
 
 Then take the decision a person must take: which one is right, and whether
-the hashes the server answered from the copy (for zero and never-written
-chunks) agree with the store's. Until then the volume serves its writes but its
-generations do not move, and `GenerationOverdue` follows.
+the hashes the server answered from the copy agree with the store's. Those
+answers cover the zero and never-written chunks, and every clean chunk it
+adopted after the restart. What the guest read since the restart came from
+them, and still does: the mismatch stops further adoption and publishing,
+but chunks already adopted keep being served. Until then the volume serves its
+writes but its generations do not move, and `GenerationOverdue` follows.
+
+Next step: keep the pod running. Its writes are kept in the cache, and an
+unstage would try to publish and be refused. Leave the cache and its
+`base-<manifest>` copy as they are (they are the evidence), and record what
+was found. There is no tested procedure yet to clear the stop. Clearing it
+means deciding which manifest is right, then restarting the block server so
+that it reloads its base; that procedure is a follow-up.
 
 ## A stage that refuses
 

@@ -189,8 +189,13 @@ func waitOn(ctx context.Context, c chan struct{}) error {
 // 68) a clean copy if its SHA-256 is chunk i's hash in the base, or deletes
 // it. The caller holds i's stripe, so no write of i runs meanwhile. Without a
 // known base, or after a base mismatch, it adopts nothing and keeps the file.
+// It reports whether i is resident now: a racing reader or writer may have
+// adopted (or replaced) it first, and then the chunk is there all the same.
 func (b *backend) adoptLocked(i uint32) bool {
-	if b.noAdopt.Load() || !b.baseKnown() || !b.cache.Unverified(i) {
+	if !b.cache.Unverified(i) {
+		return b.cache.Has(i)
+	}
+	if b.noAdopt.Load() || !b.baseKnown() {
 		return false
 	}
 	want, ok := b.chunkHash(i)
@@ -213,7 +218,7 @@ func (b *backend) adoptLocked(i uint32) bool {
 // adopt is adoptLocked for a caller that does not hold i's stripe.
 func (b *backend) adopt(i uint32) bool {
 	if !b.cache.Unverified(i) {
-		return false
+		return b.cache.Has(i)
 	}
 	m := b.stripe(i)
 	m.Lock()
@@ -645,8 +650,8 @@ func (b *backend) prefetch(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		idx := uint32(i) //nolint:gosec // bounded by the manifest length
-		if b.cache.Has(idx) {
+		idx := uint32(i)                      //nolint:gosec // bounded by the manifest length
+		if b.cache.Has(idx) || b.adopt(idx) { // a resumed clean copy needs no fetch
 			continue
 		}
 		if err := b.fetchOne(ctx, idx); errors.Is(err, cache.ErrFull) {

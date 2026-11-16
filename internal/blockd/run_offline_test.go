@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -480,4 +482,90 @@ func TestRunNeverServesAnUnindexedFileThatIsNotTheBase(t *testing.T) {
 		t.Fatalf("chunk 0 read %x..., want the base's %x...", got[:4], a[:4])
 	}
 	stopRun(t, cancel, done)
+}
+
+// Readers and a writer racing on one unverified chunk with the store away:
+// whoever adopts it, the others find it resident; none fails or waits for
+// the store.
+func TestConcurrentFirstUseOfAnUnverifiedChunk(t *testing.T) {
+	cfg, _ := testConfig(t)
+	store := openStore(t, cfg)
+	a := pattern(1, testChunk)
+	writeCurrent(t, store, 1, 1, []chunk.Hash{putChunk(t, store, a), chunk.ZeroHash(testChunk)})
+	s, err := newServer(context.Background(), cfg, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.back.ReadAt(make([]byte, testChunk), 0); err != nil { // a clean copy, in no index
+		t.Fatal(err)
+	}
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(cfg.StoreDir, cfg.StoreDir+".away"); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Timeout = 2 * time.Second // a fetch would fail fast, not hang the test
+	for round := range 20 {
+		r, err := resumeServer(context.Background(), cfg, testLog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !r.back.cache.Unverified(0) {
+			t.Fatalf("round %d: chunk 0 is not unverified after the resume", round)
+		}
+		var wg sync.WaitGroup
+		errs := make(chan error, 9)
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				buf := make([]byte, 4096)
+				if _, err := r.back.ReadAt(buf, 4096); err != nil {
+					errs <- fmt.Errorf("read: %w", err)
+				} else if !bytes.Equal(buf, a[4096:8192]) {
+					errs <- errors.New("read the wrong bytes")
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.back.WriteAt(bytes.Repeat([]byte{7}, 4096), 12288, false); err != nil {
+				errs <- fmt.Errorf("write: %w", err)
+			}
+		}()
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Errorf("round %d: %v", round, err)
+		}
+		if err := r.close(); err != nil {
+			t.Fatal(err)
+		}
+		if t.Failed() {
+			return
+		}
+		// Back to one unverified clean copy for the next round: drop the
+		// dirty write by rebuilding the cache from the original state.
+		if err := os.Rename(cfg.StoreDir+".away", cfg.StoreDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(cfg.CacheDir); err != nil {
+			t.Fatal(err)
+		}
+		s, err := newServer(context.Background(), cfg, testLog())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.back.ReadAt(make([]byte, testChunk), 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(cfg.StoreDir, cfg.StoreDir+".away"); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
