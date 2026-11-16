@@ -58,6 +58,10 @@ func TestVolumeNodeDaemonSetRoll(t *testing.T) {
 	if after := e.waitVolumeStack(t, node, vol, pod.UID); after != before {
 		t.Errorf("the stack changed across the roll: before %+v, after %+v", before, after)
 	}
+	// The writers go before the read-back: with cache accounting on, a third
+	// pod's footprint does not fit beside theirs on one worker.
+	n.deletePod(t, "writer")
+	n.deletePod(t, "subwriter")
 	if err := checkSequence(n.runOnce(t, "data", node, "cat /data/loop.log"), wrote["writer"]+5); err != nil {
 		t.Errorf("writer after the roll: %v", err)
 	}
