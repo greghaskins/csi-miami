@@ -8,6 +8,14 @@
 # is mounted whole, so the CSI socket directory and the registry directory are
 # subdirectories of that one mount; only the miami container mounts the whole
 # directory (Bidirectional), the sidecars mount just the subPaths they use.
+#
+# The socket has a directory of its own, plugins/<driver>/csi, under which the
+# driver mounts nothing (csi-miami#95). The kubelet makes each subPath a bind
+# mount on the host inside the shared kubelet root, so the bind joins that
+# mount's peer group and receives every later mount under its source. A
+# subPath of plugins/<driver> would receive the transport mounts under
+# plugins/<driver>/transports; the kubelet's unmount of it at pod teardown then
+# fails with EBUSY, and the old pod of a roll stays Terminating.
 # deploy/policy_test.go fails if any
 # occurrence disagrees.
 #
@@ -66,7 +74,7 @@ spec:
           image: ghcr.io/greghaskins/csi-miami:unset
           args:
             - node
-            - --endpoint=unix://$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+            - --endpoint=unix://$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi/csi.sock
             - --node-id=$(NODE_NAME)
             - --kubelet-dir=$(KUBELET_DIR)
             - --metrics-addr=:9810
@@ -136,7 +144,7 @@ spec:
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0@sha256:b7fefd08651f00ac4df1a196ed4c621c2451fbb899297fe9fad9e36c667af0c0
           args:
             - --csi-address=/csi/csi.sock
-            - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+            - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi/csi.sock
             - --plugin-registration-path=/registration
             - --v=2
           env:
@@ -155,11 +163,12 @@ spec:
               type: RuntimeDefault
           # Only the two subdirectories the registrar needs, not the whole
           # kubelet root. A subPath is relative to the volume root, so it needs
-          # no expansion; the kubelet creates a missing one.
+          # no expansion; the kubelet creates a missing one. Neither may hold
+          # a mount the driver makes (see the top of this file).
           volumeMounts:
             - name: kubelet-dir
               mountPath: /csi
-              subPath: plugins/miami.csi.greghaskins.com
+              subPath: plugins/miami.csi.greghaskins.com/csi
             - name: kubelet-dir
               mountPath: /registration
               subPath: plugins_registry
@@ -186,7 +195,7 @@ spec:
           volumeMounts:
             - name: kubelet-dir
               mountPath: /csi
-              subPath: plugins/miami.csi.greghaskins.com
+              subPath: plugins/miami.csi.greghaskins.com/csi
       volumes:
         # The kubelet's root, the one hostPath of the node. Under it live the
         # CSI socket (plugins/<driver>), the registry the registrar writes to

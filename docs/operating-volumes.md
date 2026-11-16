@@ -326,6 +326,7 @@ Everything the volume kind keeps on a node is under
 | `bin/miami-<hash>` | the copy of the binary the units run |
 | `intents/` | the node's intent records |
 | `transports/` | the NFS mounts |
+| `csi/csi.sock` | the CSI socket, the one directory the sidecars mount; nothing is ever mounted under it |
 
 The cache must be on local disk, never on a transport. To put the caches on a
 dedicated disk, mount it and pass `-cache-dir` to `miami node`; the plugin in
@@ -572,6 +573,18 @@ than the volume kind drops the volume parameters, epoch and grown size too and
 cannot serve the volume. Do not run an older plugin on a node with staged
 volumes of the newer kind. Block servers stay on the binary they started with
 until the volume is next staged.
+
+**The CSI socket moved to `csi/csi.sock`** under the driver's directory
+(csi-miami#95). Before, the sidecars mounted the driver's whole directory by
+subPath, the kubelet's bind of it received the transport mounts, and the old
+pod of every roll stayed Terminating on a node with a transport mounted. The
+roll onto this layout is the last one that does so: the old pods still carry
+the old subPath. They hold nothing the new pod needs (their containers have
+exited, and the new pod serves every volume), and they go at the node's next
+reboot. Do not unmount the mounts under their `volume-subpaths` by hand: those
+are propagated copies of the live transports, and an unmount there can
+propagate back to the real one. The old `csi.sock` file is left behind and is
+harmless. Rolling back to the old layout brings the stuck pods back.
 
 **Drain records written before the upgrade** count at the class size until the
 plugin's next start rewrites them.
