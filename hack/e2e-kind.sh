@@ -174,6 +174,7 @@ if [ "$transport" = nfs3 ]; then
     TestVolumeNodeRebootReusesCache
     TestVolumeRestoreDrill
     TestVolumeExpandOnline
+    TestVolumeDiscardReachesTheStore
     TestCacheCapacityAdvertised
     TestCacheVAPTypeChecks
     TestCacheFenced
