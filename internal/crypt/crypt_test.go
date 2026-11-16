@@ -57,7 +57,7 @@ func TestOpenPassesKeyOnFd3(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := f.Calls()[0]
-	want := []string{"cryptsetup", "open", "--type", "luks2", "--disable-keyring", "--key-file", "/dev/fd/3", "/dev/nbd0", "miami-v"}
+	want := []string{"cryptsetup", "open", "--type", "luks2", "--allow-discards", "--disable-keyring", "--key-file", "/dev/fd/3", "/dev/nbd0", "miami-v"}
 	if !slices.Equal(c.Argv, want) {
 		t.Fatalf("argv = %v, want %v", c.Argv, want)
 	}
