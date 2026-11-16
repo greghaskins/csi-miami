@@ -1046,8 +1046,8 @@ is retired.
     and two exist across a publish, inside the 16 MiB `indexSlack`, so the
     footprint is unchanged. Rejected for now: adopting the unindexed chunk
     files on resume by hash against the base copy, which would keep clean
-    chunks too; it is the follow-up if the rollout's drill 1 shows the writer
-    failing.
+    chunks too; it is the follow-up if a block server kill during a store
+    outage shows writes failing or ext4 going read-only.
 
 ## 7. Milestones
 
