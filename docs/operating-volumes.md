@@ -326,6 +326,7 @@ Everything the volume kind keeps on a node is under
 | `bin/miami-<hash>` | the copy of the binary the units run |
 | `intents/` | the node's intent records |
 | `transports/` | the NFS mounts |
+| `csi/csi.sock` | the CSI socket, the one directory the sidecars mount; nothing is ever mounted under it |
 
 The cache must be on local disk, never on a transport. To put the caches on a
 dedicated disk, mount it and pass `-cache-dir` to `miami node`; the plugin in
@@ -615,6 +616,38 @@ CA alone) and delete the Secret `miami-webhook-tls`, which holds the old CA's
 key. Admission works either way; this only retires the old trust anchor. The
 reverse switch needs nothing, because the controller replaces the bundle
 rather than merging.
+
+### The CSI socket moved (csi-miami#95)
+
+Upgrading from any build before csi-miami#105: the CSI socket is now
+`plugins/<driver>/csi/csi.sock`. Before, the sidecars mounted the driver's
+whole directory by subPath. The kubelet's bind of it received the transport
+mounts, and the old pod of every roll stayed Terminating on a node with a
+transport mounted.
+
+**The roll onto this layout is the last one that does so.** The old pods still
+carry the old subPath. Nodes with no transport mounted roll cleanly.
+
+- **Symptom:** `kubectl -n miami-system get pods -l app.kubernetes.io/component=node`
+  shows an old-template pod Terminating beside the new one. The node's
+  kubelet log repeats "device or resource busy" (or "target is busy") for a
+  path under `pods/<uid>/volume-subpaths/.../csi-node-driver-registrar` or
+  `.../livenessprobe`.
+- **Harmless to wait:** its containers have exited, and the new pod serves
+  every volume on the node.
+- **Fix:** a normal drain and reboot of the node clears it. The mounts go with
+  the reboot, and the kubelet then finishes the teardown. It is resolved
+  when no old-template node pod is left on the node.
+- `kubectl delete pod --force --grace-period=0` on it removes only the API
+  object. That is safe for data, since nothing in it serves a volume, but it
+  does not release the mounts: the kubelet keeps retrying the orphaned
+  directory until the reboot. (Not tested on a real node.)
+- **Do not unmount the mounts under its `volume-subpaths` by hand.** They are
+  propagated copies of the live transports, and an unmount there can
+  propagate back to the real one.
+
+The old `csi.sock` file is left behind and is harmless. After a rollback to
+the old layout, every later roll leaves Terminating pods again.
 
 ## Restore
 
