@@ -168,6 +168,7 @@ if [ "$transport" = nfs3 ]; then
     TestVolumeSurvivesReschedule
     TestVolumePluginRestart
     TestVolumeServerKill
+    TestVolumeNodeDaemonSetRoll
     TestVolumeNASOutageNoHungTask
     TestVolumeServerKillDuringNASOutage
     TestVolumeTakeover
@@ -175,6 +176,7 @@ if [ "$transport" = nfs3 ]; then
     TestVolumeNodeRebootReusesCache
     TestVolumeRestoreDrill
     TestVolumeExpandOnline
+    TestVolumeGenerationsKeep
     TestVolumeDiscardReachesTheStore
     TestCacheCapacityAdvertised
     TestCacheVAPTypeChecks

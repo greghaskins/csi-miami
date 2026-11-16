@@ -19,10 +19,6 @@ import (
 	"github.com/greghaskins/csi-miami/internal/safefs"
 )
 
-// generationsKeep is how many manifests a publish keeps; the agreed flag set
-// carries no keep parameter, so the block server uses the design's default.
-const generationsKeep = 3
-
 // device is the nbd device the server serves on; the kernel in production, a
 // fake in tests.
 type device interface {
