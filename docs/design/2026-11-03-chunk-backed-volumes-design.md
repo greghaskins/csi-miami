@@ -399,7 +399,9 @@ volume serves the volume as an nbd device backed by a local chunk cache:
   cannot be unmounted as idle while a server uses it; no new reference kind
   is needed.
 - **Discard.** `TRIM` requests mark whole chunks zero, so a deleted file's
-  chunks leave the next generation. The ext4 mount sets `discard`.
+  chunks leave the next generation. The ext4 mount sets `discard`, and an
+  encrypted volume's mapping is opened with `--allow-discards` so the TRIMs
+  pass dm-crypt (decision 69).
 - **The hot path** holds no allocations: preallocated aligned buffers, one
   goroutine per request slot. Section 7's gate measures it against a loop
   device on a Pi.
@@ -687,6 +689,11 @@ series are absent; the alert is on the server's state (`miami_volumes_served`).
   which only the node plugin writes; the unit's command line carries the
   volume name and paths, never the key, which the server never sees.
 - **Every mount** the driver makes stays `nosuid,nodev`.
+- **What the store reveals of an encrypted volume.** Its size, its chunk
+  size, when each generation was published, and which chunks hold no data:
+  a chunk never written, or freed by a discard (decision 69), is the zero
+  chunk in the manifest. A reader of the store learns which regions of the
+  volume are free, and so roughly how full it is, never what is in the rest.
 
 ## 5. Operations
 
@@ -1062,6 +1069,17 @@ is retired.
     during an NFS outage under an fsync'd writer showed why the adoption is
     needed: without it the journal's next write, into a chunk published before
     the kill, waited for the store and the writer stopped.
+
+69. **Encrypted volumes pass discards** (csi-miami#99; the owner's call, on).
+    `cryptsetup open` takes `--allow-discards`, so ext4's TRIMs reach the
+    block server through dm-crypt, a freed whole chunk becomes the zero chunk
+    at the next generation, and a prune removes its old copy: the store
+    shrinks when files are deleted, as it did for a plain volume already. The
+    cost is the leak 4.12 states, which the zero chunks of never-written
+    regions already made: a reader of the store learns which blocks are free.
+    The flag is not written to the LUKS2 header; it applies from a volume's
+    next stage, so a volume staged before the release passes discards only
+    once it is staged again.
 
 ## 7. Milestones
 

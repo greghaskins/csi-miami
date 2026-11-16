@@ -597,6 +597,11 @@ cannot serve the volume. Do not run an older plugin on a node with staged
 volumes of the newer kind. Block servers stay on the binary they started with
 until the volume is next staged.
 
+**Discards on encrypted volumes** (csi-miami#99) apply from a volume's next
+stage: a volume staged before the upgrade passes no TRIMs, and its store does
+not shrink, until it is restaged (its pod is rescheduled, or the node
+restarts).
+
 **Drain records written before the upgrade** count at the class size until the
 plugin's next start rewrites them.
 
