@@ -28,6 +28,7 @@ type blockdFlags struct {
 	cacheBound int64
 	epoch      uint64
 	node       string
+	keep int
 	readOnly   bool
 	timeout    time.Duration
 	deadConn   time.Duration
@@ -52,6 +53,7 @@ func runBlockd(args []string, stdout, stderr io.Writer) int {
 	fs.Int64Var(&f.cacheBound, "cache-bound", 0, "cache byte bound (required)")
 	fs.Uint64Var(&f.epoch, "epoch", 0, "the holder epoch to publish under (required)")
 	fs.StringVar(&f.node, "node", "", "this node's name (required)")
+	fs.IntVar(&f.keep, "keep", blockd.DefaultGenerationsKeep, "manifests a publish keeps: the class's generations.keep, at least 1")
 	fs.BoolVar(&f.readOnly, "read-only", false, "serve the device read-only")
 	fs.DurationVar(&f.timeout, "timeout", blockd.DefaultTimeout, "nbd request timeout")
 	fs.DurationVar(&f.deadConn, "dead-conn-timeout", blockd.DefaultDeadConnTimeout, "nbd dead-connection timeout")
@@ -83,6 +85,7 @@ func runBlockd(args []string, stdout, stderr io.Writer) int {
 		{"-chunk-size must be positive", f.chunkSize <= 0},
 		{"-cache-bound must be positive", f.cacheBound <= 0},
 		{"-epoch must be positive", f.epoch == 0},
+		{"-keep must be at least 1", f.keep < 1},
 	} {
 		if p.bad {
 			_, _ = fmt.Fprintf(stderr, "miami blockd: %s\n", p.msg)
@@ -101,6 +104,7 @@ func runBlockd(args []string, stdout, stderr io.Writer) int {
 		CacheBound:      f.cacheBound,
 		Epoch:           f.epoch,
 		Node:            f.node,
+		Keep:            f.keep,
 		ReadOnly:        f.readOnly,
 		Timeout:         f.timeout,
 		DeadConnTimeout: f.deadConn,
