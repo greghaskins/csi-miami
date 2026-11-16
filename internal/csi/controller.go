@@ -43,6 +43,12 @@ type ControllerOptions struct {
 	// Deadline bounds ListVolumes, which would otherwise wait for as long as
 	// its caller does. Zero or negative means DefaultListDeadline.
 	Deadline time.Duration
+
+	// AllowDirectoryKind lets CreateVolume make volumes of kind directory.
+	// The kind is internal (decision 62): off, CreateVolume refuses it, and
+	// directory volumes that already exist still stage, publish and delete.
+	// The driver's own manifests turn it on where they need the kind.
+	AllowDirectoryKind bool
 }
 
 // DefaultListDeadline bounds ListVolumes when ControllerOptions.Deadline is
@@ -63,6 +69,8 @@ type Controller struct {
 	log     *slog.Logger
 
 	deadline time.Duration
+	// allowDirectory is ControllerOptions.AllowDirectoryKind.
+	allowDirectory bool
 	// scan lists the volumes of the transport mounted at a directory; tests
 	// replace it with one that hangs.
 	scan func(dir string) []string
@@ -114,8 +122,9 @@ func NewController(o ControllerOptions) (*Controller, error) {
 		mounts:  newMounts(log, o.Root, o.Mounter, o.Transport),
 		log:     log,
 
-		deadline: deadline,
-		scan:     volumeNames,
+		deadline:       deadline,
+		allowDirectory: o.AllowDirectoryKind,
+		scan:           volumeNames,
 	}, nil
 }
 
@@ -174,6 +183,9 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 	vctx, err := volume.NewContext(req.GetParameters())
 	if err != nil {
 		return nil, err
+	}
+	if vctx.Kind == volume.KindDirectory && !c.allowDirectory {
+		return nil, status.Error(codes.InvalidArgument, errDirectoryKindInternal)
 	}
 	if err := checkCapabilitiesFor(vctx.Kind, req.GetVolumeCapabilities()); err != nil {
 		return nil, err
@@ -250,6 +262,11 @@ func (c *Controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 		AccessibleTopology: topology,
 	}}, nil
 }
+
+// errDirectoryKindInternal is CreateVolume's answer to a class of kind
+// directory when the controller does not allow the kind. It names the fix,
+// not the controller flag: the kind is not offered to deployers.
+const errDirectoryKindInternal = `StorageClass parameter kind: "directory" is internal to the driver and cannot be provisioned (decision 62); use kind: "volume". Existing directory volumes keep working until deleted`
 
 // asStatus returns err if it is already a gRPC status and Internal otherwise.
 func asStatus(err error) error {

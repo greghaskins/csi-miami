@@ -1,9 +1,8 @@
 # Example StorageClasses, named miami-LOCATION-TYPE-SHARING[-plain] (see the
-# README). Not part of the base.
+# README). Not part of the base. The directory kind is internal (decision 62),
+# so its classes live in the e2e overlay, not here.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - miami-local-dir-rwo.yaml
-  - miami-remote-dir-rwx.yaml
   - miami-remote-vol-rwo.yaml
   - miami-remote-vol-rwo-plain.yaml

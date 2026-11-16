@@ -62,6 +62,8 @@ type controllerConfig struct {
 	// namespace is the driver's namespace (POD_NAMESPACE): where the Secret
 	// lives and part of the certificate's names.
 	namespace string
+	// allowDirectoryKind is -allow-directory-kind.
+	allowDirectoryKind bool
 }
 
 // webhookBackend is what the webhook reads and writes through. serveController
@@ -90,6 +92,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&cfg.webhookTLSSecret, "webhook-tls-secret", "", "name of a TLS Secret (tls.crt, tls.key, ca.crt) in the driver's namespace that something else manages; read-only. Empty: make and keep a self-signed one named "+defaultWebhookSecret)
 	fs.StringVar(&cfg.webhookConfig, "webhook-config", defaultWebhookConfig, "MutatingWebhookConfiguration whose webhooks' caBundle is kept equal to the self-signed CA")
 	fs.StringVar(&cfg.webhookService, "webhook-service", defaultWebhookService, "Service that fronts the webhook; the certificate is valid for its in-cluster names")
+	fs.BoolVar(&cfg.allowDirectoryKind, "allow-directory-kind", false, "let CreateVolume provision the internal directory kind (decision 62); for the driver's own manifests, not for deployers")
 	fs.DurationVar(&cfg.webhookSyncInterval, "webhook-sync-interval", defaultWebhookSyncPeriod, "how often the webhook's certificate is reloaded and the caBundle asserted")
 
 	if err := fs.Parse(args); err != nil {
@@ -193,7 +196,7 @@ func serveControllerWith(ctx context.Context, cfg controllerConfig, pvs kube.PVR
 	if err != nil {
 		return err
 	}
-	ctrl, err := csi.NewController(csi.ControllerOptions{Root: root, Mounter: m, PVs: pvs, Log: log, Deadline: cfg.deadline})
+	ctrl, err := csi.NewController(csi.ControllerOptions{Root: root, Mounter: m, PVs: pvs, Log: log, Deadline: cfg.deadline, AllowDirectoryKind: cfg.allowDirectoryKind})
 	if err != nil {
 		return err
 	}
