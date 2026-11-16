@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBenchUsageErrors(t *testing.T) {
@@ -93,5 +94,64 @@ func TestBenchOutRefusesExistingFile(t *testing.T) {
 	b, _ := os.ReadFile(out) //nolint:gosec // the test's own temp path
 	if string(b) != "mine" {
 		t.Error("the existing file was changed")
+	}
+}
+
+func TestBenchParameterFlags(t *testing.T) {
+	f, err := parseBenchFlags([]string{"--stack", "nbd", "--dir", "/d", "--store", "/s", "--size", "8Gi",
+		"--chunk-size", "16Mi", "--cipher", "aes-xts-plain64", "--cache-bound", "2Gi", "--generation-interval", "90s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := f.opts
+	if o.ChunkSize != 16<<20 || o.Cipher != "aes-xts-plain64" || o.CacheBound != 2<<30 || o.GenerationInterval != 90*time.Second {
+		t.Errorf("parsed %+v", o)
+	}
+
+	// The defaults are what the bench did before the flags: zero values that
+	// Run reads as the driver's defaults.
+	f, err = parseBenchFlags([]string{"--stack", "nbd", "--dir", "/d", "--store", "/s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := f.opts; o.ChunkSize != 0 || o.Cipher != "" || o.CacheBound != 0 || o.GenerationInterval != 0 {
+		t.Errorf("defaults %+v, want zero values", o)
+	}
+	f, err = parseBenchFlags([]string{"--stack", "loop", "--dir", "/d", "--cipher", "xchacha12,aes-adiantum-plain64"})
+	if err != nil || f.opts.Cipher != "xchacha12,aes-adiantum-plain64" {
+		t.Errorf("loop with a cipher: %+v %v", f.opts, err)
+	}
+}
+
+func TestBenchParameterUsageErrors(t *testing.T) {
+	nbd := []string{"bench", "--stack", "nbd", "--dir", "/d", "--store", "/s", "--size", "8Gi"}
+	for _, extra := range [][]string{
+		{"--chunk-size", "3Mi"},             // not a power of two
+		{"--chunk-size", "512Ki"},           // below the minimum
+		{"--chunk-size", "lots"},            // not a size
+		{"--cipher", "rot13"},               // not a cipher the driver offers
+		{"--cache-bound", "1Mi"},            // below the (default 4 MiB) chunk size
+		{"--cache-bound", "-1"},             // negative
+		{"--generation-interval", "-1s"},    // negative
+		{"--generation-interval", "500ms"},  // below a second
+		{"--generation-interval", "sooner"}, // not a duration
+	} {
+		var o, e bytes.Buffer
+		args := append(append([]string{}, nbd...), extra...)
+		if code := run(args, &o, &e); code != 2 {
+			t.Errorf("%v: exit %d (%s), want 2", extra, code, e.String())
+		}
+	}
+	// The nbd-only parameters on another stack, and a cipher on none.
+	for _, args := range [][]string{
+		{"bench", "--stack", "loop", "--dir", "/d", "--chunk-size", "8Mi"},
+		{"bench", "--stack", "loop", "--dir", "/d", "--cache-bound", "1Gi"},
+		{"bench", "--stack", "loop", "--dir", "/d", "--generation-interval", "1m"},
+		{"bench", "--stack", "none", "--dir", "/d", "--cipher", "aes-xts-plain64"},
+	} {
+		var o, e bytes.Buffer
+		if code := run(args, &o, &e); code != 2 {
+			t.Errorf("%v: exit %d (%s), want 2", args, code, e.String())
+		}
 	}
 }

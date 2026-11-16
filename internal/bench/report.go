@@ -32,10 +32,25 @@ type Report struct {
 	Rounds    int           `json:"rounds"`
 	Notes     []string      `json:"notes,omitempty"`
 	Phases    []PhaseResult `json:"phases"`
+	// Params are the parameters the run used; a report from before they
+	// were recorded has none.
+	Params Params `json:"params,omitzero"`
 	// PublishSeconds is how long the nbd stack took to publish a generation
 	// after the rounds (freeze, boundary, thaw, publish). It is reported, not
 	// gated; zero for the other stacks.
 	PublishSeconds float64 `json:"publish_seconds,omitempty"`
+	// GenerationSeconds are the generations published during the rounds,
+	// with --generation-interval, each from freeze to the end of publish.
+	GenerationSeconds []float64 `json:"generation_seconds,omitempty"`
+}
+
+// Params are the swept parameters of a run, as it ran them (defaults filled).
+// Cipher is set for the nbd and loop stacks, the rest for nbd only.
+type Params struct {
+	ChunkBytes                int64   `json:"chunk_bytes,omitempty"`
+	Cipher                    string  `json:"cipher,omitempty"`
+	CacheBoundBytes           int64   `json:"cache_bound_bytes,omitempty"`
+	GenerationIntervalSeconds float64 `json:"generation_interval_seconds,omitempty"`
 }
 
 // WriteJSON writes r as indented JSON.
@@ -147,6 +162,9 @@ func Compare(nbd, loop Report) (Comparison, error) {
 	}
 	if nbd.Rounds != loop.Rounds {
 		return Comparison{}, fmt.Errorf("bench: the reports have %d and %d rounds; run both with the same --rounds", nbd.Rounds, loop.Rounds)
+	}
+	if nbd.Params.Cipher != loop.Params.Cipher {
+		return Comparison{}, fmt.Errorf("bench: the nbd report is encrypted with %q and the loop report with %q; run both with the same --cipher", nbd.Params.Cipher, loop.Params.Cipher)
 	}
 	if nbd.Rounds < 2 {
 		return Comparison{}, fmt.Errorf("bench: the reports have %d round; comparing needs at least 2 (round 1 is warm-up), use --rounds 5", nbd.Rounds)

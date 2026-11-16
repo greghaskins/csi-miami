@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func tiny() Scale {
@@ -249,5 +252,70 @@ func TestCompareRefusesRoundMismatch(t *testing.T) {
 	}
 	if _, err := Compare(rounds("nbd", 1), rounds("loop", 1)); err == nil || !strings.Contains(err.Error(), "at least 2") {
 		t.Errorf("one round: err = %v", err)
+	}
+}
+
+func TestCompareRefusesParameterMismatch(t *testing.T) {
+	nbd, loop := sample("nbd", 1), sample("loop", 1)
+	nbd.Params.Cipher, loop.Params.Cipher = "xchacha12,aes-adiantum-plain64", "aes-xts-plain64"
+	if _, err := Compare(nbd, loop); err == nil {
+		t.Error("reports encrypted with different ciphers compared")
+	}
+	loop.Params.Cipher = nbd.Params.Cipher
+	if _, err := Compare(nbd, loop); err != nil {
+		t.Errorf("same cipher: %v", err)
+	}
+}
+
+// fakePublisher counts publishes and fails from the failAt-th on (0: never).
+type fakePublisher struct {
+	mu     sync.Mutex
+	n      int
+	failAt int
+}
+
+func (f *fakePublisher) publish(context.Context) (float64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.n++
+	if f.failAt > 0 && f.n >= f.failAt {
+		return 0, errors.New("store away")
+	}
+	return 0.25, nil
+}
+
+func TestGenerationsRunEveryIntervalUntilStopped(t *testing.T) {
+	p := &fakePublisher{}
+	var rep Report
+	stop := startGenerations(context.Background(), p, Options{GenerationInterval: 10 * time.Millisecond}, &rep)
+	time.Sleep(100 * time.Millisecond)
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	n := p.n
+	p.mu.Unlock()
+	if n < 3 || len(rep.GenerationSeconds) != n {
+		t.Fatalf("%d publishes, %d recorded; want at least 3, all recorded", n, len(rep.GenerationSeconds))
+	}
+	time.Sleep(30 * time.Millisecond)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.n != n {
+		t.Errorf("published %d more after stop", p.n-n)
+	}
+}
+
+func TestGenerationsStopAtTheFirstError(t *testing.T) {
+	p := &fakePublisher{failAt: 2}
+	var rep Report
+	stop := startGenerations(context.Background(), p, Options{GenerationInterval: 5 * time.Millisecond}, &rep)
+	time.Sleep(60 * time.Millisecond)
+	err := stop()
+	if err == nil || !strings.Contains(err.Error(), "store away") {
+		t.Fatalf("stop = %v, want the publish error", err)
+	}
+	if p.n != 2 || len(rep.GenerationSeconds) != 1 {
+		t.Errorf("%d publishes, %d recorded; want 2 and 1", p.n, len(rep.GenerationSeconds))
 	}
 }

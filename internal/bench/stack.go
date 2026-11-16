@@ -59,8 +59,9 @@ func (u *undo) run() error {
 
 // built is the common stack: a mountpoint and the teardown.
 type built struct {
-	mnt string
-	u   *undo
+	mnt    string
+	u      *undo
+	cipher string // the LUKS2 cipher, crypt.DefaultCipher when empty
 	// publishFn is set for nbd.
 	publishFn func(ctx context.Context) (float64, error)
 }
@@ -73,7 +74,7 @@ type builtPublisher struct{ *built }
 func (b builtPublisher) publish(ctx context.Context) (float64, error) { return b.publishFn(ctx) }
 
 func newStack(ctx context.Context, o Options, work string) (stack, error) {
-	b := &built{u: &undo{}}
+	b := &built{u: &undo{}, cipher: o.Cipher}
 	// The work directory is removed last, and only if everything above it was
 	// undone: removing a directory that still has a mount in it would walk
 	// into the mounted file system.
@@ -127,7 +128,7 @@ func (b *built) layers(ctx context.Context, dev, mapName, mnt string, unmounted 
 	if _, err := rand.Read(key); err != nil {
 		return err
 	}
-	if err := crypt.Format(ctx, r, dev, key, crypt.Params{}); err != nil {
+	if err := crypt.Format(ctx, r, dev, key, crypt.Params{Cipher: b.cipher}); err != nil {
 		return fmt.Errorf("luksFormat: %w", err)
 	}
 	if err := crypt.Open(ctx, r, dev, mapName, key); err != nil {
@@ -289,8 +290,7 @@ func (b *built) nbd(ctx context.Context, o Options, work string, unmounted *bool
 		return h.Release(c)
 	})
 
-	chunkSize := chunk.DefaultChunkSize(o.Size)
-	size := chunk.RoundUp(o.Size, chunkSize)
+	chunkSize, size, bound := o.nbdGeometry()
 	cache := filepath.Join(work, "cache")
 	control := filepath.Join(work, "c.sock")
 	if len(control) > 100 {
@@ -299,7 +299,7 @@ func (b *built) nbd(ctx context.Context, o Options, work string, unmounted *bool
 	cmd := exec.Command(exe, "blockd", //nolint:gosec // the operator's own binary
 		"-volume", vol, "-mount", mount, "-store", volDir, "-cache-dir", cache, "-control", control,
 		"-size", strconv.FormatInt(size, 10), "-chunk-size", strconv.FormatInt(chunkSize, 10),
-		"-cache-bound", strconv.FormatInt(size, 10), "-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", node)
+		"-cache-bound", strconv.FormatInt(bound, 10), "-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", node)
 	var logs lockedBuf
 	cmd.Stderr, cmd.Stdout = &logs, &logs
 	// Pdeathsig fires when the thread that started the child exits, not the
