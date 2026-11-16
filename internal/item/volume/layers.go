@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/greghaskins/csi-miami/internal/blockd"
 	"github.com/greghaskins/csi-miami/internal/cache"
 	"github.com/greghaskins/csi-miami/internal/crypt"
 	"github.com/greghaskins/csi-miami/internal/ext4"
@@ -422,11 +423,22 @@ func (it *Item) unitFor(v vol, h *holder.Holder) systemd.Unit {
 			"-volume", v.name, "-mount", v.mount, "-store", v.storeDir, "-cache-dir", v.cacheDir, "-control", v.socket,
 			"-size", itoa(v.size), "-chunk-size", itoa(v.chunk), "-cache-bound", itoa(v.bound),
 			"-epoch", strconv.FormatUint(h.Epoch(), 10), "-node", it.cfg.Node,
+			"-keep", strconv.Itoa(keepOf(v)),
 		},
 		Restart:      "on-failure",
 		RestartDelay: RestartDelay,
 		Sandbox:      blockdSandbox(it.cfg.CacheDir, v.holdDir),
 	}
+}
+
+// keepOf is the manifests the volume's block server keeps: its class's
+// generations.keep, carried in the volume context, so a restage keeps the
+// class's value. A context from before the parameter has none: the default.
+func keepOf(v vol) int {
+	if k := v.params.Generations.Keep; k >= 1 {
+		return k
+	}
+	return blockd.DefaultGenerationsKeep
 }
 
 // blockdSandbox confines the block server, which runs as root on files from a
