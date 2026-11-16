@@ -319,3 +319,22 @@ func TestGenerationsStopAtTheFirstError(t *testing.T) {
 		t.Errorf("%d publishes, %d recorded; want 2 and 1", p.n, len(rep.GenerationSeconds))
 	}
 }
+
+// A report with parameters shows its sweep point under the header line; one
+// without (before the flags, or the none stack) prints as before.
+func TestTableShowsTheParameters(t *testing.T) {
+	r := sample("nbd", 1)
+	r.Params = Params{ChunkBytes: 16 << 20, Cipher: "aes-xts-plain64", CacheBoundBytes: 2 << 30, GenerationIntervalSeconds: 90}
+	var b bytes.Buffer
+	r.WriteTable(&b)
+	want := "chunk: 16 MiB   cipher: aes-xts-plain64   cache bound: 2 GiB   generations: 90s\n"
+	if !strings.Contains(b.String(), want) {
+		t.Errorf("table lacks %q:\n%s", want, b.String())
+	}
+	r.Params = Params{Cipher: "xchacha12,aes-adiantum-plain64"} // a loop report
+	b.Reset()
+	r.WriteTable(&b)
+	if !strings.Contains(b.String(), "chunk: -   cipher: xchacha12,aes-adiantum-plain64   cache bound: -   generations: none during the rounds\n") {
+		t.Errorf("loop table:\n%s", b.String())
+	}
+}

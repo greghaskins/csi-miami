@@ -135,6 +135,16 @@ func TestBenchParameterUsageErrors(t *testing.T) {
 		{"--generation-interval", "-1s"},    // negative
 		{"--generation-interval", "500ms"},  // below a second
 		{"--generation-interval", "sooner"}, // not a duration
+		// Given, but zero or empty: a flag that was supplied is checked,
+		// whatever its value; only an omitted one takes the default.
+		{"--generation-interval", "0s"},
+		{"--generation-interval", "0"},
+		{"--cipher", ""},
+		{"--chunk-size", ""},
+		{"--chunk-size", "0"},
+		{"--cache-bound", ""},
+		{"--cache-bound", "0"},
+		{"--chunk-size", "4KiB"}, // the size syntax is bytes or Ki/Mi/Gi/Ti
 	} {
 		var o, e bytes.Buffer
 		args := append(append([]string{}, nbd...), extra...)
@@ -148,6 +158,10 @@ func TestBenchParameterUsageErrors(t *testing.T) {
 		{"bench", "--stack", "loop", "--dir", "/d", "--cache-bound", "1Gi"},
 		{"bench", "--stack", "loop", "--dir", "/d", "--generation-interval", "1m"},
 		{"bench", "--stack", "none", "--dir", "/d", "--cipher", "aes-xts-plain64"},
+		{"bench", "--stack", "loop", "--dir", "/d", "--generation-interval", "0s"},
+		{"bench", "--stack", "loop", "--dir", "/d", "--chunk-size", ""},
+		{"bench", "--stack", "loop", "--dir", "/d", "--cache-bound", "0"},
+		{"bench", "--stack", "none", "--dir", "/d", "--cipher", ""},
 	} {
 		var o, e bytes.Buffer
 		if code := run(args, &o, &e); code != 2 {

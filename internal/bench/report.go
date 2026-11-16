@@ -64,6 +64,14 @@ func (r Report) WriteJSON(w io.Writer) error {
 // phase with a column per round.
 func (r Report) WriteTable(w io.Writer) {
 	_, _ = fmt.Fprintf(w, "stack: %s   size: %s   rounds: %d\n", r.Stack, humanSize(r.SizeBytes), r.Rounds)
+	if p := r.Params; p != (Params{}) {
+		gen := "none during the rounds"
+		if p.GenerationIntervalSeconds > 0 {
+			gen = fmt.Sprintf("%gs", p.GenerationIntervalSeconds)
+		}
+		_, _ = fmt.Fprintf(w, "chunk: %s   cipher: %s   cache bound: %s   generations: %s\n",
+			dashIfZero(p.ChunkBytes), orDash(p.Cipher), dashIfZero(p.CacheBoundBytes), gen)
+	}
 	for _, n := range r.Notes {
 		_, _ = fmt.Fprintf(w, "note: %s\n", n)
 	}
@@ -102,7 +110,7 @@ func humanSize(n int64) string {
 }
 
 // ParseSize reads a positive byte count with an optional binary suffix:
-// 4096, 512Mi, 8Gi.
+// 4194304, 4Mi, 8Gi; a unit such as KiB is refused.
 func ParseSize(s string) (int64, error) {
 	mult := int64(1)
 	num := s
@@ -114,7 +122,7 @@ func ParseSize(s string) (int64, error) {
 	}
 	n, err := strconv.ParseInt(num, 10, 64)
 	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("bench: %q is not a positive size (examples: 4096, 512Mi, 8Gi)", s)
+		return 0, fmt.Errorf("bench: %q is not a positive size: bytes, or a Ki/Mi/Gi/Ti suffix (examples: 4Mi, 512Mi, 8Gi)", s)
 	}
 	return n * mult, nil
 }
@@ -251,4 +259,18 @@ func ReadPair(a, b string) (nbd, loop Report, err error) {
 		ra, rb = rb, ra
 	}
 	return ra, rb, nil
+}
+
+func dashIfZero(n int64) string {
+	if n == 0 {
+		return "-"
+	}
+	return humanSize(n)
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }

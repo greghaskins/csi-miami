@@ -190,6 +190,11 @@ gate uses, so a run without them is the gate's run:
 | `--cache-bound` | nbd | the whole device |
 | `--generation-interval` | nbd | none during the rounds |
 
+- Sizes (`--size`, `--chunk-size`, `--cache-bound`) are bytes or take a
+  `Ki`, `Mi`, `Gi` or `Ti` suffix: `4Mi`, not `4MiB`.
+- A flag that is given is checked, whatever its value: `--generation-interval 0s`
+  or `--cipher ""` is a usage error, not the default. Leave a flag out for its
+  default.
 - `--chunk-size` is a power of two from 1Mi to 256Mi, as `chunkSize` is.
 - `--cipher` is `xchacha12,aes-adiantum-plain64` or `aes-xts-plain64`, as
   `cipher` is. Run the loop baseline with the same cipher: `--compare`
@@ -201,7 +206,8 @@ gate uses, so a run without them is the gate's run:
   times include it. The report lists each one's seconds as
   `generation_seconds`.
 
-The report records what the run used under `params`. A flag that does not
+The report records what the run used under `params`, and the table prints it
+under its header line. A flag that does not
 apply to the stack is a usage error.
 
 ## Trying the harness on any Linux host

@@ -124,9 +124,9 @@ func parseBenchFlags(args []string) (benchFlags, error) {
 	fs.StringVar(&f.outFile, "out", "", "also write the JSON report to this file")
 	fs.BoolVar(&f.asJSON, "json", false, "print the report as JSON")
 	fs.BoolVar(&f.compare, "compare", false, "compare two JSON reports given as arguments (one nbd, one loop) against the 1.5x limit of gate G1; exit 1 on FAIL")
-	fs.StringVar(&chunkSize, "chunk-size", "", "chunk size (nbd only), a power of two from 1Mi to 256Mi (default: the driver's for --size)")
+	fs.StringVar(&chunkSize, "chunk-size", "", "chunk size (nbd only): bytes or a Ki/Mi/Gi/Ti suffix, a power of two from 1Mi to 256Mi (default: the driver's for --size)")
 	fs.StringVar(&f.opts.Cipher, "cipher", "", "LUKS2 cipher (nbd and loop): "+strings.Join(benchCiphers, " or ")+" (default "+crypt.DefaultCipher+")")
-	fs.StringVar(&cacheBound, "cache-bound", "", "cache byte bound (nbd only), at least the chunk size (default: the whole device)")
+	fs.StringVar(&cacheBound, "cache-bound", "", "cache byte bound (nbd only): bytes or a Ki/Mi/Gi/Ti suffix, at least the chunk size (default: the whole device)")
 	fs.DurationVar(&f.opts.GenerationInterval, "generation-interval", 0, "publish a generation this often during the rounds (nbd only), at least 1s (default: none during the rounds)")
 
 	if err := fs.Parse(args); err != nil {
@@ -169,7 +169,11 @@ func parseBenchFlags(args []string) (benchFlags, error) {
 	nbdOnly := func(name string) error {
 		return fmt.Errorf("--%s applies to --stack nbd only", name)
 	}
-	if chunkSize != "" {
+	// A flag that was given is checked whatever its value (an explicit 0 or
+	// empty value is an error); only an omitted one takes the default.
+	given := map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) { given[fl.Name] = true })
+	if given["chunk-size"] {
 		if stack != bench.StackNBD {
 			return f, nbdOnly("chunk-size")
 		}
@@ -180,7 +184,7 @@ func parseBenchFlags(args []string) (benchFlags, error) {
 			return f, fmt.Errorf("--chunk-size: %w", err)
 		}
 	}
-	if cacheBound != "" {
+	if given["cache-bound"] {
 		if stack != bench.StackNBD {
 			return f, nbdOnly("cache-bound")
 		}
@@ -195,7 +199,7 @@ func parseBenchFlags(args []string) (benchFlags, error) {
 			return f, fmt.Errorf("--cache-bound %d is below the chunk size %d", f.opts.CacheBound, c)
 		}
 	}
-	if f.opts.Cipher != "" {
+	if given["cipher"] {
 		if stack == bench.StackNone {
 			return f, errors.New("--cipher applies to --stack nbd and loop only")
 		}
@@ -203,7 +207,7 @@ func parseBenchFlags(args []string) (benchFlags, error) {
 			return f, fmt.Errorf("unknown --cipher %q (%s)", f.opts.Cipher, strings.Join(benchCiphers, " or "))
 		}
 	}
-	if f.opts.GenerationInterval != 0 {
+	if given["generation-interval"] {
 		if stack != bench.StackNBD {
 			return f, nbdOnly("generation-interval")
 		}
