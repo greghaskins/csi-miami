@@ -42,10 +42,10 @@ func TestResumeKeepsAnUnindexedFileButNeverServesIt(t *testing.T) {
 	if err := c.Read(3, AlignedBuffer(testChunk)); !errors.Is(err, ErrMiss) {
 		t.Fatalf("Read of an unverified chunk = %v, want ErrMiss", err)
 	}
-	if got := c.ReadAt(3, 0, make([]byte, 4096)); !errors.Is(got, ErrMiss) {
+	if got := c.ReadAt(3, 0, AlignedBuffer(4096)); !errors.Is(got, ErrMiss) {
 		t.Fatalf("ReadAt of an unverified chunk = %v, want ErrMiss", got)
 	}
-	if err := c.WriteAt(3, 0, make([]byte, 4096), nil, false); !errors.Is(err, ErrNotResident) {
+	if err := c.WriteAt(3, 0, AlignedBuffer(4096), nil, false); !errors.Is(err, ErrNotResident) {
 		t.Fatalf("a partial write with no base = %v, want ErrNotResident", err)
 	}
 	if c.Used() != testChunk {
@@ -88,7 +88,7 @@ func TestWritesInsertsAndTrimsClearUnverified(t *testing.T) {
 		{"full write", func(c *Cache) error { return c.Write(3, fill(1)) }},
 		{"insert", func(c *Cache) error { return c.Insert(3, fill(1)) }},
 		{"trim", func(c *Cache) error { return c.MarkZero(3) }},
-		{"partial write with a base", func(c *Cache) error { return c.WriteAt(3, 0, make([]byte, 4096), fill(1), false) }},
+		{"partial write with a base", func(c *Cache) error { return c.WriteAt(3, 0, AlignedBuffer(4096), fill(1), false) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _ := resumedWithClean(t, 16*testChunk)
