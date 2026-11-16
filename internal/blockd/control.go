@@ -26,10 +26,13 @@ type Status struct {
 	LastAttempt      time.Time // time of the last publish attempt, success or not
 	LastPublishError string    // the last attempt's error, "" on success or refusal
 	Refused          bool      // the last attempt was refused by the fencing check
-	PublishInFlight  bool      // a publish is running now
-	BinaryHash       string
-	Epoch            uint64 // the holder epoch this server publishes under
-	Fetch            FetchStats
+	// BaseMismatch is set when the store's base manifest differed from the
+	// cache's copy a resumed server served from: publishing is stopped.
+	BaseMismatch    string
+	PublishInFlight bool // a publish is running now
+	BinaryHash      string
+	Epoch           uint64 // the holder epoch this server publishes under
+	Fetch           FetchStats
 }
 
 // PublishArgs is the argument of Publish; Trigger is interval|watermark|request|unstage.

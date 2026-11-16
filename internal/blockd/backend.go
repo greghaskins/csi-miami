@@ -86,13 +86,31 @@ type backend struct {
 	// its end, and the zero hash, read as zeros and need no fetch.
 	mu       sync.RWMutex
 	manifest []chunk.Hash
+
+	// known is closed once manifest is set, and ready once store is too. A
+	// server resumed under a device that carries a mount starts before it can
+	// reach the store (csi-miami#102). From the cache's copy of the base it
+	// knows the hashes at once (known), so a zero chunk needs no store; with
+	// no usable copy it waits for the store for those too. Until ready, a
+	// cached chunk is served as usual, and a fetch or a publish waits.
+	known, ready chan struct{}
+	knownOnce    sync.Once
 }
 
 // newBackend builds the backend over an open cache and store.
 func newBackend(ctx context.Context, c *cache.Cache, s *chunk.Store, cfg Config, base []chunk.Hash, log *slog.Logger) *backend {
+	b := newPendingBackend(ctx, c, cfg, log)
+	b.setBase(s, base)
+	return b
+}
+
+// newPendingBackend builds the backend over an open cache before the store is
+// reachable; setBase completes it.
+func newPendingBackend(ctx context.Context, c *cache.Cache, cfg Config, log *slog.Logger) *backend {
 	b := &backend{
 		cache:       c,
-		store:       s,
+		known:       make(chan struct{}),
+		ready:       make(chan struct{}),
 		chunkSize:   cfg.Chunk,
 		bound:       cfg.CacheBound,
 		zeroHash:    chunk.ZeroHash(cfg.Chunk),
@@ -100,7 +118,6 @@ func newBackend(ctx context.Context, c *cache.Cache, s *chunk.Store, cfg Config,
 		ctx:         ctx,
 		fetchBudget: cfg.Timeout - cfg.Timeout/4,
 		fetchSem:    make(chan struct{}, fetchConcurrency),
-		manifest:    base,
 	}
 	b.size.Store(cfg.Size)
 	b.bufPool.New = func() any {
@@ -108,6 +125,59 @@ func newBackend(ctx context.Context, c *cache.Cache, s *chunk.Store, cfg Config,
 		return &buf
 	}
 	return b
+}
+
+// setBase gives the backend its store and base lineage and releases what
+// waits for them. It is called once.
+func (b *backend) setBase(s *chunk.Store, base []chunk.Hash) {
+	b.mu.Lock()
+	b.store, b.manifest = s, base
+	b.mu.Unlock()
+	b.knownOnce.Do(func() { close(b.known) })
+	close(b.ready)
+}
+
+// setKnownBase gives a backend that cannot reach the store yet the base
+// lineage, from the cache's copy of it. setBase follows with the same one.
+func (b *backend) setKnownBase(base []chunk.Hash) {
+	b.mu.Lock()
+	b.manifest = base
+	b.mu.Unlock()
+	b.knownOnce.Do(func() { close(b.known) })
+}
+
+// baseReady reports whether setBase has run: the store is reachable.
+func (b *backend) baseReady() bool { return isClosed(b.ready) }
+
+// baseKnown reports whether the base lineage is known.
+func (b *backend) baseKnown() bool { return isClosed(b.known) }
+
+func isClosed(c chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
+}
+
+// errBaseNotLoaded is what an operation that needs the store gets while a
+// resumed server has not yet reached it.
+var errBaseNotLoaded = errors.New("blockd: the store has not been reached since the server started; the base manifest is not loaded")
+
+// waitBase waits for setBase or ctx.
+func (b *backend) waitBase(ctx context.Context) error { return waitOn(ctx, b.ready) }
+
+// waitKnown waits for the base lineage or ctx.
+func (b *backend) waitKnown(ctx context.Context) error { return waitOn(ctx, b.known) }
+
+func waitOn(ctx context.Context, c chan struct{}) error {
+	select {
+	case <-c:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", errBaseNotLoaded, ctx.Err())
+	}
 }
 
 // Size is the current device size in bytes.
@@ -176,8 +246,12 @@ func (b *backend) ReadAt(p []byte, off int64) (int, error) {
 	miss := missBuf[:0]
 	for pos := off; pos < off+int64(len(p)); {
 		i, _, n := b.segment(pos, int(off+int64(len(p))-pos))
-		if !b.cache.Has(i) {
-			if h, ok := b.chunkHash(i); ok && h != b.zeroHash && len(miss) < cap(miss) {
+		if !b.cache.Has(i) && len(miss) < cap(miss) {
+			// Before the base is known a miss's hash is unknown; its fetch
+			// waits for it.
+			if !b.baseKnown() {
+				miss = append(miss, i)
+			} else if h, ok := b.chunkHash(i); ok && h != b.zeroHash {
 				miss = append(miss, i)
 			}
 		}
@@ -277,9 +351,15 @@ func (b *backend) fetchMisses(chunks []uint32) error {
 // zero-based or unnamed chunk that the caller serves as zeros. It does not
 // touch the cache.
 func (b *backend) fetchInto(ctx context.Context, i uint32, buf []byte) (fetched bool, h chunk.Hash, err error) {
+	if err := b.waitKnown(ctx); err != nil {
+		return false, h, err
+	}
 	h, ok := b.chunkHash(i)
 	if !ok || h == b.zeroHash {
 		return false, h, nil
+	}
+	if err := b.waitBase(ctx); err != nil {
+		return false, h, err
 	}
 	select {
 	case b.fetchSem <- struct{}{}:
@@ -395,9 +475,12 @@ func (b *backend) writeSeg(i uint32, intra int64, src []byte, alive func() bool)
 	// resident the cache uses its file — and only fetch the base when the cache
 	// refuses (ErrNotResident) because the chunk is not, or no longer, resident.
 	// The cache enforces this; a stale Has check here could not.
+	// Before the base is known the hash is unknown, so a non-full write
+	// assumes a non-zero base: a resident chunk is written in place, and any
+	// other waits in fetchInto for the base.
 	full := intra == 0 && int64(len(src)) == b.chunkSize
 	zeroBase := full
-	if !full {
+	if !full && b.baseKnown() {
 		if h, ok := b.chunkHash(i); !ok || h == b.zeroHash {
 			zeroBase = true
 		}
@@ -499,6 +582,9 @@ func (b *backend) grow(size int64) error {
 // fetch error is skipped, and it stops when the cache is full. It runs only
 // when CacheBound >= Size.
 func (b *backend) prefetch(ctx context.Context) {
+	if b.waitBase(ctx) != nil {
+		return
+	}
 	b.mu.RLock()
 	n := len(b.manifest)
 	b.mu.RUnlock()
