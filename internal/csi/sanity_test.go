@@ -169,7 +169,7 @@ func TestSanity(t *testing.T) {
 
 	pvs := &kubefake.Reader{}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	ctrl, err := NewController(ControllerOptions{Root: root, Mounter: mount.New(10 * time.Second), PVs: pvs, Log: log})
+	ctrl, err := NewController(ControllerOptions{Root: root, Mounter: mount.New(10 * time.Second), PVs: pvs, Log: log, AllowDirectoryKind: true})
 	if err != nil {
 		t.Fatal(err)
 	}

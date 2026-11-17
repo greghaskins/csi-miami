@@ -79,10 +79,11 @@ func newEnv(t *testing.T) *env {
 		logs:    &syncBuffer{},
 	}
 	ctrl, err := NewController(ControllerOptions{
-		Root:    e.root,
-		Mounter: e.mounter,
-		PVs:     e.pvs,
-		Log:     slog.New(slog.NewTextHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		AllowDirectoryKind: true,
+		Root:               e.root,
+		Mounter:            e.mounter,
+		PVs:                e.pvs,
+		Log:                slog.New(slog.NewTextHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	if err != nil {
 		t.Fatal(err)

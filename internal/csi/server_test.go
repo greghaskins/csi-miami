@@ -436,7 +436,8 @@ func TestFailuresCarryNoPathsOrAddresses(t *testing.T) {
 	e := newEnv(t)
 	logs := &syncBuffer{}
 	ctrl, err := NewController(ControllerOptions{
-		Root: e.root, Mounter: e.mounter, PVs: e.pvs,
+		AllowDirectoryKind: true,
+		Root:               e.root, Mounter: e.mounter, PVs: e.pvs,
 		Log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
 	})
 	if err != nil {
