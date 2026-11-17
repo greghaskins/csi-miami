@@ -135,6 +135,40 @@ condition). The probe may also report it (`VolumeUnhealthy`,
 one sector and a full cache that still holds that chunk serves the read, so do
 not rely on it.
 
+## BaseCopyMismatch: generations stopped
+
+After a restart of its block server with the store unreachable, a volume is
+served from its cache and from the cache's copy of its base manifest
+(`<cache-dir>/<pv>/base-<manifest>`). When the store comes back, the server
+reads the base manifest there, and the two must be the same. If they are not,
+the server publishes nothing more, keeps every unpublished write, reports
+`BaseMismatch` in its status, and the node raises a `BaseCopyMismatch`
+Warning event on the PV.
+
+Something changed the store's manifest or the cache's copy behind the driver.
+Do not delete the cache: it holds the only copy of the unpublished writes. Look
+first:
+
+- The chunk check of [restore.md](restore.md) (its line 3, `sha256sum -c`)
+  on the named manifest, to see whether the store's copy is whole.
+- The copy in the cache directory, compared with the store's file of the same
+  name.
+
+Then take the decision a person must take: which one is right, and whether
+the hashes the server answered from the copy agree with the store's. Those
+answers cover the zero and never-written chunks, and every clean chunk it
+adopted after the restart. What the guest read since the restart came from
+them, and still does: the mismatch stops further adoption and publishing,
+but chunks already adopted keep being served. Until then the volume serves its
+writes but its generations do not move, and `GenerationOverdue` follows.
+
+Next step: keep the pod running. Its writes are kept in the cache, and an
+unstage would try to publish and be refused. Leave the cache and its
+`base-<manifest>` copy as they are (they are the evidence), and record what
+was found. There is no tested procedure yet to clear the stop. Clearing it
+means deciding which manifest is right, then restarting the block server so
+that it reloads its base; that procedure is a follow-up.
+
 ## A stage that refuses
 
 - **The cache index is unreadable.** The stage fails with `server-down` and
@@ -326,6 +360,7 @@ Everything the volume kind keeps on a node is under
 | `bin/miami-<hash>` | the copy of the binary the units run |
 | `intents/` | the node's intent records |
 | `transports/` | the NFS mounts |
+| `csi/csi.sock` | the CSI socket, the one directory the sidecars mount; nothing is ever mounted under it |
 
 The cache must be on local disk, never on a transport. To put the caches on a
 dedicated disk, mount it and pass `-cache-dir` to `miami node`; the plugin in
@@ -615,6 +650,38 @@ CA alone) and delete the Secret `miami-webhook-tls`, which holds the old CA's
 key. Admission works either way; this only retires the old trust anchor. The
 reverse switch needs nothing, because the controller replaces the bundle
 rather than merging.
+
+### The CSI socket moved (csi-miami#95)
+
+Upgrading from any build before csi-miami#105: the CSI socket is now
+`plugins/<driver>/csi/csi.sock`. Before, the sidecars mounted the driver's
+whole directory by subPath. The kubelet's bind of it received the transport
+mounts, and the old pod of every roll stayed Terminating on a node with a
+transport mounted.
+
+**The roll onto this layout is the last one that does so.** The old pods still
+carry the old subPath. Nodes with no transport mounted roll cleanly.
+
+- **Symptom:** `kubectl -n miami-system get pods -l app.kubernetes.io/component=node`
+  shows an old-template pod Terminating beside the new one. The node's
+  kubelet log repeats "device or resource busy" (or "target is busy") for a
+  path under `pods/<uid>/volume-subpaths/.../csi-node-driver-registrar` or
+  `.../livenessprobe`.
+- **Harmless to wait:** its containers have exited, and the new pod serves
+  every volume on the node.
+- **Fix:** a normal drain and reboot of the node clears it. The mounts go with
+  the reboot, and the kubelet then finishes the teardown. It is resolved
+  when no old-template node pod is left on the node.
+- `kubectl delete pod --force --grace-period=0` on it removes only the API
+  object. That is safe for data, since nothing in it serves a volume, but it
+  does not release the mounts: the kubelet keeps retrying the orphaned
+  directory until the reboot. (Not tested on a real node.)
+- **Do not unmount the mounts under its `volume-subpaths` by hand.** They are
+  propagated copies of the live transports, and an unmount there can
+  propagate back to the real one.
+
+The old `csi.sock` file is left behind and is harmless. After a rollback to
+the old layout, every later roll leaves Terminating pods again.
 
 ## Restore
 

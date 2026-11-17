@@ -139,6 +139,7 @@ func (c *Cache) WriteAt(i uint32, off int64, p, base []byte, zeroBase bool) erro
 		}
 	}
 	c.clean.remove(i)
+	delete(c.unverified, i) // establishChunk recreated it from the base
 	delete(c.zero, i)
 	delete(c.pendingUnlink, i)
 	delete(c.pinned, i)

@@ -315,7 +315,7 @@ func TestDeleteVolumeWhenTheTransportIsUnmountedBetweenMountAndRemoval(t *testin
 	e := newEnv(t)
 	id, dir, sibling := volumeWithContent(t, e)
 	gone := &unmountedAfter{Mounter: e.mounter, dir: e.mountDir(), n: 1}
-	ctrl, err := NewController(ControllerOptions{Root: e.root, Mounter: gone, PVs: e.pvs})
+	ctrl, err := NewController(ControllerOptions{Root: e.root, Mounter: gone, PVs: e.pvs, AllowDirectoryKind: true})
 	if err != nil {
 		t.Fatal(err)
 	}

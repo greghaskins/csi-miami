@@ -447,7 +447,7 @@ func TestDeleteVolumeWhenTheMountTableFailsAfterTheMount(t *testing.T) {
 	e := newEnv(t)
 	id, dir, sibling := volumeWithContent(t, e)
 	flaky := &afterFirstMounts{Mounter: e.mounter, n: 1}
-	ctrl, err := NewController(ControllerOptions{Root: e.root, Mounter: flaky, PVs: e.pvs})
+	ctrl, err := NewController(ControllerOptions{Root: e.root, Mounter: flaky, PVs: e.pvs, AllowDirectoryKind: true})
 	if err != nil {
 		t.Fatal(err)
 	}

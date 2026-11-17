@@ -753,7 +753,7 @@ spec:
       containers:
       - args:
         - node
-        - --endpoint=unix://$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+        - --endpoint=unix://$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi/csi.sock
         - --node-id=$(NODE_NAME)
         - --kubelet-dir=$(KUBELET_DIR)
         - --metrics-addr=:9810
@@ -807,7 +807,7 @@ spec:
           name: cryptsetup-lock
       - args:
         - --csi-address=/csi/csi.sock
-        - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi.sock
+        - --kubelet-registration-path=$(KUBELET_DIR)/plugins/miami.csi.greghaskins.com/csi/csi.sock
         - --plugin-registration-path=/registration
         - --v=2
         env:
@@ -834,7 +834,7 @@ spec:
         volumeMounts:
         - mountPath: /csi
           name: kubelet-dir
-          subPath: plugins/miami.csi.greghaskins.com
+          subPath: plugins/miami.csi.greghaskins.com/csi
         - mountPath: /registration
           name: kubelet-dir
           subPath: plugins_registry
@@ -866,7 +866,7 @@ spec:
         volumeMounts:
         - mountPath: /csi
           name: kubelet-dir
-          subPath: plugins/miami.csi.greghaskins.com
+          subPath: plugins/miami.csi.greghaskins.com/csi
       dnsPolicy: ClusterFirstWithHostNet
       hostNetwork: true
       priorityClassName: system-node-critical

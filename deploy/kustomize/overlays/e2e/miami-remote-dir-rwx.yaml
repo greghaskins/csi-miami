@@ -1,3 +1,5 @@
+# The internal directory kind's class (decision 62), for the end-to-end tests
+# only: the controller refuses it unless started with --allow-directory-kind.
 # Named miami-LOCATION-TYPE-SHARING: dir is a directory item, remote is a
 # network server (NFSv3 today), rwx is many nodes. A directory has no
 # encryption and no -plain suffix. The server is an IPv4 address or a host name

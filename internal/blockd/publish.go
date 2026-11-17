@@ -109,6 +109,20 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 		s.back.cache.ClearBoundary(true) // nothing to publish
 		return PublishReply{}, nil
 	}
+	// A resumed server publishes only once it has reached the store and
+	// loaded its base, and never once that base disagreed with the cache's
+	// copy; the boundary's chunks stay dirty for the next attempt.
+	s.mu.Lock()
+	mismatch := s.baseMismatch
+	s.mu.Unlock()
+	if mismatch != nil {
+		s.back.cache.ClearBoundary(false)
+		return PublishReply{}, mismatch
+	}
+	if !s.back.baseReady() {
+		s.back.cache.ClearBoundary(false)
+		return PublishReply{}, errBaseNotLoaded
+	}
 
 	size := s.back.Size()
 	chunks := s.baseManifestChunks(int(size / s.cfg.Chunk))
@@ -166,9 +180,19 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 		return PublishReply{}, err
 	}
 
-	// Committed. Advance the lineage, release the boundary as published, prune.
+	// Committed. Keep the cache's copy of the new base, durable before the
+	// index names it (a missing copy only means a resume waits for the store;
+	// a stale one is never used, being named after its manifest), then
+	// advance the lineage, release the boundary as published, prune.
+	s.mu.Lock()
+	prev := s.base
+	s.mu.Unlock()
+	if err := writeBaseCopy(s.cfg.CacheDir, m); err != nil {
+		s.log.Warn("blockd could not keep a copy of the new base manifest", "volume", s.cfg.Volume, "manifest", m.Name(), "err", err)
+	}
 	s.back.setManifest(chunks)
 	s.back.cache.SetBase(m.Name(), s.cfg.Epoch)
+	pruneBaseCopies(s.cfg.CacheDir, m.Name(), prev)
 	s.back.cache.ClearBoundary(true)
 	s.mu.Lock()
 	s.seq = m.Sequence
@@ -180,7 +204,7 @@ func (s *server) doPublish(ctx context.Context, trigger string, boundary []uint3
 	// (the decision-32 window), so re-check immediately before Prune.
 	if mine, merr := s.cfg.Holder.Mine(ctx); merr != nil || !mine {
 		s.log.Warn("skipping prune: holder no longer ours", "volume", s.cfg.Volume, "err", merr)
-	} else if _, _, perr := s.store.Prune(ctx, generationsKeep); perr != nil {
+	} else if _, _, perr := s.store.Prune(ctx, s.cfg.Keep); perr != nil {
 		s.log.Warn("prune after publish failed", "volume", s.cfg.Volume, "err", perr)
 	}
 	s.log.Info("published generation", "volume", s.cfg.Volume, "trigger", trigger, "manifest", m.Name(), "uploaded", uploaded)

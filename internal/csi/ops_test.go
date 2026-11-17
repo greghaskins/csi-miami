@@ -192,7 +192,7 @@ func TestListVolumesHasADeadlineOfItsOwn(t *testing.T) {
 	writeFile(t, filepath.Join(hung, nameB, "x"), "x")
 	e.mounter.SetTable(tableWithTransports(e.mountDir(), hung))
 
-	ctrl, err := NewController(ControllerOptions{Root: e.root, Mounter: e.mounter, PVs: e.pvs, Deadline: 50 * time.Millisecond})
+	ctrl, err := NewController(ControllerOptions{Root: e.root, Mounter: e.mounter, PVs: e.pvs, Deadline: 50 * time.Millisecond, AllowDirectoryKind: true})
 	if err != nil {
 		t.Fatal(err)
 	}

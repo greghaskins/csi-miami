@@ -87,7 +87,8 @@ func TestEnvtestPVPaths(t *testing.T) {
 	root := resolved(t, t.TempDir())
 	logs := &syncBuffer{}
 	ctrl, err := NewController(ControllerOptions{
-		Root: root, Mounter: &simMounter{Mounter: &fake.Mounter{}}, PVs: c,
+		AllowDirectoryKind: true,
+		Root:               root, Mounter: &simMounter{Mounter: &fake.Mounter{}}, PVs: c,
 		Log: slog.New(slog.NewTextHandler(logs, nil)),
 	})
 	if err != nil {

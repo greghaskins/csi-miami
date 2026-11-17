@@ -43,6 +43,11 @@ const (
 	// unpublished writes are kept. It is raised when the refusal begins, not
 	// on every tick.
 	ReasonPublishRefused = "PublishRefused"
+	// ReasonBaseCopyMismatch is a volume whose block server found the store's
+	// base manifest different from the cache's copy it had served from after
+	// a restart (csi-miami#102): it publishes nothing until a person looks.
+	// It is raised when the server first reports it, not on every tick.
+	ReasonBaseCopyMismatch = "BaseCopyMismatch"
 	// ReasonCacheBudgetExceeded is a stage refused because the node's cache
 	// budget cannot hold the volume (decision 66). It is raised when the
 	// refusal begins, not on every retry.

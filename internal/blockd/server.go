@@ -1,6 +1,7 @@
 package blockd
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,10 +18,6 @@ import (
 	"github.com/greghaskins/csi-miami/internal/chunk"
 	"github.com/greghaskins/csi-miami/internal/safefs"
 )
-
-// generationsKeep is how many manifests a publish keeps; the agreed flag set
-// carries no keep parameter, so the block server uses the design's default.
-const generationsKeep = 3
 
 // device is the nbd device the server serves on; the kernel in production, a
 // fake in tests.
@@ -71,6 +68,12 @@ type server struct {
 
 	stop     chan struct{}
 	stopOnce sync.Once
+
+	// stopLoad ends loadBase's retries; close calls it.
+	stopLoad context.CancelFunc
+	// baseMismatch is set (under mu) when the store's base manifest differs
+	// from the cache's copy a resumed server served from; it stops publishing.
+	baseMismatch error
 }
 
 // newServer opens (or creates) the cache, loads the base manifest it descends
@@ -93,6 +96,9 @@ func openServer(ctx context.Context, cfg Config, log *slog.Logger, resumeOnly bo
 	// operator's.
 	if cfg.MountRoot != "" {
 		safefs.Trust(filepath.Clean(cfg.MountRoot))
+	}
+	if resumeOnly {
+		return resumeServer(ctx, cfg, log)
 	}
 	store, err := chunk.Open(cfg.StoreDir)
 	if err != nil {
@@ -121,6 +127,112 @@ func openServer(ctx context.Context, cfg Config, log *slog.Logger, resumeOnly bo
 	s.seq = initialSeq(baseName, cfg.Epoch)
 	s.back = newBackend(ctx, c, store, cfg, base, log)
 	return s, nil
+}
+
+// resumeServer opens the server of a device that already carries a mount from
+// its cache alone, touching nothing on the store, so the device is re-pointed
+// within its dead-connection timeout however long the store is away
+// (csi-miami#102). The store and the base manifest are loaded in the
+// background, retried until they are; meanwhile the cache serves what it
+// holds, and a fetch or a publish waits for them or fails.
+func resumeServer(ctx context.Context, cfg Config, log *slog.Logger) (*server, error) {
+	c, err := cache.Open(cfg.CacheDir, cfg.CacheBound)
+	if errors.Is(err, cache.ErrNoIndex) {
+		return nil, fmt.Errorf("blockd: no cache index in %s to resume from; a device in use is not served from the store", cfg.CacheDir)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := resumeGeometry(c, &cfg); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	bh, err := binaryHash()
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	baseName := c.Index().Base
+	s := &server{
+		cfg:        cfg,
+		log:        log,
+		runCtx:     ctx,
+		binaryHash: bh,
+		dev:        nopDevice{},
+		base:       baseName,
+		stop:       make(chan struct{}),
+	}
+	s.seq = initialSeq(baseName, cfg.Epoch)
+	s.back = newPendingBackend(ctx, c, cfg, log)
+	var local *chunk.Manifest
+	switch m, ok := readBaseCopy(cfg.CacheDir, baseName, cfg.Volume, cfg.Chunk, c.Index().Size); {
+	case baseName == "":
+		s.back.setKnownBase(nil) // no base: every chunk not in the cache is zero
+	case ok:
+		local = &m
+		s.back.setKnownBase(m.Chunks)
+		s.lastPublishTime = m.Time
+	default:
+		log.Warn("blockd has no usable copy of its base manifest; chunks it does not hold wait for the store", "volume", cfg.Volume, "base", baseName)
+	}
+	lctx, cancel := context.WithCancel(ctx)
+	s.stopLoad = cancel
+	go s.loadBase(lctx, baseName, local, baseRetryMin, baseRetryMax)
+	return s, nil
+}
+
+// loadBase opens the store and reads the base manifest of a resumed server,
+// retrying with backoff until both succeed or ctx ends, then completes the
+// backend. The store's manifest must equal local, the cache's copy the server
+// has been answering hashes from; a mismatch stops publishing for good
+// (errBaseCopyMismatch). Only the first failure and the recovery are logged.
+func (s *server) loadBase(ctx context.Context, baseName string, local *chunk.Manifest, retryMin, retryMax time.Duration) {
+	wait := retryMin
+	for attempt := 1; ; attempt++ {
+		store, err := chunk.Open(s.cfg.StoreDir)
+		var m chunk.Manifest
+		if err == nil {
+			m, err = loadBaseManifest(ctx, store, s.cfg.Volume, baseName)
+		}
+		if err == nil && local != nil && !bytes.Equal(m.Marshal(), local.Marshal()) {
+			// Adoption stops before the mismatch is recorded, so no adoption
+			// against the discredited copy lands after it.
+			s.back.disableAdoption()
+			s.mu.Lock()
+			s.baseMismatch = errBaseCopyMismatch
+			s.mu.Unlock()
+			s.log.Error("blockd: the store's base manifest differs from the cache's copy; publishing is stopped", "volume", s.cfg.Volume, "base", baseName)
+			return
+		}
+		if err == nil {
+			if baseName != "" && local == nil {
+				if werr := writeBaseCopy(s.cfg.CacheDir, m); werr != nil {
+					s.log.Warn("blockd could not keep a copy of its base manifest", "volume", s.cfg.Volume, "err", werr)
+				}
+			}
+			pruneBaseCopies(s.cfg.CacheDir, baseName)
+			s.mu.Lock()
+			s.store = store
+			if s.lastPublishTime.IsZero() {
+				s.lastPublishTime = m.Time
+			}
+			s.mu.Unlock()
+			s.back.setBase(store, m.Chunks)
+			if attempt > 1 {
+				s.log.Info("blockd reached the store; the base manifest is loaded", "volume", s.cfg.Volume, "attempts", attempt)
+			}
+			return
+		}
+		if attempt == 1 {
+			s.log.Warn("blockd cannot reach the store; serving from the cache and retrying", "volume", s.cfg.Volume, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = min(2*wait, retryMax)
+	}
 }
 
 // openOrCreateCache resumes the cache from its index when one is present,
@@ -155,9 +267,38 @@ func openOrCreateCache(ctx context.Context, cfg *Config, store *chunk.Store, res
 // re-snapshots and publishes with a store-derived sequence, rather than every
 // later Boundary returning ErrBoundaryActive forever.
 func resumeCache(ctx context.Context, c *cache.Cache, cfg *Config, store *chunk.Store) ([]chunk.Hash, string, time.Time, error) {
+	if err := resumeGeometry(c, cfg); err != nil {
+		return nil, "", time.Time{}, err
+	}
+	idx := c.Index()
+	m, err := loadBaseManifest(ctx, store, cfg.Volume, idx.Base)
+	if err != nil {
+		return nil, "", time.Time{}, err
+	}
+	if idx.Base != "" {
+		local, ok := readBaseCopy(cfg.CacheDir, idx.Base, cfg.Volume, cfg.Chunk, idx.Size)
+		switch {
+		case ok && !bytes.Equal(local.Marshal(), m.Marshal()):
+			return nil, "", time.Time{}, errBaseCopyMismatch
+		case !ok:
+			// A cache from before the copies, or one whose copy was lost:
+			// keep one from now on.
+			if err := writeBaseCopy(cfg.CacheDir, m); err != nil {
+				return nil, "", time.Time{}, err
+			}
+		}
+	}
+	pruneBaseCopies(cfg.CacheDir, idx.Base)
+	return m.Chunks, idx.Base, m.Time, nil
+}
+
+// resumeGeometry checks a resumed cache's chunk size against the config,
+// adopts a larger recorded size, finishes a grow the cache has not had, and
+// reconciles a boundary left active by a crash (C3). It reads only the cache.
+func resumeGeometry(c *cache.Cache, cfg *Config) error {
 	idx := c.Index()
 	if idx.Chunk != cfg.Chunk {
-		return nil, "", time.Time{}, fmt.Errorf("blockd: cache chunk size %d, config says %d", idx.Chunk, cfg.Chunk)
+		return fmt.Errorf("blockd: cache chunk size %d, config says %d", idx.Chunk, cfg.Chunk)
 	}
 	if cfg.Size < idx.Size {
 		// A size never shrinks: the index records a grow the arguments predate.
@@ -165,17 +306,13 @@ func resumeCache(ctx context.Context, c *cache.Cache, cfg *Config, store *chunk.
 	}
 	if cfg.Size > idx.Size {
 		if err := c.Grow(cfg.Size); err != nil {
-			return nil, "", time.Time{}, err
+			return err
 		}
 	}
 	if idx.Boundary != nil {
 		c.ClearBoundary(false)
 	}
-	base, t, err := loadBase(ctx, store, cfg.Volume, idx.Base)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
-	return base, idx.Base, t, nil
+	return nil
 }
 
 // createCache makes a fresh cache from the store's current manifest, or an empty
@@ -205,7 +342,15 @@ func createCache(ctx context.Context, cfg Config, store *chunk.Store) (*cache.Ca
 		base = m.Chunks
 		baseTime = m.Time
 		idx.Base = name
+		// The copy is durable before the index names the base.
+		if err := os.MkdirAll(cfg.CacheDir, 0o700); err != nil {
+			return nil, nil, "", time.Time{}, err
+		}
+		if err := writeBaseCopy(cfg.CacheDir, m); err != nil {
+			return nil, nil, "", time.Time{}, err
+		}
 	}
+	pruneBaseCopies(cfg.CacheDir, idx.Base)
 	c, err := cache.Create(cfg.CacheDir, idx, cfg.CacheBound)
 	if err != nil {
 		return nil, nil, "", time.Time{}, err
@@ -227,17 +372,24 @@ func checkVolume(m chunk.Manifest, volume string) error {
 // loadBase reads the chunk hashes and time of the named manifest; the empty
 // name is no base: nil chunks and a zero time.
 func loadBase(ctx context.Context, store *chunk.Store, volume, name string) ([]chunk.Hash, time.Time, error) {
+	m, err := loadBaseManifest(ctx, store, volume, name)
+	return m.Chunks, m.Time, err
+}
+
+// loadBaseManifest reads the named manifest from the store and checks it is
+// this volume's; the empty name is no base, the zero Manifest.
+func loadBaseManifest(ctx context.Context, store *chunk.Store, volume, name string) (chunk.Manifest, error) {
 	if name == "" {
-		return nil, time.Time{}, nil
+		return chunk.Manifest{}, nil
 	}
 	m, err := store.ReadManifest(ctx, name)
 	if err != nil {
-		return nil, time.Time{}, err
+		return chunk.Manifest{}, err
 	}
 	if err := checkVolume(m, volume); err != nil {
-		return nil, time.Time{}, err
+		return chunk.Manifest{}, err
 	}
-	return m.Chunks, m.Time, nil
+	return m, nil
 }
 
 // initialSeq is the last sequence used within epoch: the base manifest's
@@ -279,6 +431,7 @@ func (s *server) status() Status {
 		LastPublish:      s.lastPublishTime,
 		LastAttempt:      s.lastAttempt,
 		LastPublishError: s.lastErr,
+		BaseMismatch:     errText(s.baseMismatch),
 		Refused:          s.refused,
 		PublishInFlight:  s.publishInFlight,
 		BinaryHash:       s.binaryHash,
@@ -290,7 +443,12 @@ func (s *server) status() Status {
 }
 
 // close releases the cache; the device is disconnected by Run.
-func (s *server) close() error { return s.back.cache.Close() }
+func (s *server) close() error {
+	if s.stopLoad != nil {
+		s.stopLoad()
+	}
+	return s.back.cache.Close()
+}
 
 // requestStop makes Run shut down.
 func (s *server) requestStop() {
@@ -314,4 +472,19 @@ func binaryHash() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(d.Sum(nil)), nil
+}
+
+// baseRetryMin and baseRetryMax bound the backoff between attempts to open the
+// store and load the base manifest of a resumed cache. Variables so tests can
+// shorten them.
+var (
+	baseRetryMin = time.Second
+	baseRetryMax = 30 * time.Second
+)
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
