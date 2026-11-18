@@ -610,8 +610,11 @@ until the volume is next staged.
 
 **Discards on encrypted volumes** (csi-miami#99) apply from a volume's next
 stage: a volume staged before the upgrade passes no TRIMs, and its store does
-not shrink, until it is restaged (its pod is rescheduled, or the node
-restarts).
+not shrink, until it is unstaged and staged again. `dmsetup table
+miami-<pv>` on its node shows `allow_discards` once it does. The trade
+(design decision 69): a reader of the store learns which blocks are free.
+There is no opt-out short of `encryption: "off"`, which gives up encryption
+itself.
 
 **Drain records written before the upgrade** count at the class size until the
 plugin's next start rewrites them.
