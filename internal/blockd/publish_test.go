@@ -135,29 +135,42 @@ func TestPublishNoBoundary(t *testing.T) {
 	}
 }
 
+// A publish keeps exactly the configured number of manifests, the newest
+// ones; zero is the default.
 func TestPruneAfterPublish(t *testing.T) {
-	cfg, _ := testConfig(t)
-	s := newTestServer(t, cfg)
-	ctx := context.Background()
+	for _, c := range []struct{ cfgKeep, want int }{{1, 1}, {3, 3}, {10, 10}, {0, DefaultGenerationsKeep}} {
+		t.Run(fmt.Sprintf("keep=%d", c.cfgKeep), func(t *testing.T) {
+			cfg, _ := testConfig(t)
+			cfg.Keep = c.cfgKeep
+			s := newTestServer(t, cfg)
+			ctx := context.Background()
+			for i := range c.want + 2 { // more than we keep
+				prepareBoundary(t, s, byte(10+i)) //nolint:gosec // small test counter
+				if _, err := s.publish(ctx, "request"); err != nil {
+					t.Fatalf("publish %d: %v", i, err)
+				}
+			}
+			store := openStore(t, cfg)
+			names := manifestNames(t, store)
+			if len(names) != c.want {
+				t.Fatalf("after %d publishes, kept %v, want %d", c.want+2, names, c.want)
+			}
+			cur, ok, err := store.Current(ctx)
+			if err != nil || !ok {
+				t.Fatalf("current: %v ok=%v", err, ok)
+			}
+			if want := fmt.Sprintf("1.%d", c.want+2); cur != want || names[len(names)-1] != want {
+				t.Fatalf("current = %q, newest kept %q, want %q", cur, names[len(names)-1], want)
+			}
+		})
+	}
+}
 
-	for i := range byte(generationsKeep + 1) { // one more than we keep
-		prepareBoundary(t, s, 10+i)
-		if _, err := s.publish(ctx, "request"); err != nil {
-			t.Fatalf("publish %d: %v", i, err)
-		}
-	}
-	store := openStore(t, cfg)
-	names := manifestNames(t, store)
-	if len(names) != generationsKeep {
-		t.Fatalf("after %d publishes, kept %v, want %d", generationsKeep+1, names, generationsKeep)
-	}
-	cur, ok, err := store.Current(ctx)
-	if err != nil || !ok {
-		t.Fatalf("current: %v ok=%v", err, ok)
-	}
-	want := fmt.Sprintf("1.%d", generationsKeep+1)
-	if cur != want {
-		t.Fatalf("current = %q, want %q", cur, want)
+func TestConfigRefusesKeepBelowOne(t *testing.T) {
+	cfg, _ := testConfig(t)
+	cfg.Keep = -1
+	if _, err := newServer(context.Background(), cfg, testLog()); err == nil {
+		t.Fatal("a config keeping -1 generations was accepted")
 	}
 }
 

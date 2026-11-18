@@ -591,7 +591,7 @@ func expand(s, name, value string) string {
 func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 	t.Helper()
 	driverDir := dir + "/plugins/" + driverName
-	sock := "unix://" + driverDir + "/csi.sock"
+	sock := "unix://" + driverDir + "/csi/csi.sock"
 	wantArgs := map[string]map[string]string{
 		"miami": {
 			"endpoint":    sock,
@@ -599,7 +599,7 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 		},
 		"csi-node-driver-registrar": {
 			"csi-address":               "/csi/csi.sock",
-			"kubelet-registration-path": driverDir + "/csi.sock",
+			"kubelet-registration-path": driverDir + "/csi/csi.sock",
 			"plugin-registration-path":  "/registration",
 		},
 		"livenessprobe": {
@@ -611,8 +611,8 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 	type vm struct{ mountPath, subPath string }
 	wantMounts := map[string][]vm{
 		"miami":                     {{dir, ""}},
-		"csi-node-driver-registrar": {{"/csi", "plugins/" + driverName}, {"/registration", "plugins_registry"}},
-		"livenessprobe":             {{"/csi", "plugins/" + driverName}},
+		"csi-node-driver-registrar": {{"/csi", "plugins/" + driverName + "/csi"}, {"/registration", "plugins_registry"}},
+		"livenessprobe":             {{"/csi", "plugins/" + driverName + "/csi"}},
 	}
 	// Only the miami and registrar containers use $(KUBELET_DIR).
 	wantEnv := map[string]bool{"miami": true, "csi-node-driver-registrar": true}
@@ -675,6 +675,37 @@ func checkKubeletDir(t *testing.T, spec corev1.PodSpec, dir string) {
 		for _, a := range c.Args {
 			if strings.Contains(a, dir) {
 				t.Errorf("%s: argument %q holds the kubelet directory literally", c.Name, a)
+			}
+		}
+	}
+}
+
+// TestSidecarSubPathsHoldNoMounts keeps every sidecar subPath of the kubelet
+// directory clear of the directories mounts are made under (csi-miami#95). The
+// kubelet makes a subPath a bind mount on the host, in the shared kubelet root,
+// so the bind receives every later mount under its source; a bind with a mount
+// under it cannot be unmounted, and the pod that owns it never finishes
+// terminating. A subPath may be neither such a directory, nor inside one, nor
+// above one.
+func TestSidecarSubPathsHoldNoMounts(t *testing.T) {
+	t.Parallel()
+	mountRoots := []string{
+		"plugins/" + driverName + "/transports", // the driver's transport mounts
+		"plugins/kubernetes.io/csi",             // the kubelet's stage directories
+		"pods",                                  // the kubelet's publish targets and subPath binds
+	}
+	under := func(p, dir string) bool { return p == dir || strings.HasPrefix(p, dir+"/") }
+	spec := node(t, base(t)).Spec.Template.Spec
+	for _, c := range spec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.Name != "kubelet-dir" || m.SubPath == "" {
+				continue
+			}
+			sub := strings.Trim(m.SubPath, "/")
+			for _, root := range mountRoots {
+				if under(sub, root) || under(root, sub) {
+					t.Errorf("%s: subPath %q overlaps %s, where mounts are made; the kubelet could not unmount the bind", c.Name, m.SubPath, root)
+				}
 			}
 		}
 	}
@@ -1290,7 +1321,14 @@ func TestExampleVolClassesSetExt4FsType(t *testing.T) {
 	}
 }
 
-var exampleClassNames = []string{"miami-local-dir-rwo", "miami-remote-dir-rwx", "miami-remote-vol-rwo", "miami-remote-vol-rwo-plain"}
+var exampleClassNames = []string{"miami-remote-vol-rwo", "miami-remote-vol-rwo-plain"}
+
+// e2eDirClassNames are the internal directory kind's classes (decision 62),
+// which only the e2e overlay carries.
+var e2eDirClassNames = []string{"miami-local-dir-rwo", "miami-remote-dir-rwx"}
+
+// e2eControllerArgs are the arguments the e2e overlay adds to the controller.
+var e2eControllerArgs = []string{"--allow-directory-kind"}
 
 func TestExampleStorageClasses(t *testing.T) {
 	t.Parallel()
@@ -1303,11 +1341,6 @@ func TestExampleStorageClasses(t *testing.T) {
 		binding storagev1.VolumeBindingMode
 		params  map[string]string
 	}{
-		{"miami-local-dir-rwo", storagev1.VolumeBindingWaitForFirstConsumer, map[string]string{
-			"kind": "directory", "transport.kind": "local", "transport.path": "/export/data"}},
-		{"miami-remote-dir-rwx", storagev1.VolumeBindingImmediate, map[string]string{
-			"kind": "directory", "transport.kind": "nfs3", "transport.server": "192.0.2.10",
-			"transport.export": "/export", "subdir": "${pvc.namespace}/${pvc.name}"}},
 		//nolint:gosec // G101: Secret references of a StorageClass, not credentials.
 		{"miami-remote-vol-rwo", storagev1.VolumeBindingImmediate, map[string]string{
 			"kind": "volume", "transport.kind": "nfs3", "transport.server": "192.0.2.10",
@@ -1347,7 +1380,63 @@ func TestExampleStorageClasses(t *testing.T) {
 	}
 }
 
-// TestE2EOverlay: the overlay renders, adds the two example StorageClasses,
+// TestExampleClassesOfferNoDirectoryKind: the directory kind is internal
+// (decision 62), so no example a deployer copies is of that kind, and the base
+// does not let the controller provision it.
+func TestExampleClassesOfferNoDirectoryKind(t *testing.T) {
+	t.Parallel()
+	for _, name := range render(t, "kustomize/examples").names("StorageClass") {
+		if k := exampleClass(t, name).Parameters["kind"]; k != "volume" {
+			t.Errorf("example class %s is of kind %q, want volume", name, k)
+		}
+	}
+	args := container(t, controller(t, base(t)).Spec.Template.Spec, "miami").Args
+	for _, a := range args {
+		if strings.HasPrefix(a, "--allow-directory-kind") || strings.HasPrefix(a, "-allow-directory-kind") {
+			t.Errorf("the base controller sets %s", a)
+		}
+	}
+}
+
+// TestE2EDirectoryClasses: the e2e overlay's directory classes, which the
+// suite provisions through with the kind allowed.
+func TestE2EDirectoryClasses(t *testing.T) {
+	t.Parallel()
+	o := overlay(t)
+	tests := []struct {
+		name    string
+		binding storagev1.VolumeBindingMode
+		params  map[string]string
+	}{
+		{"miami-local-dir-rwo", storagev1.VolumeBindingWaitForFirstConsumer, map[string]string{
+			"kind": "directory", "transport.kind": "local", "transport.path": "/export/data"}},
+		{"miami-remote-dir-rwx", storagev1.VolumeBindingImmediate, map[string]string{
+			"kind": "directory", "transport.kind": "nfs3", "transport.server": "192.0.2.10",
+			"transport.export": "/export", "subdir": "${pvc.namespace}/${pvc.name}"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var sc storagev1.StorageClass
+			o.get(t, "StorageClass", tc.name, &sc)
+			if sc.VolumeBindingMode == nil || *sc.VolumeBindingMode != tc.binding {
+				t.Errorf("volumeBindingMode = %v, want %v", sc.VolumeBindingMode, tc.binding)
+			}
+			if !reflect.DeepEqual(sc.Parameters, tc.params) {
+				t.Errorf("parameters = %v, want %v", sc.Parameters, tc.params)
+			}
+			if _, has := sc.Parameters["csi.storage.k8s.io/fstype"]; has {
+				t.Error("a directory class sets fstype")
+			}
+			if _, err := volume.ParseParameters(sc.Parameters); err != nil {
+				t.Errorf("volume.ParseParameters: %v", err)
+			}
+		})
+	}
+}
+
+// TestE2EOverlay: the overlay renders, adds the example StorageClasses and the
+// directory kind's two, turns the kind on in the controller,
 // and otherwise differs from the base only in the driver image and its pull
 // policy, and the node plugin's mount of the host's /export for the example
 // local class, and the node plugin's two cache arguments (e2eNodeArgs).
@@ -1355,7 +1444,8 @@ func TestE2EOverlay(t *testing.T) {
 	t.Parallel()
 	b, o := base(t), overlay(t)
 
-	if got, want := o.names("StorageClass"), exampleClassNames; !reflect.DeepEqual(got, want) {
+	want := slices.Sorted(slices.Values(append(slices.Clone(exampleClassNames), e2eDirClassNames...)))
+	if got := o.names("StorageClass"); !reflect.DeepEqual(got, want) {
 		t.Errorf("overlay storage classes = %v, want %v", got, want)
 	}
 	norm := func(r rendered) map[string]any {
@@ -1378,6 +1468,8 @@ func TestE2EOverlay(t *testing.T) {
 						cm["volumeMounts"] = without(cm["volumeMounts"], localExport)
 						if ob.kind == "DaemonSet" {
 							cm["args"] = withoutArgs(cm["args"], e2eNodeArgs...)
+						} else {
+							cm["args"] = withoutArgs(cm["args"], e2eControllerArgs...)
 						}
 					}
 				}
@@ -1398,6 +1490,12 @@ func TestE2EOverlay(t *testing.T) {
 	for _, want := range e2eNodeArgs {
 		if !slices.Contains(nodeArgs, want) {
 			t.Errorf("the overlay's node args %v lack %s", nodeArgs, want)
+		}
+	}
+	ctlArgs := container(t, controller(t, o).Spec.Template.Spec, "miami").Args
+	for _, want := range e2eControllerArgs {
+		if !slices.Contains(ctlArgs, want) {
+			t.Errorf("the overlay's controller args %v lack %s", ctlArgs, want)
 		}
 	}
 	for role, spec := range allContainers(t, o) {

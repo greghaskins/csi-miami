@@ -177,6 +177,39 @@ passes without saying so.
 - Anything odd: a note the bench printed, a run that was interrupted, a phase
   that varied between rounds by more than a factor of two.
 
+## Parameters for a sweep
+
+Gate G1 runs with the driver's defaults. To measure other settings, `miami
+bench` takes the parameters a StorageClass sets. Each defaults to what the
+gate uses, so a run without them is the gate's run:
+
+| Flag | Stacks | Default |
+|---|---|---|
+| `--chunk-size` | nbd | the driver's for `--size` (4Mi up to 256Gi) |
+| `--cipher` | nbd, loop | `xchacha12,aes-adiantum-plain64` |
+| `--cache-bound` | nbd | the whole device |
+| `--generation-interval` | nbd | none during the rounds |
+
+- Sizes (`--size`, `--chunk-size`, `--cache-bound`) are bytes or take a
+  `Ki`, `Mi`, `Gi` or `Ti` suffix: `4Mi`, not `4MiB`.
+- A flag that is given is checked, whatever its value: `--generation-interval 0s`
+  or `--cipher ""` is a usage error, not the default. Leave a flag out for its
+  default.
+- `--chunk-size` is a power of two from 1Mi to 256Mi, as `chunkSize` is.
+- `--cipher` is `xchacha12,aes-adiantum-plain64` or `aes-xts-plain64`, as
+  `cipher` is. Run the loop baseline with the same cipher: `--compare`
+  refuses two reports with different ones.
+- `--cache-bound` is at least the chunk size. Below the working set, the
+  phases fetch from the store.
+- `--generation-interval` (at least `1s`) publishes a generation (freeze,
+  boundary, thaw, publish) that often while the rounds run, so the phase
+  times include it. The report lists each one's seconds as
+  `generation_seconds`.
+
+The report records what the run used under `params`, and the table prints it
+under its header line. A flag that does not
+apply to the stack is a usage error.
+
 ## Trying the harness on any Linux host
 
 `hack/bench.sh` runs both stacks on the host as root at the scale you choose

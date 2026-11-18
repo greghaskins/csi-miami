@@ -1,6 +1,12 @@
 # What the deploy check and the end-to-end tests apply on kind: the base, the
-# two example StorageClasses, and the driver image loaded into the kind nodes
-# and never pulled.
+# example StorageClasses, and the driver image loaded into the kind nodes and
+# never pulled.
+#
+# The directory kind is internal (decision 62): the controller refuses to
+# provision it unless started with --allow-directory-kind. The suite still
+# provisions directory volumes, because blobd and M3 build on that code, so
+# this overlay turns the kind on and carries its two classes
+# (miami-remote-dir-rwx, miami-local-dir-rwo). Deployments do neither.
 #
 # The node plugin also gets the host's /export, so that the example local
 # StorageClass (transport.path /export/data) has a host directory the plugin
@@ -29,6 +35,8 @@ kind: Kustomization
 resources:
   - ../../base
   - ../../examples
+  - miami-remote-dir-rwx.yaml
+  - miami-local-dir-rwo.yaml
 images:
   - name: ghcr.io/greghaskins/csi-miami
     newName: ghcr.io/greghaskins/csi-miami
@@ -101,3 +109,10 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/args/-
         value: --reconcile-interval=5s
+  - target:
+      kind: Deployment
+      name: miami-controller
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --allow-directory-kind

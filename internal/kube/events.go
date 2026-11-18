@@ -45,6 +45,7 @@ var warningReasons = map[string]bool{
 	reconcile.ReasonKeyRequired:          true,
 	reconcile.ReasonGenerationOverdue:    true,
 	ReasonPublishRefused:                 true,
+	reconcile.ReasonBaseCopyMismatch:     true,
 	ReasonGenerationLost:                 true,
 	ReasonCacheBudgetExceeded:            true,
 }
@@ -311,6 +312,8 @@ func fixedMessage(reason, node string) string {
 		return "the volume's newest generation is older than its maximum age and node " + node + " holds unpublished writes"
 	case ReasonPublishRefused:
 		return "the store refused a generation of this volume from node " + node + " because the volume is no longer held by that node; see the node plugin's log"
+	case reconcile.ReasonBaseCopyMismatch:
+		return "the store's base manifest of this volume differs from the copy in its cache on node " + node + "; generations are stopped and the unpublished writes are kept. See docs/operating-volumes.md"
 	case ReasonGenerationLost:
 		return "unpublished writes of this volume were discarded on node " + node + "; see the node plugin's log"
 	case ReasonCacheBudgetExceeded:

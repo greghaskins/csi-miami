@@ -54,6 +54,10 @@ type Config struct {
 	Epoch uint64 // the holder epoch this server publishes under
 	Node  string // this node's name
 
+	// Keep is how many manifests a publish keeps: the class's
+	// generations.keep. Zero is DefaultGenerationsKeep.
+	Keep int
+
 	ReadOnly        bool
 	Timeout         time.Duration // nbd request timeout
 	DeadConnTimeout time.Duration // nbd dead-connection timeout
@@ -75,8 +79,15 @@ var (
 	ErrPublishInFlight = errors.New("blockd: a publish is in flight")
 )
 
-// withDefaults fills the timeouts that default when unset.
+// DefaultGenerationsKeep is how many manifests a publish keeps when the
+// config does not say: the generations.keep default.
+const DefaultGenerationsKeep = 3
+
+// withDefaults fills the timeouts and the generations kept that default when unset.
 func (cfg Config) withDefaults() Config {
+	if cfg.Keep == 0 {
+		cfg.Keep = DefaultGenerationsKeep
+	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = DefaultTimeout
 	}
@@ -98,6 +109,7 @@ func (cfg Config) validate() error {
 		{cfg.ControlSocket == "", "control socket is required"},
 		{cfg.Node == "", "node is required"},
 		{cfg.Size <= 0, "size must be positive"},
+		{cfg.Keep < 1, "generations kept must be at least 1"},
 		{cfg.CacheBound < cfg.Chunk, "cache bound must be at least one chunk"},
 		{cfg.Timeout < 0, "timeout must not be negative"},
 		{cfg.DeadConnTimeout < 0, "dead-connection timeout must not be negative"},

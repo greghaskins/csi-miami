@@ -266,6 +266,9 @@ type podSpec struct {
 	Node  string // pinned with a nodeSelector, so the scheduler still binds claims
 	Run   string // the script; a pod that stays up ends with `exec sleep`
 	Once  bool   // run to completion (restartPolicy Never) rather than stay up
+	// SubPath mounts this directory of the claim at /data instead of its
+	// root; the kubelet bind-mounts it under the pod's volume-subpaths.
+	SubPath string
 
 	Image   string // testImage when empty
 	FSGroup *int64 // the pod's securityContext.fsGroup, when set
@@ -316,7 +319,7 @@ func (n *testNS) createPod(t *testing.T, s podSpec) *corev1.Pod {
 				Image:          image,
 				Command:        []string{"sh", "-c", s.Run},
 				ReadinessProbe: probe,
-				VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+				VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/data", SubPath: s.SubPath}},
 			}},
 			Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: s.Claim},

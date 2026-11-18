@@ -125,7 +125,7 @@ func TestControllerExpandSizeSurvivesAControllerRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A new controller over the same transports remembers nothing in memory.
-	fresh, err := NewController(ControllerOptions{Root: e.root, Mounter: e.mounter, PVs: e.pvs})
+	fresh, err := NewController(ControllerOptions{Root: e.root, Mounter: e.mounter, PVs: e.pvs, AllowDirectoryKind: true})
 	if err != nil {
 		t.Fatal(err)
 	}

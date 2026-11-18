@@ -81,6 +81,9 @@ type genState struct {
 	// refused is whether the latest generation was refused by the store;
 	// refusedReported is what the loop last told the world.
 	refused, refusedReported bool
+	// mismatch is whether the server reports its base copy differed from the
+	// store's; mismatchReported is what the loop last told the world.
+	mismatch, mismatchReported bool
 	// served is the state of the volume's block server at the latest status
 	// read ("" before the first); it is what the volumes-served metric counts.
 	served string
@@ -202,6 +205,7 @@ func (p *pass) generationTick() {
 		}
 		p.reportOverdue(id, res, st)
 		p.reportRefused(id, res, st)
+		p.reportMismatch(id, st)
 		if st.running {
 			continue
 		}
@@ -244,6 +248,20 @@ func (p *pass) reportRefused(id string, res *volumeResult, st *genState) {
 		return
 	}
 	r.log.Info("a volume's generations are accepted again", "volume", id)
+}
+
+// reportMismatch raises the event and an error log line once when the server
+// reports that its base copy differed from the store's.
+func (p *pass) reportMismatch(id string, st *genState) {
+	r := p.r
+	if st.mismatch == st.mismatchReported || p.ctx.Err() != nil {
+		return
+	}
+	st.mismatchReported = st.mismatch
+	if st.mismatch {
+		r.log.Error("the store's base manifest of a volume differs from the cache's copy its block server served from; it publishes nothing until a person looks", "volume", id)
+		r.events.Event(id, ReasonBaseCopyMismatch)
+	}
 }
 
 // runGeneration is a volume's goroutine: read the server's status, decide, and
@@ -293,6 +311,7 @@ func (r *Reconciler) runGeneration(parent context.Context, gen Generator, in int
 	g.mu.Lock()
 	trigger := r.decide(st, set, status, now, readAnn, annotation, annErr)
 	st.overdue = r.isOverdue(st, set, status, now)
+	st.mismatch = status.BaseMismatch != ""
 	st.served = ServedServing
 	if bc, ok := gen.(BinaryChecker); ok && bc.ServerOutdated(status) {
 		st.served = ServedOutdatedBinary
