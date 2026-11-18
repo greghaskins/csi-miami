@@ -209,7 +209,7 @@ An unknown parameter is `InvalidArgument`, so a typo cannot silently mean the de
 | `cipher` | `xchacha12,aes-adiantum-plain64`, `aes-xts-plain64` | `xchacha12,aes-adiantum-plain64` | Adiantum suits CPUs without AES instructions |
 | `keySize` | bits: 256 for Adiantum, 256 or 512 for `aes-xts-plain64` | 256 | |
 | `generations.interval` | duration, at least `1m` | `5m` | How often a volume with unpublished writes publishes a generation |
-| `generations.keep` | integer, at least 1 | 3 | Manifests kept; chunks no kept manifest references are removed after a publish |
+| `generations.keep` | integer, at least 1 | 3 | Manifests kept; chunks no kept manifest references are removed after a publish. Fixed per volume when it is created (it is in the volume's attributes): editing the class changes new volumes only |
 | `generations.maxAge` | duration, at least `generations.interval` | `1h` | A volume with unpublished writes whose newest generation is older than this is reported overdue |
 | `generations.dirtyWatermark` | bytes, as `cacheSize`; at most `cacheSize` | half of `cacheSize` | Unpublished bytes that trigger a generation without waiting for the interval |
 | `takeoverTimeout` | | | **Rejected.** Decision 52 removed the timed takeover; a class that sets it is `InvalidArgument` (a PV that still carries it is read and ignored). See [docs/operating-volumes.md](docs/operating-volumes.md) for what moves a volume instead |
