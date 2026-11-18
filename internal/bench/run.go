@@ -7,6 +7,11 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/greghaskins/csi-miami/internal/chunk"
+	"github.com/greghaskins/csi-miami/internal/crypt"
 )
 
 // Stacks the bench can build.
@@ -24,11 +29,48 @@ type Options struct {
 	Size   int64  // device size in bytes (nbd and loop)
 	Rounds int
 	Scale  Scale
+	// The parameters a sweep varies. Each zero value is the driver's default,
+	// which is what the bench ran before they existed.
+	//
+	// ChunkSize is the nbd stack's chunk size (chunk.DefaultChunkSize of Size
+	// when zero). Cipher is the LUKS2 cipher of the nbd and loop stacks
+	// (crypt.DefaultCipher when empty). CacheBound is the nbd stack's cache
+	// bound (the rounded size when zero: the whole volume fits). With a
+	// GenerationInterval the nbd stack publishes a generation (freeze,
+	// boundary, thaw, publish) every interval while the rounds run, so the
+	// phase times include them; zero runs none during the rounds.
+	ChunkSize          int64
+	Cipher             string
+	CacheBound         int64
+	GenerationInterval time.Duration
 	// Exe is the miami binary the nbd stack starts as `blockd`; the running
 	// executable when empty.
 	Exe string
 	// Log receives progress lines; nil discards them.
 	Log io.Writer
+}
+
+// cipher is the LUKS2 cipher the stacks use.
+func (o Options) cipher() string {
+	if o.Cipher == "" {
+		return crypt.DefaultCipher
+	}
+	return o.Cipher
+}
+
+// nbdGeometry is the nbd stack's chunk size, device size (whole chunks) and
+// cache bound.
+func (o Options) nbdGeometry() (chunkSize, size, bound int64) {
+	chunkSize = o.ChunkSize
+	if chunkSize == 0 {
+		chunkSize = chunk.DefaultChunkSize(o.Size)
+	}
+	size = chunk.RoundUp(o.Size, chunkSize)
+	bound = o.CacheBound
+	if bound == 0 {
+		bound = size
+	}
+	return chunkSize, size, bound
 }
 
 func (o Options) logf(format string, args ...any) {
@@ -117,14 +159,25 @@ func Run(ctx context.Context, o Options) (rep Report, runErr error) {
 	drop, note := dropHook()
 	rep.Notes = append(rep.Notes, note)
 	if o.Stack != StackNone {
-		rep.Notes = append(rep.Notes, "encrypted with LUKS2 "+"xchacha12,aes-adiantum-plain64 on both stacks")
+		rep.Notes = append(rep.Notes, "encrypted with LUKS2 "+o.cipher()+" on both stacks")
+		rep.Params.Cipher = o.cipher()
+	}
+	if o.Stack == StackNBD {
+		c, _, bound := o.nbdGeometry()
+		rep.Params.ChunkBytes, rep.Params.CacheBoundBytes = c, bound
+		rep.Params.GenerationIntervalSeconds = o.GenerationInterval.Seconds()
 	}
 
+	p, canPublish := st.(publisher)
+	stopGens := func() error { return nil }
+	if canPublish && o.GenerationInterval > 0 {
+		stopGens = startGenerations(ctx, p, o, &rep)
+	}
 	for round := 1; round <= o.Rounds; round++ {
 		o.logf("round %d of %d", round, o.Rounds)
 		names, secs, rerr := runRound(ctx, st.mountpoint(), round, o.Scale, drop)
 		if rerr != nil {
-			return rep, rerr
+			return rep, errors.Join(rerr, stopGens())
 		}
 		if round == 1 {
 			for _, n := range names {
@@ -135,7 +188,10 @@ func Run(ctx context.Context, o Options) (rep Report, runErr error) {
 			rep.Phases[i].Seconds = append(rep.Phases[i].Seconds, s)
 		}
 	}
-	if p, ok := st.(publisher); ok {
+	if err := stopGens(); err != nil {
+		return rep, err
+	}
+	if canPublish {
 		o.logf("publishing a generation")
 		secs, perr := p.publish(ctx)
 		if perr != nil {
@@ -144,6 +200,52 @@ func Run(ctx context.Context, o Options) (rep Report, runErr error) {
 		rep.PublishSeconds = secs
 	}
 	return rep, nil
+}
+
+// startGenerations publishes a generation every o.GenerationInterval until the
+// returned stop is called, recording each one's seconds in rep. stop waits for
+// a publish in flight and returns the first error, after which no more were
+// tried.
+func startGenerations(ctx context.Context, p publisher, o Options, rep *Report) (stop func() error) {
+	gctx, cancel := context.WithCancel(ctx)
+	var (
+		mu    sync.Mutex
+		secs  []float64
+		first error
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(o.GenerationInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return
+			case <-t.C:
+			}
+			s, err := p.publish(gctx)
+			mu.Lock()
+			if err != nil {
+				if gctx.Err() == nil {
+					first = fmt.Errorf("generation during the rounds: %w", err)
+				}
+				mu.Unlock()
+				return
+			}
+			secs = append(secs, s)
+			mu.Unlock()
+			o.logf("generation published in %.2f s", s)
+		}
+	}()
+	return func() error {
+		cancel()
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		rep.GenerationSeconds = secs
+		return first
+	}
 }
 
 // dropHook returns the function that empties the page cache and the note that

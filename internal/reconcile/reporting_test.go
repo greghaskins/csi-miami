@@ -262,3 +262,22 @@ func TestStackDownGetsNoGenerationAndNoSeries(t *testing.T) {
 		t.Error("the probe gauge stayed while the server was down")
 	}
 }
+
+// A server reporting a base copy mismatch raises one Warning, however many
+// ticks see it.
+func TestBaseCopyMismatchRaisesOneEvent(t *testing.T) {
+	t.Parallel()
+	e := newReportEnv(t)
+	e.s.set(func(g *genItem) {
+		g.status.Dirty = 4096
+		g.status.LastPublish = e.clock.Now()
+		g.status.BaseMismatch = "the store's base manifest differs"
+	})
+	for range 4 {
+		e.tick()
+		e.clock.Advance(5 * time.Minute)
+	}
+	if n := len(e.events.reasons(ReasonBaseCopyMismatch)); n != 1 {
+		t.Errorf("BaseCopyMismatch events = %d, want 1", n)
+	}
+}

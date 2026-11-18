@@ -32,10 +32,25 @@ type Report struct {
 	Rounds    int           `json:"rounds"`
 	Notes     []string      `json:"notes,omitempty"`
 	Phases    []PhaseResult `json:"phases"`
+	// Params are the parameters the run used; a report from before they
+	// were recorded has none.
+	Params Params `json:"params,omitzero"`
 	// PublishSeconds is how long the nbd stack took to publish a generation
 	// after the rounds (freeze, boundary, thaw, publish). It is reported, not
 	// gated; zero for the other stacks.
 	PublishSeconds float64 `json:"publish_seconds,omitempty"`
+	// GenerationSeconds are the generations published during the rounds,
+	// with --generation-interval, each from freeze to the end of publish.
+	GenerationSeconds []float64 `json:"generation_seconds,omitempty"`
+}
+
+// Params are the swept parameters of a run, as it ran them (defaults filled).
+// Cipher is set for the nbd and loop stacks, the rest for nbd only.
+type Params struct {
+	ChunkBytes                int64   `json:"chunk_bytes,omitempty"`
+	Cipher                    string  `json:"cipher,omitempty"`
+	CacheBoundBytes           int64   `json:"cache_bound_bytes,omitempty"`
+	GenerationIntervalSeconds float64 `json:"generation_interval_seconds,omitempty"`
 }
 
 // WriteJSON writes r as indented JSON.
@@ -49,6 +64,14 @@ func (r Report) WriteJSON(w io.Writer) error {
 // phase with a column per round.
 func (r Report) WriteTable(w io.Writer) {
 	_, _ = fmt.Fprintf(w, "stack: %s   size: %s   rounds: %d\n", r.Stack, humanSize(r.SizeBytes), r.Rounds)
+	if p := r.Params; p != (Params{}) {
+		gen := "none during the rounds"
+		if p.GenerationIntervalSeconds > 0 {
+			gen = fmt.Sprintf("%gs", p.GenerationIntervalSeconds)
+		}
+		_, _ = fmt.Fprintf(w, "chunk: %s   cipher: %s   cache bound: %s   generations: %s\n",
+			dashIfZero(p.ChunkBytes), orDash(p.Cipher), dashIfZero(p.CacheBoundBytes), gen)
+	}
 	for _, n := range r.Notes {
 		_, _ = fmt.Fprintf(w, "note: %s\n", n)
 	}
@@ -87,7 +110,7 @@ func humanSize(n int64) string {
 }
 
 // ParseSize reads a positive byte count with an optional binary suffix:
-// 4096, 512Mi, 8Gi.
+// 4194304, 4Mi, 8Gi; a unit such as KiB is refused.
 func ParseSize(s string) (int64, error) {
 	mult := int64(1)
 	num := s
@@ -99,7 +122,7 @@ func ParseSize(s string) (int64, error) {
 	}
 	n, err := strconv.ParseInt(num, 10, 64)
 	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("bench: %q is not a positive size (examples: 4096, 512Mi, 8Gi)", s)
+		return 0, fmt.Errorf("bench: %q is not a positive size: bytes, or a Ki/Mi/Gi/Ti suffix (examples: 4Mi, 512Mi, 8Gi)", s)
 	}
 	return n * mult, nil
 }
@@ -147,6 +170,9 @@ func Compare(nbd, loop Report) (Comparison, error) {
 	}
 	if nbd.Rounds != loop.Rounds {
 		return Comparison{}, fmt.Errorf("bench: the reports have %d and %d rounds; run both with the same --rounds", nbd.Rounds, loop.Rounds)
+	}
+	if nbd.Params.Cipher != loop.Params.Cipher {
+		return Comparison{}, fmt.Errorf("bench: the nbd report is encrypted with %q and the loop report with %q; run both with the same --cipher", nbd.Params.Cipher, loop.Params.Cipher)
 	}
 	if nbd.Rounds < 2 {
 		return Comparison{}, fmt.Errorf("bench: the reports have %d round; comparing needs at least 2 (round 1 is warm-up), use --rounds 5", nbd.Rounds)
@@ -233,4 +259,18 @@ func ReadPair(a, b string) (nbd, loop Report, err error) {
 		ra, rb = rb, ra
 	}
 	return ra, rb, nil
+}
+
+func dashIfZero(n int64) string {
+	if n == 0 {
+		return "-"
+	}
+	return humanSize(n)
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
