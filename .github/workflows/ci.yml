@@ -436,6 +436,15 @@ jobs:
           fi
           echo "${index} is ${index_digest}, listing ${amd64} (amd64) and ${arm64} (arm64)"
           echo "index_digest=${index_digest}" >> "$GITHUB_OUTPUT"
+          # For the pin script (go run ./hack/pin pin), which reads the
+          # verified index from this run rather than from the registry.
+          jq -n --arg tag "x-${HASH}" --arg digest "$index_digest" '{tag: $tag, digest: $digest}' > "${RUNNER_TEMP}/image-ref.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ref
+          path: ${{ runner.temp }}/image-ref.json
+          if-no-files-found: error
+          retention-days: 30
 
   # The deploy check (hack/kind.sh): the e2e overlay on a kind cluster of one
   # control plane and two workers, with the amd64 image the build job pushed
@@ -617,12 +626,42 @@ jobs:
           image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
           docker buildx imagetools create -t "${image}:${SHA}" "${image}@${INDEX}"
 
+  # The `pin` check (docs/releasing.md): the base pins this tree's content
+  # tag, the registry holds that tag under the pinned digest, the render uses
+  # the digest, and a tag the base branch already pins keeps its digest. It
+  # runs after manifest whatever its result (skipped on a documentation-only
+  # change, when the tag cannot have moved) and reads the registry itself.
+  # HEAD^1 is the base: the base branch on a pull request's merge ref, the
+  # previous main on a push.
+  pin:
+    needs: manifest
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Log in to ghcr.io
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - run: go run ./hack/pin check HEAD^1
+
   # The single required check. It runs even when a job it needs failed, was
   # cancelled or was skipped (if: always()), and passes only if:
   #
   #   - `changes` succeeded and said "true" or "false" (anything else, including
   #     a failure to decide, fails);
-  #   - static and unit succeeded (they run on every change);
+  #   - static, unit and pin succeeded (they run on every change);
   #   - each filtered job (envtest, sanity, smoke, e2e, e2e-kind, build,
   #     manifest, deploy) succeeded when `changes` said "true" (code), so a job
   #     that was skipped, cancelled or failed on a code change fails here; and,
@@ -634,7 +673,7 @@ jobs:
   # skipped on a code change.
   ci-ok:
     if: always()
-    needs: [changes, static, unit, envtest, sanity, smoke, e2e, e2e-kind, build, manifest, deploy, publish]
+    needs: [changes, static, unit, envtest, sanity, smoke, e2e, e2e-kind, build, manifest, deploy, publish, pin]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -654,6 +693,7 @@ jobs:
           MANIFEST: ${{ needs.manifest.result }}
           DEPLOY: ${{ needs.deploy.result }}
           PUBLISH: ${{ needs.publish.result }}
+          PIN: ${{ needs.pin.result }}
           PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           fail=0
@@ -666,7 +706,7 @@ jobs:
             fail=1
           fi
           # Jobs that run on every change.
-          for pair in "static=$STATIC" "unit=$UNIT"; do
+          for pair in "static=$STATIC" "unit=$UNIT" "pin=$PIN"; do
             if [ "${pair#*=}" != "success" ]; then
               echo "::error::${pair%%=*} was ${pair#*=}, expected success"
               fail=1

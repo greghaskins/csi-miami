@@ -125,7 +125,7 @@ For a cluster with tenants, or with powerful controllers in the namespaces the w
 
 **Namespace.** Everything runs in `miami-system`, labeled with Pod Security Admission `enforce: privileged` for the node agent's privileged security context and the controller's `SYS_ADMIN` capability (the controller mounts NFSv3 transports with `mount(2)`, which containerd's default AppArmor profile denies even with the capability).
 
-**Images.** The base uses the placeholder `ghcr.io/greghaskins/csi-miami:unset`, a tag that cannot be pulled; every overlay sets the real image with `images:`, preferably by digest. The sidecars (csi-provisioner, csi-attacher, csi-resizer, csi-node-driver-registrar, livenessprobe) are pinned by digest and are public at `registry.k8s.io/sig-storage/`. The driver image is public at ghcr.io/greghaskins/csi-miami.
+**Images.** The base pins the driver image by content tag and multi-arch index digest, so applying any commit of the base runs the image built from that commit's code, pulled by digest (see [docs/releasing.md](docs/releasing.md)). An overlay may still set its own image with `images:`. The sidecars (csi-provisioner, csi-attacher, csi-resizer, csi-node-driver-registrar, livenessprobe) are pinned by digest and are public at `registry.k8s.io/sig-storage/`. The driver image is public at ghcr.io/greghaskins/csi-miami.
 
 **Kubelet directory.** The base defaults to `/var/lib/kubelet`. Every distribution has its own:
 
