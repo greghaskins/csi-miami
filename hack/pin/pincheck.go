@@ -100,13 +100,17 @@ func checkPin(env pinCheckEnv, base string) (pin, []ruleFailure) {
 	}
 
 	// Rule 4: a tag the base already pins keeps its digest. Only a base
-	// without the pin file skips it; an unreadable base fails, so the
-	// re-push guard never turns itself off.
+	// without the pin file, or with no pin in it at all, skips it; an
+	// unreadable base or a garbled pin fails, so the re-push guard never
+	// turns itself off.
 	bc, berr := env.show(base, kustomization)
 	switch {
 	case errors.Is(berr, errAbsent):
 	case berr != nil:
 		fail(4, fmt.Sprintf("cannot read the base pin (%s at %s): %v", kustomization, base, berr), "re-run this job; the base must be readable to rule out a re-pushed tag")
+	case unpinned(bc):
+		// The base predates the pin (the first pin lands here); nothing to
+		// compare against.
 	default:
 		bp, perr := readPin(bc)
 		switch {
@@ -237,4 +241,10 @@ func renderBase() ([]byte, error) {
 		return nil, err
 	}
 	return m.AsYaml()
+}
+
+// unpinned reports whether kustomization content carries no pin at all: no
+// digest line and no newTag line.
+func unpinned(content []byte) bool {
+	return len(digestLine.FindAll(content, -1)) == 0 && len(tagLine.FindAll(content, -1)) == 0
 }

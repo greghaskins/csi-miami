@@ -146,7 +146,8 @@ func TestCheckPin(t *testing.T) {
 		{"rule 3: no image rendered", func(f *fakeEnv) { f.render = "kind: Namespace\n" }, []int{3}, "no ghcr.io/greghaskins/csi-miami image"},
 		{"base without a pin file skips rule 4", func(f *fakeEnv) { f.base = "" }, nil, ""},
 		{"rule 4: unreadable base does not skip the guard", func(f *fakeEnv) { f.baseErr = errors.New("bad revision") }, []int{4}, "cannot read the base pin"},
-		{"rule 4: malformed base pin", func(f *fakeEnv) { f.base = "images: []\n" }, []int{4}, "cannot read the base pin"},
+		{"base from before the pin skips rule 4", func(f *fakeEnv) { f.base = "resources:\n  - daemonset-node.yaml\n" }, nil, ""},
+		{"rule 4: malformed base pin", func(f *fakeEnv) { f.base = pinned("x-11", dA) + "    digest: " + dB + "\n" }, []int{4}, "cannot read the base pin"},
 		{"rule 4: same tag, new digest", func(f *fakeEnv) { f.base = pinned("x-11", dB) }, []int{4},
 			"same tag x-11 now has digest " + dA + "; escalate to the maintainer; change a hashed input to get a new tag"},
 	}
