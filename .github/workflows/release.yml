@@ -44,6 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "### release ${TAG}: $1" >> "$GITHUB_STEP_SUMMARY"; echo "$1" >&2; exit 1; }
+          [[ "${TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "R1 failed: ${TAG} is not vMAJOR.MINOR.PATCH"
           obj="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha')" || fail "cannot read tag ${TAG}"
           while [ "${obj%% *}" = tag ]; do
             obj="$(gh api "repos/${REPO}/git/tags/${obj#* }" --jq '.object.type + " " + .object.sha')" || fail "cannot peel tag ${TAG}"
@@ -51,25 +52,24 @@ jobs:
           [ "${obj%% *}" = commit ] || fail "tag ${TAG} does not point at a commit"
           echo "sha=${obj#* }" >> "$GITHUB_OUTPUT"
 
-      # R0: the commit's latest release-review is a success from the release
-      # reviewer's App, and its description's first token is this tag.
+      # R0: the latest release-review from the release reviewer's App is a
+      # success, and its description's first token is this tag. Statuses from
+      # any other account are ignored.
       - name: R0 release-review
         env:
           SHA: ${{ steps.commit.outputs.sha }}
         run: |
           set -euo pipefail
           fail() { echo "### release ${TAG}: R0 failed: $1" >> "$GITHUB_STEP_SUMMARY"; echo "R0: $1" >&2; exit 1; }
-          # Statuses come newest first; the first with the context is the latest.
+          [[ "${REVIEWER_ID}" =~ ^[0-9]+$ ]] || fail "repository variable RELEASE_REVIEWER_ID is not set"
+          # Statuses come newest first; the first match is the latest.
           s="$(gh api --paginate "repos/${REPO}/commits/${SHA}/statuses" \
-                --jq '.[] | select(.context == "release-review") | [.state, (.creator.id|tostring), .creator.login, .creator.type, (.description // "")] | @tsv')" \
+                --jq '.[] | select(.context == "release-review" and (.creator.id|tostring) == env.REVIEWER_ID and .creator.type == "Bot") | [.state, .creator.login, (.description // "")] | @tsv')" \
             || fail "cannot read statuses of ${SHA}"
           s="${s%%$'\n'*}"
-          [ -n "${s}" ] || fail "no release-review status on ${SHA}"
-          IFS=$'\t' read -r state cid clogin ctype desc <<<"${s}"
-          [ "${state}" = success ] || fail "latest release-review on ${SHA} is ${state}"
-          [[ "${REVIEWER_ID}" =~ ^[0-9]+$ ]] || fail "repository variable RELEASE_REVIEWER_ID is not set"
-          [ "${cid}" = "${REVIEWER_ID}" ] && [ "${ctype}" = Bot ] \
-            || fail "latest release-review on ${SHA} is from ${clogin} (${cid}), not the release reviewer (${REVIEWER_ID})"
+          [ -n "${s}" ] || fail "no release-review from the release reviewer (${REVIEWER_ID}) on ${SHA}"
+          IFS=$'\t' read -r state clogin desc <<<"${s}"
+          [ "${state}" = success ] || fail "latest release-review from the release reviewer on ${SHA} is ${state}"
           first="${desc%% *}"
           [ "${first}" = "${TAG}" ] || fail "release-review names '${first}', not ${TAG}"
           echo "R0 ok: ${TAG} reviewed by ${clogin}"
@@ -84,15 +84,18 @@ jobs:
           set -euo pipefail
           fail() { echo "### release ${TAG}: R1 failed: $1" >> "$GITHUB_STEP_SUMMARY"; echo "R1: $1" >&2; exit 1; }
           semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-          [[ "${TAG}" =~ ${semver} ]] || fail "${TAG} is not vMAJOR.MINOR.PATCH"
           tags="$(gh api --paginate "repos/${REPO}/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")')" \
             || fail "cannot list tags"
           pred=""
           # Lower SemVer tags, highest first.
           while read -r t; do
             [ -n "${t}" ] || continue
-            if author="$(gh api "repos/${REPO}/releases/tags/${t}" --jq '(.author.id|tostring) + " " + (.draft|tostring)' 2>/dev/null)"; then
+            # Only a 404 means "no Release"; any other error stops, so an
+            # unreadable Release never skips to an older predecessor.
+            if author="$(gh api "repos/${REPO}/releases/tags/${t}" --jq '(.author.id|tostring) + " " + (.draft|tostring)' 2>"${RUNNER_TEMP}/r1.err")"; then
               if [ "${author}" = "${RELEASER_ID} false" ]; then pred="${t}"; break; fi
+            elif ! grep -q 'HTTP 404' "${RUNNER_TEMP}/r1.err"; then
+              fail "cannot read the Release for ${t}: $(cat "${RUNNER_TEMP}/r1.err")"
             fi
           done < <(grep -E "${semver}" <<<"${tags}" | { cat; echo "${TAG}"; } | sort -uV | sed "/^${TAG//./\\.}\$/,\$d" | tac)
           if [ -z "${pred}" ]; then
@@ -140,8 +143,8 @@ jobs:
           digest="$(jq -r '.[0].digest // ""' <<<"${entry}")"
           [[ "${tag}" =~ ^x-[0-9a-f]+$ ]] || fail "${PIN_FILE} at ${SHA} pins tag '${tag}', not x-<hex>"
           [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "${PIN_FILE} at ${SHA} pins digest '${digest}'"
-          out="$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .Manifest}}' 2>&1)" \
-            || fail "the registry has no ${IMAGE}:${tag}: ${out}"
+          out="$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .Manifest}}' 2>"${RUNNER_TEMP}/r3.err")" \
+            || fail "the registry has no ${IMAGE}:${tag}: $(cat "${RUNNER_TEMP}/r3.err")"
           have="$(jq -r .digest <<<"${out}")"
           [ "${have}" = "${digest}" ] || fail "${IMAGE}:${tag} is ${have}, but the pin names ${digest}"
           echo "R3 ok: ${IMAGE}:${tag}@${digest}"
@@ -157,8 +160,8 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "### release ${TAG}: $1" >> "$GITHUB_STEP_SUMMARY"; echo "$1" >&2; exit 1; }
-          if ! rel="$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>&1)"; then
-            grep -q 'HTTP 404' <<<"${rel}" || fail "cannot read the Release for ${TAG}: ${rel}"
+          if ! rel="$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>"${RUNNER_TEMP}/rel.err")"; then
+            grep -q 'HTTP 404' "${RUNNER_TEMP}/rel.err" || fail "cannot read the Release for ${TAG}: $(cat "${RUNNER_TEMP}/rel.err")"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -180,6 +183,7 @@ jobs:
           DIGEST: ${{ steps.r3.outputs.digest }}
         run: |
           set -euo pipefail
+          trap 'echo "### release ${TAG}: publishing failed; see the step log" >> "$GITHUB_STEP_SUMMARY"' ERR
           notes="${RUNNER_TEMP}/notes.md"
           args=(-f "tag_name=${TAG}" -f "target_commitish=${SHA}")
           [ -z "${PRED}" ] || args+=(-f "previous_tag_name=${PRED}")
