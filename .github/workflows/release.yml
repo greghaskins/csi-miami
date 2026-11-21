@@ -1,0 +1,199 @@
+# Release job: a `v*` tag push publishes the GitHub Release (docs/releasing.md).
+# The tag ruleset only accepts a tag whose commit has a green `release-review`
+# from the release reviewer's App and a green `pin` from GitHub Actions. This
+# job re-checks R0 to R3 from the API, then creates the Release once.
+#
+# One job, no checkout, no repo code: every check reads the API, so nothing
+# in the tagged tree runs with this token. Rules R0 to R3 each stop the run
+# and name themselves in the job summary. Nothing edits a Release; a failed
+# run is re-run by a maintainer once the cause is fixed, or the next version
+# is released. Tags never move.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+  statuses: read
+  checks: read
+  # R3 reads the registry with this token.
+  packages: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  TAG: ${{ github.ref_name }}
+  IMAGE: ghcr.io/greghaskins/csi-miami
+  PIN_FILE: deploy/kustomize/base/kustomization.yaml
+  # The release reviewer's bot account id, a repository variable set by the
+  # maintainer; and github-actions[bot], which creates every Release.
+  REVIEWER_ID: ${{ vars.RELEASE_REVIEWER_ID }}
+  RELEASER_ID: '41898282'
+defaults:
+  run:
+    shell: bash
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # The tag's commit (annotated tags peeled), from the API.
+      - id: commit
+        run: |
+          set -euo pipefail
+          fail() { echo "### release ${TAG}: $1" >> "$GITHUB_STEP_SUMMARY"; echo "$1" >&2; exit 1; }
+          obj="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha')" || fail "cannot read tag ${TAG}"
+          while [ "${obj%% *}" = tag ]; do
+            obj="$(gh api "repos/${REPO}/git/tags/${obj#* }" --jq '.object.type + " " + .object.sha')" || fail "cannot peel tag ${TAG}"
+          done
+          [ "${obj%% *}" = commit ] || fail "tag ${TAG} does not point at a commit"
+          echo "sha=${obj#* }" >> "$GITHUB_OUTPUT"
+
+      # R0: the commit's latest release-review is a success from the release
+      # reviewer's App, and its description's first token is this tag.
+      - name: R0 release-review
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "### release ${TAG}: R0 failed: $1" >> "$GITHUB_STEP_SUMMARY"; echo "R0: $1" >&2; exit 1; }
+          # Statuses come newest first; the first with the context is the latest.
+          s="$(gh api --paginate "repos/${REPO}/commits/${SHA}/statuses" \
+                --jq '.[] | select(.context == "release-review") | [.state, (.creator.id|tostring), .creator.login, .creator.type, (.description // "")] | @tsv')" \
+            || fail "cannot read statuses of ${SHA}"
+          s="${s%%$'\n'*}"
+          [ -n "${s}" ] || fail "no release-review status on ${SHA}"
+          IFS=$'\t' read -r state cid clogin ctype desc <<<"${s}"
+          [ "${state}" = success ] || fail "latest release-review on ${SHA} is ${state}"
+          [[ "${REVIEWER_ID}" =~ ^[0-9]+$ ]] || fail "repository variable RELEASE_REVIEWER_ID is not set"
+          [ "${cid}" = "${REVIEWER_ID}" ] && [ "${ctype}" = Bot ] \
+            || fail "latest release-review on ${SHA} is from ${clogin} (${cid}), not the release reviewer (${REVIEWER_ID})"
+          first="${desc%% *}"
+          [ "${first}" = "${TAG}" ] || fail "release-review names '${first}', not ${TAG}"
+          echo "R0 ok: ${TAG} reviewed by ${clogin}"
+
+      # R1: the tag is SemVer; its predecessor is the highest lower v* tag
+      # with a Release by github-actions[bot]; the commit descends from it.
+      - id: r1
+        name: R1 SemVer and predecessor
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "### release ${TAG}: R1 failed: $1" >> "$GITHUB_STEP_SUMMARY"; echo "R1: $1" >&2; exit 1; }
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "${TAG}" =~ ${semver} ]] || fail "${TAG} is not vMAJOR.MINOR.PATCH"
+          tags="$(gh api --paginate "repos/${REPO}/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")')" \
+            || fail "cannot list tags"
+          pred=""
+          # Lower SemVer tags, highest first.
+          while read -r t; do
+            [ -n "${t}" ] || continue
+            if author="$(gh api "repos/${REPO}/releases/tags/${t}" --jq '(.author.id|tostring) + " " + (.draft|tostring)' 2>/dev/null)"; then
+              if [ "${author}" = "${RELEASER_ID} false" ]; then pred="${t}"; break; fi
+            fi
+          done < <(grep -E "${semver}" <<<"${tags}" | { cat; echo "${TAG}"; } | sort -uV | sed "/^${TAG//./\\.}\$/,\$d" | tac)
+          if [ -z "${pred}" ]; then
+            echo "R1 ok: ${TAG} is the first release"
+            echo "pred=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status="$(gh api "repos/${REPO}/compare/${pred}...${SHA}" --jq .status)" || fail "cannot compare ${pred} with ${SHA}"
+          [ "${status}" = ahead ] || fail "${SHA} does not descend from ${pred} (compare: ${status})"
+          echo "R1 ok: predecessor ${pred}"
+          echo "pred=${pred}" >> "$GITHUB_OUTPUT"
+
+      # R2: the tag commit is on main.
+      - name: R2 on main
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "### release ${TAG}: R2 failed: $1" >> "$GITHUB_STEP_SUMMARY"; echo "R2: $1" >&2; exit 1; }
+          status="$(gh api "repos/${REPO}/compare/${SHA}...main" --jq .status)" || fail "cannot compare ${SHA} with main"
+          [ "${status}" = ahead ] || [ "${status}" = identical ] || fail "${SHA} is not on main (compare: ${status})"
+          echo "R2 ok: ${SHA} is on main"
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # R3: the pin file at the tag names a digest the registry still returns
+      # for its content tag.
+      - id: r3
+        name: R3 pin and registry
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "### release ${TAG}: R3 failed: $1" >> "$GITHUB_STEP_SUMMARY"; echo "R3: $1" >&2; exit 1; }
+          pin="$(gh api "repos/${REPO}/contents/${PIN_FILE}?ref=${SHA}" --jq .content | base64 -d)" \
+            || fail "cannot read ${PIN_FILE} at ${SHA}"
+          entry="$(IMG="${IMAGE}" yq -o=json '[.images[] | select(.name == strenv(IMG))]' <<<"${pin}")" \
+            || fail "${PIN_FILE} at ${SHA} does not parse"
+          [ "$(jq length <<<"${entry}")" = 1 ] || fail "${PIN_FILE} at ${SHA} has no single images entry for ${IMAGE}"
+          tag="$(jq -r '.[0].newTag // ""' <<<"${entry}")"
+          digest="$(jq -r '.[0].digest // ""' <<<"${entry}")"
+          [[ "${tag}" =~ ^x-[0-9a-f]+$ ]] || fail "${PIN_FILE} at ${SHA} pins tag '${tag}', not x-<hex>"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "${PIN_FILE} at ${SHA} pins digest '${digest}'"
+          out="$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .Manifest}}' 2>&1)" \
+            || fail "the registry has no ${IMAGE}:${tag}: ${out}"
+          have="$(jq -r .digest <<<"${out}")"
+          [ "${have}" = "${digest}" ] || fail "${IMAGE}:${tag} is ${have}, but the pin names ${digest}"
+          echo "R3 ok: ${IMAGE}:${tag}@${digest}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # A re-run skips a Release github-actions[bot] already created with the
+      # same commit and digest, and fails on any other existing Release.
+      - id: existing
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+          DIGEST: ${{ steps.r3.outputs.digest }}
+        run: |
+          set -euo pipefail
+          fail() { echo "### release ${TAG}: $1" >> "$GITHUB_STEP_SUMMARY"; echo "$1" >&2; exit 1; }
+          if ! rel="$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>&1)"; then
+            grep -q 'HTTP 404' <<<"${rel}" || fail "cannot read the Release for ${TAG}: ${rel}"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          author="$(jq -r '.author.id|tostring' <<<"${rel}")"
+          body="$(jq -r '.body // ""' <<<"${rel}")"
+          if [ "${author}" = "${RELEASER_ID}" ] && grep -qF "${SHA}" <<<"${body}" && grep -qF "${DIGEST}" <<<"${body}"; then
+            echo "Release ${TAG} already exists for ${SHA} and ${DIGEST}; nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fail "a different Release ${TAG} already exists (author id ${author}); it is never edited"
+
+      - if: steps.existing.outputs.skip == 'false'
+        name: Publish the Release
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+          PRED: ${{ steps.r1.outputs.pred }}
+          CONTENT_TAG: ${{ steps.r3.outputs.tag }}
+          DIGEST: ${{ steps.r3.outputs.digest }}
+        run: |
+          set -euo pipefail
+          notes="${RUNNER_TEMP}/notes.md"
+          args=(-f "tag_name=${TAG}" -f "target_commitish=${SHA}")
+          [ -z "${PRED}" ] || args+=(-f "previous_tag_name=${PRED}")
+          # The notes `--generate-notes --notes-start-tag` would write, generated
+          # first so the Release is created once and never edited.
+          gh api "repos/${REPO}/releases/generate-notes" "${args[@]}" --jq .body > "${notes}"
+          {
+            echo
+            echo "### Image"
+            echo
+            echo "- content tag: \`${CONTENT_TAG}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- reference: \`${IMAGE}:${CONTENT_TAG}@${DIGEST}\`"
+            echo "- tag commit: \`${SHA}\`"
+          } >> "${notes}"
+          gh release create "${TAG}" -R "${REPO}" --verify-tag --title "${TAG}" --notes-file "${notes}"
+          echo "Released ${TAG} at ${SHA} (${IMAGE}@${DIGEST})" | tee -a "$GITHUB_STEP_SUMMARY"
