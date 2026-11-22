@@ -52,7 +52,7 @@ once `pin` is green: the pin push dismisses earlier approvals.
 
 The `pin` job calls release-checks' `pin.yml` at a pinned SHA, so its check is
 `pin / pin` and none of this repository's code runs in it. It runs on every
-pull request and every push to `main`, after `manifest` (also when `manifest`
+pull request and every push to `main`, after `image` (also when `image`
 was skipped) and once `release-checks-ref` has passed, and checks the pull
 request's head commit. `ci-ok` requires it. Each failure prints its rule and
 the fix:

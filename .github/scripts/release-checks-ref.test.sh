@@ -32,12 +32,12 @@ Y
 case_ "one full SHA on main (identical)" pass <<Y
 on: push
 permissions: {contents: read}
-jobs: {p: {uses: "greghaskins/release-checks/.github/workflows/pin.yml@$A"}}
+jobs: {p: {permissions: {contents: read}, uses: "greghaskins/release-checks/.github/workflows/pin.yml@$A"}}
 Y
 STUB_COMPARE=behind case_ "SHA behind main" pass <<Y
 on: push
 permissions: {contents: read}
-jobs: {p: {uses: "greghaskins/release-checks/.github/workflows/pin.yml@$A"}}
+jobs: {p: {permissions: {contents: read}, uses: "greghaskins/release-checks/.github/workflows/pin.yml@$A"}}
 Y
 STUB_COMPARE=diverged case_ "SHA diverged from main (a fork's commit)" fail 2 <<Y
 on: push
@@ -115,6 +115,7 @@ jobs: {a: {runs-on: x, permissions: {contents: write}, steps: [{uses: ./tools/ac
 Y
 case_ "write job, local action under .github" pass <<Y
 on: push
+permissions: {contents: read}
 jobs: {a: {runs-on: x, permissions: {contents: write}, steps: [{uses: ./.github/actions/act}]}}
 Y
 case_ "write job, unpinned docker action" fail 3 <<Y
@@ -123,6 +124,7 @@ jobs: {a: {runs-on: x, permissions: {contents: write}, steps: [{uses: "docker://
 Y
 case_ "write job, docker action by digest" pass <<Y
 on: push
+permissions: {contents: read}
 jobs: {a: {runs-on: x, permissions: {contents: write}, steps: [{uses: "docker://alpine@sha256:$(printf 'd%.0s' {1..64})"}]}}
 Y
 case_ "write job calls another repo's workflow at a tag" fail 3 <<Y
@@ -134,31 +136,60 @@ on: push
 permissions: {contents: read}
 jobs: {a: {uses: other/repo/.github/workflows/x.yml@v1, secrets: inherit}}
 Y
-case_ "write job runs ko without KO_CONFIG_PATH" fail 4 <<Y
-on: push
-jobs: {a: {runs-on: x, permissions: {packages: write}, steps: [{uses: "ko-build/setup-ko@$P"}, {run: "ko build ./cmd/x"}]}}
-Y
-case_ "ko config from .ko.yaml in the tree" fail 4 <<Y
-on: push
-jobs: {a: {runs-on: x, permissions: {packages: write}, env: {KO_CONFIG_PATH: .ko.yaml}, steps: [{run: "ko build ./cmd/x"}]}}
-Y
-case_ "ko config under .github (job env)" pass <<Y
-on: push
-jobs: {a: {runs-on: x, permissions: {packages: write}, env: {KO_CONFIG_PATH: .github/ko.yaml}, steps: [{uses: "ko-build/setup-ko@$P"}, {run: "ko build ./cmd/x"}]}}
-Y
-case_ "ko config under .github (workflow env, workspace prefix)" pass <<'Y'
-on: push
-env: {KO_CONFIG_PATH: "${{ github.workspace }}/.github/ko.yaml"}
-jobs: {a: {runs-on: x, permissions: {packages: write}, steps: [{run: "ko build ./cmd/x"}]}}
-Y
-case_ "ko step env must also be under .github" fail 4 <<Y
-on: push
-jobs: {a: {runs-on: x, permissions: {packages: write}, env: {KO_CONFIG_PATH: .github/ko.yaml}, steps: [{run: "ko build ./cmd/x", env: {KO_CONFIG_PATH: cfg/ko.yaml}}]}}
-Y
-case_ "ko in a read-only job is out of scope" pass <<Y
+B="greghaskins/release-checks/.github/workflows/build.yml@$A"
+case_ "rule 4: the build.yml caller holds packages: write" pass <<Y
 on: push
 permissions: {contents: read}
-jobs: {a: {runs-on: x, steps: [{run: "ko build ./cmd/x"}]}}
+jobs: {image: {permissions: {contents: read, packages: write}, uses: "$B"}}
+Y
+case_ "rule 4: a job with steps holds packages: write" fail 4 <<Y
+on: push
+permissions: {contents: read}
+jobs: {a: {runs-on: x, permissions: {packages: write}, steps: [{uses: "actions/checkout@$P"}]}}
+Y
+case_ "rule 4: another reusable workflow holds packages: write" fail 4 <<Y
+on: push
+permissions: {contents: read}
+jobs: {a: {permissions: {packages: write}, uses: "greghaskins/release-checks/.github/workflows/pin.yml@$A"}}
+Y
+case_ "rule 4: the build.yml caller passes secrets" fail 4 <<'Y'
+on: push
+permissions: {contents: read}
+jobs: {image: {permissions: {packages: write}, uses: "greghaskins/release-checks/.github/workflows/build.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", secrets: {K: "${{ secrets.K }}"}}}
+Y
+case_ "rule 4: the build.yml caller passes secrets: inherit" fail 4 <<Y
+on: push
+permissions: {contents: read}
+jobs: {image: {permissions: {packages: write}, uses: "$B", secrets: inherit}}
+Y
+case_ "rule 4: packages: write at the workflow's top level" fail 4 <<Y
+on: push
+permissions: {contents: read, packages: write}
+jobs: {image: {permissions: {packages: write}, uses: "$B"}}
+Y
+case_ "rule 4: write-all at the top level" fail 4 <<Y
+on: push
+permissions: write-all
+jobs: {a: {runs-on: x, permissions: {}, steps: [{run: x}]}}
+Y
+case_ "rule 4: write-all on the build.yml caller" fail 4 <<Y
+on: push
+permissions: {contents: read}
+jobs: {image: {permissions: write-all, uses: "$B"}}
+Y
+case_ "rule 4: no top-level permissions" fail 4 <<Y
+on: push
+jobs: {a: {runs-on: x, permissions: {}, steps: [{run: x}]}}
+Y
+case_ "rule 4: a reusable-workflow job without its own permissions" fail 4 <<Y
+on: push
+permissions: {contents: read}
+jobs: {p: {uses: "greghaskins/release-checks/.github/workflows/pin.yml@$A"}}
+Y
+case_ "rule 4: a step job inherits read-only top-level permissions" pass <<Y
+on: push
+permissions: {contents: read}
+jobs: {a: {runs-on: x, steps: [{run: x}]}}
 Y
 case_ "owner and repo in another case" fail 1 <<Y
 on: push

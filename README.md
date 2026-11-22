@@ -135,14 +135,15 @@ For a cluster with tenants, or with powerful controllers in the namespaces the w
 | k3s | `/var/lib/rancher/k3s/agent/kubelet` |
 | microk8s | `/var/snap/microk8s/common/var/lib/kubelet` |
 
-An overlay (at `deploy/kustomize/overlays/<name>/kustomization.yaml`, or with `../../base` replaced if elsewhere) that sets a different path must repeat the kustomization.yaml replacement (the base snippet is in comments there). Set `newTag` to a commit sha (the publish job tags images by sha) or a release tag:
+An overlay (at `deploy/kustomize/overlays/<name>/kustomization.yaml`, or with `../../base` replaced if elsewhere) that sets a different path must repeat the kustomization.yaml replacement (the base snippet is in comments there). The base pins the driver image by content tag and digest; an overlay that pins its own sets `newTag` and `digest` together, from a release:
 
 ```yaml
 resources:
   - ../../base
 images:
   - name: ghcr.io/greghaskins/csi-miami
-    newTag: <sha or tag>
+    newTag: r-<64 hex>          # the release's content tag
+    digest: sha256:<64 hex>     # what runs
 configMapGenerator:
   - name: miami-deploy
     namespace: miami-system

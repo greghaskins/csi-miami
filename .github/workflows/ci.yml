@@ -5,16 +5,16 @@
 #
 # The `changes` job decides whether the pull request touches anything but
 # documentation (docs/, Markdown files, LICENSE). If it does not, the heavy
-# jobs (envtest, sanity, smoke, e2e, e2e-kind, build, manifest, deploy) are
+# jobs (envtest, sanity, smoke, e2e, e2e-kind, deploy) are
 # skipped, and `ci-ok` accepts exactly those jobs as skipped; on any other
 # change, and on every push to main, they must all have succeeded.
 #
-# Images are content-addressed: they are tagged by hack/content-hash.sh, a
-# hash of the build inputs (including hack/image-build.sh, which holds the
-# build command), not by commit. A commit whose inputs are unchanged rebuilds
-# nothing, and a push to main normally only adds its sha as an alias of the
-# existing index. The registry is the artifact store, so this repository takes
-# no fork pull requests (their token cannot push).
+# Images are content-addressed (`r-<64 hex>` over the input set that
+# .github/image.json names) and built by release-checks' build.yml, called at
+# one full SHA from the `image` job: only that job holds `packages: write`. A
+# commit whose inputs are unchanged builds nothing. The registry is the
+# artifact store, so fork pull requests skip the image (their token cannot
+# push) and `pin` fails "not built" for them.
 name: ci
 on:
   pull_request:
@@ -278,184 +278,30 @@ jobs:
           path: ${{ runner.temp }}/e2e/
           if-no-files-found: ignore
 
-  # Builds and pushes x-<hash>-<arch> natively on each architecture (no
-  # emulation) unless that tag already exists, then runs the image from the
-  # registry, so every run proves the image that will be used starts, whether
-  # or not this run built it. It records the digest of the image it ran, and
-  # the index is created from exactly those digests.
-  build:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+  # The image, built by release-checks' build.yml at the SHA every reference
+  # here names (release-checks-ref rule 1), from the input set alone. It runs
+  # on every same-repo event (an unchanged input set finds its tag and builds
+  # nothing) and uploads image-ref, which `pin` and the pin script read
+  # (`image / ref`). The only job holding packages: write
+  # (release-checks-ref rule 4).
+  image:
+    needs: release-checks-ref
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: greghaskins/release-checks/.github/workflows/build.yml@cb86ca4e65bef56175a5747abd0e5dcafec7c6bc
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Compute the image identity
-        id: id
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          hash="$(hack/content-hash.sh)"
-          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
-            echo "::error::unexpected content hash: '${hash}'"
-            exit 1
-          fi
-          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
-          {
-            echo "hash=${hash}"
-            echo "image=${image}"
-          } >> "$GITHUB_OUTPUT"
-      - name: Log in to ghcr.io
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Build and push the image unless it exists
-        env:
-          IMAGE: ${{ steps.id.outputs.image }}
-          HASH: ${{ steps.id.outputs.hash }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          tag="${IMAGE}:x-${HASH}-${ARCH}"
-          if hack/image-exists.sh "$tag"; then
-            echo "$tag already exists; not rebuilding"
-          else
-            status=$?
-            if [ "$status" -ne 1 ]; then
-              echo "::error::could not tell whether $tag exists"
-              exit "$status"
-            fi
-            echo "$tag does not exist; building"
-            hack/image-build.sh --arch "$ARCH" --tag "$tag" --push
-          fi
-      - name: Run the image from the registry and record its digest
-        env:
-          IMAGE: ${{ steps.id.outputs.image }}
-          HASH: ${{ steps.id.outputs.hash }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          tag="${IMAGE}:x-${HASH}-${ARCH}"
-          digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$tag" |
-            jq -er --arg arch "$ARCH" '
-              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)]
-              | if length == 1 then .[0].digest else error("expected exactly one linux/" + $arch + " manifest") end')"
-          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::unexpected digest: '${digest}'"
-            exit 1
-          fi
-          got="$(docker run --rm "${IMAGE}@${digest}" version)"
-          echo "${IMAGE}@${digest} (${tag}) reports version ${got}"
-          test "$got" = "x-${HASH}"
-          printf '%s\n' "$digest" > "digest-${ARCH}"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: digest-${{ matrix.arch }}
-          path: digest-${{ matrix.arch }}
-          if-no-files-found: error
-
-  # Creates the multi-arch index x-<hash> from exactly the two digests the
-  # build legs ran, and verifies that it lists those and nothing else.
-  manifest:
-    needs: [changes, build]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      index_digest: ${{ steps.index.outputs.index_digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Compute the image identity
-        id: id
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          hash="$(hack/content-hash.sh)"
-          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
-            echo "::error::unexpected content hash: '${hash}'"
-            exit 1
-          fi
-          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
-          {
-            echo "hash=${hash}"
-            echo "image=${image}"
-          } >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: digest-*
-          merge-multiple: true
-          path: digests
-      - name: Log in to ghcr.io
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Create and verify the index
-        id: index
-        env:
-          IMAGE: ${{ steps.id.outputs.image }}
-          HASH: ${{ steps.id.outputs.hash }}
-        run: |
-          amd64="$(cat digests/digest-amd64)"
-          arm64="$(cat digests/digest-arm64)"
-          for d in "$amd64" "$arm64"; do
-            if ! [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::unexpected digest: '${d}'"
-              exit 1
-            fi
-          done
-          index="${IMAGE}:x-${HASH}"
-          docker buildx imagetools create -t "$index" "${IMAGE}@${amd64}" "${IMAGE}@${arm64}"
-          docker buildx imagetools inspect --format '{{json .Manifest}}' "$index" |
-            jq -e --arg amd64 "$amd64" --arg arm64 "$arm64" '
-              (.manifests | map({digest: .digest, platform: (.platform.os + "/" + .platform.architecture)})
-                | sort_by(.platform))
-              == [{digest: $amd64, platform: "linux/amd64"}, {digest: $arm64, platform: "linux/arm64"}]'
-          index_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$index")"
-          if ! [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::unexpected index digest: '${index_digest}'"
-            exit 1
-          fi
-          echo "${index} is ${index_digest}, listing ${amd64} (amd64) and ${arm64} (arm64)"
-          echo "index_digest=${index_digest}" >> "$GITHUB_OUTPUT"
-          # For the pin script (go run ./hack/pin pin), which reads the
-          # verified index from this run rather than from the registry.
-          jq -n --arg tag "x-${HASH}" --arg digest "$index_digest" '{tag: $tag, digest: $digest}' > "${RUNNER_TEMP}/image-ref.json"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: image-ref
-          path: ${{ runner.temp }}/image-ref.json
-          if-no-files-found: error
-          retention-days: 30
 
   # The deploy check (hack/kind.sh): the e2e overlay on a kind cluster of one
-  # control plane and two workers, with the amd64 image the build job pushed
-  # (the content tag, pulled and loaded into the nodes, never pulled by them).
+  # control plane and two workers, with this run's image (pulled by digest,
+  # tagged with its content tag, loaded into the nodes, never pulled by them).
   # Passes when the node pod is Ready on each of the two workers and not on the
   # control plane, the driver is registered in every worker's CSINode and /healthz and /metrics answer through the API server. A
   # failing run uploads kind's logs, the pods' logs and descriptions and each
   # node's mountinfo. kind is built, and kubectl downloaded and checked against its
   # published checksum, at the versions mise.toml pins.
   deploy:
-    needs: [changes, build]
+    needs: [changes, image]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -474,22 +320,28 @@ jobs:
         run: |
           hack/install-kind-tools.sh "${RUNNER_TEMP}/bin"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
-      - name: Pull the image the build job pushed
+      # This run's image, by its index digest (the runner's own platform),
+      # tagged locally with its content tag, and checked: it reports that tag
+      # as its version (build.yml passes it as CONTENT_TAG).
+      - name: Pull the image this run built or found
         id: image
         env:
           REPO: ${{ github.repository }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
+          TAG: ${{ needs.image.outputs.tag }}
+          DIGEST: ${{ needs.image.outputs.digest }}
         run: |
-          hash="$(hack/content-hash.sh)"
-          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
-            echo "::error::unexpected content hash: '${hash}'"
-            exit 1
-          fi
-          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]'):x-${hash}-amd64"
+          set -euo pipefail
+          [[ "$TAG" =~ ^r-[0-9a-f]{64}$ && "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::image job gave tag '${TAG}', digest '${DIGEST}'"; exit 1; }
+          name="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
           printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-          docker pull "$image"
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          docker pull "${name}@${DIGEST}"
+          docker tag "${name}@${DIGEST}" "${name}:${TAG}"
+          got="$(docker run --rm "${name}:${TAG}" version)"
+          echo "${name}@${DIGEST} reports version ${got}"
+          [ "$got" = "$TAG" ] || { echo "::error::the image reports version '${got}', not its content tag ${TAG}"; exit 1; }
+          echo "image=${name}:${TAG}" >> "$GITHUB_OUTPUT"
       - name: Run the deploy check
         env:
           DEPLOY_IMAGE: ${{ steps.image.outputs.image }}
@@ -503,9 +355,9 @@ jobs:
           if-no-files-found: ignore
 
   # The driver on kind, end to end (hack/e2e-kind.sh, test/e2e): a cluster of
-  # one control plane and two workers, the image the build job pushed for this
-  # architecture (the content tag, pulled and loaded into the nodes, never
-  # pulled by them), and exit criteria 1 to 6 of the M1 plan as Go tests driven
+  # one control plane and two workers, this run's image for this architecture
+  # (pulled by digest, tagged with its content tag, loaded into the nodes,
+  # never pulled by them), and exit criteria 1 to 6 of the M1 plan as Go tests driven
   # through the API: two pods on two nodes share an nfs3 volume, a local volume
   # lives on one node, delete removes (nfs3) or leaves (local) the directory,
   # also across a controller restart, a node plugin restart changes nothing, a
@@ -527,7 +379,7 @@ jobs:
   # cryptsetup and e2fsprogs for the restore drill.
   e2e-kind:
     name: e2e-kind (${{ matrix.transport }}, ${{ matrix.arch }})
-    needs: [changes, build]
+    needs: [changes, image]
     if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -559,23 +411,24 @@ jobs:
         run: |
           hack/install-kind-tools.sh "${RUNNER_TEMP}/bin"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
-      - name: Pull the image the build job pushed
+      # This run's image by its index digest; the runner pulls its own
+      # platform. Tagged locally with the content tag for kind to load.
+      - name: Pull the image this run built or found
         id: image
         env:
           REPO: ${{ github.repository }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
-          ARCH: ${{ matrix.arch }}
+          TAG: ${{ needs.image.outputs.tag }}
+          DIGEST: ${{ needs.image.outputs.digest }}
         run: |
-          hash="$(hack/content-hash.sh)"
-          if ! [[ "$hash" =~ ^[0-9a-f]{16}$ ]]; then
-            echo "::error::unexpected content hash: '${hash}'"
-            exit 1
-          fi
-          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]'):x-${hash}-${ARCH}"
+          set -euo pipefail
+          [[ "$TAG" =~ ^r-[0-9a-f]{64}$ && "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::image job gave tag '${TAG}', digest '${DIGEST}'"; exit 1; }
+          name="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
           printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-          docker pull "$image"
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          docker pull "${name}@${DIGEST}"
+          docker tag "${name}@${DIGEST}" "${name}:${TAG}"
+          echo "image=${name}:${TAG}" >> "$GITHUB_OUTPUT"
       # The volume tests restore a volume on the runner and check it there
       # (hack/e2e-kind.sh checks for the tools; the nfs3 legs need these two).
       - name: Install cryptsetup and e2fsprogs
@@ -596,46 +449,16 @@ jobs:
           path: ${{ runner.temp }}/e2e-kind/
           if-no-files-found: ignore
 
-  # On main only: add the commit sha as an alias of the index that this run's
-  # manifest job created and verified. Idempotent, so a re-run or an
-  # out-of-order main job is harmless.
-  publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: manifest
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Log in to ghcr.io
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Alias the commit sha to the verified index
-        env:
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-          INDEX: ${{ needs.manifest.outputs.index_digest }}
-        run: |
-          if ! [[ "$INDEX" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::unexpected index digest: '${INDEX}'"
-            exit 1
-          fi
-          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
-          docker buildx imagetools create -t "${image}:${SHA}" "${image}@${INDEX}"
-
   # The `pin` check (docs/releasing.md): the base pins this commit's content
   # tag and digest, and that image exists. The rules run from release-checks'
   # pin.yml at this SHA (never from this tree), reading .github/image.json; its
-  # check is `pin / pin`. It runs after manifest whatever its result, but only
+  # check is `pin / pin`. It runs after image whatever its result, but only
   # once release-checks-ref has passed, so a release-checks SHA off its main
   # never runs here.
   pin:
-    needs: [manifest, release-checks-ref]
+    needs: [image, release-checks-ref]
     if: always() && needs.release-checks-ref.result == 'success'
-    uses: greghaskins/release-checks/.github/workflows/pin.yml@d745785109c5f75803c4296ea3fc084e202a25e6
+    uses: greghaskins/release-checks/.github/workflows/pin.yml@cb86ca4e65bef56175a5747abd0e5dcafec7c6bc
     permissions:
       contents: read
       packages: read
@@ -647,13 +470,13 @@ jobs:
   #
   #   - `changes` succeeded and said "true" or "false" (anything else, including
   #     a failure to decide, fails);
-  #   - static, unit and pin succeeded (they run on every change);
-  #   - each filtered job (envtest, sanity, smoke, e2e, e2e-kind, build,
-  #     manifest, deploy) succeeded when `changes` said "true" (code), so a job
-  #     that was skipped, cancelled or failed on a code change fails here; and,
-  #     when it said "false" (documentation only), is either skipped, which is
-  #     what the filter does, or succeeded, but never failed or cancelled;
-  #   - publish succeeded on a push to main and was skipped everywhere else.
+  #   - static, unit, image and pin succeeded (they run on every change; a
+  #     fork pull request skips image, so it fails here, as before);
+  #   - each filtered job (envtest, sanity, smoke, e2e, e2e-kind, deploy)
+  #     succeeded when `changes` said "true" (code), so a job that was skipped,
+  #     cancelled or failed on a code change fails here; and, when it said
+  #     "false" (documentation only), is either skipped, which is what the
+  #     filter does, or succeeded, but never failed or cancelled.
   #
   # A filtered job therefore cannot stand in for a pass, and a pass cannot be
   # skipped on a code change.
@@ -681,7 +504,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [changes, static, unit, envtest, sanity, smoke, e2e, e2e-kind, build, manifest, deploy, publish, pin]
+    needs: [changes, static, unit, envtest, sanity, smoke, e2e, e2e-kind, image, deploy, pin]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -697,12 +520,9 @@ jobs:
           SMOKE: ${{ needs.smoke.result }}
           E2E: ${{ needs.e2e.result }}
           E2E_KIND: ${{ needs.e2e-kind.result }}
-          BUILD: ${{ needs.build.result }}
-          MANIFEST: ${{ needs.manifest.result }}
+          IMAGE: ${{ needs.image.result }}
           DEPLOY: ${{ needs.deploy.result }}
-          PUBLISH: ${{ needs.publish.result }}
           PIN: ${{ needs.pin.result }}
-          PUBLISHING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           fail=0
           if [ "$CHANGES" != "success" ]; then
@@ -714,7 +534,7 @@ jobs:
             fail=1
           fi
           # Jobs that run on every change.
-          for pair in "static=$STATIC" "unit=$UNIT" "pin=$PIN"; do
+          for pair in "static=$STATIC" "unit=$UNIT" "image=$IMAGE" "pin=$PIN"; do
             if [ "${pair#*=}" != "success" ]; then
               echo "::error::${pair%%=*} was ${pair#*=}, expected success"
               fail=1
@@ -722,7 +542,7 @@ jobs:
           done
           # Jobs the filter may skip. On a code change (CODE is not "false", so
           # an undecided filter is a code change here) only success will do.
-          for pair in "envtest=$ENVTEST" "sanity=$SANITY" "smoke=$SMOKE" "e2e=$E2E" "e2e-kind=$E2E_KIND" "build=$BUILD" "manifest=$MANIFEST" "deploy=$DEPLOY"; do
+          for pair in "envtest=$ENVTEST" "sanity=$SANITY" "smoke=$SMOKE" "e2e=$E2E" "e2e-kind=$E2E_KIND" "deploy=$DEPLOY"; do
             result="${pair#*=}"
             if [ "$result" = "success" ]; then
               continue
@@ -734,15 +554,4 @@ jobs:
             echo "::error::${pair%%=*} was $result, expected success (the change filter said '$CODE')"
             fail=1
           done
-          # publish only runs when publishing from main; skipped is expected
-          # everywhere else, and a failure to run it on main is a failure.
-          if [ "$PUBLISHING" = "true" ]; then
-            want="success"
-          else
-            want="skipped"
-          fi
-          if [ "$PUBLISH" != "$want" ]; then
-            echo "::error::publish was $PUBLISH, expected $want"
-            fail=1
-          fi
           exit "$fail"
