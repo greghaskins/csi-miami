@@ -31,24 +31,29 @@ func TestReadWritePin(t *testing.T) {
 	if err != nil || p != (pin{Digest: dA}) {
 		t.Fatalf("readPin(old) = %+v, %v", p, err)
 	}
-	out, err := writePin([]byte(old), pin{"x-0123456789abcdef", dB})
+	out, err := writePin([]byte(old), pin{"r-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", dB})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := pinned("x-0123456789abcdef", dB); string(out) != want {
+	if want := pinned("r-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", dB); string(out) != want {
 		t.Fatalf("writePin added\n%s\nwant\n%s", out, want)
 	}
 	// Rewriting an existing pin touches only the two values.
-	out, err = writePin(out, pin{"x-0000", dA})
-	if err != nil || string(out) != pinned("x-0000", dA) {
+	out, err = writePin(out, pin{"r-abababababababababababababababababababababababababababababababab", dA})
+	if err != nil || string(out) != pinned("r-abababababababababababababababababababababababababababababababab", dA) {
 		t.Fatalf("writePin rewrite = %q, %v", out, err)
 	}
-	for _, bad := range []pin{{"0000", dA}, {"x-ABC", dA}, {"x-00", "sha256:1"}} {
+	for _, bad := range []pin{{"0000", dA}, {"x-ABC", dA}, {"x-0123456789abcdef", dA}, {"r-0000000000000000000000000000000000000000000000000000000000000000", "sha256:1"}} {
 		if _, err := writePin([]byte(old), bad); err == nil {
 			t.Errorf("writePin(%+v): want error", bad)
 		}
 	}
-	two := pinned("x-00", dA) + "    newTag: x-11\n"
+	// main may still pin an old x- tag: reading it works, so the script can
+	// replace it.
+	if p, err := readPin([]byte(pinned("x-0123456789abcdef", dA))); err != nil || p.Tag != "x-0123456789abcdef" {
+		t.Errorf("readPin of an x- pin = %+v, %v", p, err)
+	}
+	two := pinned("r-0000000000000000000000000000000000000000000000000000000000000000", dA) + "    newTag: r-1111111111111111111111111111111111111111111111111111111111111111\n"
 	if _, err := readPin([]byte(two)); err == nil {
 		t.Error("readPin with two newTag lines: want error")
 	}
@@ -82,9 +87,9 @@ func newPinRepo(t *testing.T) *pinRepo {
 		t.Skip("git not installed")
 	}
 	root := t.TempDir()
-	r := &pinRepo{t: t, dir: filepath.Join(root, "work"), bare: filepath.Join(root, "origin.git"), tag: "x-11",
+	r := &pinRepo{t: t, dir: filepath.Join(root, "work"), bare: filepath.Join(root, "origin.git"), tag: "r-1111111111111111111111111111111111111111111111111111111111111111",
 		jobs: `{"status":"completed","conclusion":"failure","jobs":[{"name":"image / ref","status":"completed","conclusion":"success","url":"u"},{"name":"pin","status":"completed","conclusion":"failure"}]}`}
-	r.artifact = `{"tag":"x-11","digest":"` + dA + `"}`
+	r.artifact = `{"tag":"r-1111111111111111111111111111111111111111111111111111111111111111","digest":"` + dA + `"}`
 	for _, args := range [][]string{{"init", "-q", "--bare", "-b", "main", r.bare}, {"clone", "-q", r.bare, r.dir}} {
 		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil { //nolint:gosec // test repo setup
 			t.Fatalf("git %v: %v %s", args, err, out)
@@ -95,7 +100,7 @@ func newPinRepo(t *testing.T) *pinRepo {
 	r.git("config", "commit.gpgsign", "false")
 	r.git("config", "core.hooksPath", "/dev/null")
 	r.git("checkout", "-q", "-B", "main")
-	r.write(kustomization, pinned("x-00", dB))
+	r.write(kustomization, pinned("r-0000000000000000000000000000000000000000000000000000000000000000", dB))
 	r.write("README", "a\n")
 	r.git("add", "-A")
 	r.git("commit", "-q", "-m", "init")
@@ -160,24 +165,24 @@ func TestPinScriptPins(t *testing.T) {
 	r := newPinRepo(t)
 	// main moves on with its own pin, so the merge conflicts in the pin file.
 	r.git("checkout", "-q", "main")
-	r.write(kustomization, pinned("x-01", dA))
-	r.git("commit", "-q", "-am", "pin: x-01")
+	r.write(kustomization, pinned("r-0101010101010101010101010101010101010101010101010101010101010101", dA))
+	r.git("commit", "-q", "-am", "pin: r-0101010101010101010101010101010101010101010101010101010101010101")
 	r.git("push", "-q", "origin", "main")
 	r.git("checkout", "-q", "feature")
-	r.write(kustomization, pinned("x-02", dB))
-	r.git("commit", "-q", "-am", "pin: x-02")
+	r.write(kustomization, pinned("r-0202020202020202020202020202020202020202020202020202020202020202", dB))
+	r.git("commit", "-q", "-am", "pin: r-0202020202020202020202020202020202020202020202020202020202020202")
 	r.git("push", "-q", "origin", "feature")
 
 	if err := r.script().run(); err != nil {
 		t.Fatalf("%v\n%s", err, r.out.String())
 	}
-	if got := r.git("log", "-1", "--format=%s"); got != "pin: x-11" {
-		t.Errorf("last commit %q, want pin: x-11", got)
+	if got := r.git("log", "-1", "--format=%s"); got != "pin: r-1111111111111111111111111111111111111111111111111111111111111111" {
+		t.Errorf("last commit %q, want pin: r-1111111111111111111111111111111111111111111111111111111111111111", got)
 	}
 	if r.remote("feature") != r.git("rev-parse", "HEAD") {
 		t.Error("pin commit not pushed")
 	}
-	if got, _ := os.ReadFile(filepath.Join(r.dir, kustomization)); string(got) != pinned("x-11", dA) {
+	if got, _ := os.ReadFile(filepath.Join(r.dir, kustomization)); string(got) != pinned("r-1111111111111111111111111111111111111111111111111111111111111111", dA) {
 		t.Errorf("pin file:\n%s", got)
 	}
 	// Updated by merge: main is an ancestor, and nothing was rewritten.
@@ -191,7 +196,7 @@ func TestPinScriptPins(t *testing.T) {
 
 func TestPinScriptAlreadyPinned(t *testing.T) {
 	r := newPinRepo(t)
-	r.tag = "x-00"
+	r.tag = "r-0000000000000000000000000000000000000000000000000000000000000000"
 	before := r.remote("feature")
 	if err := r.script().run(); err != nil {
 		t.Fatal(err)
@@ -212,9 +217,13 @@ func TestPinScriptFailsWithoutPushing(t *testing.T) {
 		"run cancelled before the image job": func(r *pinRepo) {
 			r.jobs = `{"status":"completed","conclusion":"cancelled","jobs":[]}`
 		},
-		"no image run":          func(r *pinRepo) { r.noRun = true },
-		"run built another tag": func(r *pinRepo) { r.artifact = `{"tag":"x-99","digest":"` + dA + `"}` },
-		"artifact garbage":      func(r *pinRepo) { r.artifact = `{"tag":"x-11"}` },
+		"no image run": func(r *pinRepo) { r.noRun = true },
+		"run built another tag": func(r *pinRepo) {
+			r.artifact = `{"tag":"r-9999999999999999999999999999999999999999999999999999999999999999","digest":"` + dA + `"}`
+		},
+		"artifact garbage": func(r *pinRepo) {
+			r.artifact = `{"tag":"r-1111111111111111111111111111111111111111111111111111111111111111"}`
+		},
 	}
 	for name, breakIt := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -278,7 +278,7 @@ func (s pinScript) download(runID int64, url string) (pin, error) {
 		return pin{}, bad("the %s artifact has no %s", pinArtifact, pinJSON)
 	}
 	var p pin
-	if err := json.Unmarshal(b, &p); err != nil || !tagRE.MatchString(p.Tag) || !digestRE.MatchString(p.Digest) {
+	if err := json.Unmarshal(b, &p); err != nil || !rTagRE.MatchString(p.Tag) || !digestRE.MatchString(p.Digest) {
 		return pin{}, bad("%s holds %q, not a tag and a digest", pinJSON, b)
 	}
 	return p, nil

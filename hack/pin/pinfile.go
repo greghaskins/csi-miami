@@ -11,17 +11,16 @@ import (
 //
 //	images:
 //	  - name: ghcr.io/greghaskins/csi-miami
-//	    newTag: x-<hex>
+//	    newTag: r-<64 hex>
 //	    digest: sha256:<64 hex>
 //
-// kustomize renders that as imageName:x-<hex>@sha256:<64 hex>. The runtime
+// kustomize renders that as imageName:r-<64 hex>@sha256:<64 hex>. The runtime
 // pulls by the digest; the tag says which inputs the image was built from.
 // The pin file is not an image input (hack/content-hash.sh), so pinning never
 // changes the tag.
 const imageName = "ghcr.io/greghaskins/csi-miami"
 
 var (
-	tagRE   = regexp.MustCompile(`^x-[0-9a-f]+$`)
 	tagLine = regexp.MustCompile(`(?m)^(\s+newTag: )(\S*)$`)
 )
 
@@ -52,8 +51,8 @@ func readPin(content []byte) (pin, error) {
 // writePin sets the tag and digest in kustomization content. A missing
 // newTag line is added just above the digest line, with its indentation.
 func writePin(content []byte, p pin) ([]byte, error) {
-	if !tagRE.MatchString(p.Tag) {
-		return nil, fmt.Errorf("tag %q is not x-<hex>", p.Tag)
+	if !rTagRE.MatchString(p.Tag) {
+		return nil, fmt.Errorf("tag %q is not r-<64 hex>", p.Tag)
 	}
 	out, err := setDigest(content, p.Digest)
 	if err != nil {
