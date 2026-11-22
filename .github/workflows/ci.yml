@@ -626,35 +626,21 @@ jobs:
           image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
           docker buildx imagetools create -t "${image}:${SHA}" "${image}@${INDEX}"
 
-  # The `pin` check (docs/releasing.md): the base pins this tree's content
-  # tag, the registry holds that tag under the pinned digest, the render uses
-  # the digest, and a tag the base branch already pins keeps its digest. It
-  # runs after manifest whatever its result (skipped on a documentation-only
-  # change, when the tag cannot have moved) and reads the registry itself.
-  # HEAD^1 is the base: the base branch on a pull request's merge ref, the
-  # previous main on a push.
+  # The `pin` check (docs/releasing.md): the base pins this commit's content
+  # tag and digest, and that image exists. The rules run from release-checks'
+  # pin.yml at this SHA (never from this tree), reading .github/image.json; its
+  # check is `pin / pin`. It runs after manifest whatever its result, but only
+  # once release-checks-ref has passed, so a release-checks SHA off its main
+  # never runs here.
   pin:
-    needs: manifest
-    if: always()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    needs: [manifest, release-checks-ref]
+    if: always() && needs.release-checks-ref.result == 'success'
+    uses: greghaskins/release-checks/.github/workflows/pin.yml@d745785109c5f75803c4296ea3fc084e202a25e6
     permissions:
       contents: read
       packages: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 2
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Log in to ghcr.io
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - run: go run ./hack/pin check HEAD^1
+    with:
+      pin-fix: run `go run ./hack/pin pin` on the branch
 
   # The single required check. It runs even when a job it needs failed, was
   # cancelled or was skipped (if: always()), and passes only if:
