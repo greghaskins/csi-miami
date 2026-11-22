@@ -39,8 +39,9 @@ It runs four steps, printing `pin 1/4` to `pin 4/4`:
 2. Computes the content tag with release-checks' `content-tag.sh`, at the SHA
    `.github/workflows/ci.yml` pins, so it agrees with the `pin` check. If the
    tag is already pinned, it stops: there is nothing to do.
-3. Pushes the head if needed, then waits for that commit's image job (up to an
-   hour, `--timeout`).
+3. Pushes the head if needed, then waits for that commit's `image / ref` job
+   (up to two hours, `--timeout`). Each git or gh call it makes is stopped
+   after five minutes.
 4. Reads the tag and digest from the run's `image-ref` artifact, checks the
    tag, commits `pin: <tag>` and pushes.
 
