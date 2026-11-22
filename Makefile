@@ -67,9 +67,10 @@ vuln:
 content-hash:
 	@hack/content-hash.sh
 
-# Image for the host architecture, loaded into the local Docker daemon. It is
-# built by hack/image-build.sh, the script CI uses, and tagged and versioned
-# x-<content hash>. A working tree whose build inputs differ from the index
+# Image for the host architecture, loaded into the local Docker daemon, for
+# local testing only. It is built by hack/image-build.sh and tagged and
+# versioned x-<local content hash>; CI builds the shipped image with
+# release-checks' build.yml, tagged r-<64 hex> (docs/releasing.md). A working tree whose build inputs differ from the index
 # gets "-dirty" on the tag and version, so a local build is never labelled as
 # the committed hash. Local builds carry no attestations.
 image:
