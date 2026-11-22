@@ -77,7 +77,7 @@ fi
 args=(
   --builder "$builder"
   --platform "linux/${arch}"
-  --build-arg "VERSION=${version}"
+  --build-arg "CONTENT_TAG=${version}"
   -t "$tag"
 )
 if [ "$mode" = "push" ]; then

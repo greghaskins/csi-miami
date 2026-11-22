@@ -547,7 +547,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
-        image: ghcr.io/greghaskins/csi-miami:unset
+        image: ghcr.io/greghaskins/csi-miami:PINNED
         livenessProbe:
           failureThreshold: 3
           httpGet:
@@ -764,7 +764,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-        image: ghcr.io/greghaskins/csi-miami:unset
+        image: ghcr.io/greghaskins/csi-miami:PINNED
         livenessProbe:
           failureThreshold: 3
           httpGet:

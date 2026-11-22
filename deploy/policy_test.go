@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -30,6 +31,18 @@ import (
 )
 
 var update = flag.Bool("update", false, "rewrite testdata/base.golden.yaml")
+
+// pinnedDriverImage is the driver image as the base pins it.
+var pinnedDriverImage = regexp.MustCompile(`^` + regexp.QuoteMeta(driverImage) + `:r-[0-9a-f]{64}@sha256:[0-9a-f]{64}$`)
+
+// goldenPin stands in for the pinned driver image in the golden file, so a
+// re-pin (a commit that changes only the tag and digest) leaves it unchanged.
+const goldenPin = driverImage + ":PINNED"
+
+func unpin(render []byte) []byte {
+	re := regexp.MustCompile(regexp.QuoteMeta(driverImage) + `:r-[0-9a-f]{64}@sha256:[0-9a-f]{64}`)
+	return re.ReplaceAll(render, []byte(goldenPin))
+}
 
 const (
 	driverName  = "miami.csi.greghaskins.com"
@@ -987,8 +1000,10 @@ func TestResourcesAndImages(t *testing.T) {
 			}
 			switch {
 			case c.Name == "miami":
-				if c.Image != driverImage+":unset" {
-					t.Errorf("%s: image = %q, want the placeholder %s:unset", id, c.Image, driverImage)
+				// The pin: content tag for the reader, index digest for the
+				// runtime (hack/pin checks that both are current).
+				if !pinnedDriverImage.MatchString(c.Image) {
+					t.Errorf("%s: image = %q, want %s:r-<64 hex>@sha256:<64 hex>", id, c.Image, driverImage)
 				}
 			case !strings.HasPrefix(c.Image, "registry.k8s.io/sig-storage/"):
 				t.Errorf("%s: image %q is not a sig-storage sidecar", id, c.Image)
@@ -1581,7 +1596,7 @@ func nestedSlice(m map[string]any, keys ...string) ([]any, bool, error) {
 
 func TestBaseGolden(t *testing.T) {
 	t.Parallel()
-	got := base(t).yaml
+	got := unpin(base(t).yaml)
 	path := filepath.Join("testdata", "base.golden.yaml")
 	if *update {
 		if err := os.WriteFile(path, got, 0o600); err != nil {

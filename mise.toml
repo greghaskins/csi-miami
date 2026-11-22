@@ -7,7 +7,7 @@ setup-envtest = "0.25.2"
 kind = "0.33.0"
 kubectl = "1.37.2"
 "go:github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity" = "5.6.0"
-# Read by the secret-scan hooks (hack/secret-scan/range.sh).
+# Read by the secret-scan hooks (.github/scripts/secret-scan/range.sh).
 jq = "1.8.2"
 "pipx:pre-commit" = "4.7.0"
 

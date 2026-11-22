@@ -5,7 +5,8 @@
 # golang:1.27.4, pinned by digest; keep the tag in step with go.mod and mise.toml.
 FROM --platform=$BUILDPLATFORM golang:1.27.4@sha256:5e8afd493a7124a8586e134d9b532731161d4b9becf9dee5a5956b107426f93d AS build
 ARG TARGETARCH
-ARG VERSION=dev
+# The content tag (r-<64 hex>), which the build sets; dev for a local build.
+ARG CONTENT_TAG=dev
 ENV GOTOOLCHAIN=local
 # CPU baselines, pinned so a default change in the toolchain cannot raise them:
 # amd64 v1 runs on older x86 without SSE4.2 or AVX, arm64 v8.0 on the
@@ -14,7 +15,7 @@ ENV GOAMD64=v1 GOARM64=v8.0
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /miami ./cmd/miami
+    go build -trimpath -ldflags "-s -w -X main.version=${CONTENT_TAG}" -o /miami ./cmd/miami
 
 # alpine:3.24, pinned by digest. Built for the target architecture, natively:
 # the tools are dynamically linked and are copied together with their

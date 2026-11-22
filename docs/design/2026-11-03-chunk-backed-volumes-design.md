@@ -1166,7 +1166,7 @@ A new session continues from here with no other context:
 
 1. Read `README.md`, the brief (its sections stand; decisions 36 to 59 win
    where they differ), `2026-10-31-working-mode.md`, then this document.
-2. Confirm the secret-scan config (`hack/secret-scan/require-config.sh`).
+2. Confirm the secret-scan config (`.github/scripts/secret-scan/require-config.sh`).
 3. The spec is approved. The plan is `2026-11-03-m2-implementation-plan.md`
    on the same branch; its work breakdown says which tasks are merged (the
    pull request's commits and `git log` are the truth). Execute the next

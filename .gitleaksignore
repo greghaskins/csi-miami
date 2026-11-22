@@ -1,4 +1,4 @@
-# Findings that secret scanning (hack/secret-scan/) must not report, one
+# Findings that secret scanning (.github/scripts/secret-scan/) must not report, one
 # fingerprint per line. gitleaks reads this file from the repository root. Lines
 # starting with '#' are comments; a comment cannot follow a fingerprint on the
 # same line.
@@ -10,7 +10,7 @@
 # Fingerprint formats:
 #   content of a commit (gitleaks git):
 #     <full commit sha>:<path in that commit>:<rule id>:<line number>
-#   message of a commit (hack/secret-scan/range.sh scans each message as a file
+#   message of a commit (.github/scripts/secret-scan/range.sh scans each message as a file
 #   named by the commit's full sha, and reports it with no directory):
 #     <full commit sha>:<rule id>:<line number>
 #

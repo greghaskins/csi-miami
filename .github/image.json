@@ -1,0 +1,15 @@
+{
+  "image": "ghcr.io/greghaskins/csi-miami",
+  "dockerfile": "Dockerfile",
+  "paths": [
+    "Dockerfile",
+    ".dockerignore",
+    "go.mod",
+    "go.sum",
+    "cmd",
+    "internal",
+    "hack/image-closure.sh",
+    "hack/tools.txt"
+  ],
+  "pin_file": "deploy/kustomize/base/kustomization.yaml"
+}
