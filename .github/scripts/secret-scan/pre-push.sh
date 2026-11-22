@@ -11,8 +11,8 @@ set -euo pipefail
 fail=0
 scan() {
   local from=$1 to=$2 ref=$3
-  printf '%s' "${ref#refs/heads/}" | hack/secret-scan/text.sh "the ref name" || fail=1
-  hack/secret-scan/range.sh "$from" "$to" || fail=1
+  printf '%s' "${ref#refs/heads/}" | .github/scripts/secret-scan/text.sh "the ref name" || fail=1
+  .github/scripts/secret-scan/range.sh "$from" "$to" || fail=1
 }
 if [[ -n "${PRE_COMMIT_TO_REF:-}" ]]; then
   scan "${PRE_COMMIT_FROM_REF:-0}" "$PRE_COMMIT_TO_REF" "${PRE_COMMIT_REMOTE_BRANCH:-}"

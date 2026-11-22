@@ -13,26 +13,26 @@ repos:
     hooks:
       - id: secret-scan-config-present
         name: "secret scan: config present"
-        entry: hack/secret-scan/require-config.sh
+        entry: .github/scripts/secret-scan/require-config.sh
         language: script
         always_run: true
         pass_filenames: false
         stages: [pre-commit, commit-msg]
       - id: secret-scan-staged
         name: "secret scan: staged files and paths"
-        entry: hack/secret-scan/staged.sh
+        entry: .github/scripts/secret-scan/staged.sh
         language: script
         always_run: true
         pass_filenames: false
         stages: [pre-commit]
       - id: secret-scan-commit-msg
         name: "secret scan: commit message"
-        entry: hack/secret-scan/commit-msg.sh
+        entry: .github/scripts/secret-scan/commit-msg.sh
         language: script
         stages: [commit-msg]
       - id: secret-scan-pre-push
         name: "secret scan: commits and ref name being pushed"
-        entry: hack/secret-scan/pre-push.sh
+        entry: .github/scripts/secret-scan/pre-push.sh
         language: script
         always_run: true
         pass_filenames: false
