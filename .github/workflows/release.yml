@@ -1,0 +1,38 @@
+# A reviewed v* tag publishes the GitHub Release, through release-checks'
+# shared release.yml (docs/releasing.md). The reviewer's bot account id comes
+# from the repository variable RELEASE_REVIEWER_ID.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions: {}
+jobs:
+  # The release-checks commit this workflow calls is one full SHA on
+  # release-checks' main (.github/scripts/release-checks-ref.sh). It runs
+  # first, with no `if:`, and the job that calls release-checks needs it.
+  release-checks-ref:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Self-test
+        run: .github/scripts/release-checks-ref.test.sh
+      - name: Check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/release-checks-ref.sh
+
+  release:
+    needs: release-checks-ref
+    uses: greghaskins/release-checks/.github/workflows/release.yml@908ba677391c1d39ad82a8e312016836bc68222f
+    permissions:
+      contents: write
+      statuses: read
+      checks: read
+      packages: read
+    with:
+      reviewer-id: ${{ vars.RELEASE_REVIEWER_ID }}
