@@ -287,7 +287,7 @@ jobs:
   image:
     needs: release-checks-ref
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    uses: greghaskins/release-checks/.github/workflows/build.yml@da12c45ebc8560ab6af4ca2b2a04cdb32070f2d2
+    uses: greghaskins/release-checks/.github/workflows/build.yml@1062e329f98578941d64f329136c2dc77690b5f4
     permissions:
       contents: read
       packages: write
@@ -458,7 +458,7 @@ jobs:
   pin:
     needs: [image, release-checks-ref]
     if: always() && needs.release-checks-ref.result == 'success'
-    uses: greghaskins/release-checks/.github/workflows/pin.yml@da12c45ebc8560ab6af4ca2b2a04cdb32070f2d2
+    uses: greghaskins/release-checks/.github/workflows/pin.yml@1062e329f98578941d64f329136c2dc77690b5f4
     permissions:
       contents: read
       packages: read
