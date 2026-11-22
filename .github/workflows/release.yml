@@ -141,7 +141,7 @@ jobs:
           [ "$(jq length <<<"${entry}")" = 1 ] || fail "${PIN_FILE} at ${SHA} has no single images entry for ${IMAGE}"
           tag="$(jq -r '.[0].newTag // ""' <<<"${entry}")"
           digest="$(jq -r '.[0].digest // ""' <<<"${entry}")"
-          [[ "${tag}" =~ ^x-[0-9a-f]+$ ]] || fail "${PIN_FILE} at ${SHA} pins tag '${tag}', not x-<hex>"
+          [[ "${tag}" =~ ^r-[0-9a-f]{64}$ ]] || fail "${PIN_FILE} at ${SHA} pins tag '${tag}', not r-<64 hex>"
           [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "${PIN_FILE} at ${SHA} pins digest '${digest}'"
           out="$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .Manifest}}' 2>"${RUNNER_TEMP}/r3.err")" \
             || fail "the registry has no ${IMAGE}:${tag}: $(cat "${RUNNER_TEMP}/r3.err")"
