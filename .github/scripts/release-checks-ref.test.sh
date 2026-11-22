@@ -160,5 +160,39 @@ on: push
 permissions: {contents: read}
 jobs: {a: {runs-on: x, steps: [{run: "ko build ./cmd/x"}]}}
 Y
+case_ "owner and repo in another case" fail 1 <<Y
+on: push
+permissions: {contents: read}
+jobs: {p: {uses: "GregHaskins/Release-Checks/.github/workflows/pin.yml@main"}}
+Y
+STUB_COMPARE=diverged case_ "another case still runs the compare" fail 2 <<Y
+on: push
+permissions: {contents: read}
+jobs: {p: {uses: "GregHaskins/release-checks/.github/workflows/pin.yml@$A"}}
+Y
+case_ "secret by index" fail 3 <<'Y'
+on: push
+permissions: {contents: read}
+jobs: {a: {runs-on: x, steps: [{uses: actions/checkout@v5}, {run: x, env: {K: "${{ secrets['GITLEAKS_CONFIG_TOML'] }}"}}]}}
+Y
+case_ "all secrets as JSON" fail 3 <<'Y'
+on: push
+permissions: {contents: read}
+jobs: {a: {runs-on: x, steps: [{uses: actions/checkout@v5}, {run: x, env: {K: "${{ toJSON(secrets) }}"}}]}}
+Y
+case_ "secrets passed by name to a reusable workflow" fail 3 <<'Y'
+on: push
+permissions: {contents: read}
+jobs: {a: {uses: other/repo/.github/workflows/x.yml@v1, secrets: {K: "${{ secrets.K }}"}}}
+Y
+case_ "GITHUB_TOKEN by index is not a secret" pass <<'Y'
+on: push
+permissions: {contents: read}
+jobs: {a: {runs-on: x, steps: [{uses: actions/checkout@v5}, {run: x, env: {T: "${{ secrets['GITHUB_TOKEN'] }}"}}]}}
+Y
+case_ "a workflow that does not parse fails" fail 0 <<'Y'
+on: push
+jobs: {a: [unclosed
+Y
 echo "1..$n"
 exit $failed

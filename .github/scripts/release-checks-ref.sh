@@ -8,7 +8,7 @@
 # release-checks, tells them apart. It runs the PR's own copy of itself, so a
 # PR could weaken it; such a PR changes .github/, which CODEOWNERS covers.
 #
-# Fails unless:
+# Fails unless (rule 0: every workflow file parses):
 #   rule 1: every release-checks reference under .github/workflows/ is a full
 #           SHA, and all name the same SHA;
 #   rule 2: GitHub's compare of release-checks main...<sha> is `behind` or
@@ -21,7 +21,8 @@
 # A job holds a write token when its permissions (or, if it sets none, the
 # workflow's) grant any `write`, or when neither sets permissions (GitHub's
 # default may grant write). It holds a secret when it names one other than
-# GITHUB_TOKEN, or passes `secrets: inherit`. `run:` lines are left to review.
+# GITHUB_TOKEN (any use of the `secrets` context), or passes secrets to a
+# reusable workflow. `run:` lines are left to review.
 #
 # Usage: release-checks-ref.sh [repo root]   (default: the current directory)
 # Needs: yq (mikefarah v4), jq, gh (with GH_TOKEN) from the runner image.
@@ -41,22 +42,29 @@ shopt -s nullglob
 files=("$wf_dir"/*.yml "$wf_dir"/*.yaml)
 [ "${#files[@]}" -gt 0 ] || { echo "no workflows under ${wf_dir}"; exit 0; }
 
-# One JSON document per workflow: {file, wf}.
-docs="$(for f in "${files[@]}"; do
-  yq -o=json '.' "$f" | jq -c --arg f "$f" '{file: $f, wf: .}'
-done)"
+# One JSON document per workflow: {file, wf}. A file that does not parse
+# fails the check (rule 0): it could hide any job.
+docs=""
+for f in "${files[@]}"; do
+  if ! j="$(yq -o=json '.' "$f" 2>&1)" || ! d="$(jq -c --arg f "$f" '{file: $f, wf: .}' <<<"$j" 2>&1)"; then
+    fail 0 "${f} does not parse: ${j%%$'\n'*}"
+    continue
+  fi
+  docs+="$d"$'\n'
+done
 
 sha_re='^[0-9a-f]{40}$'
 
 # --- rules 1 and 2: release-checks references --------------------------------
 # `uses: greghaskins/release-checks/...@ref` (jobs and steps), and checkouts
 # with `repository: greghaskins/release-checks`.
+# GitHub matches owner and repository names in any case.
 refs="$(jq -r --arg rc "$RC_REPO" '
   .file as $f | .wf.jobs // {} | to_entries[] | .key as $j | .value as $job
   | ( [$job.uses // empty] + [($job.steps // [])[] | .uses // empty]
-      | .[] | select(startswith($rc + "/") or startswith($rc + "@"))
+      | .[] | select(ascii_downcase | startswith($rc + "/") or startswith($rc + "@"))
       | "\($f) \($j) \(split("@") | if length > 1 then .[-1] else "" end)" ),
-    ( ($job.steps // [])[] | select((.with.repository // "") == $rc)
+    ( ($job.steps // [])[] | select(((.with.repository // "") | ascii_downcase) == $rc)
       | "\($f) \($j) \((.with.ref // "") | tostring)" )
 ' <<<"$docs")"
 
@@ -109,8 +117,10 @@ violations="$(jq -r '
   | (if $job | has("permissions") then $job.permissions else $wf.permissions end) as $p
   | ($job | tostring) as $text
   | (perms_write($p)
-     or ($text | test("secrets\\.(?!GITHUB_TOKEN\\b)[A-Za-z_]"))
-     or (($job.secrets // null) == "inherit")) as $privileged
+     or ($text
+         | gsub("secrets\\.GITHUB_TOKEN\\b|secrets\\[ *[\\x27\\x22]GITHUB_TOKEN[\\x27\\x22] *\\]"; "")
+         | test("\\bsecrets\\b"))
+     or (($job.secrets // null) != null)) as $privileged
   | select($privileged)
   | ( [$job.uses // empty, ($job.steps // [])[].uses // empty][] as $u
       | if ($u | test("^jdx/mise-action(@|/|$)")) then
@@ -138,6 +148,7 @@ done <<<"$violations"
 [ -n "$violations" ] || echo "ok: rules 3 and 4: no privileged job uses mise-action, an unpinned or outside action, or ko without KO_CONFIG_PATH under .github/"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  [ "$fails" -ne 0 ] || echo "- release-checks-ref: all rules passed" >> "$GITHUB_STEP_SUMMARY"
   { echo "- tools: $(yq --version 2>&1 | head -n1); $(jq --version); $(gh --version | head -n1)"; } >> "$GITHUB_STEP_SUMMARY"
 fi
 exit "$fails"
