@@ -83,7 +83,7 @@ func newPinRepo(t *testing.T) *pinRepo {
 	}
 	root := t.TempDir()
 	r := &pinRepo{t: t, dir: filepath.Join(root, "work"), bare: filepath.Join(root, "origin.git"), tag: "x-11",
-		jobs: `{"status":"completed","conclusion":"failure","jobs":[{"name":"manifest","status":"completed","conclusion":"success","url":"u"},{"name":"pin","status":"completed","conclusion":"failure"}]}`}
+		jobs: `{"status":"completed","conclusion":"failure","jobs":[{"name":"image / ref","status":"completed","conclusion":"success","url":"u"},{"name":"pin","status":"completed","conclusion":"failure"}]}`}
 	r.artifact = `{"tag":"x-11","digest":"` + dA + `"}`
 	for _, args := range [][]string{{"init", "-q", "--bare", "-b", "main", r.bare}, {"clone", "-q", r.bare, r.dir}} {
 		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil { //nolint:gosec // test repo setup
@@ -204,10 +204,10 @@ func TestPinScriptAlreadyPinned(t *testing.T) {
 func TestPinScriptFailsWithoutPushing(t *testing.T) {
 	cases := map[string]func(*pinRepo){
 		"image job failed": func(r *pinRepo) {
-			r.jobs = `{"status":"completed","conclusion":"failure","jobs":[{"name":"manifest","status":"completed","conclusion":"failure","url":"u"}]}`
+			r.jobs = `{"status":"completed","conclusion":"failure","jobs":[{"name":"image / ref","status":"completed","conclusion":"failure","url":"u"}]}`
 		},
 		"image job never finishes": func(r *pinRepo) {
-			r.jobs = `{"status":"in_progress","jobs":[{"name":"manifest","status":"in_progress"}]}`
+			r.jobs = `{"status":"in_progress","jobs":[{"name":"image / ref","status":"in_progress"}]}`
 		},
 		"run cancelled before the image job": func(r *pinRepo) {
 			r.jobs = `{"status":"completed","conclusion":"cancelled","jobs":[]}`

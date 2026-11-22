@@ -18,7 +18,7 @@ func init() { commands["pin"] = pinCmd }
 
 const (
 	imageWorkflow = "ci.yml"
-	imageJob      = "manifest"
+	imageJob      = "image / ref"
 	pinArtifact   = "image-ref"
 	pinJSON       = "image-ref.json"
 )
