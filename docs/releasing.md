@@ -69,3 +69,17 @@ now resolves to another index: possibly a re-pushed tag. Do not re-pin it.
 Change a hashed input to get a new tag, and escalate.
 
 A documentation-only change keeps its tag, so it passes without a new pin.
+
+## Releases
+
+A release is a `vX.Y.Z` tag on a commit of `main`, pushed once the commit has
+a green `release-review` from the release reviewer and a green `pin`. The tag
+push runs `.github/workflows/release.yml`, which calls release-checks'
+`release.yml`: it checks the review, the version, that the commit is on `main`
+and that the pinned image is still in the registry, then creates the GitHub
+Release once.
+
+Before the first tag, set the repository variable `RELEASE_REVIEWER_ID`
+(Settings > Secrets and variables > Actions > Variables) to the release
+reviewer's bot account id. Unset, the release job fails at its first rule and
+names the variable.
