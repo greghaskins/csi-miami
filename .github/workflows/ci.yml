@@ -671,6 +671,28 @@ jobs:
   #
   # A filtered job therefore cannot stand in for a pass, and a pass cannot be
   # skipped on a code change.
+  # The release-checks commit this repository calls is one full SHA on
+  # release-checks' main, and no job holding a write token or a secret runs
+  # mise-action, an unpinned action or an action outside .github/
+  # (.github/scripts/release-checks-ref.sh). Runs on every event with no
+  # `if:`, so a skipped run can never satisfy the required check. Every job
+  # that calls release-checks needs it.
+  release-checks-ref:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Self-test
+        run: .github/scripts/release-checks-ref.test.sh
+      - name: Check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/release-checks-ref.sh
+
   ci-ok:
     if: always()
     needs: [changes, static, unit, envtest, sanity, smoke, e2e, e2e-kind, build, manifest, deploy, publish, pin]
