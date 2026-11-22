@@ -111,5 +111,5 @@ replacements:
           - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path
 images:
   - name: ghcr.io/greghaskins/csi-miami
-    newTag: x-4980e709e5b943d0
-    digest: sha256:bc10a5257cee066156a23d07a3305cd776ff00cb55690ef9de6de5233f1b322f
+    newTag: r-28eaaab325ddab7287736347d9cfb04f45bba04faf4b981b4e2e5b2305284e64
+    digest: sha256:840754be769fcac960305e6faf2678155a2a1b9f3d187154db7c3b22b7fb21a2
