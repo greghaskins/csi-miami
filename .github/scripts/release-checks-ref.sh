@@ -16,7 +16,10 @@
 #   rule 3: no job holding a write token or a secret uses mise-action, a
 #           local action outside ./.github/, or an action or reusable
 #           workflow not pinned to a full SHA (docker:// by sha256 digest);
-#   rule 4: every such job that runs ko sets KO_CONFIG_PATH under .github/.
+#   rule 4: only a job that calls release-checks' build.yml holds
+#           packages: write, and it passes no secrets; every workflow sets
+#           top-level permissions, every reusable-workflow job its own, and
+#           nothing grants write-all.
 #
 # A job holds a write token when its permissions (or, if it sets none, the
 # workflow's) grant any `write`, or when neither sets permissions (GitHub's
@@ -97,7 +100,7 @@ else
   done <<<"$uniq_shas"
 fi
 
-# --- rules 3 and 4: jobs holding a write token or a secret -------------------
+# --- rule 3: jobs holding a write token or a secret -------------------------
 violations="$(jq -r '
   def perms_write(p):
     if p == null then true
@@ -108,10 +111,6 @@ violations="$(jq -r '
     if (u | startswith("./")) then true
     elif (u | startswith("docker://")) then (u | test("@sha256:[0-9a-f]{64}$"))
     else (u | full_sha_ref) end;
-  def under_github(p):
-    (p | tostring) as $s
-    | ($s | startswith(".github/")) or ($s | startswith("./.github/"))
-      or ($s | test("^\\$\\{\\{ *github\\.workspace *\\}\\}/\\.github/"));
   .file as $f | .wf as $wf
   | ($wf.jobs // {}) | to_entries[] | .key as $j | .value as $job
   | (if $job | has("permissions") then $job.permissions else $wf.permissions end) as $p
@@ -129,15 +128,6 @@ violations="$(jq -r '
           "3\t\($f) job \($j) uses a local action outside ./.github/ (\($u))"
         elif (pinned($u) | not) then
           "3\t\($f) job \($j) uses \($u), not pinned to a full SHA"
-        else empty end ),
-    ( ($job.steps // []) as $steps
-      | select([$steps[] | ((.uses // "") | test("^ko-build/setup-ko@")) or ((.run // "") | test("(^|[^A-Za-z0-9_-])ko +(build|apply|resolve|publish)\\b"))] | any)
-      | [ $wf.env.KO_CONFIG_PATH, $job.env.KO_CONFIG_PATH, ($steps[] | .env.KO_CONFIG_PATH) ]
-      | map(select(. != null)) as $cfg
-      | if ($cfg | length) == 0 then
-          "4\t\($f) job \($j) runs ko without KO_CONFIG_PATH; set it under .github/"
-        elif ([$cfg[] | under_github(.)] | all | not) then
-          "4\t\($f) job \($j) sets KO_CONFIG_PATH outside .github/ (\($cfg | join(", ")))"
         else empty end )
 ' <<<"$docs")"
 
@@ -145,7 +135,38 @@ while IFS=$'\t' read -r rule msg; do
   [ -n "${rule:-}" ] || continue
   fail "$rule" "$msg"
 done <<<"$violations"
-[ -n "$violations" ] || echo "ok: rules 3 and 4: no privileged job uses mise-action, an unpinned or outside action, or ko without KO_CONFIG_PATH under .github/"
+[ -n "$violations" ] || echo "ok: rule 3: no privileged job uses mise-action, an unpinned action or an action outside ./.github/"
+
+# --- rule 4: packages: write only where build.yml is called -----------------
+# Parsed, not grepped. Every workflow sets permissions at its top level, every
+# job that calls a reusable workflow sets its own (so the repository's default
+# token permissions never apply), nothing grants write-all, and only a job that
+# calls release-checks' build.yml holds packages: write, passing no secrets.
+r4="$(jq -r --arg rc "$RC_REPO" '
+  def grants_pkg(p): (p | type) == "object" and (p.packages // "") == "write";
+  .file as $f | .wf as $wf
+  | ( if ($wf | has("permissions") | not) then "4\t\($f) sets no top-level permissions"
+      elif $wf.permissions == "write-all" then "4\t\($f) grants write-all at the top level"
+      elif grants_pkg($wf.permissions) then "4\t\($f) grants packages: write at the top level"
+      else empty end ),
+    ( ($wf.jobs // {}) | to_entries[] | .key as $j | .value as $job
+      | (if $job | has("permissions") then $job.permissions else $wf.permissions end) as $p
+      | (($job.uses // "") | ascii_downcase | test("^" + $rc + "/\\.github/workflows/build\\.yml@")) as $builds
+      | ( if (($job.uses // null) != null) and ($job | has("permissions") | not) then
+            "4\t\($f) job \($j) calls a reusable workflow without its own permissions"
+          else empty end ),
+        ( if $job.permissions == "write-all" then "4\t\($f) job \($j) grants write-all"
+          elif grants_pkg($p) and ($builds | not) then
+            "4\t\($f) job \($j) holds packages: write but does not call \($rc)/.github/workflows/build.yml"
+          elif grants_pkg($p) and (($job.secrets // null) != null) then
+            "4\t\($f) job \($j) calls build.yml and passes secrets"
+          else empty end ) )
+' <<<"$docs")"
+while IFS=$'\t' read -r rule msg; do
+  [ -n "${rule:-}" ] || continue
+  fail "$rule" "$msg"
+done <<<"$r4"
+[ -n "$r4" ] || echo "ok: rule 4: packages: write is held only by the job that calls build.yml"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   [ "$fails" -ne 0 ] || echo "- release-checks-ref: all rules passed" >> "$GITHUB_STEP_SUMMARY"

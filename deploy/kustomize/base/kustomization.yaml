@@ -54,10 +54,14 @@
 # capacity key needs VAP v1 (1.30) and the node-name token extra (1.32). On a
 # cluster older than 1.30 the ClusterRole grant would land without its fence.
 #
-# The driver image below is the placeholder ghcr.io/greghaskins/csi-miami:unset,
-# a tag CI never publishes, so applying this base without an overlay fails to
-# pull and never runs a mutable image in the privileged node DaemonSet. Every
-# overlay sets the real one with `images:`, by digest where it can. The sidecar images carry a tag for the reader and the digest of the
+# The driver image is pinned at the end of this file: its content tag (the
+# hash of its build inputs, hack/content-hash.sh) and the digest of its
+# multi-arch index. Every commit on main carries a pin for its own tree, kept
+# current by `go run ./hack/pin pin` and verified by the `pin` check
+# (docs/releasing.md). The render is ghcr.io/greghaskins/csi-miami:<tag>@<digest>,
+# and the runtime pulls by the digest, so the privileged node DaemonSet never
+# runs a mutable tag. An overlay may still set its own image with `images:`.
+# The sidecar images carry a tag for the reader and the digest of the
 # multi-arch index for the runtime.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -105,3 +109,7 @@ replacements:
           - spec.template.spec.containers.[name=csi-node-driver-registrar].env.[name=KUBELET_DIR].value
           - spec.template.spec.containers.[name=miami].volumeMounts.[name=kubelet-dir].mountPath
           - spec.template.spec.volumes.[name=kubelet-dir].hostPath.path
+images:
+  - name: ghcr.io/greghaskins/csi-miami
+    newTag: r-28eaaab325ddab7287736347d9cfb04f45bba04faf4b981b4e2e5b2305284e64
+    digest: sha256:840754be769fcac960305e6faf2678155a2a1b9f3d187154db7c3b22b7fb21a2

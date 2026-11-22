@@ -125,7 +125,7 @@ For a cluster with tenants, or with powerful controllers in the namespaces the w
 
 **Namespace.** Everything runs in `miami-system`, labeled with Pod Security Admission `enforce: privileged` for the node agent's privileged security context and the controller's `SYS_ADMIN` capability (the controller mounts NFSv3 transports with `mount(2)`, which containerd's default AppArmor profile denies even with the capability).
 
-**Images.** The base uses the placeholder `ghcr.io/greghaskins/csi-miami:unset`, a tag that cannot be pulled; every overlay sets the real image with `images:`, preferably by digest. The sidecars (csi-provisioner, csi-attacher, csi-resizer, csi-node-driver-registrar, livenessprobe) are pinned by digest and are public at `registry.k8s.io/sig-storage/`. The driver image is public at ghcr.io/greghaskins/csi-miami.
+**Images.** The base pins the driver image by content tag and multi-arch index digest, so applying any commit of the base runs the image built from that commit's code, pulled by digest (see [docs/releasing.md](docs/releasing.md)). An overlay may still set its own image with `images:`. The sidecars (csi-provisioner, csi-attacher, csi-resizer, csi-node-driver-registrar, livenessprobe) are pinned by digest and are public at `registry.k8s.io/sig-storage/`. The driver image is public at ghcr.io/greghaskins/csi-miami.
 
 **Kubelet directory.** The base defaults to `/var/lib/kubelet`. Every distribution has its own:
 
@@ -135,14 +135,15 @@ For a cluster with tenants, or with powerful controllers in the namespaces the w
 | k3s | `/var/lib/rancher/k3s/agent/kubelet` |
 | microk8s | `/var/snap/microk8s/common/var/lib/kubelet` |
 
-An overlay (at `deploy/kustomize/overlays/<name>/kustomization.yaml`, or with `../../base` replaced if elsewhere) that sets a different path must repeat the kustomization.yaml replacement (the base snippet is in comments there). Set `newTag` to a commit sha (the publish job tags images by sha) or a release tag:
+An overlay (at `deploy/kustomize/overlays/<name>/kustomization.yaml`, or with `../../base` replaced if elsewhere) that sets a different path must repeat the kustomization.yaml replacement (the base snippet is in comments there). The base pins the driver image by content tag and digest; an overlay that pins its own sets `newTag` and `digest` together, from a release:
 
 ```yaml
 resources:
   - ../../base
 images:
   - name: ghcr.io/greghaskins/csi-miami
-    newTag: <sha or tag>
+    newTag: r-<64 hex>          # the release's content tag
+    digest: sha256:<64 hex>     # what runs
 configMapGenerator:
   - name: miami-deploy
     namespace: miami-system
