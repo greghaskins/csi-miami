@@ -31,7 +31,7 @@ for s in "${spec[@]}"; do
   if [[ -z $value ]]; then
     continue
   fi
-  if ! printf '%s\n' "$value" | hack/secret-scan/text.sh "$ev $name"; then
+  if ! printf '%s\n' "$value" | .github/scripts/secret-scan/text.sh "$ev $name"; then
     fields+=("$name")
   fi
 done

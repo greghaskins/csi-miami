@@ -19,7 +19,7 @@ Done once by the repository owner; the session checks, never assumes.
    exists.
 2. The agent environment exports `GITLEAKS_CONFIG_TOML` or its `_B64`
    form. First command of any session, from the checkout:
-   `hack/secret-scan/require-config.sh` must exit 0 and print nothing.
+   `.github/scripts/secret-scan/require-config.sh` must exit 0 and print nothing.
    Subagents inherit the same environment, and git hooks live in the
    shared `.git` directory, so every worktree is covered once the variable
    is present.
@@ -112,7 +112,7 @@ unmerged predecessor's branch when the wave needs it, and says so in the PR.
 
 ## 6. Starting the next session
 
-1. Confirm the config: `hack/secret-scan/require-config.sh`.
+1. Confirm the config: `.github/scripts/secret-scan/require-config.sh`.
 2. Read the three design files.
 3. Check which PRs are open and which tasks are merged (`git log main`),
    and pick up at the first incomplete wave.
