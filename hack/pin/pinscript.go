@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -33,7 +34,7 @@ type pinScript struct {
 	gh  func(args ...string) (string, error)
 	tag func(rev string) (string, error)
 	// appear bounds the wait for the image run to show up; timeout bounds the
-	// whole wait for its image job (the job's own timeout is 60 min).
+	// whole wait for its image / ref job (see pinCmd's default).
 	appear, timeout, poll time.Duration
 	sleep                 func(time.Duration)
 }
@@ -284,7 +285,7 @@ func (s pinScript) download(runID int64, url string) (pin, error) {
 	return p, nil
 }
 
-// ghRetry runs gh, retrying twice on failure: a wait of up to 75 minutes
+// ghRetry runs gh, retrying twice on failure: a wait of up to two hours
 // should not die on one transient API error.
 func (s pinScript) ghRetry(args ...string) (string, error) {
 	var out string
@@ -316,12 +317,21 @@ func short(sha string) string {
 
 // runner runs name in the working tree and returns its trimmed stdout. Its
 // error includes stderr.
+// commandTimeout bounds one git, gh or bash call, so a hung network call
+// cannot stall the pin script past its own waits.
+const commandTimeout = 5 * time.Minute
+
 func runner(name string) func(args ...string) (string, error) {
 	return func(args ...string) (string, error) {
-		cmd := exec.Command(name, args...) //nolint:gosec // name is git or gh; args are built here
+		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // name is git, gh or bash; args are built here
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return "", fmt.Errorf("%s %s: no answer within %s", name, strings.Join(args, " "), commandTimeout)
+			}
 			return "", fmt.Errorf("%s %s: %v: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 		}
 		return strings.TrimSpace(stdout.String()), nil
@@ -331,12 +341,13 @@ func runner(name string) func(args ...string) (string, error) {
 func pinCmd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pin", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	// The manifest job waits on both builds (20 min each, in parallel) and
-	// takes up to 10 min itself; an hour leaves room for queueing.
-	timeout := fs.Duration("timeout", time.Hour, "how long to wait for the manifest job")
+	// build.yml's jobs time out at tag 10, each build 30 (in parallel), merge
+	// 5 and ref 5 minutes, about 50 in all; two hours leaves room for
+	// queueing for a runner and a re-run.
+	timeout := fs.Duration("timeout", 2*time.Hour, "how long to wait for the image / ref job")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "usage: go run ./hack/pin pin [--timeout 1h]")
-		_, _ = fmt.Fprintln(stderr, "Merges origin/main in, waits for this commit's manifest job, then commits and pushes `pin: <tag>`.")
+		_, _ = fmt.Fprintln(stderr, "usage: go run ./hack/pin pin [--timeout 2h]")
+		_, _ = fmt.Fprintln(stderr, "Merges origin/main in, waits for this commit's image / ref job, then commits and pushes `pin: <tag>`.")
 	}
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		if err == nil {
