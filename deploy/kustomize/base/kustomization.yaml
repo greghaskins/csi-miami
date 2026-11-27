@@ -54,9 +54,9 @@
 # capacity key needs VAP v1 (1.30) and the node-name token extra (1.32). On a
 # cluster older than 1.30 the ClusterRole grant would land without its fence.
 #
-# The driver image is pinned at the end of this file: its content tag (the
-# hash of its build inputs, hack/content-hash.sh) and the digest of its
-# multi-arch index. Every commit on main carries a pin for its own tree, kept
+# The driver image is pinned at the end of this file: its content tag (r- and
+# the hash of the input set .github/image.json names, computed by
+# release-checks' content-tag.sh) and the digest of its multi-arch index. Every commit on main carries a pin for its own tree, kept
 # current by `go run ./hack/pin pin` and verified by the `pin` check
 # (docs/releasing.md). The render is ghcr.io/greghaskins/csi-miami:<tag>@<digest>,
 # and the runtime pulls by the digest, so the privileged node DaemonSet never
