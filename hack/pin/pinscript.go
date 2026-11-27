@@ -326,6 +326,10 @@ func runner(name string) func(args ...string) (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // name is git, gh or bash; args are built here
+		// The kill reaches only the direct child. A grandchild that holds the
+		// output pipes (an ssh helper, a credential helper) would keep Run
+		// waiting; WaitDelay closes the pipes and returns soon after.
+		cmd.WaitDelay = 10 * time.Second
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil {
