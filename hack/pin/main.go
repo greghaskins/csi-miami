@@ -6,11 +6,9 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -23,8 +21,10 @@ var (
 	digestRE   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	digestLine = regexp.MustCompile(`(?m)^(\s+digest: )(sha256:[0-9a-f]{64})$`)
 	rTagRE     = regexp.MustCompile(`^r-[0-9a-f]{64}$`)
-	// pinnedChecksRE finds the release-checks commit ci.yml calls pin.yml at.
-	pinnedChecksRE = regexp.MustCompile(`greghaskins/release-checks/\.github/workflows/pin\.yml@([0-9a-f]{40})`)
+	// pinnedChecksRE finds the release-checks commit ci.yml calls pin.yml at,
+	// only on a whole `uses:` line, so a comment that mentions pin.yml cannot
+	// be read as the pinned SHA.
+	pinnedChecksRE = regexp.MustCompile(`(?m)^\s*uses:\s*greghaskins/release-checks/\.github/workflows/pin\.yml@([0-9a-f]{40})\s*(#.*)?$`)
 )
 
 type command func(args []string, stdout, stderr io.Writer) int
@@ -53,54 +53,48 @@ func run(args []string, stdout, stderr io.Writer) int {
 // at: the same script and SHA the `pin` check runs, so the two cannot
 // disagree. It reads .github/image.json from rev, never the work tree.
 func contentTag(rev string) (string, error) {
-	root, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	top, err := runner("git")("rev-parse", "--show-toplevel")
 	if err != nil {
-		return "", exitDetail(err)
+		return "", err
 	}
-	top := strings.TrimSpace(string(root))
-	wf, err := os.ReadFile(filepath.Join(top, ".github/workflows/ci.yml")) //nolint:gosec // the repo's own workflow
+	wf, err := os.ReadFile(filepath.Join(top, ciWorkflowFile)) //nolint:gosec // the repo's own workflow
 	if err != nil {
 		return "", err
 	}
 	m := pinnedChecksRE.FindSubmatch(wf)
 	if m == nil {
-		return "", fmt.Errorf(".github/workflows/ci.yml does not call greghaskins/release-checks/.github/workflows/pin.yml at a full SHA")
+		return "", failf("%s has no `uses: greghaskins/release-checks/.github/workflows/pin.yml@<40 hex>` line, so the pin script cannot tell which content-tag.sh to run", ciWorkflowFile)
 	}
-	script, err := exec.Command("gh", "api", "-H", "Accept: application/vnd.github.raw", //nolint:gosec // a fixed path at a checked SHA
-		"repos/greghaskins/release-checks/contents/.github/scripts/content-tag.sh?ref="+string(m[1])).Output()
+	sha := string(m[1])
+	script, err := runner("gh")("api", "-H", "Accept: application/vnd.github.raw",
+		"repos/greghaskins/release-checks/contents/.github/scripts/content-tag.sh?ref="+sha)
 	if err != nil {
-		return "", fmt.Errorf("fetching content-tag.sh at %s: %w", m[1], exitDetail(err))
+		return "", failf("fetching release-checks' content-tag.sh at %s failed: %v\ncheck `gh auth status` and the network, then run the pin script again", sha[:12], err)
 	}
 	f, err := os.CreateTemp("", "content-tag-*.sh")
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = os.Remove(f.Name()) }()
-	if _, err := f.Write(script); err != nil {
+	if _, err := f.WriteString(script + "\n"); err != nil {
 		return "", err
 	}
 	if err := f.Close(); err != nil {
 		return "", err
 	}
-	out, err := exec.Command("bash", f.Name(), top, rev).Output() //nolint:gosec // our temp copy of a pinned script
+	t, err := runner("bash")(f.Name(), top, rev)
 	if err != nil {
-		return "", exitDetail(err)
+		// content-tag.sh names the broken rule: "content-tag: <rule>: <detail>".
+		return "", failf("computing the content tag failed: %v\nfix .github/image.json or the file it names, commit, then run the pin script again", err)
 	}
-	t := strings.TrimSpace(string(out))
 	if !rTagRE.MatchString(t) {
 		return "", fmt.Errorf("content-tag.sh printed %q, want r-<64 hex>", t)
 	}
 	return t, nil
 }
 
-// exitDetail adds a command's stderr to its error.
-func exitDetail(err error) error {
-	var ee *exec.ExitError
-	if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(ee.Stderr)))
-	}
-	return err
-}
+// ciWorkflowFile is where the pin script reads the release-checks SHA.
+const ciWorkflowFile = ".github/workflows/ci.yml"
 
 // setDigest rewrites the pinned digest in kustomization content.
 func setDigest(content []byte, digest string) ([]byte, error) {
